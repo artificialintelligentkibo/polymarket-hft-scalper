@@ -1,0 +1,189 @@
+# Polymarket HFT Scalper
+
+Standalone Polymarket scalper repo built from the proven pieces of `polymarket-copy-bot`, but stripped of copy-trading logic. This project keeps the gasless trader, JSONL logging, CCXT enrichment, and CLOB connectivity, then swaps in a dedicated short-horizon mean-reversion signal for 5-minute markets.
+
+## Repo Layout
+
+```text
+polymarket-hft-scalper/
+├── src/
+│   ├── config.ts
+│   ├── clob-fetcher.ts
+│   ├── signal-scalper.ts
+│   ├── position-manager.ts
+│   ├── trader.ts
+│   ├── logger.ts
+│   └── monitor.ts
+├── backtest/
+│   └── backtester.ts
+├── .env.example
+├── README.md
+└── package.json
+```
+
+## Stack
+
+- `@polymarket/clob-client` for gasless order posting
+- `ws` for CLOB WebSocket subscriptions
+- native `fetch` for Gamma market discovery
+- `ccxt` for crypto context snapshots in logs
+- TypeScript + `tsx`
+
+## Strategy
+
+The signal is implemented literally from the reconstructed rules:
+
+- Trade only the binary `outcomeIndex` tokens:
+  - `0` => `YES` / `UP`
+  - `1` => `NO` / `DOWN`
+- Entry BUY condition:
+  - `token_price < mid_price_orderbook - 0.018`
+- Inventory SELL condition:
+  - `token_price > mid_price_orderbook + 0.015`
+- Position sizing:
+  - `8` to `35` shares, scaled by market liquidity and available book depth
+- Net inventory controls:
+  - `MAX_NET_YES = +65`
+  - `MAX_NET_NO = -75`
+  - when breached, the engine auto-flips with the opposite corrective action
+- Exits:
+  - trailing take-profit distance: `0.012`
+  - hard stop distance: `0.025`
+  - flatten before slot end
+- Market filter:
+  - liquidity strictly above `$500`
+  - optionally only 5-minute markets
+
+## Important Assumptions
+
+Two parts of the original reverse-engineered behavior needed a deterministic implementation choice:
+
+1. `Trailing take-profit +0.012`
+   - implemented as: once peak mark is at least `entry + 0.012`, exit on a `0.012` retrace from the peak
+2. `SELL if token_price > mid + 0.015`
+   - implemented as an inventory reduction signal, not naked shorting
+   - the strategy only sells inventory it already owns
+
+These assumptions are explicit in code and easy to change.
+
+## Components
+
+### `src/monitor.ts`
+
+- pulls active Gamma markets
+- extracts binary token IDs
+- filters by liquidity and 5-minute duration
+- drops markets that are too close to slot end
+
+### `src/clob-fetcher.ts`
+
+- subscribes to `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+- tracks `last_trade_price` from WebSocket
+- refreshes full bid/ask books from REST when local state is stale
+- computes real `bestBid`, `bestAsk`, `midPrice`, spread, and depth
+
+### `src/signal-scalper.ts`
+
+- evaluates entry/exit edges
+- applies net position correction before new entries
+- sizes orders from liquidity
+- orchestrates live runtime loops
+
+### `src/position-manager.ts`
+
+- tracks YES / NO inventory separately
+- computes signed net exposure `yesShares - noShares`
+- marks unrealized PnL
+- triggers hard stop, trailing stop, and slot-end exits
+
+### `src/trader.ts`
+
+- derives or creates Polymarket API credentials from the configured signer
+- supports `EOA` and `PROXY` style auth
+- places gasless orders through the Polymarket SDK
+- preserves approval and balance checks needed for live trading
+
+### `src/logger.ts`
+
+- writes structured app events
+- writes JSONL trade records
+- enriches each record with CCXT crypto snapshots
+- captures realized / unrealized PnL and signed net inventory
+
+## Running
+
+```bash
+npm install
+cp .env.example .env
+npm start
+```
+
+Simulation mode:
+
+```bash
+SIMULATION_MODE=true
+ENABLE_SIGNAL=true
+npm start
+```
+
+Backtest:
+
+```bash
+npm run backtest -- backtest/data/sample.jsonl
+```
+
+Tests:
+
+```bash
+npm test
+```
+
+## Logging
+
+Trade logs are written as JSONL under `logs/` and include:
+
+- timestamp
+- market / slot metadata
+- token price, mid, best bid, best ask
+- action, shares, notional
+- net YES / net NO inventory
+- realized, unrealized, and total PnL
+- crypto prices from Binance via CCXT
+
+## Backtest Notes
+
+`backtest/backtester.ts` is designed to run on JSONL logs that already contain `token_price` and `mid_price_orderbook`, including the simulation logs produced by the earlier reverse-engineering workflow.
+
+The included sample dataset is synthetic and exists to verify that:
+
+- entries fire on the configured discount to mid
+- exits fire on the configured premium to mid
+- hard stop logic works
+- summary PnL aggregation is stable
+
+## Sample Results
+
+On the included synthetic dataset in [backtest/data/sample.jsonl](/C:/GitHub/polymarket-hft-scalper/backtest/data/sample.jsonl), the expected baseline result is:
+
+- `samples`: `6`
+- `markets`: `3`
+- `entries`: `3`
+- `exits`: `3`
+- `wins`: `1`
+- `losses`: `2`
+- `realizedPnl`: about `+0.0827`
+- `maxSignedNet`: about `25.55` shares
+- `forcedExitCount`: `1`
+
+This is intentionally a sanity-check dataset, not a profitability claim. It proves that:
+
+- discount-to-mid entries fire
+- premium-to-mid exits fire
+- hard stop logic closes losing inventory
+- net inventory never exceeds the configured caps on the sample flow
+
+## Next Steps
+
+- wire a persistent position snapshot store if you want restart-safe inventory
+- add per-market concurrency locks if you plan to run many slots in parallel
+- add maker/taker fill reconciliation from the user WebSocket channel for production
