@@ -3,6 +3,7 @@ import path from 'node:path';
 import { config } from './config.js';
 import type { Outcome } from './clob-fetcher.js';
 import type { SignalType } from './strategy-types.js';
+import { formatLogTimestamp, getErrorMessage, sanitizeInlineText } from './utils.js';
 
 export interface LatencyLogEntry {
   readonly timestampMs: number;
@@ -22,6 +23,7 @@ export interface LatencyLogEntry {
 let slotReportQueue = Promise.resolve();
 let latencyQueue = Promise.resolve();
 let redeemQueue = Promise.resolve();
+const reportWriteFailures = new Map<'slot-report' | 'latency' | 'redeem', number>();
 
 export function getReportsDirectory(): string {
   return path.resolve(process.cwd(), config.REPORTS_DIR);
@@ -62,10 +64,10 @@ function resolveLatencyLogPath(value: Date): string {
 
 function formatLatencyLogEntry(entry: LatencyLogEntry): string {
   return [
-    `[${formatTimestamp(new Date(entry.timestampMs))}]`,
+    `[${formatLogTimestamp(new Date(entry.timestampMs))}]`,
     `signal=${entry.signalType}`,
     `market=${entry.marketId}`,
-    `title="${sanitizeInline(entry.marketTitle)}"`,
+    `title="${sanitizeInlineText(entry.marketTitle)}"`,
     `side=${entry.action}`,
     `outcome=${entry.outcome}`,
     `signalToOrderMs=${formatLatencyValue(entry.latencySignalToOrderMs)}`,
@@ -86,10 +88,16 @@ function enqueueAppend(
   const task = queue.then(async () => {
     await mkdir(path.dirname(filePath), { recursive: true });
     await appendFile(filePath, payload, 'utf8');
+    reportWriteFailures.delete(channel);
   });
 
   void task.catch((error) => {
-    console.error(`[reports] Failed to write ${channel} file`, error);
+    const failureCount = (reportWriteFailures.get(channel) ?? 0) + 1;
+    reportWriteFailures.set(channel, failureCount);
+    console.error(
+      `[reports] Failed to write ${channel} file (consecutive failures: ${failureCount})`,
+      getErrorMessage(error)
+    );
   });
 
   return task.then(
@@ -105,25 +113,11 @@ function formatDayKey(value: Date): string {
   return `${year}-${month}-${day}`;
 }
 
-function formatTimestamp(value: Date): string {
-  const year = value.getFullYear();
-  const month = String(value.getMonth() + 1).padStart(2, '0');
-  const day = String(value.getDate()).padStart(2, '0');
-  const hours = String(value.getHours()).padStart(2, '0');
-  const minutes = String(value.getMinutes()).padStart(2, '0');
-  const seconds = String(value.getSeconds()).padStart(2, '0');
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-}
-
 function formatLatencyValue(value: number | undefined): string {
   if (value === undefined || !Number.isFinite(value)) {
     return 'n/a';
   }
   return `${Math.max(0, Math.round(value))}`;
-}
-
-function sanitizeInline(value: string): string {
-  return String(value || '').replace(/[\r\n"]/g, ' ').trim();
 }
 
 function ensureTrailingNewline(value: string): string {

@@ -119,7 +119,6 @@ class MarketMakerRuntime {
           await this.executor.cancelAll();
           await this.flattenAllOpenPositions('SLOT_FLATTEN');
           this.printPendingReports();
-          this.redeemer.stop();
           await this.executor.close();
         })(),
         config.runtime.gracefulShutdownTimeoutMs

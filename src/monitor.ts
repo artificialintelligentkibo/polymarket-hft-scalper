@@ -93,6 +93,7 @@ const GAMMA_EVENT_PAGE_LIMIT = 200;
 const MAX_GAMMA_EVENT_PAGES = 6;
 const MARKET_DISCOVERY_BUFFER_MULTIPLIER = 6;
 const STALE_SLOT_GRACE_MS = 60_000;
+let preferredGammaOrderField: 'endDate' | 'end_date' | null | undefined;
 const CLOCK_RANGE_PATTERN =
   /\b\d{1,2}:\d{2}\s?(?:AM|PM)\s*-\s*\d{1,2}:\d{2}\s?(?:AM|PM)\b/i;
 const UP_OR_DOWN_PATTERN = /\bup\s+or\s+down\b/i;
@@ -329,7 +330,7 @@ export async function fetchGammaEventsPage(params: {
   fetchImpl?: FetchLike;
 }): Promise<JsonRecord[]> {
   const fetchImpl = params.fetchImpl ?? fetch;
-  const orderCandidates = ['endDate', 'end_date', null] as const;
+  const orderCandidates = buildOrderCandidates(preferredGammaOrderField);
   let lastError: Error | null = null;
 
   for (const orderField of orderCandidates) {
@@ -360,6 +361,9 @@ export async function fetchGammaEventsPage(params: {
         /order fields are not valid/i.test(errorText);
 
       if (isOrderValidationError && orderField) {
+        if (preferredGammaOrderField === orderField) {
+          preferredGammaOrderField = undefined;
+        }
         lastError = new Error(
           `Gamma events API rejected order field "${orderField}": ${errorText}`
         );
@@ -372,6 +376,7 @@ export async function fetchGammaEventsPage(params: {
     }
 
     const payload = (await response.json()) as unknown;
+    preferredGammaOrderField = orderField;
     if (Array.isArray(payload)) {
       return payload.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
     }
@@ -386,6 +391,17 @@ export async function fetchGammaEventsPage(params: {
   }
 
   return [];
+}
+
+function buildOrderCandidates(
+  preferred: 'endDate' | 'end_date' | null | undefined
+): ReadonlyArray<'endDate' | 'end_date' | null> {
+  const defaults = ['endDate', 'end_date', null] as const;
+  if (preferred === undefined) {
+    return defaults;
+  }
+
+  return [preferred, ...defaults.filter((candidate) => candidate !== preferred)];
 }
 
 export function flattenGammaEventMarkets(events: readonly JsonRecord[]): GammaMarketSource[] {

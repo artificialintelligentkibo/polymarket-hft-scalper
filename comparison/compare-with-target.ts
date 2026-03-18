@@ -86,6 +86,7 @@ const DEFAULT_TARGET_LOG_ROOTS = [
   '/home/node/.openclaw/workspace/polymarket-copy-bot/logs',
 ] as const;
 const DEFAULT_OUR_LOG_ROOTS = [path.resolve(process.cwd(), 'logs')] as const;
+const globRegexCache = new Map<string, RegExp>();
 
 export function parseCliArgs(argv: readonly string[]): CliOptions {
   let hours = DEFAULT_WINDOW_HOURS;
@@ -719,7 +720,9 @@ function sanitizeMarkdownCell(value: string): string {
 }
 
 function escapeCsvCell(value: string): string {
-  return `"${value.replaceAll('"', '""')}"`;
+  const escaped = value.replaceAll('"', '""');
+  const guarded = /^[=+\-@]/.test(escaped) ? `'${escaped}` : escaped;
+  return `"${guarded}"`;
 }
 
 async function resolveTargetLogPath(): Promise<string | null> {
@@ -864,8 +867,13 @@ function parsePositiveNumber(value: string | undefined, fallback: number): numbe
 }
 
 function matchGlob(fileName: string, pattern: string): boolean {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  return new RegExp(`^${escaped}$`, 'i').test(fileName);
+  let regex = globRegexCache.get(pattern);
+  if (!regex) {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    regex = new RegExp(`^${escaped}$`, 'i');
+    globRegexCache.set(pattern, regex);
+  }
+  return regex.test(fileName);
 }
 
 function extractLogDateMs(fileName: string): number | null {

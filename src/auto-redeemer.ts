@@ -3,12 +3,13 @@ import { ethers } from 'ethers';
 import { config, isDryRunMode, type AppConfig } from './config.js';
 import { logger } from './logger.js';
 import { writeRedeemLog } from './reports.js';
-import { roundTo } from './utils.js';
+import { formatLogTimestamp, getErrorMessage, roundTo, sanitizeInlineText } from './utils.js';
 
 const DATA_API_POSITIONS_URL = 'https://data-api.polymarket.com/positions';
 const POSITIONS_PAGE_LIMIT = 500;
 const MAX_POSITION_PAGES = 10;
 const RECENT_REDEEM_TTL_MS = 10 * 60 * 1000;
+const MAX_RELAYER_POLL_COUNT = 100;
 const TOKEN_DECIMALS = 6;
 const DEFAULT_PROXY_GAS_LIMIT = ethers.BigNumber.from('10000000');
 const ZERO_ADDRESS = ethers.constants.AddressZero;
@@ -194,7 +195,7 @@ export class AutoRedeemer {
         await this.redeemGroup(group);
       }
     } catch (error: any) {
-      const message = error?.message || 'Unknown error';
+      const message = getErrorMessage(error);
       logger.warn('Auto redeem cycle failed', {
         positionsUser: this.status.positionsUser,
         message,
@@ -307,7 +308,7 @@ export class AutoRedeemer {
         ].join(' '),
       });
     } catch (error: any) {
-      const message = error?.message || 'Unknown error';
+      const message = getErrorMessage(error);
       logger.warn('Gasless redeem failed', {
         conditionId: group.conditionId,
         title: group.title,
@@ -370,7 +371,7 @@ export class AutoRedeemer {
       transactionId,
       ['STATE_MINED', 'STATE_CONFIRMED'],
       'STATE_FAILED',
-      100
+      MAX_RELAYER_POLL_COUNT
     );
 
     if (!result) {
@@ -406,7 +407,12 @@ export class AutoRedeemer {
         data: transaction.data,
       },
     ]]);
-    const gasLimit = await this.estimateProxyGasLimit(PROXY_FACTORY_ADDRESS, from, encodedProxyData);
+    const gasLimit = await this.estimateProxyGasLimit(
+      this.signerWallet,
+      PROXY_FACTORY_ADDRESS,
+      from,
+      encodedProxyData
+    );
     const structHash = ethers.utils.keccak256(
       ethers.utils.hexConcat([
         ethers.utils.hexlify(ethers.utils.toUtf8Bytes('rlx:')),
@@ -584,7 +590,7 @@ export class AutoRedeemer {
       transactionId,
       ['STATE_MINED', 'STATE_CONFIRMED'],
       'STATE_FAILED',
-      100
+      MAX_RELAYER_POLL_COUNT
     );
     if (!result) {
       throw new Error('Safe deploy did not reach STATE_MINED/STATE_CONFIRMED.');
@@ -592,19 +598,20 @@ export class AutoRedeemer {
   }
 
   private async estimateProxyGasLimit(
+    signerWallet: ethers.Wallet,
     to: string,
     from: string,
     data: string
   ): Promise<ethers.BigNumber> {
     try {
-      return await this.signerWallet!.estimateGas({
+      return await signerWallet.estimateGas({
         from,
         to,
         data,
       });
     } catch (error) {
       logger.warn('Could not estimate proxy redeem gas, using fallback gas limit', {
-        message: error instanceof Error ? error.message : String(error),
+        message: getErrorMessage(error),
       });
       return DEFAULT_PROXY_GAS_LIMIT;
     }
@@ -634,7 +641,7 @@ export class AutoRedeemer {
   ): void {
     const timestamp = new Date(this.now());
     writeRedeemLog(
-      `[${formatLogTimestamp(timestamp)}] status=${status} conditionId=${entry.conditionId} title="${sanitizeInline(
+      `[${formatLogTimestamp(timestamp)}] status=${status} conditionId=${entry.conditionId} title="${sanitizeInlineText(
         entry.title
       )}" ${entry.detail}`,
       timestamp.getTime()
@@ -906,20 +913,6 @@ function sanitizeAddress(value: unknown): string | null {
 function normalizeOptionalString(value: unknown): string | null {
   const normalized = String(value ?? '').trim();
   return normalized ? normalized : null;
-}
-
-function formatLogTimestamp(value: Date): string {
-  const year = value.getFullYear();
-  const month = String(value.getMonth() + 1).padStart(2, '0');
-  const day = String(value.getDate()).padStart(2, '0');
-  const hours = String(value.getHours()).padStart(2, '0');
-  const minutes = String(value.getMinutes()).padStart(2, '0');
-  const seconds = String(value.getSeconds()).padStart(2, '0');
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-}
-
-function sanitizeInline(value: string): string {
-  return String(value || '').replace(/[\r\n"]/g, ' ').trim();
 }
 
 function deriveProxyWallet(address: string, proxyFactory: string): string {
