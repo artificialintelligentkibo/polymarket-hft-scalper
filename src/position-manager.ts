@@ -68,6 +68,7 @@ interface OutcomeState {
   lastMarkPrice: number | null;
   peakMarkPrice: number | null;
   lastFillAt: string | null;
+  cooldownUntilAt: string | null;
 }
 
 const EPSILON = 0.000001;
@@ -126,6 +127,25 @@ export class PositionManager {
 
   getGrossExposureShares(): number {
     return this.yes.shares + this.no.shares;
+  }
+
+  isEntryCoolingDown(outcome: Outcome, now: Date = new Date()): boolean {
+    const cooldownUntilAt = this.getState(outcome).cooldownUntilAt;
+    if (!cooldownUntilAt) {
+      return false;
+    }
+
+    const cooldownMs = Date.parse(cooldownUntilAt);
+    return Number.isFinite(cooldownMs) && cooldownMs > now.getTime();
+  }
+
+  setEntryCooldown(outcome: Outcome, cooldownMs: number, now: Date = new Date()): void {
+    if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) {
+      this.getState(outcome).cooldownUntilAt = null;
+      return;
+    }
+
+    this.getState(outcome).cooldownUntilAt = new Date(now.getTime() + cooldownMs).toISOString();
   }
 
   getAvailableEntryCapacity(outcome: Outcome, limits: PositionRiskLimits): number {
@@ -342,6 +362,7 @@ export class PositionManager {
       lastMarkPrice: null,
       peakMarkPrice: null,
       lastFillAt: null,
+      cooldownUntilAt: null,
     };
   }
 }

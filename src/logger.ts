@@ -71,6 +71,13 @@ export interface TradeLogInput {
   realizedPnl: number;
   unrealizedPnl: number;
   totalPnl: number;
+  slotEntryCount?: number;
+  slotFillCount?: number;
+  upExposureUsd?: number;
+  downExposureUsd?: number;
+  dayPnl?: number;
+  peakDayPnl?: number;
+  dayDrawdown?: number;
   latencySignalToOrderMs?: number;
   latencyRoundTripMs?: number;
   orderId?: string | null;
@@ -253,6 +260,13 @@ export class TradeLogger {
       realizedPnl: roundTo(input.realizedPnl, 4),
       unrealizedPnl: roundTo(input.unrealizedPnl, 4),
       totalPnl: roundTo(input.totalPnl, 4),
+      slotEntryCount: safePositiveCount(input.slotEntryCount),
+      slotFillCount: safePositiveCount(input.slotFillCount),
+      upExposureUsd: safeNumberOrNull(input.upExposureUsd ?? null),
+      downExposureUsd: safeNumberOrNull(input.downExposureUsd ?? null),
+      dayPnl: safeNumberOrNull(input.dayPnl ?? null),
+      peakDayPnl: safeNumberOrNull(input.peakDayPnl ?? null),
+      dayDrawdown: safeNumberOrNull(input.dayDrawdown ?? null),
       latencySignalToOrderMs: safeLatency(input.latencySignalToOrderMs),
       latencyRoundTripMs: safeLatency(input.latencyRoundTripMs),
       crypto_prices_at_time: await getCryptoPrices(input.timestampMs),
@@ -420,6 +434,10 @@ function safeNumberOrNull(value: number | null): number | null {
 
 function safeLatency(value: number | undefined): number | undefined {
   return value === undefined || !Number.isFinite(value) ? undefined : Math.max(0, roundTo(value, 0));
+}
+
+function safePositiveCount(value: number | undefined): number | undefined {
+  return value === undefined || !Number.isFinite(value) ? undefined : Math.max(0, Math.round(value));
 }
 
 export const logger = new StructuredLogger();

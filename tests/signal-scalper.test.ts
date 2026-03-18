@@ -181,7 +181,7 @@ test('fair value buy uses paired normalization rather than raw single-book mid',
     combinedBid: 0.91,
     combinedAsk: 0.94,
     combinedMid: 0.925,
-    combinedDiscount: 0.01,
+    combinedDiscount: 0.005,
     combinedPremium: -0.09,
     pairSpread: 0.03,
   };
@@ -218,4 +218,102 @@ test('fair value buy uses paired normalization rather than raw single-book mid',
   assert.ok(fairValueBuy);
   assert.equal((fairValueBuy?.fairValue ?? 0) > (orderbook.yes.midPrice ?? 0), true);
   assert.equal((fairValueBuy?.referencePrice ?? 0) > orderbook.yes.bestAsk, true);
+});
+
+test('fair value sell can reduce YES inventory when YES is rich versus parity', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.combined = {
+    combinedBid: 1.04,
+    combinedAsk: 1.08,
+    combinedMid: 1.06,
+    combinedDiscount: -0.08,
+    combinedPremium: 0.04,
+    pairSpread: 0.04,
+  };
+  orderbook.yes.bestBid = 0.7;
+  orderbook.yes.bestAsk = 0.72;
+  orderbook.yes.midPrice = 0.71;
+  orderbook.yes.depthSharesBid = 160;
+  orderbook.yes.depthNotionalBid = 112;
+  orderbook.no.bestBid = 0.34;
+  orderbook.no.bestAsk = 0.36;
+  orderbook.no.midPrice = 0.35;
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 24,
+    price: 0.44,
+  });
+
+  const riskManager = new RiskManager();
+  const signalEngine = new SignalScalper();
+  const riskAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  const fairValueSell = signals.find(
+    (signal) => signal.signalType === 'FAIR_VALUE_SELL' && signal.outcome === 'YES'
+  );
+
+  assert.ok(fairValueSell);
+  assert.equal(fairValueSell?.action, 'SELL');
+  assert.equal((fairValueSell?.fairValue ?? 0) < (orderbook.yes.bestBid ?? 0), true);
+});
+
+test('extreme buy skips degenerate entry books with negligible ask depth', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.combined = {
+    combinedBid: 0.99,
+    combinedAsk: 1.01,
+    combinedMid: 1,
+    combinedDiscount: -0.01,
+    combinedPremium: -0.01,
+    pairSpread: 0.02,
+  };
+  orderbook.yes.bestBid = 0.01;
+  orderbook.yes.bestAsk = 0.03;
+  orderbook.yes.midPrice = 0.02;
+  orderbook.yes.spread = 0.02;
+  orderbook.yes.depthSharesAsk = 1;
+  orderbook.yes.depthNotionalAsk = 0.03;
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+  const signalEngine = new SignalScalper();
+  const riskAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  assert.equal(
+    signals.some(
+      (signal) => signal.signalType === 'EXTREME_BUY' && signal.outcome === 'YES'
+    ),
+    false
+  );
 });

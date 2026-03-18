@@ -1,5 +1,6 @@
 import { config, type AppConfig } from './config.js';
 import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob-fetcher.js';
+import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
 import type { RiskAssessment } from './risk-manager.js';
@@ -61,10 +62,28 @@ export class SignalScalper {
     const combinedDiscount = orderbook.combined.combinedDiscount;
     const combinedAsk = orderbook.combined.combinedAsk;
 
+    if (combinedAsk !== null || combinedDiscount !== null) {
+      logger.debug('Evaluated combined discount metrics', {
+        marketId: market.marketId,
+        combinedAsk,
+        combinedBid: orderbook.combined.combinedBid,
+        combinedMid: orderbook.combined.combinedMid,
+        combinedDiscount,
+        minCombinedDiscount: this.runtimeConfig.strategy.minCombinedDiscount,
+      });
+    }
+
     if (
       combinedDiscount === null ||
       combinedAsk === null ||
       combinedDiscount < this.runtimeConfig.strategy.minCombinedDiscount
+    ) {
+      return [];
+    }
+
+    if (
+      !isTradableEntryBook(orderbook.yes, this.runtimeConfig) ||
+      !isTradableEntryBook(orderbook.no, this.runtimeConfig)
     ) {
       return [];
     }
@@ -144,7 +163,11 @@ export class SignalScalper {
       const openShares = positionManager.getShares(outcome);
       const fairValue = estimateFairValue(orderbook, outcome);
 
-      if (!riskAssessment.blockedOutcomes.has(outcome) && bestAsk !== null) {
+      if (
+        !riskAssessment.blockedOutcomes.has(outcome) &&
+        bestAsk !== null &&
+        isTradableEntryBook(book, this.runtimeConfig)
+      ) {
         const edge = this.runtimeConfig.strategy.extremeBuyThreshold - bestAsk;
         if (edge >= 0) {
           const size = calculateTradeSize({
@@ -190,8 +213,9 @@ export class SignalScalper {
         }
       }
 
-      if (openShares > 0 && bestBid !== null) {
-        const edge = bestBid - this.runtimeConfig.strategy.extremeSellThreshold;
+      if (openShares > 0 && hasExecutableBid(book)) {
+        const executableBid = book.bestBid;
+        const edge = executableBid - this.runtimeConfig.strategy.extremeSellThreshold;
         if (edge >= 0) {
           const size = calculateTradeSize({
             action: 'SELL',
@@ -200,7 +224,7 @@ export class SignalScalper {
             availableCapacity: openShares,
             depthShares: book.depthSharesBid,
             liquidityUsd: market.liquidityUsd,
-            price: bestBid,
+            price: executableBid,
             referenceEdge: 1 - this.runtimeConfig.strategy.extremeSellThreshold,
             runtimeConfig: this.runtimeConfig,
             allowBelowMin: true,
@@ -216,9 +240,9 @@ export class SignalScalper {
                 action: 'SELL',
                 outcome,
                 shares: size.shares,
-                targetPrice: bestBid,
+                targetPrice: executableBid,
                 referencePrice: this.runtimeConfig.strategy.extremeSellThreshold,
-                tokenPrice: book.lastTradePrice ?? bestBid,
+                tokenPrice: book.lastTradePrice ?? executableBid,
                 midPrice: book.midPrice,
                 fairValue,
                 edgeAmount: edge,
@@ -227,7 +251,7 @@ export class SignalScalper {
                 capitalClamp: size.capitalClamp,
                 urgency: 'cross',
                 reduceOnly: true,
-                reason: `${outcome} bid ${formatPrice(bestBid)} is inside the extreme sell zone`,
+                reason: `${outcome} bid ${formatPrice(executableBid)} is inside the extreme sell zone`,
               })
             );
           }
@@ -256,7 +280,8 @@ export class SignalScalper {
       if (
         !riskAssessment.blockedOutcomes.has(outcome) &&
         fairValue !== null &&
-        bestAsk !== null
+        bestAsk !== null &&
+        isTradableEntryBook(book, this.runtimeConfig)
       ) {
         const buyEdge = fairValue - bestAsk;
         if (buyEdge >= this.runtimeConfig.strategy.fairValueBuyThreshold) {
@@ -303,8 +328,9 @@ export class SignalScalper {
         }
       }
 
-      if (fairValue !== null && bestBid !== null && openShares > 0) {
-        const sellEdge = bestBid - fairValue;
+      if (fairValue !== null && hasExecutableBid(book) && openShares > 0) {
+        const executableBid = book.bestBid;
+        const sellEdge = executableBid - fairValue;
         if (sellEdge >= this.runtimeConfig.strategy.fairValueSellThreshold) {
           const size = calculateTradeSize({
             action: 'SELL',
@@ -313,7 +339,7 @@ export class SignalScalper {
             availableCapacity: openShares,
             depthShares: book.depthSharesBid,
             liquidityUsd: market.liquidityUsd,
-            price: bestBid,
+            price: executableBid,
             referenceEdge: this.runtimeConfig.strategy.fairValueSellThreshold,
             runtimeConfig: this.runtimeConfig,
             allowBelowMin: true,
@@ -329,9 +355,9 @@ export class SignalScalper {
                 action: 'SELL',
                 outcome,
                 shares: size.shares,
-                targetPrice: bestBid,
+                targetPrice: executableBid,
                 referencePrice: fairValue,
-                tokenPrice: book.lastTradePrice ?? bestBid,
+                tokenPrice: book.lastTradePrice ?? executableBid,
                 midPrice: book.midPrice,
                 fairValue,
                 edgeAmount: sellEdge,
@@ -340,7 +366,7 @@ export class SignalScalper {
                 capitalClamp: size.capitalClamp,
                 urgency: 'improve',
                 reduceOnly: true,
-                reason: `${outcome} bid ${formatPrice(bestBid)} is above fair value ${formatPrice(fairValue)}`,
+                reason: `${outcome} bid ${formatPrice(executableBid)} is above fair value ${formatPrice(fairValue)}`,
               })
             );
           }
@@ -596,49 +622,101 @@ function estimateFairValue(
 ): number | null {
   const own = getBookForOutcome(snapshot, outcome);
   const opposite = getBookForOutcome(snapshot, outcome === 'YES' ? 'NO' : 'YES');
-  const normalizedMid = normalizePairedFairValues(own.midPrice, opposite.midPrice);
-  if (normalizedMid) {
-    return outcome === 'YES' ? normalizedMid.left : normalizedMid.right;
+
+  const pairedMid = parityAdjustedOwnValue(own.midPrice, opposite.midPrice);
+  if (pairedMid !== null) {
+    return pairedMid;
   }
 
-  const normalizedLastTrade = normalizePairedFairValues(
-    own.lastTradePrice,
-    opposite.lastTradePrice
-  );
-  if (normalizedLastTrade) {
-    return outcome === 'YES' ? normalizedLastTrade.left : normalizedLastTrade.right;
+  const pairedLastTrade = parityAdjustedOwnValue(own.lastTradePrice, opposite.lastTradePrice);
+  if (pairedLastTrade !== null) {
+    return pairedLastTrade;
   }
 
-  if (opposite.midPrice !== null) {
-    return roundTo(1 - opposite.midPrice, 6);
+  const ownTouchMid = deriveTouchMid(own);
+  const oppositeTouchMid = deriveTouchMid(opposite);
+  const pairedTouchMid = parityAdjustedOwnValue(ownTouchMid, oppositeTouchMid);
+  if (pairedTouchMid !== null) {
+    return pairedTouchMid;
   }
 
-  if (opposite.lastTradePrice !== null) {
-    return roundTo(1 - opposite.lastTradePrice, 6);
+  const oppositeParity = complementaryPrice(opposite.midPrice ?? oppositeTouchMid ?? opposite.lastTradePrice);
+  if (oppositeParity !== null) {
+    return oppositeParity;
+  }
+
+  const ownDirect = own.midPrice ?? ownTouchMid ?? own.lastTradePrice;
+  if (isValidProbability(ownDirect)) {
+    return roundTo(ownDirect, 6);
   }
 
   return null;
 }
 
-function normalizePairedFairValues(
-  left: number | null,
-  right: number | null
-): { left: number; right: number } | null {
-  if (left === null || right === null) {
-    return null;
-  }
-
-  const total = left + right;
-  if (!Number.isFinite(total) || total <= 0) {
-    return null;
-  }
-
-  return {
-    left: roundTo(left / total, 6),
-    right: roundTo(right / total, 6),
-  };
-}
-
 function formatPrice(value: number): string {
   return Number.isFinite(value) ? value.toFixed(4) : 'n/a';
+}
+
+function isTradableEntryBook(book: TokenBookSnapshot, runtimeConfig: AppConfig): boolean {
+  if (
+    !isValidProbability(book.bestBid) ||
+    !isValidProbability(book.bestAsk) ||
+    book.bestAsk <= book.bestBid
+  ) {
+    return false;
+  }
+
+  if (
+    book.spread === null ||
+    !Number.isFinite(book.spread) ||
+    book.spread <= 0 ||
+    book.spread > runtimeConfig.strategy.maxEntrySpread
+  ) {
+    return false;
+  }
+
+  return book.depthNotionalAsk >= runtimeConfig.strategy.minEntryDepthUsd;
+}
+
+function hasExecutableBid(book: TokenBookSnapshot): book is TokenBookSnapshot & { bestBid: number } {
+  return isValidProbability(book.bestBid) && book.depthNotionalBid > 0;
+}
+
+function deriveTouchMid(book: TokenBookSnapshot): number | null {
+  if (!isValidProbability(book.bestBid) || !isValidProbability(book.bestAsk)) {
+    return null;
+  }
+
+  if (book.bestAsk <= book.bestBid) {
+    return null;
+  }
+
+  return roundTo((book.bestBid + book.bestAsk) / 2, 6);
+}
+
+function parityAdjustedOwnValue(
+  ownValue: number | null,
+  oppositeValue: number | null
+): number | null {
+  if (!isValidProbability(ownValue) || !isValidProbability(oppositeValue)) {
+    return null;
+  }
+
+  return clampProbability(ownValue + (1 - (ownValue + oppositeValue)) / 2);
+}
+
+function complementaryPrice(value: number | null): number | null {
+  if (!isValidProbability(value)) {
+    return null;
+  }
+
+  return clampProbability(1 - value);
+}
+
+function clampProbability(value: number): number {
+  return roundTo(clamp(value, 0.001, 0.999), 6);
+}
+
+function isValidProbability(value: number | null): value is number {
+  return value !== null && Number.isFinite(value) && value > 0 && value < 1;
 }

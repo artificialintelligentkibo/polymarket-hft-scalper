@@ -1,5 +1,8 @@
 import { config, type AppConfig } from './config.js';
 import type { MarketOrderbookSnapshot, Outcome } from './clob-fetcher.js';
+import { evaluateDayDrawdown } from './day-pnl-state.js';
+import { buildFlattenSignals } from './flatten-signals.js';
+import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import type {
   BoundaryCorrection,
@@ -35,6 +38,37 @@ export class RiskManager {
       NO: orderbook.no.midPrice ?? orderbook.no.bestBid,
     });
 
+    const blockedOutcomes = new Set<Outcome>();
+    const drawdownEvaluation = evaluateDayDrawdown(now, this.runtimeConfig);
+    if (drawdownEvaluation.justHalted) {
+      logger.warn('RISK_STOP_DRAWDOWN triggered', {
+        marketId: market.marketId,
+        dayPnl: drawdownEvaluation.state.dayPnl,
+        peakPnl: drawdownEvaluation.state.peakPnl,
+        drawdown: drawdownEvaluation.state.drawdown,
+        threshold: this.runtimeConfig.strategy.maxDrawdownUsdc,
+      });
+    }
+
+    if (drawdownEvaluation.state.tradingHalted) {
+      blockedOutcomes.add('YES');
+      blockedOutcomes.add('NO');
+
+      const forcedSignals = buildFlattenSignals({
+        market,
+        orderbook,
+        snapshot: positionManager.getSnapshot(),
+        signalType: 'RISK_LIMIT',
+        reasonPrefix: 'RISK_STOP_DRAWDOWN',
+      });
+
+      return {
+        snapshot: positionManager.getSnapshot(),
+        blockedOutcomes,
+        forcedSignals: sortSignals(forcedSignals).slice(0, limits.maxSignalsPerTick),
+      };
+    }
+
     const forcedSignals: StrategySignal[] = [];
     const boundary = positionManager.getBoundaryCorrection(limits);
     if (boundary) {
@@ -48,12 +82,27 @@ export class RiskManager {
       }
     }
 
-    const blockedOutcomes = new Set<Outcome>();
-    if (positionManager.getAvailableEntryCapacity('YES', limits) < this.runtimeConfig.strategy.minShares) {
+    if (
+      positionManager.getAvailableEntryCapacity('YES', limits) <
+        this.runtimeConfig.strategy.minShares ||
+      positionManager.isEntryCoolingDown('YES', now)
+    ) {
       blockedOutcomes.add('YES');
     }
-    if (positionManager.getAvailableEntryCapacity('NO', limits) < this.runtimeConfig.strategy.minShares) {
+    if (
+      positionManager.getAvailableEntryCapacity('NO', limits) <
+        this.runtimeConfig.strategy.minShares ||
+      positionManager.isEntryCoolingDown('NO', now)
+    ) {
       blockedOutcomes.add('NO');
+    }
+
+    const imbalanceState = positionManager.getInventoryImbalanceState(limits);
+    if (
+      imbalanceState.dominantOutcome &&
+      Math.abs(imbalanceState.imbalance) >= this.runtimeConfig.strategy.entryImbalanceBlockThreshold
+    ) {
+      blockedOutcomes.add(imbalanceState.dominantOutcome);
     }
 
     return {

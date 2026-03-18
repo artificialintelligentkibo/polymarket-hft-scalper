@@ -26,6 +26,7 @@ export interface AppConfig {
   readonly WHITELIST_CONDITION_IDS: readonly string[];
   readonly REPORTS_DIR: string;
   readonly LATENCY_LOG: string;
+  readonly STATE_FILE: string;
   readonly REPORTS_FOLDER: string;
   readonly REPORTS_FILE_PREFIX: string;
   readonly POLYMARKET_API_KEY: string;
@@ -63,6 +64,8 @@ export interface AppConfig {
     readonly fairValueSellThreshold: number;
     readonly trailingTakeProfit: number;
     readonly hardStopLoss: number;
+    readonly hardStopCooldownMs: number;
+    readonly maxDrawdownUsdc: number;
     readonly minShares: number;
     readonly maxShares: number;
     readonly baseOrderShares: number;
@@ -74,6 +77,9 @@ export interface AppConfig {
     readonly sizeLiquidityCapUsd: number;
     readonly depthReferenceShares: number;
     readonly capitalReferenceShares: number;
+    readonly minEntryDepthUsd: number;
+    readonly maxEntrySpread: number;
+    readonly entryImbalanceBlockThreshold: number;
     readonly maxSignalsPerTick: number;
     readonly priceMultiplierLevels: readonly PriceMultiplierLevel[];
     readonly exitBeforeEndMs: number;
@@ -262,6 +268,9 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     LATENCY_LOG:
       (env.LATENCY_LOG || `${reportsDir}/latency_YYYY-MM-DD.log`).trim() ||
       `${reportsDir}/latency_YYYY-MM-DD.log`,
+    STATE_FILE:
+      (env.STATE_FILE || `${reportsDir}/state.json`).trim() ||
+      `${reportsDir}/state.json`,
     REPORTS_FOLDER: reportsDir,
     REPORTS_FILE_PREFIX: reportsFilePrefix,
     POLYMARKET_API_KEY: (
@@ -304,13 +313,18 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       initialDump: parseBoolean(env.CLOB_WS_INITIAL_DUMP, true),
     },
     strategy: {
-      minCombinedDiscount: parseFloatOrDefault(env.MIN_COMBINED_DISCOUNT, '0.035'),
+      minCombinedDiscount: parseFloatOrDefault(env.MIN_COMBINED_DISCOUNT, '0.01'),
       extremeSellThreshold: parseFloatOrDefault(env.EXTREME_SELL_THRESHOLD, '0.74'),
-      extremeBuyThreshold: parseFloatOrDefault(env.EXTREME_BUY_THRESHOLD, '0.26'),
+      extremeBuyThreshold: parseFloatOrDefault(env.EXTREME_BUY_THRESHOLD, '0.04'),
       fairValueBuyThreshold: parseFloatOrDefault(env.FAIR_VALUE_BUY_THRESHOLD, '0.018'),
       fairValueSellThreshold: parseFloatOrDefault(env.FAIR_VALUE_SELL_THRESHOLD, '0.015'),
       trailingTakeProfit: parseFloatOrDefault(env.TRAILING_TAKE_PROFIT, '0.012'),
       hardStopLoss: parseFloatOrDefault(env.HARD_STOP_LOSS, '0.025'),
+      hardStopCooldownMs: Math.max(
+        0,
+        parseIntOrDefault(env.HARD_STOP_COOLDOWN_MS, '15000')
+      ),
+      maxDrawdownUsdc: parseFloatOrDefault(env.MAX_DRAWDOWN_USDC, '-100'),
       minShares: parseFloatOrDefault(env.MIN_SHARES, '8'),
       maxShares: parseFloatOrDefault(env.MAX_SHARES, '35'),
       baseOrderShares: parseFloatOrDefault(env.BASE_ORDER_SHARES, '12'),
@@ -328,6 +342,12 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       sizeLiquidityCapUsd: parseFloatOrDefault(env.SIZE_LIQUIDITY_CAP_USD, '4000'),
       depthReferenceShares: parseFloatOrDefault(env.DEPTH_REFERENCE_SHARES, '180'),
       capitalReferenceShares: parseFloatOrDefault(env.CAPITAL_REFERENCE_SHARES, '120'),
+      minEntryDepthUsd: parseFloatOrDefault(env.MIN_ENTRY_DEPTH_USD, '5'),
+      maxEntrySpread: parseFloatOrDefault(env.MAX_ENTRY_SPREAD, '0.2'),
+      entryImbalanceBlockThreshold: parseFloatOrDefault(
+        env.ENTRY_IMBALANCE_BLOCK_THRESHOLD,
+        '100'
+      ),
       maxSignalsPerTick: Math.max(1, parseIntOrDefault(env.MAX_SIGNALS_PER_TICK, '2')),
       priceMultiplierLevels: parsePriceMultiplierLevels(env.PRICE_MULTIPLIER_LEVELS),
       exitBeforeEndMs: Math.max(0, parseIntOrDefault(env.EXIT_BEFORE_END_MS, '20000')),
@@ -428,6 +448,22 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.strategy.inventoryImbalanceThreshold <= 0) {
     throw new Error('INVENTORY_IMBALANCE_THRESHOLD must be positive.');
+  }
+
+  if (candidate.strategy.minEntryDepthUsd < 0) {
+    throw new Error('MIN_ENTRY_DEPTH_USD must be zero or positive.');
+  }
+
+  if (candidate.strategy.maxEntrySpread <= 0) {
+    throw new Error('MAX_ENTRY_SPREAD must be positive.');
+  }
+
+  if (candidate.strategy.entryImbalanceBlockThreshold <= 0) {
+    throw new Error('ENTRY_IMBALANCE_BLOCK_THRESHOLD must be positive.');
+  }
+
+  if (candidate.strategy.maxDrawdownUsdc >= 0) {
+    throw new Error('MAX_DRAWDOWN_USDC must be negative.');
   }
 
   if (

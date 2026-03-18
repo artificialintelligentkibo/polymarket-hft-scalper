@@ -33,10 +33,18 @@ test('createConfig defaults to dynamic BTC/SOL/XRP market scan when whitelist is
   assert.equal(candidate.MIN_LIQUIDITY_USD, 500);
   assert.equal(candidate.REPORTS_DIR, './reports');
   assert.equal(candidate.LATENCY_LOG, './reports/latency_YYYY-MM-DD.log');
+  assert.equal(candidate.STATE_FILE, './reports/state.json');
   assert.equal(candidate.REPORTS_FOLDER, './reports');
   assert.equal(candidate.REPORTS_FILE_PREFIX, 'slot-reports');
   assert.equal(candidate.AUTO_REDEEM, true);
   assert.equal(candidate.REDEEM_INTERVAL_MS, 30000);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
   assert.equal(candidate.POLYMARKET_RELAYER_URL, 'https://relayer-v2.polymarket.com');
+  assert.equal(candidate.strategy.minCombinedDiscount, 0.01);
+  assert.equal(candidate.strategy.extremeBuyThreshold, 0.04);
+  assert.equal(candidate.strategy.minEntryDepthUsd, 5);
+  assert.equal(candidate.strategy.maxEntrySpread, 0.2);
+  assert.equal(candidate.strategy.entryImbalanceBlockThreshold, 100);
+  assert.equal(candidate.strategy.maxDrawdownUsdc, -100);
+  assert.equal(candidate.strategy.hardStopCooldownMs, 15000);
 });

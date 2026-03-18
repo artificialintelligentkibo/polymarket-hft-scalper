@@ -2,6 +2,7 @@ import { AutoRedeemer } from './auto-redeemer.js';
 import { pathToFileURL } from 'node:url';
 import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
 import { config, isDryRunMode, validateConfig } from './config.js';
+import { getDayPnlState } from './day-pnl-state.js';
 import { buildFlattenSignals } from './flatten-signals.js';
 import { logger, TradeLogger } from './logger.js';
 import {
@@ -15,7 +16,13 @@ import { PositionManager } from './position-manager.js';
 import { writeLatencyLog } from './reports.js';
 import { RiskManager } from './risk-manager.js';
 import { SignalScalper } from './signal-scalper.js';
-import { ensureSlotResult, printSlotReport, recordTrade } from './slot-reporter.js';
+import {
+  ensureSlotResult,
+  getSlotMetrics,
+  printSlotReport,
+  recordExecution,
+  recordTrade,
+} from './slot-reporter.js';
 import type { StrategySignal } from './strategy-types.js';
 import { pruneSetEntries, roundTo, sleep } from './utils.js';
 
@@ -224,6 +231,16 @@ class MarketMakerRuntime {
       timestamp: new Date().toISOString(),
       orderId: execution.orderId,
     });
+    recordExecution({
+      slotKey,
+      marketId: market.marketId,
+      marketTitle: market.title,
+      outcome: resolveSlotOutcome(market, signal.outcome),
+      action: signal.action,
+      notionalUsd: execution.notionalUsd,
+      slotStart: market.startTime,
+      slotEnd: market.endTime,
+    });
     const realizedDelta = roundTo(afterSnapshot.realizedPnl - beforeSnapshot.realizedPnl, 4);
 
     if (realizedDelta !== 0) {
@@ -238,6 +255,16 @@ class MarketMakerRuntime {
       );
     }
     const completedAt = Date.now();
+    if (signal.signalType === 'HARD_STOP' && signal.action === 'SELL') {
+      positionManager.setEntryCooldown(
+        signal.outcome,
+        config.strategy.hardStopCooldownMs,
+        new Date(completedAt)
+      );
+    }
+
+    const slotMetrics = getSlotMetrics(slotKey);
+    const dayState = getDayPnlState(new Date(completedAt));
     const latencyRoundTripMs =
       signal.generatedAt !== undefined ? Math.max(0, completedAt - signal.generatedAt) : undefined;
 
@@ -299,6 +326,13 @@ class MarketMakerRuntime {
       realizedPnl: afterSnapshot.realizedPnl,
       unrealizedPnl: afterSnapshot.unrealizedPnl,
       totalPnl: afterSnapshot.totalPnl,
+      slotEntryCount: slotMetrics?.entryCount,
+      slotFillCount: slotMetrics?.fillCount,
+      upExposureUsd: slotMetrics?.upExposureUsd,
+      downExposureUsd: slotMetrics?.downExposureUsd,
+      dayPnl: dayState.dayPnl,
+      peakDayPnl: dayState.peakPnl,
+      dayDrawdown: dayState.drawdown,
       latencySignalToOrderMs: execution.latencySignalToOrderMs,
       latencyRoundTripMs,
       orderId: execution.orderId,
@@ -321,6 +355,7 @@ class MarketMakerRuntime {
       latencyRoundTripMs,
       signedNetShares: afterSnapshot.signedNetShares,
       totalPnl: afterSnapshot.totalPnl,
+      dayDrawdown: dayState.drawdown,
     });
   }
 

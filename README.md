@@ -70,6 +70,11 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `EXTREME_BUY_THRESHOLD`
 - `FAIR_VALUE_BUY_THRESHOLD`
 - `FAIR_VALUE_SELL_THRESHOLD`
+- `MIN_ENTRY_DEPTH_USD`
+- `MAX_ENTRY_SPREAD`
+- `ENTRY_IMBALANCE_BLOCK_THRESHOLD`
+- `MAX_DRAWDOWN_USDC`
+- `HARD_STOP_COOLDOWN_MS`
 - `INVENTORY_IMBALANCE_THRESHOLD`
 - `MAX_SIGNALS_PER_TICK`
 - `PRICE_MULTIPLIER_LEVELS`
@@ -85,6 +90,7 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `POLYMARKET_RELAYER_URL=https://relayer-v2.polymarket.com`
 - `REPORTS_DIR=./reports`
 - `LATENCY_LOG=./reports/latency_YYYY-MM-DD.log`
+- `STATE_FILE=./reports/state.json`
 - `REPORTS_FOLDER=./reports`
 - `REPORTS_FILE_PREFIX=slot-reports`
 
@@ -123,6 +129,7 @@ What goes into `reports/`:
 - `Down PNL`
 - `NET PNL`
 - `TOTAL DAY PNL`
+- persisted `state.json` with day PnL / peak PnL / drawdown for restart-safe risk limits
 - per-signal latency lines with `signalToOrderMs` and `roundTripMs`
 - gasless redeem activity in `redeem_log_YYYY-MM-DD.log`
 
@@ -132,10 +139,10 @@ Example block:
 
 ```text
 [2026-03-18 14:04:43] === SLOT REPORT ===
-Slot                           | Market                  |    Up PNL |  Down PNL |    NET PNL
-Solana 10:00-10:05             | 0x5f34c201...           |    +46.02 |      -5.91 |    +40.10
-XRP 10:00-10:05                | 0xcb43642c...           |     -0.54 |     +67.61 |    +67.06
-TOTAL DAY PNL: +390.53
+Slot                           | Market                  | Entries | Fills |    Up PNL |  Down PNL |    NET PNL
+Solana 10:00-10:05             | 0x5f34c201...           |       3 |     5 |    +46.02 |      -5.91 |    +40.10
+XRP 10:00-10:05                | 0xcb43642c...           |       2 |     4 |     -0.54 |     +67.61 |    +67.06
+TOTAL DAY PNL: +390.53 | PEAK PNL: +412.10 | DRAWDOWN: -21.57
 ```
 
 Example latency line:
@@ -236,6 +243,8 @@ Dynamic scan no longer depends on a stale manual whitelist. Out of the box it:
 - prefers recurring slot timestamps from `startTime` / `eventStartTime` instead of treating market `startDate` as the slot open
 - matches `BTC|Bitcoin`, `ETH|Ethereum`, `SOL|Solana`, `XRP` with strict whole-word regexes
 - detects 5-minute markets primarily from parsed duration (`<= 5.5m`) and secondarily from `Up or Down` / clock-range / slug hints
+- skips degenerate entry books with missing bids/asks, negligible ask depth, or spreads above `MAX_ENTRY_SPREAD`
+- halts new entries once persisted day drawdown breaches `MAX_DRAWDOWN_USDC`
 
 Live-like runtime without simulation:
 
@@ -343,10 +352,17 @@ Trade JSONL logs now include:
 - `wasMaker`
 - `inventoryImbalance`
 - `grossExposureShares`
+- `slotEntryCount`
+- `slotFillCount`
+- `upExposureUsd`
+- `downExposureUsd`
+- `dayPnl`
+- `peakDayPnl`
+- `dayDrawdown`
 - full PnL snapshot
 
 ## Notes
 
-- There is no external database; state is in-memory and JSONL only.
+- There is no external database; runtime state is in-memory plus small files in `reports/` such as `state.json`.
 - Graceful shutdown calls `cancelAllOrders()` and then flattens inventory.
 - `TEST_MODE`, `SIMULATION_MODE`, and `DRY_RUN` all bypass live execution.

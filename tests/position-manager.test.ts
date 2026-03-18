@@ -79,3 +79,14 @@ test('position manager reports inventory imbalance state', () => {
   assert.equal(imbalance.excess > 0, true);
   assert.equal(imbalance.suggestedReduceShares > 0, true);
 });
+
+test('position manager tracks per-outcome hard-stop cooldown windows', () => {
+  const manager = new PositionManager('market-4');
+  const now = new Date('2026-03-18T10:00:00.000Z');
+
+  manager.setEntryCooldown('YES', 15_000, now);
+
+  assert.equal(manager.isEntryCoolingDown('YES', new Date('2026-03-18T10:00:10.000Z')), true);
+  assert.equal(manager.isEntryCoolingDown('YES', new Date('2026-03-18T10:00:16.000Z')), false);
+  assert.equal(manager.isEntryCoolingDown('NO', new Date('2026-03-18T10:00:10.000Z')), false);
+});

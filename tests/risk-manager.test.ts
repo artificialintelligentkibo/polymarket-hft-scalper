@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { rmSync } from 'node:fs';
+import path from 'node:path';
 import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
+import { createConfig } from '../src/config.js';
+import { recordDayPnlDelta, resetDayPnlStateCache } from '../src/day-pnl-state.js';
 import type { MarketCandidate } from '../src/monitor.js';
 import { PositionManager } from '../src/position-manager.js';
 import { RiskManager } from '../src/risk-manager.js';
@@ -100,4 +104,47 @@ test('risk manager emits slot flatten signal near end of slot', () => {
   assert.equal(assessment.forcedSignals.length > 0, true);
   assert.equal(assessment.forcedSignals[0]?.signalType, 'SLOT_FLATTEN');
   assert.equal(assessment.forcedSignals[0]?.action, 'SELL');
+});
+
+test('risk manager halts entries and flattens inventory after drawdown breach', () => {
+  const stateFile = path.resolve(process.cwd(), 'reports', 'risk-manager-test-state.json');
+  rmSync(stateFile, { force: true });
+  resetDayPnlStateCache();
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    STATE_FILE: './reports/risk-manager-test-state.json',
+    MAX_DRAWDOWN_USDC: '-100',
+  });
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const manager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager(runtimeConfig);
+
+  manager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 20,
+    price: 0.45,
+  });
+
+  const now = new Date('2026-03-18T11:02:00.000Z');
+  recordDayPnlDelta(120, now, runtimeConfig);
+  recordDayPnlDelta(-235, now, runtimeConfig);
+
+  const assessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager: manager,
+    now,
+  });
+
+  assert.equal(assessment.blockedOutcomes.has('YES'), true);
+  assert.equal(assessment.blockedOutcomes.has('NO'), true);
+  assert.equal(assessment.forcedSignals.length > 0, true);
+  assert.equal(assessment.forcedSignals[0]?.signalType, 'RISK_LIMIT');
+  assert.equal(assessment.forcedSignals[0]?.action, 'SELL');
+
+  rmSync(stateFile, { force: true });
+  resetDayPnlStateCache();
 });
