@@ -522,6 +522,7 @@ function buildSignal(params: {
     marketTitle: params.market.title,
     signalType: params.signalType,
     priority: params.priority,
+    generatedAt: Date.now(),
     action: params.action,
     outcome: params.outcome,
     outcomeIndex: params.outcome === 'YES' ? 0 : 1,

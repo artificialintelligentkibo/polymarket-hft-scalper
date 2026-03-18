@@ -1,6 +1,4 @@
-import { appendFile, mkdir } from 'node:fs/promises';
-import path from 'node:path';
-import { config } from './config.js';
+import { writeSlotReportToFile } from './reports.js';
 import { pruneMapEntries } from './utils.js';
 
 export type SlotOutcome = 'Up' | 'Down';
@@ -20,7 +18,6 @@ interface SlotResult {
 
 const slotResults = new Map<string, SlotResult>();
 const MAX_SLOT_RESULTS = 2_048;
-let writeQueue = Promise.resolve();
 
 export function ensureSlotResult(
   slotKey: string,
@@ -89,31 +86,29 @@ export function getTotalDayPnl(dayKey = getLocalDayKey(new Date())): number {
     .reduce((sum, entry) => sum + entry.total, 0);
 }
 
-export async function writeSlotReport(slotKey?: string): Promise<string | null> {
+export function printSlotReport(slotKey?: string): void {
   const rows = slotKey
     ? [slotResults.get(slotKey)].filter((entry): entry is SlotResult => entry !== undefined)
     : Array.from(slotResults.values());
 
   if (rows.length === 0) {
-    return null;
+    return;
   }
 
   const dayKey = rows[0]?.dayKey ?? getLocalDayKey(new Date());
-  const filePath = getReportFilePath(dayKey);
-  const payload = formatSlotReport(rows, dayKey);
+  const totalDayPnl = getTotalDayPnl(dayKey);
+  const tableRows = rows.map((entry) => ({
+    Slot: truncate(formatSlotLabel(entry), 30),
+    Market: `${entry.marketId.slice(0, 12)}...`,
+    'Up PNL': entry.upPnl.toFixed(2),
+    'Down PNL': entry.downPnl.toFixed(2),
+    'NET PNL': entry.total.toFixed(2),
+  }));
 
-  const task = writeQueue.then(async () => {
-    await mkdir(getReportsDirectory(), { recursive: true });
-    await appendFile(filePath, payload, 'utf8');
-    return filePath;
-  });
-
-  writeQueue = task.then(
-    () => undefined,
-    () => undefined
-  );
-
-  return task;
+  console.log('\n[slot-report] === SLOT REPORT ===');
+  console.table(tableRows);
+  console.log(`[slot-report] TOTAL DAY PNL (${dayKey}): $${totalDayPnl.toFixed(2)}\n`);
+  writeSlotReportToFile(formatSlotReport(rows, dayKey), dayKey);
 }
 
 function formatSlotReport(rows: readonly SlotResult[], dayKey: string): string {
@@ -188,17 +183,6 @@ function formatSlotRange(slotStart: string | null, slotEnd: string | null): stri
   }
 
   return `${formatTime(start)}-${formatTime(end)}`;
-}
-
-function getReportsDirectory(): string {
-  return path.resolve(process.cwd(), config.REPORTS_FOLDER);
-}
-
-function getReportFilePath(dayKey: string): string {
-  return path.join(
-    getReportsDirectory(),
-    `${config.REPORTS_FILE_PREFIX}_${dayKey}.log`
-  );
 }
 
 function truncateMarketId(value: string): string {

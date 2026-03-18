@@ -11,9 +11,10 @@ import {
 } from './monitor.js';
 import { OrderExecutor } from './order-executor.js';
 import { PositionManager } from './position-manager.js';
+import { writeLatencyLog } from './reports.js';
 import { RiskManager } from './risk-manager.js';
 import { SignalScalper } from './signal-scalper.js';
-import { ensureSlotResult, recordTrade, writeSlotReport } from './slot-reporter.js';
+import { ensureSlotResult, printSlotReport, recordTrade } from './slot-reporter.js';
 import type { StrategySignal } from './strategy-types.js';
 import { pruneSetEntries, roundTo, sleep } from './utils.js';
 
@@ -112,7 +113,7 @@ class MarketMakerRuntime {
         (async () => {
           await this.executor.cancelAll();
           await this.flattenAllOpenPositions('SLOT_FLATTEN');
-          await this.flushPendingReports();
+          this.printPendingReports();
           await this.executor.close();
         })(),
         config.runtime.gracefulShutdownTimeoutMs
@@ -131,7 +132,7 @@ class MarketMakerRuntime {
     const markets = await this.monitor.scanEligibleMarkets();
     if (markets.length === 0) {
       logger.debug('No eligible markets found for this cycle');
-      await this.flushPendingReports();
+      this.printPendingReports();
       return;
     }
 
@@ -146,7 +147,7 @@ class MarketMakerRuntime {
       await this.processMarket(market);
     });
 
-    await this.flushPendingReports();
+    this.printPendingReports();
   }
 
   private async processMarket(market: MarketCandidate): Promise<void> {
@@ -168,7 +169,7 @@ class MarketMakerRuntime {
     });
 
     if (signals.length === 0) {
-      await this.maybeWriteSlotReport(slotKey);
+      this.maybePrintSlotReport(slotKey);
       return;
     }
 
@@ -186,7 +187,7 @@ class MarketMakerRuntime {
       }
     }
 
-    await this.maybeWriteSlotReport(slotKey);
+    this.maybePrintSlotReport(slotKey);
   }
 
   private async executeSignal(
@@ -230,6 +231,24 @@ class MarketMakerRuntime {
         market.endTime
       );
     }
+    const completedAt = Date.now();
+    const latencyRoundTripMs =
+      signal.generatedAt !== undefined ? Math.max(0, completedAt - signal.generatedAt) : undefined;
+
+    writeLatencyLog({
+      timestampMs: completedAt,
+      marketId: market.marketId,
+      marketTitle: market.title,
+      signalType: signal.signalType,
+      action: signal.action,
+      outcome: signal.outcome,
+      orderId: execution.orderId,
+      latencySignalToOrderMs: execution.latencySignalToOrderMs,
+      latencyRoundTripMs,
+      simulationMode: execution.simulation,
+      dryRun: isDryRunMode(config),
+      testMode: config.TEST_MODE,
+    });
 
     await this.tradeLogger.logTrade({
       phase: 'live',
@@ -274,6 +293,8 @@ class MarketMakerRuntime {
       realizedPnl: afterSnapshot.realizedPnl,
       unrealizedPnl: afterSnapshot.unrealizedPnl,
       totalPnl: afterSnapshot.totalPnl,
+      latencySignalToOrderMs: execution.latencySignalToOrderMs,
+      latencyRoundTripMs,
       orderId: execution.orderId,
       wasMaker: execution.wasMaker,
       simulationMode: execution.simulation,
@@ -290,6 +311,8 @@ class MarketMakerRuntime {
       price: execution.price,
       urgency: signal.urgency,
       wasMaker: execution.wasMaker,
+      latencySignalToOrderMs: execution.latencySignalToOrderMs,
+      latencyRoundTripMs,
       signedNetShares: afterSnapshot.signedNetShares,
       totalPnl: afterSnapshot.totalPnl,
     });
@@ -307,42 +330,27 @@ class MarketMakerRuntime {
     return created;
   }
 
-  private async maybeWriteSlotReport(slotKey: string): Promise<void> {
+  private maybePrintSlotReport(slotKey: string): void {
     if (!this.pendingSlotReports.has(slotKey) || this.printedSlotReports.has(slotKey)) {
       return;
     }
 
-    try {
-      await writeSlotReport(slotKey);
-      this.pendingSlotReports.delete(slotKey);
-      this.printedSlotReports.add(slotKey);
-    } catch (error: any) {
-      logger.warn('Could not write slot report', {
-        slotKey,
-        message: error?.message || 'Unknown error',
-      });
-    }
-
+    printSlotReport(slotKey);
+    this.pendingSlotReports.delete(slotKey);
+    this.printedSlotReports.add(slotKey);
     this.pruneSlotReportState();
   }
 
-  private async flushPendingReports(): Promise<void> {
+  private printPendingReports(): void {
     for (const slotKey of Array.from(this.pendingSlotReports)) {
       if (this.printedSlotReports.has(slotKey)) {
         this.pendingSlotReports.delete(slotKey);
         continue;
       }
 
-      try {
-        await writeSlotReport(slotKey);
-        this.pendingSlotReports.delete(slotKey);
-        this.printedSlotReports.add(slotKey);
-      } catch (error: any) {
-        logger.warn('Could not flush slot report', {
-          slotKey,
-          message: error?.message || 'Unknown error',
-        });
-      }
+      printSlotReport(slotKey);
+      this.pendingSlotReports.delete(slotKey);
+      this.printedSlotReports.add(slotKey);
     }
 
     this.pruneSlotReportState();
@@ -384,7 +392,7 @@ class MarketMakerRuntime {
         }
       }
 
-      await this.maybeWriteSlotReport(slotKey);
+      this.maybePrintSlotReport(slotKey);
     }
   }
 

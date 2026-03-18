@@ -9,6 +9,8 @@ import { roundTo, sleep } from './utils.js';
 export interface OrderExecutionReport extends TradeExecutionResult {
   attemptCount: number;
   urgency: StrategySignal['urgency'];
+  latencySignalToOrderMs?: number;
+  latencyRoundTripMs?: number;
 }
 
 export class OrderExecutor {
@@ -44,6 +46,7 @@ export class OrderExecutor {
       await this.waitForRateLimit();
 
       try {
+        const orderDispatchStartedAt = Date.now();
         const execution = await this.trader.placeOrder({
           marketId: market.marketId,
           marketTitle: market.title,
@@ -56,11 +59,22 @@ export class OrderExecutor {
           postOnly: executionPlan.postOnly,
           orderType: executionPlan.orderType,
         });
+        const orderCompletedAt = Date.now();
+        const latencySignalToOrderMs =
+          signal.generatedAt !== undefined
+            ? Math.max(0, orderDispatchStartedAt - signal.generatedAt)
+            : undefined;
+        const latencyRoundTripMs =
+          signal.generatedAt !== undefined
+            ? Math.max(0, orderCompletedAt - signal.generatedAt)
+            : undefined;
 
         return {
           ...execution,
           attemptCount: attempt,
           urgency: signal.urgency,
+          latencySignalToOrderMs,
+          latencyRoundTripMs,
         };
       } catch (error: any) {
         lastError = error instanceof Error ? error : new Error(String(error));

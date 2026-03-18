@@ -31,6 +31,8 @@ test('createConfig defaults to dynamic BTC/SOL/XRP market scan when whitelist is
   assert.deepEqual(candidate.COINS_TO_TRADE, ['BTC', 'SOL', 'XRP', 'ETH']);
   assert.equal(candidate.FILTER_5MIN_ONLY, true);
   assert.equal(candidate.MIN_LIQUIDITY_USD, 500);
+  assert.equal(candidate.REPORTS_DIR, './reports');
+  assert.equal(candidate.LATENCY_LOG, './reports/latency_YYYY-MM-DD.log');
   assert.equal(candidate.REPORTS_FOLDER, './reports');
   assert.equal(candidate.REPORTS_FILE_PREFIX, 'slot-reports');
 });

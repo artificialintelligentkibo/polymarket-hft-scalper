@@ -71,6 +71,8 @@ export interface TradeLogInput {
   realizedPnl: number;
   unrealizedPnl: number;
   totalPnl: number;
+  latencySignalToOrderMs?: number;
+  latencyRoundTripMs?: number;
   orderId?: string | null;
   wasMaker: boolean | null;
   simulationMode: boolean;
@@ -251,6 +253,8 @@ export class TradeLogger {
       realizedPnl: roundTo(input.realizedPnl, 4),
       unrealizedPnl: roundTo(input.unrealizedPnl, 4),
       totalPnl: roundTo(input.totalPnl, 4),
+      latencySignalToOrderMs: safeLatency(input.latencySignalToOrderMs),
+      latencyRoundTripMs: safeLatency(input.latencyRoundTripMs),
       crypto_prices_at_time: await getCryptoPrices(input.timestampMs),
     };
 
@@ -412,6 +416,10 @@ function emptyCryptoPrices(): CryptoPricesAtTime {
 
 function safeNumberOrNull(value: number | null): number | null {
   return value === null || !Number.isFinite(value) ? null : value;
+}
+
+function safeLatency(value: number | undefined): number | undefined {
+  return value === undefined || !Number.isFinite(value) ? undefined : Math.max(0, roundTo(value, 0));
 }
 
 export const logger = new StructuredLogger();

@@ -8,6 +8,7 @@
     "dev": "tsx watch src/index.ts",
     "backtest": "tsx backtest/backtester.ts",
     "compare": "ts-node comparison/compare-with-target.ts",
+    "reports": "echo 'Reports folder: ./reports/'",
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test tests/**/*.test.ts"
   },

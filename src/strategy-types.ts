@@ -19,6 +19,7 @@ export interface StrategySignal {
   readonly marketTitle: string;
   readonly signalType: SignalType;
   readonly priority: number;
+  readonly generatedAt?: number;
   readonly action: SignalAction;
   readonly outcome: Outcome;
   readonly outcomeIndex: 0 | 1;

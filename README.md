@@ -39,6 +39,7 @@ src/
   monitor.ts
   order-executor.ts
   position-manager.ts
+  reports.ts
   risk-manager.ts
   signal-scalper.ts
   slot-reporter.ts
@@ -76,6 +77,8 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `COINS_TO_TRADE=BTC,SOL,XRP`
 - `FILTER_5MIN_ONLY=true`
 - `MIN_LIQUIDITY_USD=500`
+- `REPORTS_DIR=./reports`
+- `LATENCY_LOG=./reports/latency_YYYY-MM-DD.log`
 - `REPORTS_FOLDER=./reports`
 - `REPORTS_FILE_PREFIX=slot-reports`
 
@@ -102,17 +105,20 @@ The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) 
 
 ## Reports
 
-Slot reports are now written only to `./reports/slot-reports_YYYY-MM-DD.log`.
+Slot reports still print to the console exactly as before, and are now also duplicated into `./reports/slot-reports_YYYY-MM-DD.log`.
 
-What goes there:
+Latency metrics are written separately to `./reports/latency_YYYY-MM-DD.log`.
 
-- timestamped slot report blocks
+What goes into `reports/`:
+
+- slot report blocks duplicated from the console stream
 - `Up PNL`
 - `Down PNL`
 - `NET PNL`
 - `TOTAL DAY PNL`
+- per-signal latency lines with `signalToOrderMs` and `roundTripMs`
 
-The runtime creates `REPORTS_FOLDER` automatically when needed and appends new blocks to `REPORTS_FILE_PREFIX_YYYY-MM-DD.log`.
+The runtime creates `REPORTS_DIR` automatically when needed.
 
 Example block:
 
@@ -124,7 +130,17 @@ XRP 10:00-10:05                | 0xcb43642c...           |     -0.54 |     +67.6
 TOTAL DAY PNL: +390.53
 ```
 
-Slot-report output no longer uses the main runtime console log stream.
+Example latency line:
+
+```text
+[2026-03-18 14:04:43] signal=FAIR_VALUE_BUY market=0xabc... title="Bitcoin Up or Down" side=BUY outcome=YES signalToOrderMs=42 roundTripMs=97 orderId=sim-buy-123 simulation=true dryRun=true testMode=false
+```
+
+Helper command:
+
+```bash
+npm run reports
+```
 
 ## Running
 

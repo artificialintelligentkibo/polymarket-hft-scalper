@@ -22,6 +22,8 @@ export interface AppConfig {
   readonly FILTER_5MIN_ONLY: boolean;
   readonly MIN_LIQUIDITY_USD: number;
   readonly WHITELIST_CONDITION_IDS: readonly string[];
+  readonly REPORTS_DIR: string;
+  readonly LATENCY_LOG: string;
   readonly REPORTS_FOLDER: string;
   readonly REPORTS_FILE_PREFIX: string;
   readonly signerPrivateKey: string;
@@ -232,6 +234,8 @@ function resolveSignerPrivateKey(env: NodeJS.ProcessEnv): string {
 
 export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const minLiquidityUsd = parseFloatOrDefault(env.MIN_LIQUIDITY_USD, '500');
+  const reportsDir = (env.REPORTS_DIR || env.REPORTS_FOLDER || './reports').trim() || './reports';
+  const reportsFilePrefix = (env.REPORTS_FILE_PREFIX || 'slot-reports').trim() || 'slot-reports';
 
   return {
     SIMULATION_MODE: parseBoolean(env.SIMULATION_MODE, false),
@@ -247,8 +251,12 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     WHITELIST_CONDITION_IDS: parseCsv(
       env.WHITELIST_CONDITION_IDS || DEFAULT_WHITELIST_CONDITION_IDS.join(',')
     ),
-    REPORTS_FOLDER: (env.REPORTS_FOLDER || './reports').trim() || './reports',
-    REPORTS_FILE_PREFIX: (env.REPORTS_FILE_PREFIX || 'slot-reports').trim() || 'slot-reports',
+    REPORTS_DIR: reportsDir,
+    LATENCY_LOG:
+      (env.LATENCY_LOG || `${reportsDir}/latency_YYYY-MM-DD.log`).trim() ||
+      `${reportsDir}/latency_YYYY-MM-DD.log`,
+    REPORTS_FOLDER: reportsDir,
+    REPORTS_FILE_PREFIX: reportsFilePrefix,
     signerPrivateKey: resolveSignerPrivateKey(env),
     polymarketGeoToken: (env.POLYMARKET_GEO_TOKEN || '').trim(),
     rpcUrl: (env.RPC_URL || 'https://polygon.drpc.org').trim(),
