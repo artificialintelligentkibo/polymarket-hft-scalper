@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -29,7 +30,14 @@ interface BinaryTokenSet {
   noLabel: string;
 }
 
-export class MarketMonitor {
+export class MarketMonitor extends EventEmitter {
+  private readonly seenSlots = new Map<string, MarketCandidate>();
+  private readonly reportedSlots = new Set<string>();
+
+  constructor() {
+    super();
+  }
+
   async scanEligibleMarkets(): Promise<MarketCandidate[]> {
     const markets = await this.fetchMarkets();
     const eligible = markets
@@ -37,8 +45,8 @@ export class MarketMonitor {
       .filter((candidate): candidate is MarketCandidate => candidate !== null)
       .filter((candidate) => candidate.liquidityUsd >= config.strategy.minLiquidityUsd)
       .filter((candidate) => candidate.acceptingOrders)
+      .filter((candidate) => this.passesWhitelist(candidate))
       .filter((candidate) => this.passesFiveMinuteFilter(candidate))
-      .filter((candidate) => this.hasTradeableTimeRemaining(candidate))
       .sort((left, right) => {
         const leftEnd = left.endTime ? Date.parse(left.endTime) : Number.MAX_SAFE_INTEGER;
         const rightEnd = right.endTime ? Date.parse(right.endTime) : Number.MAX_SAFE_INTEGER;
@@ -48,6 +56,8 @@ export class MarketMonitor {
         return right.liquidityUsd - left.liquidityUsd;
       })
       .slice(0, config.runtime.marketQueryLimit);
+
+    this.emitSlotEndedEvents(eligible);
 
     logger.debug('Market scan completed', {
       fetched: markets.length,
@@ -166,18 +176,61 @@ export class MarketMonitor {
     return /\b5\s*(?:min|minute|minutes|m)\b/i.test(candidate.title);
   }
 
-  private hasTradeableTimeRemaining(candidate: MarketCandidate): boolean {
-    if (!candidate.endTime) {
+  private passesWhitelist(candidate: MarketCandidate): boolean {
+    if (config.WHITELIST_CONDITION_IDS.length === 0) {
       return true;
+    }
+
+    const allowed = new Set(
+      config.WHITELIST_CONDITION_IDS.map((conditionId) => conditionId.toLowerCase())
+    );
+    return allowed.has(candidate.conditionId.toLowerCase());
+  }
+
+  private emitSlotEndedEvents(candidates: MarketCandidate[]): void {
+    const activeKeys = new Set<string>();
+
+    for (const candidate of candidates) {
+      const slotKey = getSlotKey(candidate);
+      activeKeys.add(slotKey);
+      this.seenSlots.set(slotKey, candidate);
+
+      if (this.isSlotEndingSoon(candidate) && !this.reportedSlots.has(slotKey)) {
+        this.reportedSlots.add(slotKey);
+        this.emit('slot-ended', candidate);
+      }
+    }
+
+    for (const [slotKey, market] of this.seenSlots.entries()) {
+      if (activeKeys.has(slotKey)) {
+        continue;
+      }
+
+      if (!this.reportedSlots.has(slotKey)) {
+        this.reportedSlots.add(slotKey);
+        this.emit('slot-ended', market);
+      }
+
+      this.seenSlots.delete(slotKey);
+    }
+  }
+
+  private isSlotEndingSoon(candidate: MarketCandidate): boolean {
+    if (!candidate.endTime) {
+      return false;
     }
 
     const endMs = Date.parse(candidate.endTime);
     if (!Number.isFinite(endMs)) {
-      return true;
+      return false;
     }
 
-    return endMs - Date.now() > config.strategy.exitBeforeEndMs;
+    return endMs - Date.now() <= config.strategy.exitBeforeEndMs;
   }
+}
+
+export function getSlotKey(candidate: Pick<MarketCandidate, 'marketId' | 'startTime' | 'endTime'>): string {
+  return `${candidate.marketId}:${candidate.startTime || 'unknown'}:${candidate.endTime || 'unknown'}`;
 }
 
 function parseBinaryTokens(record: JsonRecord): BinaryTokenSet | null {

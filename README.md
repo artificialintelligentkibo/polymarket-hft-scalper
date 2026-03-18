@@ -182,6 +182,45 @@ This is intentionally a sanity-check dataset, not a profitability claim. It prov
 - hard stop logic closes losing inventory
 - net inventory never exceeds the configured caps on the sample flow
 
+## Simulation + Slot Reports
+
+```bash
+TEST_MODE=true SIMULATION_MODE=true WHITELIST_CONDITION_IDS="0x3f5dc93e...,0x3756c929..." npm start
+```
+
+In this mode the bot can be constrained to a manual whitelist of `conditionId` values, trade only the selected 5-minute slots, and print a console report after each slot ends.
+
+What the runtime does:
+
+- filters markets by `WHITELIST_CONDITION_IDS` when the list is non-empty
+- treats `TEST_MODE` the same as simulation for order placement
+- flattens positions into the slot-end window
+- prints per-slot `Up`, `Down`, and `NET` PnL
+- keeps a cumulative day total in memory for the process lifetime
+
+### Quick Test
+
+1. Copy [`.env.example`](/C:/GitHub/polymarket-hft-scalper/.env.example) to `.env`
+2. Set:
+
+```bash
+TEST_MODE=true
+SIMULATION_MODE=true
+WHITELIST_CONDITION_IDS=0x3f5dc93e734dc9f2c441882160bdf6716d8bb7953ce67962094c6b17f73210c0,0x3756c929609555f5b6cd8a8231d083400ea92397873fcd5ca24182186766e2e7
+```
+
+3. Run:
+
+```bash
+npm start
+```
+
+Expected behavior:
+
+- the bot trades only the whitelisted slots
+- each ending 5-minute slot prints a console summary table
+- `TOTAL DAY PNL` accumulates across slot reports
+
 ## Next Steps
 
 - wire a persistent position snapshot store if you want restart-safe inventory

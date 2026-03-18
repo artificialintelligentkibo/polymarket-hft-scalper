@@ -7,12 +7,13 @@ import {
   type TokenBookSnapshot,
 } from './clob-fetcher.js';
 import { logger, TradeLogger } from './logger.js';
-import { MarketMonitor, type MarketCandidate } from './monitor.js';
+import { MarketMonitor, getSlotKey, type MarketCandidate } from './monitor.js';
 import {
   PositionManager,
   type BoundaryCorrection,
   type PositionRiskLimits,
 } from './position-manager.js';
+import { ensureSlotResult, printSlotReport, recordTrade } from './slot-reporter.js';
 import { Trader } from './trader.js';
 
 export interface SignalDecision {
@@ -129,6 +130,10 @@ export class SignalScalper {
 
     if (!this.runtimeConfig.ENABLE_SIGNAL) {
       return holdDecision('Signal engine disabled via ENABLE_SIGNAL=false');
+    }
+
+    if (!this.isEntryWindowOpen(market, now)) {
+      return holdDecision('Slot is inside the flatten window; new entries are disabled');
     }
 
     const candidates = [
@@ -255,6 +260,19 @@ export class SignalScalper {
   ): TokenBookSnapshot {
     return outcome === 'YES' ? snapshot.yes : snapshot.no;
   }
+
+  private isEntryWindowOpen(market: MarketCandidate, now: Date): boolean {
+    if (!market.endTime) {
+      return true;
+    }
+
+    const endMs = Date.parse(market.endTime);
+    if (!Number.isFinite(endMs)) {
+      return true;
+    }
+
+    return endMs - now.getTime() > this.runtimeConfig.strategy.exitBeforeEndMs;
+  }
 }
 
 class HftScalperRuntime {
@@ -264,7 +282,17 @@ class HftScalperRuntime {
   private readonly tradeLogger = new TradeLogger();
   private readonly signal = new SignalScalper();
   private readonly positions = new Map<string, PositionManager>();
+  private readonly pendingSlotReports = new Set<string>();
+  private readonly printedSlotReports = new Set<string>();
   private running = false;
+
+  constructor() {
+    this.monitor.on('slot-ended', (market: MarketCandidate) => {
+      const slotKey = getSlotKey(market);
+      ensureSlotResult(slotKey, market.marketId, market.title);
+      this.pendingSlotReports.add(slotKey);
+    });
+  }
 
   async initialize(): Promise<void> {
     validateConfig();
@@ -273,10 +301,12 @@ class HftScalperRuntime {
 
     logger.info('Polymarket HFT scalper initialized', {
       simulationMode: config.SIMULATION_MODE,
+      testMode: config.TEST_MODE,
       enableSignal: config.ENABLE_SIGNAL,
       entryBuyEdge: config.strategy.entryBuyEdge,
       entrySellEdge: config.strategy.entrySellEdge,
       minLiquidityUsd: config.strategy.minLiquidityUsd,
+      whitelistSize: config.WHITELIST_CONDITION_IDS.length,
     });
   }
 
@@ -317,6 +347,7 @@ class HftScalperRuntime {
   }
 
   private async processMarket(market: MarketCandidate): Promise<void> {
+    const slotKey = getSlotKey(market);
     const orderbook = await this.fetcher.getMarketSnapshot(market);
     const positionManager = this.getPositionManager(market);
     const decision = this.signal.evaluate({
@@ -331,10 +362,12 @@ class HftScalperRuntime {
       decision.targetPrice === null ||
       decision.shares <= 0
     ) {
+      this.maybePrintSlotReport(market);
       return;
     }
 
     const tokenId = decision.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
+    const beforeSnapshot = positionManager.getSnapshot();
     const execution = await this.trader.placeOrder({
       marketId: market.marketId,
       marketTitle: market.title,
@@ -346,7 +379,7 @@ class HftScalperRuntime {
       reason: decision.reason,
     });
 
-    positionManager.applyFill({
+    const afterSnapshot = positionManager.applyFill({
       outcome: decision.outcome,
       side: decision.action,
       shares: execution.shares,
@@ -355,7 +388,18 @@ class HftScalperRuntime {
       orderId: execution.orderId,
     });
 
-    const snapshot = positionManager.getSnapshot();
+    const realizedDelta = roundTo(afterSnapshot.realizedPnl - beforeSnapshot.realizedPnl, 4);
+    if (realizedDelta !== 0) {
+      recordTrade(
+        slotKey,
+        market.marketId,
+        market.title,
+        toSlotOutcome(decision.outcome),
+        realizedDelta
+      );
+    }
+
+    const snapshot = afterSnapshot;
     const book = decision.outcome === 'YES' ? orderbook.yes : orderbook.no;
 
     await this.tradeLogger.logTrade({
@@ -397,6 +441,8 @@ class HftScalperRuntime {
       signedNetShares: snapshot.signedNetShares,
       totalPnl: snapshot.totalPnl,
     });
+
+    this.maybePrintSlotReport(market);
   }
 
   private getPositionManager(market: MarketCandidate): PositionManager {
@@ -409,6 +455,18 @@ class HftScalperRuntime {
     const created = new PositionManager(market.marketId, market.endTime);
     this.positions.set(market.marketId, created);
     return created;
+  }
+
+  private maybePrintSlotReport(market: MarketCandidate): void {
+    const slotKey = getSlotKey(market);
+    if (!this.pendingSlotReports.has(slotKey) || this.printedSlotReports.has(slotKey)) {
+      return;
+    }
+
+    ensureSlotResult(slotKey, market.marketId, market.title);
+    printSlotReport(slotKey);
+    this.pendingSlotReports.delete(slotKey);
+    this.printedSlotReports.add(slotKey);
   }
 }
 
@@ -455,6 +513,10 @@ function roundTo(value: number, decimals: number): number {
 
 function formatPrice(value: number | null): string {
   return value === null ? 'n/a' : value.toFixed(4);
+}
+
+function toSlotOutcome(outcome: Outcome): 'Up' | 'Down' {
+  return outcome === 'YES' ? 'Up' : 'Down';
 }
 
 async function runWithConcurrency<T>(

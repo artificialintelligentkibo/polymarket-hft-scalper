@@ -87,12 +87,13 @@ export class Trader {
 
     logger.info('Initializing trader', {
       simulationMode: config.SIMULATION_MODE,
+      testMode: config.TEST_MODE,
       authMode: this.executionContext.authMode,
       funderAddress: this.executionContext.funderAddress,
       signerAddress: this.executionContext.signerAddress,
     });
 
-    if (!config.SIMULATION_MODE) {
+    if (!config.SIMULATION_MODE && !config.TEST_MODE) {
       await this.deriveApiCredentials();
       await this.ensureApprovals();
     }
@@ -116,7 +117,7 @@ export class Trader {
       throw new Error('Order price must be positive.');
     }
 
-    if (config.SIMULATION_MODE) {
+    if (config.SIMULATION_MODE || config.TEST_MODE) {
       logger.info('Simulation mode: skipping live order placement', {
         marketId: request.marketId,
         tokenId: request.tokenId,
@@ -124,6 +125,7 @@ export class Trader {
         shares: validatedShares,
         price: validatedPrice,
         reason: request.reason,
+        mode: config.TEST_MODE ? 'TEST_MODE' : 'SIMULATION_MODE',
       });
 
       return {
@@ -418,14 +420,14 @@ function normalizeFeeRateBps(raw: unknown): number {
 }
 
 function resolveSignerAddress(candidate: AppConfig, signerAddress: string): string {
-  if (candidate.SIMULATION_MODE && !candidate.signerPrivateKey) {
+  if (isDryRunMode(candidate) && !candidate.signerPrivateKey) {
     return ethers.constants.AddressZero;
   }
   return ethers.utils.getAddress(signerAddress);
 }
 
 function resolveFunderAddress(candidate: AppConfig, signerAddress: string): string {
-  if (candidate.SIMULATION_MODE && !candidate.auth.funderAddress) {
+  if (isDryRunMode(candidate) && !candidate.auth.funderAddress) {
     return ethers.constants.AddressZero;
   }
 
@@ -439,6 +441,9 @@ function resolveFunderAddress(candidate: AppConfig, signerAddress: string): stri
 function getActiveSignatureType(candidate: AppConfig): SignatureType {
   if (candidate.auth.signatureType !== undefined) {
     return candidate.auth.signatureType;
+  }
+  if (isDryRunMode(candidate)) {
+    return 0;
   }
   return candidate.auth.mode === 'EOA' ? 0 : 1;
 }
@@ -466,4 +471,8 @@ function toOrderType(orderType: 'GTC' | 'FOK' | 'FAK'): OrderType {
 function roundTo(value: number, decimals: number): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
+}
+
+function isDryRunMode(candidate: AppConfig): boolean {
+  return candidate.SIMULATION_MODE || candidate.TEST_MODE;
 }

@@ -9,7 +9,9 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 export interface AppConfig {
   SIMULATION_MODE: boolean;
+  TEST_MODE: boolean;
   ENABLE_SIGNAL: boolean;
+  WHITELIST_CONDITION_IDS: string[];
   signerPrivateKey: string;
   polymarketGeoToken: string;
   rpcUrl: string;
@@ -79,6 +81,17 @@ function parseFloatOrDefault(value: string | undefined, fallback: string): numbe
   return Number.isFinite(parsed) ? parsed : Number.parseFloat(fallback);
 }
 
+function parseCsv(value?: string): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 function parseIntOrDefault(value: string | undefined, fallback: string): number {
   const parsed = Number.parseInt(value ?? fallback, 10);
   return Number.isFinite(parsed) ? parsed : Number.parseInt(fallback, 10);
@@ -143,7 +156,9 @@ function resolveSignerPrivateKey(env: NodeJS.ProcessEnv): string {
 export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     SIMULATION_MODE: parseBoolean(env.SIMULATION_MODE, false),
+    TEST_MODE: parseBoolean(env.TEST_MODE, false),
     ENABLE_SIGNAL: parseBoolean(env.ENABLE_SIGNAL, true),
+    WHITELIST_CONDITION_IDS: parseCsv(env.WHITELIST_CONDITION_IDS),
     signerPrivateKey: resolveSignerPrivateKey(env),
     polymarketGeoToken: (env.POLYMARKET_GEO_TOKEN || '').trim(),
     rpcUrl: (env.RPC_URL || 'https://polygon.drpc.org').trim(),
@@ -210,13 +225,13 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 export const config = createConfig();
 
 export function validateConfig(candidate: AppConfig = config): void {
-  if (!candidate.SIMULATION_MODE && !candidate.signerPrivateKey) {
+  if (!candidate.SIMULATION_MODE && !candidate.TEST_MODE && !candidate.signerPrivateKey) {
     throw new Error(
       'Missing signer private key. Set SIGNER_PRIVATE_KEY or PRIVATE_KEY for live trading.'
     );
   }
 
-  if (candidate.auth.mode === 'PROXY' && !candidate.SIMULATION_MODE) {
+  if (candidate.auth.mode === 'PROXY' && !candidate.SIMULATION_MODE && !candidate.TEST_MODE) {
     if (!candidate.auth.funderAddress) {
       throw new Error('FUNDER_ADDRESS is required in PROXY mode.');
     }
