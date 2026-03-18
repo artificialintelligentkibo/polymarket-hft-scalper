@@ -47,6 +47,7 @@ src/
 backtest/
   backtester.ts
 tests/
+  monitor.test.ts
   position-manager.test.ts
   risk-manager.test.ts
   signal-scalper.test.ts
@@ -80,14 +81,16 @@ Sizing is now driven by:
 
 The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) runs:
 
-1. Gamma scan for active crypto markets via `tag=crypto`
-2. whitelist filter via `WHITELIST_CONDITION_IDS` in `TEST_MODE`, otherwise dynamic `COINS_TO_TRADE` + 5-minute slot filter
-3. orderbook sync from CLOB WebSocket + REST fallback
-4. risk assessment
-5. top-2 signal generation
-6. post-only / improve / cross execution
-7. JSONL trade logging
-8. slot-end console reporting
+1. Gamma `/events` pagination with `limit` + `offset`, then flattening nested markets
+2. robust Gamma normalization using `clobTokenIds`, `outcomes`, `question/title/slug`, and start/end timestamps
+3. whitelist filter via `WHITELIST_CONDITION_IDS` in `TEST_MODE`, otherwise dynamic `COINS_TO_TRADE` + optional 5-minute slot filter
+4. duration-first 5-minute detection with title / slug fallbacks
+5. orderbook sync from CLOB WebSocket + REST fallback
+6. risk assessment
+7. top-2 signal generation
+8. post-only / improve / cross execution
+9. JSONL trade logging
+10. slot-end console reporting
 
 ## Slot Reports
 
@@ -127,6 +130,17 @@ npm start
 Dynamic 5-minute crypto slot scan for BTC / SOL / XRP:
 
 ```bash
+TEST_MODE=false
+WHITELIST_CONDITION_IDS=
+COINS_TO_TRADE=BTC,SOL,XRP
+FILTER_5MIN_ONLY=true
+MIN_LIQUIDITY_USD=500
+npm start
+```
+
+One-liner:
+
+```bash
 COINS_TO_TRADE=BTC,SOL,XRP FILTER_5MIN_ONLY=true npm start
 ```
 
@@ -137,6 +151,13 @@ COINS_TO_TRADE=BTC,SOL,XRP,ETH FILTER_5MIN_ONLY=true npm start
 ```
 
 In `TEST_MODE=true`, the runtime ignores the coin filter and only trades markets from `WHITELIST_CONDITION_IDS`.
+
+Dynamic scan no longer depends on a stale manual whitelist. Out of the box it:
+
+- pages Gamma `/events` until enough active crypto candidates are collected or the safety cap is reached
+- normalizes current payloads that expose token IDs via `clobTokenIds`
+- matches `BTC|Bitcoin`, `ETH|Ethereum`, `SOL|Solana`, `XRP` with strict whole-word regexes
+- detects 5-minute markets primarily from parsed duration (`<= 5.5m`) and secondarily from `Up or Down` / clock-range / slug hints
 
 Live-like runtime without simulation:
 
@@ -178,6 +199,10 @@ npm test
 
 Current test coverage focuses on:
 
+- Gamma event pagination and event -> market flattening
+- current Gamma payload normalization with `clobTokenIds`
+- strict coin matching and 5-minute detection
+- whitelist-vs-dynamic selection behavior
 - combined discount dual-entry behavior
 - inventory rebalance generation
 - position risk caps

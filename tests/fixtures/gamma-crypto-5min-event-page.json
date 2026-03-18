@@ -1,0 +1,38 @@
+[
+  {
+    "id": "999001",
+    "ticker": "bitcoin-up-or-down-mar-18-1110am-et",
+    "slug": "bitcoin-up-or-down-mar-18-1110am-et",
+    "title": "Bitcoin Up or Down - Mar 18, 11:10AM-11:15AM ET",
+    "description": "Realistic current Gamma event payload shape for a 5-minute crypto market.",
+    "startDate": "2026-03-18T15:10:00Z",
+    "endDate": "2026-03-18T15:15:00Z",
+    "active": true,
+    "closed": false,
+    "archived": false,
+    "liquidity": 1825.55,
+    "volume": 9250.12,
+    "liquidityClob": 1825.55,
+    "markets": [
+      {
+        "id": "888001",
+        "question": "Bitcoin Up or Down - Mar 18, 11:10AM-11:15AM ET?",
+        "conditionId": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "slug": "bitcoin-up-or-down-mar-18-1110am-et",
+        "startDate": "2026-03-18T15:10:00Z",
+        "endDate": "2026-03-18T15:15:00Z",
+        "outcomes": "[\"Up\", \"Down\"]",
+        "clobTokenIds": "[\"1029384756102938475610293847561029384756102938475610293847561029384756\", \"5647382910564738291056473829105647382910564738291056473829105647382910\"]",
+        "liquidity": "1825.55",
+        "liquidityClob": 1825.55,
+        "volume": "9250.12",
+        "volumeClob": 9250.12,
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "acceptingOrders": true,
+        "enableOrderBook": true
+      }
+    ]
+  }
+]

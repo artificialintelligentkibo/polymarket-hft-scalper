@@ -3,7 +3,12 @@ import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
 import { config, isDryRunMode, validateConfig } from './config.js';
 import { buildFlattenSignals } from './flatten-signals.js';
 import { logger, TradeLogger } from './logger.js';
-import { MarketMonitor, getSlotKey, type MarketCandidate } from './monitor.js';
+import {
+  MarketMonitor,
+  describeDiscoveryMode,
+  getSlotKey,
+  type MarketCandidate,
+} from './monitor.js';
 import { OrderExecutor } from './order-executor.js';
 import { PositionManager } from './position-manager.js';
 import { RiskManager } from './risk-manager.js';
@@ -42,6 +47,7 @@ class MarketMakerRuntime {
     validateConfig();
     await this.tradeLogger.ensureReady();
     await this.executor.initialize();
+    const discoveryMode = describeDiscoveryMode(config);
 
     logger.info('Polymarket dual-sided market-maker initialized', {
       simulationMode: config.SIMULATION_MODE,
@@ -52,7 +58,12 @@ class MarketMakerRuntime {
       extremeBuyThreshold: config.strategy.extremeBuyThreshold,
       extremeSellThreshold: config.strategy.extremeSellThreshold,
       maxSignalsPerTick: config.strategy.maxSignalsPerTick,
+      discoveryMode: discoveryMode.mode,
+      discoveryDescription: discoveryMode.description,
       whitelistSize: config.WHITELIST_CONDITION_IDS.length,
+      coinsToTrade: config.COINS_TO_TRADE,
+      filterFiveMinuteOnly: config.FILTER_5MIN_ONLY,
+      minLiquidityUsd: config.MIN_LIQUIDITY_USD,
     });
   }
 
