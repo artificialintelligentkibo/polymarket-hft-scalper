@@ -1,5 +1,5 @@
-import WebSocket from 'ws';
 import { ClobClient } from '@polymarket/clob-client';
+import WebSocket from 'ws';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
@@ -30,12 +30,22 @@ export interface TokenBookSnapshot {
   updatedAt: string;
 }
 
+export interface CombinedBookMetrics {
+  combinedBid: number | null;
+  combinedAsk: number | null;
+  combinedMid: number | null;
+  combinedDiscount: number | null;
+  combinedPremium: number | null;
+  pairSpread: number | null;
+}
+
 export interface MarketOrderbookSnapshot {
   marketId: string;
   title: string;
   timestamp: string;
   yes: TokenBookSnapshot;
   no: TokenBookSnapshot;
+  combined: CombinedBookMetrics;
 }
 
 interface TokenMarketState extends TokenBookSnapshot {}
@@ -83,6 +93,7 @@ export class ClobFetcher {
       timestamp: new Date().toISOString(),
       yes,
       no,
+      combined: computeCombinedBookMetrics(yes, no),
     };
   }
 
@@ -275,8 +286,10 @@ export class ClobFetcher {
     if (event === 'last_trade_price') {
       const price = toNumber(message.price);
       const size = toNumber(message.size);
-      nextState.lastTradePrice = Number.isFinite(price) && price > 0 ? price : nextState.lastTradePrice;
-      nextState.lastTradeSize = Number.isFinite(size) && size > 0 ? size : nextState.lastTradeSize;
+      nextState.lastTradePrice =
+        Number.isFinite(price) && price > 0 ? price : nextState.lastTradePrice;
+      nextState.lastTradeSize =
+        Number.isFinite(size) && size > 0 ? size : nextState.lastTradeSize;
     }
 
     if (message.bids || message.asks) {
@@ -316,6 +329,30 @@ export class ClobFetcher {
 
     this.pingInterval.unref?.();
   }
+}
+
+export function computeCombinedBookMetrics(
+  yes: Pick<TokenBookSnapshot, 'bestBid' | 'bestAsk' | 'midPrice'>,
+  no: Pick<TokenBookSnapshot, 'bestBid' | 'bestAsk' | 'midPrice'>
+): CombinedBookMetrics {
+  const combinedBid = sumPair(yes.bestBid, no.bestBid);
+  const combinedAsk = sumPair(yes.bestAsk, no.bestAsk);
+  const combinedMid = sumPair(yes.midPrice, no.midPrice);
+  const combinedDiscount =
+    combinedAsk !== null ? roundTo(1 - combinedAsk, 6) : null;
+  const combinedPremium =
+    combinedBid !== null ? roundTo(combinedBid - 1, 6) : null;
+  const pairSpread =
+    combinedAsk !== null && combinedBid !== null ? roundTo(combinedAsk - combinedBid, 6) : null;
+
+  return {
+    combinedBid,
+    combinedAsk,
+    combinedMid,
+    combinedDiscount,
+    combinedPremium,
+    pairSpread,
+  };
 }
 
 export function normalizeTokenBook(
@@ -427,6 +464,14 @@ function sumSizes(levels: OrderbookLevel[]): number {
 
 function sumNotional(levels: OrderbookLevel[]): number {
   return levels.reduce((total, level) => total + level.price * level.size, 0);
+}
+
+function sumPair(left: number | null, right: number | null): number | null {
+  if (left === null || right === null) {
+    return null;
+  }
+
+  return roundTo(left + right, 6);
 }
 
 function toNumber(value: unknown): number {

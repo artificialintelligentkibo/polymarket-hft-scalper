@@ -1,264 +1,414 @@
-import { pathToFileURL } from 'node:url';
-import { config, validateConfig, type AppConfig } from './config.js';
-import {
-  ClobFetcher,
-  type MarketOrderbookSnapshot,
-  type Outcome,
-  type TokenBookSnapshot,
-} from './clob-fetcher.js';
-import { logger, TradeLogger } from './logger.js';
-import { MarketMonitor, getSlotKey, type MarketCandidate } from './monitor.js';
-import {
-  PositionManager,
-  type BoundaryCorrection,
-  type PositionRiskLimits,
-} from './position-manager.js';
-import { ensureSlotResult, printSlotReport, recordTrade } from './slot-reporter.js';
-import { Trader } from './trader.js';
+import { config, type AppConfig } from './config.js';
+import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob-fetcher.js';
+import type { MarketCandidate } from './monitor.js';
+import type { PositionManager } from './position-manager.js';
+import type { RiskAssessment } from './risk-manager.js';
+import type { StrategySignal } from './strategy-types.js';
 
-export interface SignalDecision {
-  action: 'BUY' | 'SELL' | 'HOLD';
-  outcome: Outcome | null;
+export interface SizeCalculationResult {
   shares: number;
-  targetPrice: number | null;
-  reason: string;
-  tokenPrice: number | null;
-  midPrice: number | null;
-  outcomeIndex: 0 | 1 | null;
-}
-
-export function hasBuyEdge(
-  tokenPrice: number | null,
-  midPrice: number | null,
-  threshold = config.strategy.entryBuyEdge
-): boolean {
-  return (
-    tokenPrice !== null &&
-    midPrice !== null &&
-    Number.isFinite(tokenPrice) &&
-    Number.isFinite(midPrice) &&
-    tokenPrice < midPrice - threshold
-  );
-}
-
-export function hasSellEdge(
-  tokenPrice: number | null,
-  midPrice: number | null,
-  threshold = config.strategy.entrySellEdge
-): boolean {
-  return (
-    tokenPrice !== null &&
-    midPrice !== null &&
-    Number.isFinite(tokenPrice) &&
-    Number.isFinite(midPrice) &&
-    tokenPrice > midPrice + threshold
-  );
-}
-
-export function scaleSharesForLiquidity(
-  liquidityUsd: number,
-  depthShares: number,
-  runtimeConfig: AppConfig = config
-): number {
-  const { minShares, maxShares, minLiquidityUsd, sizeLiquidityCapUsd } = runtimeConfig.strategy;
-  const liquidityRange = Math.max(1, sizeLiquidityCapUsd - minLiquidityUsd);
-  const clampedLiquidity = clamp(liquidityUsd, minLiquidityUsd, sizeLiquidityCapUsd);
-  const liquidityScore = (clampedLiquidity - minLiquidityUsd) / liquidityRange;
-  const rawShares = minShares + liquidityScore * (maxShares - minShares);
-  const depthCap = Math.max(minShares, depthShares * 0.35);
-  return roundTo(clamp(rawShares, minShares, Math.min(maxShares, depthCap)), 2);
+  priceMultiplier: number;
+  fillRatio: number;
+  capitalClamp: number;
 }
 
 export class SignalScalper {
   constructor(private readonly runtimeConfig: AppConfig = config) {}
 
-  evaluate(params: {
+  generateSignals(params: {
     market: MarketCandidate;
     orderbook: MarketOrderbookSnapshot;
     positionManager: PositionManager;
+    riskAssessment: RiskAssessment;
     now?: Date;
-  }): SignalDecision {
+  }): StrategySignal[] {
     const now = params.now ?? new Date();
-    const { market, orderbook, positionManager } = params;
-    const limits: PositionRiskLimits = this.runtimeConfig.strategy;
+    const { market, orderbook, positionManager, riskAssessment } = params;
 
-    positionManager.setSlotEndsAt(market.endTime);
-    positionManager.markToMarket({
-      YES: orderbook.yes.bestBid ?? orderbook.yes.midPrice,
-      NO: orderbook.no.bestBid ?? orderbook.no.midPrice,
-    });
-
-    const boundaryCorrection = positionManager.getBoundaryCorrection(limits);
-    if (boundaryCorrection) {
-      return this.fromBoundaryCorrection(boundaryCorrection, market, orderbook);
-    }
-
-    for (const outcome of ['YES', 'NO'] as Outcome[]) {
-      const exit = positionManager.getExitSignal(outcome, now, limits);
-      if (exit) {
-        const book = this.getBookForOutcome(orderbook, outcome);
-        return {
-          action: 'SELL',
-          outcome,
-          shares: roundTo(exit.shares, 4),
-          targetPrice: book.bestBid ?? exit.targetPrice,
-          reason: exit.reason,
-          tokenPrice: book.lastTradePrice,
-          midPrice: book.midPrice,
-          outcomeIndex: outcome === 'YES' ? 0 : 1,
-        };
-      }
-    }
-
-    const yesExitBySignal = this.getSellEdgeDecision(
-      'YES',
-      orderbook.yes,
-      positionManager.getShares('YES')
-    );
-    if (yesExitBySignal) {
-      return yesExitBySignal;
-    }
-
-    const noExitBySignal = this.getSellEdgeDecision(
-      'NO',
-      orderbook.no,
-      positionManager.getShares('NO')
-    );
-    if (noExitBySignal) {
-      return noExitBySignal;
+    if (riskAssessment.forcedSignals.length > 0) {
+      return takeTopSignals(
+        riskAssessment.forcedSignals,
+        this.runtimeConfig.strategy.maxSignalsPerTick
+      );
     }
 
     if (!this.runtimeConfig.ENABLE_SIGNAL) {
-      return holdDecision('Signal engine disabled via ENABLE_SIGNAL=false');
+      return [];
     }
 
     if (!this.isEntryWindowOpen(market, now)) {
-      return holdDecision('Slot is inside the flatten window; new entries are disabled');
+      return [];
     }
 
-    const candidates = [
-      this.getBuyEdgeDecision('YES', market, orderbook.yes, positionManager),
-      this.getBuyEdgeDecision('NO', market, orderbook.no, positionManager),
-    ]
-      .filter((decision): decision is SignalDecision => decision !== null)
-      .sort((left, right) => {
-        const leftEdge = (left.midPrice ?? 0) - (left.tokenPrice ?? 0);
-        const rightEdge = (right.midPrice ?? 0) - (right.tokenPrice ?? 0);
-        return rightEdge - leftEdge;
+    const groups: StrategySignal[][] = [
+      this.getCombinedDiscountSignals(market, orderbook, positionManager, riskAssessment),
+      this.getExtremeSignals(market, orderbook, positionManager, riskAssessment),
+      this.getFairValueSignals(market, orderbook, positionManager, riskAssessment),
+      this.getInventoryRebalanceSignals(market, orderbook, positionManager, riskAssessment),
+    ];
+
+    const flattened = mergeSignals(groups.flat());
+    return takeTopSignals(flattened, this.runtimeConfig.strategy.maxSignalsPerTick);
+  }
+
+  private getCombinedDiscountSignals(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot,
+    positionManager: PositionManager,
+    riskAssessment: RiskAssessment
+  ): StrategySignal[] {
+    const combinedDiscount = orderbook.combined.combinedDiscount;
+    const combinedAsk = orderbook.combined.combinedAsk;
+
+    if (
+      combinedDiscount === null ||
+      combinedAsk === null ||
+      combinedDiscount < this.runtimeConfig.strategy.minCombinedDiscount
+    ) {
+      return [];
+    }
+
+    const signals: StrategySignal[] = [];
+    for (const outcome of ['YES', 'NO'] as Outcome[]) {
+      if (riskAssessment.blockedOutcomes.has(outcome)) {
+        continue;
+      }
+
+      const book = getBookForOutcome(orderbook, outcome);
+      const bestAsk = book.bestAsk;
+      if (bestAsk === null) {
+        continue;
+      }
+
+      const size = calculateTradeSize({
+        action: 'BUY',
+        signalType: 'COMBINED_DISCOUNT_BUY_BOTH',
+        edgeAmount: combinedDiscount,
+        availableCapacity: positionManager.getAvailableEntryCapacity(
+          outcome,
+          this.runtimeConfig.strategy
+        ),
+        depthShares: book.depthSharesAsk,
+        liquidityUsd: market.liquidityUsd,
+        price: bestAsk,
+        referenceEdge: this.runtimeConfig.strategy.minCombinedDiscount,
+        runtimeConfig: this.runtimeConfig,
       });
 
-    return candidates[0] ?? holdDecision('No entry or exit edge at current thresholds');
+      if (size.shares < this.runtimeConfig.strategy.minShares) {
+        continue;
+      }
+
+      signals.push(
+        buildSignal({
+          market,
+          orderbook,
+          signalType: 'COMBINED_DISCOUNT_BUY_BOTH',
+          priority: 400,
+          action: 'BUY',
+          outcome,
+          shares: size.shares,
+          targetPrice: bestAsk,
+          referencePrice: combinedAsk,
+          tokenPrice: book.lastTradePrice ?? bestAsk,
+          midPrice: book.midPrice,
+          fairValue: book.midPrice,
+          edgeAmount: combinedDiscount,
+          priceMultiplier: size.priceMultiplier,
+          fillRatio: size.fillRatio,
+          capitalClamp: size.capitalClamp,
+          urgency: 'improve',
+          reduceOnly: false,
+          reason: `Combined ask ${formatPrice(combinedAsk)} is discounted by ${formatPrice(combinedDiscount)} versus parity`,
+        })
+      );
+    }
+
+    return signals;
   }
 
-  private getBuyEdgeDecision(
-    outcome: Outcome,
+  private getExtremeSignals(
     market: MarketCandidate,
-    book: TokenBookSnapshot,
-    positionManager: PositionManager
-  ): SignalDecision | null {
-    if (!hasBuyEdge(book.lastTradePrice, book.midPrice, this.runtimeConfig.strategy.entryBuyEdge)) {
-      return null;
+    orderbook: MarketOrderbookSnapshot,
+    positionManager: PositionManager,
+    riskAssessment: RiskAssessment
+  ): StrategySignal[] {
+    const signals: StrategySignal[] = [];
+
+    for (const outcome of ['YES', 'NO'] as Outcome[]) {
+      const book = getBookForOutcome(orderbook, outcome);
+      const bestAsk = book.bestAsk;
+      const bestBid = book.bestBid;
+      const openShares = positionManager.getShares(outcome);
+
+      if (!riskAssessment.blockedOutcomes.has(outcome) && bestAsk !== null) {
+        const edge = this.runtimeConfig.strategy.extremeBuyThreshold - bestAsk;
+        if (edge >= 0) {
+          const size = calculateTradeSize({
+            action: 'BUY',
+            signalType: 'EXTREME_BUY',
+            edgeAmount: edge,
+            availableCapacity: positionManager.getAvailableEntryCapacity(
+              outcome,
+              this.runtimeConfig.strategy
+            ),
+            depthShares: book.depthSharesAsk,
+            liquidityUsd: market.liquidityUsd,
+            price: bestAsk,
+            referenceEdge: this.runtimeConfig.strategy.extremeBuyThreshold,
+            runtimeConfig: this.runtimeConfig,
+          });
+
+          if (size.shares >= this.runtimeConfig.strategy.minShares) {
+            signals.push(
+              buildSignal({
+                market,
+                orderbook,
+                signalType: 'EXTREME_BUY',
+                priority: 300,
+                action: 'BUY',
+                outcome,
+                shares: size.shares,
+                targetPrice: bestAsk,
+                referencePrice: this.runtimeConfig.strategy.extremeBuyThreshold,
+                tokenPrice: book.lastTradePrice ?? bestAsk,
+                midPrice: book.midPrice,
+                fairValue: book.midPrice,
+                edgeAmount: edge,
+                priceMultiplier: size.priceMultiplier,
+                fillRatio: size.fillRatio,
+                capitalClamp: size.capitalClamp,
+                urgency: 'improve',
+                reduceOnly: false,
+                reason: `${outcome} ask ${formatPrice(bestAsk)} is inside the extreme buy zone`,
+              })
+            );
+          }
+        }
+      }
+
+      if (openShares > 0 && bestBid !== null) {
+        const edge = bestBid - this.runtimeConfig.strategy.extremeSellThreshold;
+        if (edge >= 0) {
+          const size = calculateTradeSize({
+            action: 'SELL',
+            signalType: 'EXTREME_SELL',
+            edgeAmount: edge,
+            availableCapacity: openShares,
+            depthShares: book.depthSharesBid,
+            liquidityUsd: market.liquidityUsd,
+            price: bestBid,
+            referenceEdge: 1 - this.runtimeConfig.strategy.extremeSellThreshold,
+            runtimeConfig: this.runtimeConfig,
+            allowBelowMin: true,
+          });
+
+          if (size.shares > 0) {
+            signals.push(
+              buildSignal({
+                market,
+                orderbook,
+                signalType: 'EXTREME_SELL',
+                priority: 300,
+                action: 'SELL',
+                outcome,
+                shares: size.shares,
+                targetPrice: bestBid,
+                referencePrice: this.runtimeConfig.strategy.extremeSellThreshold,
+                tokenPrice: book.lastTradePrice ?? bestBid,
+                midPrice: book.midPrice,
+                fairValue: book.midPrice,
+                edgeAmount: edge,
+                priceMultiplier: size.priceMultiplier,
+                fillRatio: size.fillRatio,
+                capitalClamp: size.capitalClamp,
+                urgency: 'cross',
+                reduceOnly: true,
+                reason: `${outcome} bid ${formatPrice(bestBid)} is inside the extreme sell zone`,
+              })
+            );
+          }
+        }
+      }
     }
 
-    const bestAsk = book.bestAsk ?? book.midPrice;
-    if (bestAsk === null) {
-      return null;
-    }
-
-    const availableCapacity = positionManager.getAvailableEntryCapacity(
-      outcome,
-      this.runtimeConfig.strategy
-    );
-    if (availableCapacity < this.runtimeConfig.strategy.minShares) {
-      return null;
-    }
-
-    const scaledShares = scaleSharesForLiquidity(
-      market.liquidityUsd,
-      book.depthSharesAsk,
-      this.runtimeConfig
-    );
-    const shares = roundTo(
-      clamp(
-        Math.min(scaledShares, availableCapacity),
-        this.runtimeConfig.strategy.minShares,
-        this.runtimeConfig.strategy.maxShares
-      ),
-      2
-    );
-
-    if (shares < this.runtimeConfig.strategy.minShares) {
-      return null;
-    }
-
-    return {
-      action: 'BUY',
-      outcome,
-      shares,
-      targetPrice: bestAsk,
-      reason: `${outcome} last trade ${formatPrice(book.lastTradePrice)} is below mid ${formatPrice(book.midPrice)} by at least ${this.runtimeConfig.strategy.entryBuyEdge}`,
-      tokenPrice: book.lastTradePrice,
-      midPrice: book.midPrice,
-      outcomeIndex: outcome === 'YES' ? 0 : 1,
-    };
+    return signals;
   }
 
-  private getSellEdgeDecision(
-    outcome: Outcome,
-    book: TokenBookSnapshot,
-    openShares: number
-  ): SignalDecision | null {
-    if (openShares <= 0) {
-      return null;
+  private getFairValueSignals(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot,
+    positionManager: PositionManager,
+    riskAssessment: RiskAssessment
+  ): StrategySignal[] {
+    const signals: StrategySignal[] = [];
+
+    for (const outcome of ['YES', 'NO'] as Outcome[]) {
+      const book = getBookForOutcome(orderbook, outcome);
+      const bestAsk = book.bestAsk;
+      const bestBid = book.bestBid;
+      const fairValue = book.midPrice;
+      const openShares = positionManager.getShares(outcome);
+
+      if (
+        !riskAssessment.blockedOutcomes.has(outcome) &&
+        fairValue !== null &&
+        bestAsk !== null
+      ) {
+        const buyEdge = fairValue - bestAsk;
+        if (buyEdge >= this.runtimeConfig.strategy.fairValueBuyThreshold) {
+          const size = calculateTradeSize({
+            action: 'BUY',
+            signalType: 'FAIR_VALUE_BUY',
+            edgeAmount: buyEdge,
+            availableCapacity: positionManager.getAvailableEntryCapacity(
+              outcome,
+              this.runtimeConfig.strategy
+            ),
+            depthShares: book.depthSharesAsk,
+            liquidityUsd: market.liquidityUsd,
+            price: bestAsk,
+            referenceEdge: this.runtimeConfig.strategy.fairValueBuyThreshold,
+            runtimeConfig: this.runtimeConfig,
+          });
+
+          if (size.shares >= this.runtimeConfig.strategy.minShares) {
+            signals.push(
+              buildSignal({
+                market,
+                orderbook,
+                signalType: 'FAIR_VALUE_BUY',
+                priority: 200,
+                action: 'BUY',
+                outcome,
+                shares: size.shares,
+                targetPrice: bestAsk,
+                referencePrice: fairValue,
+                tokenPrice: book.lastTradePrice ?? bestAsk,
+                midPrice: fairValue,
+                fairValue,
+                edgeAmount: buyEdge,
+                priceMultiplier: size.priceMultiplier,
+                fillRatio: size.fillRatio,
+                capitalClamp: size.capitalClamp,
+                urgency: 'passive',
+                reduceOnly: false,
+                reason: `${outcome} ask ${formatPrice(bestAsk)} is below fair value ${formatPrice(fairValue)}`,
+              })
+            );
+          }
+        }
+      }
+
+      if (fairValue !== null && bestBid !== null && openShares > 0) {
+        const sellEdge = bestBid - fairValue;
+        if (sellEdge >= this.runtimeConfig.strategy.fairValueSellThreshold) {
+          const size = calculateTradeSize({
+            action: 'SELL',
+            signalType: 'FAIR_VALUE_SELL',
+            edgeAmount: sellEdge,
+            availableCapacity: openShares,
+            depthShares: book.depthSharesBid,
+            liquidityUsd: market.liquidityUsd,
+            price: bestBid,
+            referenceEdge: this.runtimeConfig.strategy.fairValueSellThreshold,
+            runtimeConfig: this.runtimeConfig,
+            allowBelowMin: true,
+          });
+
+          if (size.shares > 0) {
+            signals.push(
+              buildSignal({
+                market,
+                orderbook,
+                signalType: 'FAIR_VALUE_SELL',
+                priority: 200,
+                action: 'SELL',
+                outcome,
+                shares: size.shares,
+                targetPrice: bestBid,
+                referencePrice: fairValue,
+                tokenPrice: book.lastTradePrice ?? bestBid,
+                midPrice: fairValue,
+                fairValue,
+                edgeAmount: sellEdge,
+                priceMultiplier: size.priceMultiplier,
+                fillRatio: size.fillRatio,
+                capitalClamp: size.capitalClamp,
+                urgency: 'improve',
+                reduceOnly: true,
+                reason: `${outcome} bid ${formatPrice(bestBid)} is above fair value ${formatPrice(fairValue)}`,
+              })
+            );
+          }
+        }
+      }
     }
 
-    if (!hasSellEdge(book.lastTradePrice, book.midPrice, this.runtimeConfig.strategy.entrySellEdge)) {
-      return null;
+    return signals;
+  }
+
+  private getInventoryRebalanceSignals(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot,
+    positionManager: PositionManager,
+    riskAssessment: RiskAssessment
+  ): StrategySignal[] {
+    const imbalanceState = positionManager.getInventoryImbalanceState(this.runtimeConfig.strategy);
+    if (!imbalanceState.dominantOutcome || imbalanceState.suggestedReduceShares <= 0) {
+      return [];
     }
 
+    const outcome = imbalanceState.dominantOutcome;
+    const book = getBookForOutcome(orderbook, outcome);
     const bestBid = book.bestBid ?? book.midPrice;
     if (bestBid === null) {
-      return null;
+      return [];
     }
 
-    return {
+    const size = calculateTradeSize({
       action: 'SELL',
-      outcome,
-      shares: roundTo(openShares, 4),
-      targetPrice: bestBid,
-      reason: `${outcome} last trade ${formatPrice(book.lastTradePrice)} is above mid ${formatPrice(book.midPrice)} by at least ${this.runtimeConfig.strategy.entrySellEdge}`,
-      tokenPrice: book.lastTradePrice,
-      midPrice: book.midPrice,
-      outcomeIndex: outcome === 'YES' ? 0 : 1,
-    };
-  }
+      signalType: 'INVENTORY_REBALANCE',
+      edgeAmount: imbalanceState.excess,
+      availableCapacity: Math.min(
+        positionManager.getShares(outcome),
+        imbalanceState.suggestedReduceShares
+      ),
+      depthShares: book.depthSharesBid,
+      liquidityUsd: market.liquidityUsd,
+      price: bestBid,
+      referenceEdge: this.runtimeConfig.strategy.inventoryImbalanceThreshold,
+      runtimeConfig: this.runtimeConfig,
+      allowBelowMin: true,
+    });
 
-  private fromBoundaryCorrection(
-    correction: BoundaryCorrection,
-    market: MarketCandidate,
-    orderbook: MarketOrderbookSnapshot
-  ): SignalDecision {
-    const book = this.getBookForOutcome(orderbook, correction.outcome);
-    const targetPrice =
-      correction.action === 'BUY' ? book.bestAsk ?? book.midPrice : book.bestBid ?? book.midPrice;
+    if (size.shares <= 0) {
+      return [];
+    }
 
-    return {
-      action: correction.action,
-      outcome: correction.outcome,
-      shares: roundTo(correction.shares, 4),
-      targetPrice,
-      reason: correction.reason,
-      tokenPrice: book.lastTradePrice,
-      midPrice: book.midPrice,
-      outcomeIndex: correction.outcome === 'YES' ? market.yesOutcomeIndex : market.noOutcomeIndex,
-    };
-  }
-
-  private getBookForOutcome(
-    snapshot: MarketOrderbookSnapshot,
-    outcome: Outcome
-  ): TokenBookSnapshot {
-    return outcome === 'YES' ? snapshot.yes : snapshot.no;
+    return [
+      buildSignal({
+        market,
+        orderbook,
+        signalType: 'INVENTORY_REBALANCE',
+        priority: 100,
+        action: 'SELL',
+        outcome,
+        shares: size.shares,
+        targetPrice: bestBid,
+        referencePrice: 0,
+        tokenPrice: book.lastTradePrice ?? bestBid,
+        midPrice: book.midPrice,
+        fairValue: book.midPrice,
+        edgeAmount: imbalanceState.excess,
+        priceMultiplier: size.priceMultiplier,
+        fillRatio: size.fillRatio,
+        capitalClamp: size.capitalClamp,
+        urgency: 'improve',
+        reduceOnly: true,
+        reason: `Inventory imbalance ${formatPrice(imbalanceState.imbalance)} exceeded threshold ${this.runtimeConfig.strategy.inventoryImbalanceThreshold}`,
+      }),
+    ];
   }
 
   private isEntryWindowOpen(market: MarketCandidate, now: Date): boolean {
@@ -275,231 +425,164 @@ export class SignalScalper {
   }
 }
 
-class HftScalperRuntime {
-  private readonly monitor = new MarketMonitor();
-  private readonly fetcher = new ClobFetcher();
-  private readonly trader = new Trader();
-  private readonly tradeLogger = new TradeLogger();
-  private readonly signal = new SignalScalper();
-  private readonly positions = new Map<string, PositionManager>();
-  private readonly pendingSlotReports = new Set<string>();
-  private readonly printedSlotReports = new Set<string>();
-  private running = false;
+export function calculateTradeSize(params: {
+  action: 'BUY' | 'SELL';
+  signalType: StrategySignal['signalType'];
+  edgeAmount: number;
+  availableCapacity: number;
+  depthShares: number;
+  liquidityUsd: number;
+  price: number | null;
+  referenceEdge: number;
+  runtimeConfig?: AppConfig;
+  allowBelowMin?: boolean;
+}): SizeCalculationResult {
+  const runtimeConfig = params.runtimeConfig ?? config;
+  const strategy = runtimeConfig.strategy;
+  const priceMultiplier = resolvePriceMultiplier(params.price, runtimeConfig);
+  const normalizedDepth = params.depthShares / Math.max(1, strategy.depthReferenceShares);
+  const normalizedEdge =
+    params.referenceEdge > 0 ? params.edgeAmount / params.referenceEdge : 1;
+  const fillRatio = roundTo(clamp(normalizedDepth * normalizedEdge, 0.25, 1.75), 4);
+  const capacityBase =
+    params.action === 'SELL' ? strategy.maxShares : strategy.capitalReferenceShares;
+  const capitalClamp = roundTo(
+    clamp(params.availableCapacity / Math.max(1, capacityBase), 0.2, 1),
+    4
+  );
+  const liquidityClamp = clamp(
+    params.liquidityUsd / Math.max(strategy.minLiquidityUsd, strategy.sizeLiquidityCapUsd),
+    0.35,
+    1
+  );
+  const rawShares =
+    strategy.baseOrderShares *
+    priceMultiplier *
+    fillRatio *
+    capitalClamp *
+    liquidityClamp;
+  const minShares = params.allowBelowMin ? 0.01 : strategy.minShares;
+  const shares = roundTo(
+    clamp(rawShares, minShares, Math.min(strategy.maxShares, params.availableCapacity)),
+    4
+  );
 
-  constructor() {
-    this.monitor.on('slot-ended', (market: MarketCandidate) => {
-      const slotKey = getSlotKey(market);
-      ensureSlotResult(slotKey, market.marketId, market.title);
-      this.pendingSlotReports.add(slotKey);
-    });
+  return {
+    shares,
+    priceMultiplier,
+    fillRatio,
+    capitalClamp,
+  };
+}
+
+export function resolvePriceMultiplier(
+  price: number | null,
+  runtimeConfig: AppConfig = config
+): number {
+  if (price === null || !Number.isFinite(price) || price <= 0) {
+    return 1;
   }
 
-  async initialize(): Promise<void> {
-    validateConfig();
-    await this.tradeLogger.ensureReady();
-    await this.trader.initialize();
-
-    logger.info('Polymarket HFT scalper initialized', {
-      simulationMode: config.SIMULATION_MODE,
-      testMode: config.TEST_MODE,
-      enableSignal: config.ENABLE_SIGNAL,
-      entryBuyEdge: config.strategy.entryBuyEdge,
-      entrySellEdge: config.strategy.entrySellEdge,
-      minLiquidityUsd: config.strategy.minLiquidityUsd,
-      whitelistSize: config.WHITELIST_CONDITION_IDS.length,
-    });
-  }
-
-  async run(): Promise<void> {
-    this.running = true;
-
-    while (this.running) {
-      try {
-        await this.runCycle();
-      } catch (error: any) {
-        logger.error('Scan cycle failed', {
-          message: error?.message || 'Unknown error',
-        });
-      }
-
-      await sleep(config.runtime.marketScanIntervalMs);
+  for (const level of runtimeConfig.strategy.priceMultiplierLevels) {
+    if (price <= level.maxPrice) {
+      return level.multiplier;
     }
   }
 
-  stop(): void {
-    this.running = false;
-    this.fetcher.close();
-  }
+  return runtimeConfig.strategy.priceMultiplierLevels.at(-1)?.multiplier ?? 1;
+}
 
-  private async runCycle(): Promise<void> {
-    const markets = await this.monitor.scanEligibleMarkets();
-    if (markets.length === 0) {
-      logger.debug('No eligible markets found for this cycle');
-      return;
+function buildSignal(params: {
+  market: MarketCandidate;
+  orderbook: MarketOrderbookSnapshot;
+  signalType: StrategySignal['signalType'];
+  priority: number;
+  action: 'BUY' | 'SELL';
+  outcome: Outcome;
+  shares: number;
+  targetPrice: number | null;
+  referencePrice: number | null;
+  tokenPrice: number | null;
+  midPrice: number | null;
+  fairValue: number | null;
+  edgeAmount: number;
+  priceMultiplier: number;
+  fillRatio: number;
+  capitalClamp: number;
+  urgency: StrategySignal['urgency'];
+  reduceOnly: boolean;
+  reason: string;
+}): StrategySignal {
+  return {
+    marketId: params.market.marketId,
+    marketTitle: params.market.title,
+    signalType: params.signalType,
+    priority: params.priority,
+    action: params.action,
+    outcome: params.outcome,
+    outcomeIndex: params.outcome === 'YES' ? 0 : 1,
+    shares: roundTo(params.shares, 4),
+    targetPrice: params.targetPrice,
+    referencePrice: params.referencePrice,
+    tokenPrice: params.tokenPrice,
+    midPrice: params.midPrice,
+    fairValue: params.fairValue,
+    edgeAmount: roundTo(params.edgeAmount, 6),
+    combinedBid: params.orderbook.combined.combinedBid,
+    combinedAsk: params.orderbook.combined.combinedAsk,
+    combinedMid: params.orderbook.combined.combinedMid,
+    combinedDiscount: params.orderbook.combined.combinedDiscount,
+    combinedPremium: params.orderbook.combined.combinedPremium,
+    fillRatio: params.fillRatio,
+    capitalClamp: params.capitalClamp,
+    priceMultiplier: params.priceMultiplier,
+    urgency: params.urgency,
+    reduceOnly: params.reduceOnly,
+    reason: params.reason,
+  };
+}
+
+function mergeSignals(signals: StrategySignal[]): StrategySignal[] {
+  const byOutcomeAction = new Map<string, StrategySignal>();
+
+  for (const signal of signals) {
+    const key = `${signal.outcome}:${signal.action}`;
+    const existing = byOutcomeAction.get(key);
+    if (!existing) {
+      byOutcomeAction.set(key, signal);
+      continue;
     }
-
-    const tokenIds = markets.flatMap((market) => [market.yesTokenId, market.noTokenId]);
-    await this.fetcher.subscribeAssets(tokenIds);
-
-    await runWithConcurrency(markets, config.runtime.maxConcurrentMarkets, async (market) => {
-      await this.processMarket(market);
-    });
-  }
-
-  private async processMarket(market: MarketCandidate): Promise<void> {
-    const slotKey = getSlotKey(market);
-    const orderbook = await this.fetcher.getMarketSnapshot(market);
-    const positionManager = this.getPositionManager(market);
-    const decision = this.signal.evaluate({
-      market,
-      orderbook,
-      positionManager,
-    });
 
     if (
-      decision.action === 'HOLD' ||
-      !decision.outcome ||
-      decision.targetPrice === null ||
-      decision.shares <= 0
+      signal.priority > existing.priority ||
+      (signal.priority === existing.priority && signal.edgeAmount > existing.edgeAmount)
     ) {
-      this.maybePrintSlotReport(market);
-      return;
+      byOutcomeAction.set(key, signal);
     }
-
-    const tokenId = decision.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
-    const beforeSnapshot = positionManager.getSnapshot();
-    const execution = await this.trader.placeOrder({
-      marketId: market.marketId,
-      marketTitle: market.title,
-      tokenId,
-      outcome: decision.outcome,
-      side: decision.action,
-      shares: decision.shares,
-      price: decision.targetPrice,
-      reason: decision.reason,
-    });
-
-    const afterSnapshot = positionManager.applyFill({
-      outcome: decision.outcome,
-      side: decision.action,
-      shares: execution.shares,
-      price: execution.price,
-      timestamp: new Date().toISOString(),
-      orderId: execution.orderId,
-    });
-
-    const realizedDelta = roundTo(afterSnapshot.realizedPnl - beforeSnapshot.realizedPnl, 4);
-    if (realizedDelta !== 0) {
-      recordTrade(
-        slotKey,
-        market.marketId,
-        market.title,
-        toSlotOutcome(decision.outcome),
-        realizedDelta
-      );
-    }
-
-    const snapshot = afterSnapshot;
-    const book = decision.outcome === 'YES' ? orderbook.yes : orderbook.no;
-
-    await this.tradeLogger.logTrade({
-      phase: 'live',
-      timestampMs: Date.now(),
-      marketId: market.marketId,
-      marketTitle: market.title,
-      slotStart: market.startTime,
-      slotEnd: market.endTime,
-      tokenId,
-      outcome: decision.outcome,
-      outcomeIndex: decision.outcome === 'YES' ? 0 : 1,
-      action: decision.action,
-      reason: decision.reason,
-      tokenPrice: decision.tokenPrice,
-      midPrice: decision.midPrice,
-      bestBid: book.bestBid,
-      bestAsk: book.bestAsk,
-      shares: execution.shares,
-      notionalUsd: execution.notionalUsd,
-      liquidityUsd: market.liquidityUsd,
-      netYesShares: snapshot.yesShares,
-      netNoShares: snapshot.noShares,
-      signedNetShares: snapshot.signedNetShares,
-      realizedPnl: snapshot.realizedPnl,
-      unrealizedPnl: snapshot.unrealizedPnl,
-      totalPnl: snapshot.totalPnl,
-      orderId: execution.orderId,
-      simulationMode: execution.simulation,
-    });
-
-    logger.info('Trade executed', {
-      marketId: market.marketId,
-      outcome: decision.outcome,
-      action: decision.action,
-      shares: execution.shares,
-      price: execution.price,
-      reason: decision.reason,
-      signedNetShares: snapshot.signedNetShares,
-      totalPnl: snapshot.totalPnl,
-    });
-
-    this.maybePrintSlotReport(market);
   }
 
-  private getPositionManager(market: MarketCandidate): PositionManager {
-    const existing = this.positions.get(market.marketId);
-    if (existing) {
-      existing.setSlotEndsAt(market.endTime);
-      return existing;
-    }
-
-    const created = new PositionManager(market.marketId, market.endTime);
-    this.positions.set(market.marketId, created);
-    return created;
-  }
-
-  private maybePrintSlotReport(market: MarketCandidate): void {
-    const slotKey = getSlotKey(market);
-    if (!this.pendingSlotReports.has(slotKey) || this.printedSlotReports.has(slotKey)) {
-      return;
-    }
-
-    ensureSlotResult(slotKey, market.marketId, market.title);
-    printSlotReport(slotKey);
-    this.pendingSlotReports.delete(slotKey);
-    this.printedSlotReports.add(slotKey);
-  }
+  return Array.from(byOutcomeAction.values());
 }
 
-export async function main(): Promise<void> {
-  const runtime = new HftScalperRuntime();
-
-  process.on('SIGINT', () => {
-    logger.info('Received SIGINT, shutting down');
-    runtime.stop();
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', () => {
-    logger.info('Received SIGTERM, shutting down');
-    runtime.stop();
-    process.exit(0);
-  });
-
-  await runtime.initialize();
-  await runtime.run();
+function takeTopSignals(signals: StrategySignal[], maxSignals: number): StrategySignal[] {
+  return [...signals]
+    .sort((left, right) => {
+      if (left.priority !== right.priority) {
+        return right.priority - left.priority;
+      }
+      if (left.reduceOnly !== right.reduceOnly) {
+        return left.reduceOnly ? -1 : 1;
+      }
+      return right.edgeAmount - left.edgeAmount;
+    })
+    .slice(0, Math.max(1, maxSignals));
 }
 
-function holdDecision(reason: string): SignalDecision {
-  return {
-    action: 'HOLD',
-    outcome: null,
-    shares: 0,
-    targetPrice: null,
-    reason,
-    tokenPrice: null,
-    midPrice: null,
-    outcomeIndex: null,
-  };
+function getBookForOutcome(
+  snapshot: MarketOrderbookSnapshot,
+  outcome: Outcome
+): TokenBookSnapshot {
+  return outcome === 'YES' ? snapshot.yes : snapshot.no;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -511,40 +594,6 @@ function roundTo(value: number, decimals: number): number {
   return Math.round(value * factor) / factor;
 }
 
-function formatPrice(value: number | null): string {
-  return value === null ? 'n/a' : value.toFixed(4);
-}
-
-function toSlotOutcome(outcome: Outcome): 'Up' | 'Down' {
-  return outcome === 'YES' ? 'Up' : 'Down';
-}
-
-async function runWithConcurrency<T>(
-  values: T[],
-  concurrency: number,
-  worker: (value: T) => Promise<void>
-): Promise<void> {
-  const queue = [...values];
-  const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
-    while (queue.length > 0) {
-      const next = queue.shift();
-      if (!next) {
-        return;
-      }
-      await worker(next);
-    }
-  });
-
-  await Promise.all(workers);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-const isDirectRun =
-  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
-
-if (isDirectRun) {
-  void main();
+function formatPrice(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(4) : 'n/a';
 }

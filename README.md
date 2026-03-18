@@ -1,228 +1,193 @@
-# Polymarket HFT Scalper
+# polymarket-hft-scalper
 
-Standalone Polymarket scalper repo built from the proven pieces of `polymarket-copy-bot`, but stripped of copy-trading logic. This project keeps the gasless trader, JSONL logging, CCXT enrichment, and CLOB connectivity, then swaps in a dedicated short-horizon mean-reversion signal for 5-minute markets.
+Dual-sided Polymarket CLOB market-maker for 5-minute markets. The runtime now combines:
 
-## Repo Layout
+- combined discount detection across both outcomes
+- extreme buy / extreme sell zones
+- fair-value mean reversion
+- inventory rebalance on imbalance
+- risk-enforced flatten, hard stop, and trailing take-profit
+- post-only execution with urgency tiers and retry logic
+- JSONL trade logs with signal metadata and slot-level PnL reporting
+
+## Strategy Model
+
+Priority order per tick:
+
+1. `COMBINED_DISCOUNT_BUY_BOTH`
+2. `EXTREME_BUY` / `EXTREME_SELL`
+3. `FAIR_VALUE_BUY` / `FAIR_VALUE_SELL`
+4. `INVENTORY_REBALANCE`
+
+Risk exits override all of the above:
+
+- `SLOT_FLATTEN`
+- `HARD_STOP`
+- `TRAILING_TAKE_PROFIT`
+- `RISK_LIMIT`
+
+The engine evaluates both `YES` and `NO` every cycle and executes at most `MAX_SIGNALS_PER_TICK=2`.
+
+## Repository Layout
 
 ```text
-polymarket-hft-scalper/
-├── src/
-│   ├── config.ts
-│   ├── clob-fetcher.ts
-│   ├── signal-scalper.ts
-│   ├── position-manager.ts
-│   ├── trader.ts
-│   ├── logger.ts
-│   └── monitor.ts
-├── backtest/
-│   └── backtester.ts
-├── .env.example
-├── README.md
-└── package.json
+src/
+  clob-fetcher.ts
+  config.ts
+  index.ts
+  logger.ts
+  monitor.ts
+  order-executor.ts
+  position-manager.ts
+  risk-manager.ts
+  signal-scalper.ts
+  slot-reporter.ts
+  strategy-types.ts
+  trader.ts
+backtest/
+  backtester.ts
+tests/
+  position-manager.test.ts
+  risk-manager.test.ts
+  signal-scalper.test.ts
 ```
 
-## Stack
+## Key Configuration
 
-- `@polymarket/clob-client` for gasless order posting
-- `ws` for CLOB WebSocket subscriptions
-- native `fetch` for Gamma market discovery
-- `ccxt` for crypto context snapshots in logs
-- TypeScript + `tsx`
+Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper/src/config.ts):
 
-## Strategy
+- `MIN_COMBINED_DISCOUNT`
+- `EXTREME_SELL_THRESHOLD`
+- `EXTREME_BUY_THRESHOLD`
+- `FAIR_VALUE_BUY_THRESHOLD`
+- `FAIR_VALUE_SELL_THRESHOLD`
+- `INVENTORY_IMBALANCE_THRESHOLD`
+- `MAX_SIGNALS_PER_TICK`
+- `PRICE_MULTIPLIER_LEVELS`
+- `MAX_NET_YES=200`
+- `MAX_NET_NO=250`
 
-The signal is implemented literally from the reconstructed rules:
+Sizing is now driven by:
 
-- Trade only the binary `outcomeIndex` tokens:
-  - `0` => `YES` / `UP`
-  - `1` => `NO` / `DOWN`
-- Entry BUY condition:
-  - `token_price < mid_price_orderbook - 0.018`
-- Inventory SELL condition:
-  - `token_price > mid_price_orderbook + 0.015`
-- Position sizing:
-  - `8` to `35` shares, scaled by market liquidity and available book depth
-- Net inventory controls:
-  - `MAX_NET_YES = +65`
-  - `MAX_NET_NO = -75`
-  - when breached, the engine auto-flips with the opposite corrective action
-- Exits:
-  - trailing take-profit distance: `0.012`
-  - hard stop distance: `0.025`
-  - flatten before slot end
-- Market filter:
-  - liquidity strictly above `$500`
-  - optionally only 5-minute markets
+- `priceMultiplier`
+- `fillRatio`
+- `capitalClamp`
 
-## Important Assumptions
+## Runtime Flow
 
-Two parts of the original reverse-engineered behavior needed a deterministic implementation choice:
+The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) runs:
 
-1. `Trailing take-profit +0.012`
-   - implemented as: once peak mark is at least `entry + 0.012`, exit on a `0.012` retrace from the peak
-2. `SELL if token_price > mid + 0.015`
-   - implemented as an inventory reduction signal, not naked shorting
-   - the strategy only sells inventory it already owns
+1. Gamma scan for liquid 5-minute markets
+2. whitelist filter via `WHITELIST_CONDITION_IDS`
+3. orderbook sync from CLOB WebSocket + REST fallback
+4. risk assessment
+5. top-2 signal generation
+6. post-only / improve / cross execution
+7. JSONL trade logging
+8. slot-end console reporting
 
-These assumptions are explicit in code and easy to change.
+## Slot Reports
 
-## Components
+The slot reporter aggregates realized PnL per slot and prints:
 
-### `src/monitor.ts`
+- `Up PNL`
+- `Down PNL`
+- `NET PNL`
+- `TOTAL DAY PNL`
 
-- pulls active Gamma markets
-- extracts binary token IDs
-- filters by liquidity and 5-minute duration
-- drops markets that are too close to slot end
-
-### `src/clob-fetcher.ts`
-
-- subscribes to `wss://ws-subscriptions-clob.polymarket.com/ws/market`
-- tracks `last_trade_price` from WebSocket
-- refreshes full bid/ask books from REST when local state is stale
-- computes real `bestBid`, `bestAsk`, `midPrice`, spread, and depth
-
-### `src/signal-scalper.ts`
-
-- evaluates entry/exit edges
-- applies net position correction before new entries
-- sizes orders from liquidity
-- orchestrates live runtime loops
-
-### `src/position-manager.ts`
-
-- tracks YES / NO inventory separately
-- computes signed net exposure `yesShares - noShares`
-- marks unrealized PnL
-- triggers hard stop, trailing stop, and slot-end exits
-
-### `src/trader.ts`
-
-- derives or creates Polymarket API credentials from the configured signer
-- supports `EOA` and `PROXY` style auth
-- places gasless orders through the Polymarket SDK
-- preserves approval and balance checks needed for live trading
-
-### `src/logger.ts`
-
-- writes structured app events
-- writes JSONL trade records
-- enriches each record with CCXT crypto snapshots
-- captures realized / unrealized PnL and signed net inventory
+This is triggered when the monitor emits `slot-ended` and also during graceful shutdown.
 
 ## Running
 
+Install dependencies:
+
 ```bash
 npm install
-cp .env.example .env
-npm start
 ```
 
-Simulation mode:
+Create your env file:
 
 ```bash
+cp .env.example .env
+```
+
+Dry-run / simulation test:
+
+```bash
+TEST_MODE=true
 SIMULATION_MODE=true
-ENABLE_SIGNAL=true
+DRY_RUN=true
+WHITELIST_CONDITION_IDS=0x3f5dc93e734dc9f2c441882160bdf6716d8bb7953ce67962094c6b17f73210c0,0x3756c929609555f5b6cd8a8231d083400ea92397873fcd5ca24182186766e2e7
 npm start
 ```
 
-Backtest:
+Live-like runtime without simulation:
+
+```bash
+SIMULATION_MODE=false
+TEST_MODE=false
+DRY_RUN=false
+npm start
+```
+
+## Backtest
+
+The backtester now groups both outcomes into a single paired market snapshot and reports:
+
+- realized and total PnL
+- slot PnL
+- win-rate per signal type
+- forced exit count
+- Sharpe based on slot-level returns
+- optional comparison with observed trade logs
+
+Run:
 
 ```bash
 npm run backtest -- backtest/data/sample.jsonl
 ```
 
-Tests:
+Compare against observed trades:
+
+```bash
+npm run backtest -- backtest/data/sample.jsonl path/to/observed-trades.jsonl
+```
+
+## Tests
 
 ```bash
 npm test
 ```
 
+Current test coverage focuses on:
+
+- combined discount dual-entry behavior
+- inventory rebalance generation
+- position risk caps
+- slot-end flattening
+
 ## Logging
 
-Trade logs are written as JSONL under `logs/` and include:
+Trade JSONL logs now include:
 
-- timestamp
-- market / slot metadata
-- token price, mid, best bid, best ask
-- action, shares, notional
-- net YES / net NO inventory
-- realized, unrealized, and total PnL
-- crypto prices from Binance via CCXT
+- `signalType`
+- `edgeAmount`
+- `combinedBid`
+- `combinedAsk`
+- `combinedMid`
+- `combinedDiscount`
+- `combinedPremium`
+- `fillRatio`
+- `capitalClamp`
+- `priceMultiplier`
+- `urgency`
+- `wasMaker`
+- `inventoryImbalance`
+- `grossExposureShares`
+- full PnL snapshot
 
-## Backtest Notes
+## Notes
 
-`backtest/backtester.ts` is designed to run on JSONL logs that already contain `token_price` and `mid_price_orderbook`, including the simulation logs produced by the earlier reverse-engineering workflow.
-
-The included sample dataset is synthetic and exists to verify that:
-
-- entries fire on the configured discount to mid
-- exits fire on the configured premium to mid
-- hard stop logic works
-- summary PnL aggregation is stable
-
-## Sample Results
-
-On the included synthetic dataset in [backtest/data/sample.jsonl](/C:/GitHub/polymarket-hft-scalper/backtest/data/sample.jsonl), the expected baseline result is:
-
-- `samples`: `6`
-- `markets`: `3`
-- `entries`: `3`
-- `exits`: `3`
-- `wins`: `1`
-- `losses`: `2`
-- `realizedPnl`: about `+0.0827`
-- `maxSignedNet`: about `25.55` shares
-- `forcedExitCount`: `1`
-
-This is intentionally a sanity-check dataset, not a profitability claim. It proves that:
-
-- discount-to-mid entries fire
-- premium-to-mid exits fire
-- hard stop logic closes losing inventory
-- net inventory never exceeds the configured caps on the sample flow
-
-## Simulation + Slot Reports
-
-```bash
-TEST_MODE=true SIMULATION_MODE=true WHITELIST_CONDITION_IDS="0x3f5dc93e...,0x3756c929..." npm start
-```
-
-In this mode the bot can be constrained to a manual whitelist of `conditionId` values, trade only the selected 5-minute slots, and print a console report after each slot ends.
-
-What the runtime does:
-
-- filters markets by `WHITELIST_CONDITION_IDS` when the list is non-empty
-- treats `TEST_MODE` the same as simulation for order placement
-- flattens positions into the slot-end window
-- prints per-slot `Up`, `Down`, and `NET` PnL
-- keeps a cumulative day total in memory for the process lifetime
-
-### Quick Test
-
-1. Copy [`.env.example`](/C:/GitHub/polymarket-hft-scalper/.env.example) to `.env`
-2. Set:
-
-```bash
-TEST_MODE=true
-SIMULATION_MODE=true
-WHITELIST_CONDITION_IDS=0x3f5dc93e734dc9f2c441882160bdf6716d8bb7953ce67962094c6b17f73210c0,0x3756c929609555f5b6cd8a8231d083400ea92397873fcd5ca24182186766e2e7
-```
-
-3. Run:
-
-```bash
-npm start
-```
-
-Expected behavior:
-
-- the bot trades only the whitelisted slots
-- each ending 5-minute slot prints a console summary table
-- `TOTAL DAY PNL` accumulates across slot reports
-
-## Next Steps
-
-- wire a persistent position snapshot store if you want restart-safe inventory
-- add per-market concurrency locks if you plan to run many slots in parallel
-- add maker/taker fill reconciliation from the user WebSocket channel for production
+- There is no external database; state is in-memory and JSONL only.
+- Graceful shutdown calls `cancelAllOrders()` and then flattens inventory.
+- `TEST_MODE`, `SIMULATION_MODE`, and `DRY_RUN` all bypass live execution.

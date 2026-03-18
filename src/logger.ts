@@ -2,6 +2,7 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { config, type LogLevel } from './config.js';
 import type { Outcome } from './clob-fetcher.js';
+import type { SignalType, SignalUrgency } from './strategy-types.js';
 
 export interface LoggerOptions {
   name?: string;
@@ -29,6 +30,7 @@ export interface CryptoPricesAtTime {
 export interface TradeLogInput {
   phase: 'live' | 'backtest';
   timestampMs: number;
+  slotKey: string;
   marketId: string;
   marketTitle: string;
   slotStart?: string | null;
@@ -38,13 +40,30 @@ export interface TradeLogInput {
   outcomeIndex: 0 | 1;
   action: 'BUY' | 'SELL';
   reason: string;
+  signalType: SignalType;
+  priority: number;
+  urgency: SignalUrgency;
+  reduceOnly: boolean;
   tokenPrice: number | null;
+  referencePrice: number | null;
+  fairValue: number | null;
   midPrice: number | null;
   bestBid: number | null;
   bestAsk: number | null;
+  combinedBid: number | null;
+  combinedAsk: number | null;
+  combinedMid: number | null;
+  combinedDiscount: number | null;
+  combinedPremium: number | null;
+  edgeAmount: number;
   shares: number;
   notionalUsd: number;
   liquidityUsd: number;
+  fillRatio: number;
+  capitalClamp: number;
+  priceMultiplier: number;
+  inventoryImbalance: number;
+  grossExposureShares: number;
   netYesShares: number;
   netNoShares: number;
   signedNetShares: number;
@@ -52,7 +71,10 @@ export interface TradeLogInput {
   unrealizedPnl: number;
   totalPnl: number;
   orderId?: string | null;
+  wasMaker: boolean;
   simulationMode: boolean;
+  dryRun: boolean;
+  testMode: boolean;
 }
 
 export interface TradeLogRecord extends TradeLogInput {
@@ -202,12 +224,25 @@ export class TradeLogger {
       ...input,
       timestamp: new Date(input.timestampMs).toISOString(),
       tokenPrice: safeNumberOrNull(input.tokenPrice),
+      referencePrice: safeNumberOrNull(input.referencePrice),
+      fairValue: safeNumberOrNull(input.fairValue),
       midPrice: safeNumberOrNull(input.midPrice),
       bestBid: safeNumberOrNull(input.bestBid),
       bestAsk: safeNumberOrNull(input.bestAsk),
+      combinedBid: safeNumberOrNull(input.combinedBid),
+      combinedAsk: safeNumberOrNull(input.combinedAsk),
+      combinedMid: safeNumberOrNull(input.combinedMid),
+      combinedDiscount: safeNumberOrNull(input.combinedDiscount),
+      combinedPremium: safeNumberOrNull(input.combinedPremium),
+      edgeAmount: roundTo(input.edgeAmount, 6),
       shares: roundTo(input.shares, 4),
       notionalUsd: roundTo(input.notionalUsd, 2),
       liquidityUsd: roundTo(input.liquidityUsd, 2),
+      fillRatio: roundTo(input.fillRatio, 4),
+      capitalClamp: roundTo(input.capitalClamp, 4),
+      priceMultiplier: roundTo(input.priceMultiplier, 4),
+      inventoryImbalance: roundTo(input.inventoryImbalance, 4),
+      grossExposureShares: roundTo(input.grossExposureShares, 4),
       netYesShares: roundTo(input.netYesShares, 4),
       netNoShares: roundTo(input.netNoShares, 4),
       signedNetShares: roundTo(input.signedNetShares, 4),

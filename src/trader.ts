@@ -1,6 +1,13 @@
 import { ClobClient, OrderType, Side } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
-import { config, type AppConfig, type AuthMode, type SignatureType } from './config.js';
+import {
+  config,
+  isDryRunMode,
+  type AppConfig,
+  type AuthMode,
+  type OrderMode,
+  type SignatureType,
+} from './config.js';
 import { logger } from './logger.js';
 import type { Outcome } from './clob-fetcher.js';
 
@@ -34,6 +41,8 @@ export interface PlaceOrderRequest {
   shares: number;
   price: number;
   reason: string;
+  postOnly?: boolean;
+  orderType?: OrderMode;
 }
 
 export interface TradeExecutionResult {
@@ -46,6 +55,9 @@ export interface TradeExecutionResult {
   price: number;
   notionalUsd: number;
   simulation: boolean;
+  wasMaker: boolean;
+  postOnly: boolean;
+  orderType: OrderMode;
 }
 
 export class Trader {
@@ -69,14 +81,14 @@ export class Trader {
     'function setApprovalForAll(address operator, bool approved)',
   ];
 
-  constructor() {
-    this.provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
+  constructor(private readonly runtimeConfig: AppConfig = config) {
+    this.provider = new ethers.providers.JsonRpcProvider(runtimeConfig.rpcUrl);
     this.signerWallet = (
-      config.signerPrivateKey
-        ? new ethers.Wallet(config.signerPrivateKey, this.provider)
+      runtimeConfig.signerPrivateKey
+        ? new ethers.Wallet(runtimeConfig.signerPrivateKey, this.provider)
         : ethers.Wallet.createRandom().connect(this.provider)
     ) as ethers.Wallet;
-    this.executionContext = createExecutionContext(config, this.signerWallet.address);
+    this.executionContext = createExecutionContext(runtimeConfig, this.signerWallet.address);
     this.clobClient = this.createUnauthenticatedClient();
   }
 
@@ -86,14 +98,15 @@ export class Trader {
     }
 
     logger.info('Initializing trader', {
-      simulationMode: config.SIMULATION_MODE,
-      testMode: config.TEST_MODE,
+      simulationMode: this.runtimeConfig.SIMULATION_MODE,
+      testMode: this.runtimeConfig.TEST_MODE,
+      dryRun: this.runtimeConfig.DRY_RUN,
       authMode: this.executionContext.authMode,
       funderAddress: this.executionContext.funderAddress,
       signerAddress: this.executionContext.signerAddress,
     });
 
-    if (!config.SIMULATION_MODE && !config.TEST_MODE) {
+    if (!isDryRunMode(this.runtimeConfig)) {
       await this.deriveApiCredentials();
       await this.ensureApprovals();
     }
@@ -108,6 +121,8 @@ export class Trader {
     const metadata = await this.getMarketMetadata(request.tokenId);
     const validatedPrice = this.validatePrice(request.price, metadata.tickSize);
     const notionalUsd = roundTo(validatedShares * validatedPrice, 2);
+    const orderType = request.orderType ?? this.runtimeConfig.trading.orderType;
+    const postOnly = request.postOnly ?? this.runtimeConfig.trading.defaultPostOnly;
 
     if (!Number.isFinite(validatedShares) || validatedShares <= 0) {
       throw new Error('Order shares must be positive.');
@@ -117,15 +132,19 @@ export class Trader {
       throw new Error('Order price must be positive.');
     }
 
-    if (config.SIMULATION_MODE || config.TEST_MODE) {
-      logger.info('Simulation mode: skipping live order placement', {
+    if (isDryRunMode(this.runtimeConfig)) {
+      logger.info('Dry-run mode: skipping live order placement', {
         marketId: request.marketId,
         tokenId: request.tokenId,
         side: request.side,
         shares: validatedShares,
         price: validatedPrice,
         reason: request.reason,
-        mode: config.TEST_MODE ? 'TEST_MODE' : 'SIMULATION_MODE',
+        mode: this.runtimeConfig.TEST_MODE
+          ? 'TEST_MODE'
+          : this.runtimeConfig.SIMULATION_MODE
+            ? 'SIMULATION_MODE'
+            : 'DRY_RUN',
       });
 
       return {
@@ -138,6 +157,9 @@ export class Trader {
         price: validatedPrice,
         notionalUsd,
         simulation: true,
+        wasMaker: postOnly,
+        postOnly,
+        orderType,
       };
     }
 
@@ -145,7 +167,7 @@ export class Trader {
       await this.validateBalance(notionalUsd, metadata.negRisk);
     }
 
-    const orderType = toOrderType(config.trading.orderType);
+    const orderTypeValue = toOrderType(orderType);
     const side = request.side === 'BUY' ? Side.BUY : Side.SELL;
     const orderOptions = {
       tickSize: metadata.tickSizeStr as any,
@@ -160,11 +182,12 @@ export class Trader {
       shares: validatedShares,
       price: validatedPrice,
       feeRateBps: metadata.feeRateBps,
-      orderType: config.trading.orderType,
+      orderType,
+      postOnly,
     });
 
     const response =
-      orderType === OrderType.GTC
+      orderTypeValue === OrderType.GTC
         ? await this.clobClient.createAndPostOrder(
             {
               tokenID: request.tokenId,
@@ -174,9 +197,9 @@ export class Trader {
               feeRateBps: metadata.feeRateBps,
             },
             orderOptions,
-            orderType,
+            orderTypeValue,
             false,
-            config.trading.postOnly
+            postOnly
           )
         : await this.clobClient.createAndPostMarketOrder(
             {
@@ -185,10 +208,10 @@ export class Trader {
               price: validatedPrice,
               side,
               feeRateBps: metadata.feeRateBps,
-              orderType,
+              orderType: orderTypeValue,
             },
             orderOptions,
-            orderType
+            orderTypeValue
           );
 
     if (!response?.success) {
@@ -206,25 +229,55 @@ export class Trader {
       price: validatedPrice,
       notionalUsd,
       simulation: false,
+      wasMaker: postOnly,
+      postOnly,
+      orderType,
     };
+  }
+
+  async cancelAllOrders(): Promise<void> {
+    await this.initialize();
+
+    if (isDryRunMode(this.runtimeConfig)) {
+      logger.info('Dry-run mode: skipping cancelAllOrders');
+      return;
+    }
+
+    const client = this.clobClient as any;
+
+    if (typeof client.cancelAll === 'function') {
+      await client.cancelAll();
+      return;
+    }
+
+    if (typeof client.cancelAllOrders === 'function') {
+      await client.cancelAllOrders();
+      return;
+    }
+
+    logger.warn('Authenticated client does not expose cancel-all functionality');
+  }
+
+  async close(): Promise<void> {
+    return Promise.resolve();
   }
 
   private createUnauthenticatedClient(): ClobClient {
     return new ClobClient(
-      config.clob.host,
-      config.chainId as any,
+      this.runtimeConfig.clob.host,
+      this.runtimeConfig.chainId as any,
       this.signerWallet,
       undefined,
       undefined,
       undefined,
-      config.polymarketGeoToken || undefined
+      this.runtimeConfig.polymarketGeoToken || undefined
     );
   }
 
   private createAuthenticatedClient(creds: ApiCredentials): ClobClient {
     return new ClobClient(
-      config.clob.host,
-      config.chainId as any,
+      this.runtimeConfig.clob.host,
+      this.runtimeConfig.chainId as any,
       this.signerWallet,
       {
         key: creds.apiKey,
@@ -233,18 +286,22 @@ export class Trader {
       },
       this.executionContext.signatureType,
       this.executionContext.funderAddress,
-      config.polymarketGeoToken || undefined
+      this.runtimeConfig.polymarketGeoToken || undefined
     );
   }
 
   private async deriveApiCredentials(): Promise<void> {
     const bootstrapClient = this.createUnauthenticatedClient();
-    const createOrDeriveApiKey = (bootstrapClient as any).createOrDeriveApiKey?.bind(bootstrapClient);
+    const createOrDeriveApiKey = (bootstrapClient as any).createOrDeriveApiKey?.bind(
+      bootstrapClient
+    );
 
     const creds =
       (createOrDeriveApiKey
         ? await createOrDeriveApiKey()
-        : await bootstrapClient.deriveApiKey().catch(() => bootstrapClient.createApiKey())) as any;
+        : await bootstrapClient
+            .deriveApiKey()
+            .catch(() => bootstrapClient.createApiKey())) as any;
 
     const apiKey = creds?.apiKey || creds?.key;
     if (!apiKey || !creds?.secret || !creds?.passphrase) {
@@ -303,19 +360,19 @@ export class Trader {
       return;
     }
 
-    const usdc = new ethers.Contract(config.contracts.usdc, this.erc20Abi, this.signerWallet);
-    const ctf = new ethers.Contract(config.contracts.ctf, this.ctfAbi, this.signerWallet);
+    const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.signerWallet);
+    const ctf = new ethers.Contract(this.runtimeConfig.contracts.ctf, this.ctfAbi, this.signerWallet);
     const decimals = await usdc.decimals();
     const approvalAmount = ethers.utils.parseUnits(
-      String(Math.max(config.strategy.maxShares * 0.99, 50)),
+      String(Math.max(this.runtimeConfig.strategy.maxShares * 0.99, 50)),
       decimals
     );
     const gasOverrides = await this.getGasOverrides();
 
     const usdcSpenders = [
-      { name: 'CTF', address: config.contracts.ctf },
-      { name: 'Exchange', address: config.contracts.exchange },
-      { name: 'NegRiskExchange', address: config.contracts.negRiskExchange },
+      { name: 'CTF', address: this.runtimeConfig.contracts.ctf },
+      { name: 'Exchange', address: this.runtimeConfig.contracts.exchange },
+      { name: 'NegRiskExchange', address: this.runtimeConfig.contracts.negRiskExchange },
     ];
 
     for (const spender of usdcSpenders) {
@@ -329,7 +386,10 @@ export class Trader {
       await tx.wait();
     }
 
-    const operators = [config.contracts.exchange, config.contracts.negRiskExchange];
+    const operators = [
+      this.runtimeConfig.contracts.exchange,
+      this.runtimeConfig.contracts.negRiskExchange,
+    ];
     for (const operator of operators) {
       const approved = await ctf.isApprovedForAll(this.executionContext.funderAddress, operator);
       if (approved) {
@@ -343,15 +403,17 @@ export class Trader {
   }
 
   private async validateBalance(requiredAmount: number, negRisk: boolean): Promise<void> {
-    const usdc = new ethers.Contract(config.contracts.usdc, this.erc20Abi, this.provider);
+    const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.provider);
     const decimals = await usdc.decimals();
     const required = ethers.utils.parseUnits(requiredAmount.toFixed(2), decimals);
     const owner = this.executionContext.funderAddress;
-    const spender = negRisk ? config.contracts.negRiskExchange : config.contracts.exchange;
+    const spender = negRisk
+      ? this.runtimeConfig.contracts.negRiskExchange
+      : this.runtimeConfig.contracts.exchange;
 
     const [balance, allowanceToCtf, allowanceToExchange] = await Promise.all([
       usdc.balanceOf(owner),
-      usdc.allowance(owner, config.contracts.ctf),
+      usdc.allowance(owner, this.runtimeConfig.contracts.ctf),
       usdc.allowance(owner, spender),
     ]);
 
@@ -458,7 +520,7 @@ function createExecutionContext(candidate: AppConfig, signerAddress: string): Ex
   };
 }
 
-function toOrderType(orderType: 'GTC' | 'FOK' | 'FAK'): OrderType {
+function toOrderType(orderType: OrderMode): OrderType {
   if (orderType === 'FOK') {
     return OrderType.FOK;
   }
@@ -471,8 +533,4 @@ function toOrderType(orderType: 'GTC' | 'FOK' | 'FAK'): OrderType {
 function roundTo(value: number, decimals: number): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
-}
-
-function isDryRunMode(candidate: AppConfig): boolean {
-  return candidate.SIMULATION_MODE || candidate.TEST_MODE;
 }

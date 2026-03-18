@@ -1,11 +1,11 @@
 {
   "name": "polymarket-hft-scalper",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "tsx src/signal-scalper.ts",
-    "dev": "tsx watch src/signal-scalper.ts",
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
     "backtest": "tsx backtest/backtester.ts",
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test tests/**/*.test.ts"
@@ -13,12 +13,12 @@
   "keywords": [
     "polymarket",
     "hft",
-    "scalper",
+    "market-maker",
     "clob",
     "prediction-markets"
   ],
   "license": "ISC",
-  "description": "Standalone Polymarket HFT scalper with CLOB WebSocket/REST market data, gasless order placement, JSONL logging, and backtesting.",
+  "description": "Dual-sided Polymarket CLOB market-maker with combined discount signals, inventory rebalancing, post-only execution, slot reporting, and backtesting.",
   "dependencies": {
     "@polymarket/clob-client": "^5.2.1",
     "ccxt": "^4.4.0",

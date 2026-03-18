@@ -63,6 +63,8 @@ export class MarketMonitor extends EventEmitter {
       fetched: markets.length,
       eligible: eligible.length,
       minLiquidityUsd: config.strategy.minLiquidityUsd,
+      whitelistSize: config.WHITELIST_CONDITION_IDS.length,
+      testMode: config.TEST_MODE,
     });
 
     return eligible;
@@ -229,7 +231,9 @@ export class MarketMonitor extends EventEmitter {
   }
 }
 
-export function getSlotKey(candidate: Pick<MarketCandidate, 'marketId' | 'startTime' | 'endTime'>): string {
+export function getSlotKey(
+  candidate: Pick<MarketCandidate, 'marketId' | 'startTime' | 'endTime'>
+): string {
   return `${candidate.marketId}:${candidate.startTime || 'unknown'}:${candidate.endTime || 'unknown'}`;
 }
 

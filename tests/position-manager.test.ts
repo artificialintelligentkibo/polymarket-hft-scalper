@@ -22,52 +22,60 @@ test('position manager realizes pnl on sell', () => {
   assert.equal(snapshot.realizedPnl, 0.12);
 });
 
-test('position manager generates boundary correction when YES cap is breached', () => {
+test('position manager enforces absolute YES cap breaches via boundary correction', () => {
   const manager = new PositionManager('market-2');
   manager.applyFill({
     outcome: 'YES',
     side: 'BUY',
-    shares: 70,
+    shares: 210,
     price: 0.5,
   });
 
   const correction = manager.getBoundaryCorrection({
-    maxNetYes: 65,
-    maxNetNo: -75,
+    maxNetYes: 200,
+    maxNetNo: 250,
+    inventoryImbalanceThreshold: 90,
+    inventoryRebalanceFraction: 0.45,
     trailingTakeProfit: 0.012,
     hardStopLoss: 0.025,
     exitBeforeEndMs: 20_000,
   });
 
   assert.deepEqual(correction, {
+    signalType: 'RISK_LIMIT',
     action: 'SELL',
     outcome: 'YES',
-    shares: 5,
-    reason: 'Net YES 70 exceeded cap 65',
+    shares: 10,
+    reason: 'YES exposure 210 exceeded cap 200',
   });
 });
 
-test('position manager triggers trailing take-profit after retrace', () => {
+test('position manager reports inventory imbalance state', () => {
   const manager = new PositionManager('market-3');
   manager.applyFill({
     outcome: 'YES',
     side: 'BUY',
-    shares: 10,
+    shares: 150,
     price: 0.4,
   });
+  manager.applyFill({
+    outcome: 'NO',
+    side: 'BUY',
+    shares: 20,
+    price: 0.41,
+  });
 
-  manager.markToMarket({ YES: 0.415 });
-  manager.markToMarket({ YES: 0.403 });
-
-  const exit = manager.getExitSignal('YES', new Date(), {
-    maxNetYes: 65,
-    maxNetNo: -75,
+  const imbalance = manager.getInventoryImbalanceState({
+    maxNetYes: 200,
+    maxNetNo: 250,
+    inventoryImbalanceThreshold: 90,
+    inventoryRebalanceFraction: 0.45,
     trailingTakeProfit: 0.012,
     hardStopLoss: 0.025,
     exitBeforeEndMs: 20_000,
   });
 
-  assert.equal(exit?.outcome, 'YES');
-  assert.equal(exit?.shares, 10);
-  assert.match(exit?.reason || '', /Trailing take-profit/);
+  assert.equal(imbalance.dominantOutcome, 'YES');
+  assert.equal(imbalance.excess > 0, true);
+  assert.equal(imbalance.suggestedReduceShares > 0, true);
 });

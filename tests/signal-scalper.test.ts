@@ -1,39 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PositionManager } from '../src/position-manager.js';
-import {
-  SignalScalper,
-  hasBuyEdge,
-  hasSellEdge,
-  scaleSharesForLiquidity,
-} from '../src/signal-scalper.js';
-import type { MarketCandidate } from '../src/monitor.js';
 import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
+import type { MarketCandidate } from '../src/monitor.js';
+import { PositionManager } from '../src/position-manager.js';
+import { RiskManager } from '../src/risk-manager.js';
+import { SignalScalper, calculateTradeSize, resolvePriceMultiplier } from '../src/signal-scalper.js';
 
-test('buy and sell edge helpers follow configured thresholds', () => {
-  assert.equal(hasBuyEdge(0.45, 0.47, 0.018), true);
-  assert.equal(hasBuyEdge(0.453, 0.47, 0.018), false);
-  assert.equal(hasSellEdge(0.49, 0.47, 0.015), true);
-  assert.equal(hasSellEdge(0.482, 0.47, 0.015), false);
-});
-
-test('liquidity-based sizing stays within configured bounds', () => {
-  assert.equal(scaleSharesForLiquidity(500, 100), 8);
-  assert.equal(scaleSharesForLiquidity(2500, 200), 35);
-});
-
-test('signal scalper emits BUY when token trades below mid by threshold', () => {
-  const signal = new SignalScalper();
-  const positionManager = new PositionManager('market-1');
-
-  const market: MarketCandidate = {
+function createMarket(): MarketCandidate {
+  return {
     marketId: 'market-1',
     conditionId: 'market-1',
     title: 'BTC 5m test market',
     liquidityUsd: 1800,
     volumeUsd: 5000,
-    startTime: null,
-    endTime: null,
+    startTime: '2026-03-18T10:00:00.000Z',
+    endTime: '2026-03-18T10:05:00.000Z',
     durationMinutes: 5,
     yesTokenId: 'yes-token',
     noTokenId: 'no-token',
@@ -43,25 +24,27 @@ test('signal scalper emits BUY when token trades below mid by threshold', () => 
     noOutcomeIndex: 1,
     acceptingOrders: true,
   };
+}
 
-  const orderbook: MarketOrderbookSnapshot = {
+function createOrderbook(): MarketOrderbookSnapshot {
+  return {
     marketId: 'market-1',
-    title: market.title,
+    title: 'BTC 5m test market',
     timestamp: new Date().toISOString(),
     yes: {
       tokenId: 'yes-token',
       bids: [],
       asks: [],
-      bestBid: 0.45,
-      bestAsk: 0.455,
-      midPrice: 0.47,
-      spread: 0.005,
-      spreadBps: 106.38,
-      depthSharesBid: 100,
-      depthSharesAsk: 100,
-      depthNotionalBid: 45,
-      depthNotionalAsk: 45.5,
-      lastTradePrice: 0.449,
+      bestBid: 0.43,
+      bestAsk: 0.44,
+      midPrice: 0.455,
+      spread: 0.01,
+      spreadBps: 219.78,
+      depthSharesBid: 160,
+      depthSharesAsk: 140,
+      depthNotionalBid: 68.8,
+      depthNotionalAsk: 61.6,
+      lastTradePrice: 0.442,
       lastTradeSize: 20,
       source: 'rest',
       updatedAt: new Date().toISOString(),
@@ -70,29 +53,123 @@ test('signal scalper emits BUY when token trades below mid by threshold', () => 
       tokenId: 'no-token',
       bids: [],
       asks: [],
-      bestBid: 0.53,
-      bestAsk: 0.535,
-      midPrice: 0.5325,
-      spread: 0.005,
-      spreadBps: 93.9,
-      depthSharesBid: 100,
-      depthSharesAsk: 100,
-      depthNotionalBid: 53,
-      depthNotionalAsk: 53.5,
-      lastTradePrice: 0.534,
-      lastTradeSize: 20,
+      bestBid: 0.45,
+      bestAsk: 0.46,
+      midPrice: 0.47,
+      spread: 0.01,
+      spreadBps: 212.77,
+      depthSharesBid: 150,
+      depthSharesAsk: 135,
+      depthNotionalBid: 67.5,
+      depthNotionalAsk: 62.1,
+      lastTradePrice: 0.461,
+      lastTradeSize: 18,
       source: 'rest',
       updatedAt: new Date().toISOString(),
     },
+    combined: {
+      combinedBid: 0.88,
+      combinedAsk: 0.9,
+      combinedMid: 0.925,
+      combinedDiscount: 0.1,
+      combinedPremium: -0.12,
+      pairSpread: 0.02,
+    },
   };
+}
 
-  const decision = signal.evaluate({
+test('combined discount emits dual-sided BUY signals capped at two', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+  const signalEngine = new SignalScalper();
+
+  const riskAssessment = riskManager.checkRiskLimits({
     market,
     orderbook,
     positionManager,
+    now: new Date('2026-03-18T10:02:00.000Z'),
   });
 
-  assert.equal(decision.action, 'BUY');
-  assert.equal(decision.outcome, 'YES');
-  assert.equal(decision.targetPrice, 0.455);
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  assert.equal(signals.length, 2);
+  assert.deepEqual(signals.map((signal) => signal.signalType), [
+    'COMBINED_DISCOUNT_BUY_BOTH',
+    'COMBINED_DISCOUNT_BUY_BOTH',
+  ]);
+  assert.deepEqual(
+    signals.map((signal) => signal.outcome).sort(),
+    ['NO', 'YES']
+  );
+});
+
+test('inventory rebalance emits a reduce-only sell on dominant inventory', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.combined = {
+    combinedBid: 0.98,
+    combinedAsk: 1.02,
+    combinedMid: 1,
+    combinedDiscount: -0.02,
+    combinedPremium: -0.02,
+    pairSpread: 0.04,
+  };
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+  const signalEngine = new SignalScalper();
+
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 140,
+    price: 0.44,
+  });
+
+  const riskAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  const rebalanceSignal = signals.find((signal) => signal.signalType === 'INVENTORY_REBALANCE');
+  assert.ok(rebalanceSignal);
+  assert.equal(rebalanceSignal?.action, 'SELL');
+  assert.equal(rebalanceSignal?.outcome, 'YES');
+  assert.equal(rebalanceSignal?.reduceOnly, true);
+});
+
+test('trade size uses price multiplier, fill ratio, and capital clamp', () => {
+  const size = calculateTradeSize({
+    action: 'BUY',
+    signalType: 'FAIR_VALUE_BUY',
+    edgeAmount: 0.03,
+    availableCapacity: 80,
+    depthShares: 150,
+    liquidityUsd: 2500,
+    price: 0.18,
+    referenceEdge: 0.018,
+  });
+
+  assert.equal(resolvePriceMultiplier(0.18) > 1, true);
+  assert.equal(size.shares >= 8, true);
+  assert.equal(size.priceMultiplier > 1, true);
+  assert.equal(size.fillRatio > 0, true);
+  assert.equal(size.capitalClamp > 0, true);
 });
