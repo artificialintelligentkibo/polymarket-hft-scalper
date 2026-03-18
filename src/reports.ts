@@ -21,6 +21,7 @@ export interface LatencyLogEntry {
 
 let slotReportQueue = Promise.resolve();
 let latencyQueue = Promise.resolve();
+let redeemQueue = Promise.resolve();
 
 export function getReportsDirectory(): string {
   return path.resolve(process.cwd(), config.REPORTS_DIR);
@@ -44,6 +45,14 @@ export function writeLatencyLog(entry: LatencyLogEntry): void {
   const line = formatLatencyLogEntry(entry);
   const filePath = resolveLatencyLogPath(new Date(entry.timestampMs));
   latencyQueue = enqueueAppend(latencyQueue, filePath, line, 'latency');
+}
+
+export function writeRedeemLog(line: string, timestampMs = Date.now()): void {
+  const filePath = path.join(
+    getReportsDirectory(),
+    `redeem_log_${formatDayKey(new Date(timestampMs))}.log`
+  );
+  redeemQueue = enqueueAppend(redeemQueue, filePath, ensureTrailingNewline(line), 'redeem');
 }
 
 function resolveLatencyLogPath(value: Date): string {
@@ -72,7 +81,7 @@ function enqueueAppend(
   queue: Promise<void>,
   filePath: string,
   payload: string,
-  channel: 'slot-report' | 'latency'
+  channel: 'slot-report' | 'latency' | 'redeem'
 ): Promise<void> {
   const task = queue.then(async () => {
     await mkdir(path.dirname(filePath), { recursive: true });
@@ -115,4 +124,8 @@ function formatLatencyValue(value: number | undefined): string {
 
 function sanitizeInline(value: string): string {
   return String(value || '').replace(/[\r\n"]/g, ' ').trim();
+}
+
+function ensureTrailingNewline(value: string): string {
+  return value.endsWith('\n') ? value : `${value}\n`;
 }

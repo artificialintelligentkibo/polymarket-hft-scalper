@@ -1,3 +1,4 @@
+import { AutoRedeemer } from './auto-redeemer.js';
 import { pathToFileURL } from 'node:url';
 import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
 import { config, isDryRunMode, validateConfig } from './config.js';
@@ -27,6 +28,7 @@ class MarketMakerRuntime {
   private readonly tradeLogger = new TradeLogger();
   private readonly riskManager = new RiskManager();
   private readonly signalEngine = new SignalScalper();
+  private readonly redeemer = new AutoRedeemer();
   private readonly positions = new Map<string, PositionManager>();
   private readonly markets = new Map<string, MarketCandidate>();
   private readonly latestBooks = new Map<string, MarketOrderbookSnapshot>();
@@ -71,7 +73,10 @@ class MarketMakerRuntime {
       coinsToTrade: config.COINS_TO_TRADE,
       filterFiveMinuteOnly: config.FILTER_5MIN_ONLY,
       minLiquidityUsd: config.MIN_LIQUIDITY_USD,
+      autoRedeem: config.AUTO_REDEEM,
+      redeemIntervalMs: config.REDEEM_INTERVAL_MS,
     });
+    this.redeemer.start();
   }
 
   async run(): Promise<void> {
@@ -114,6 +119,7 @@ class MarketMakerRuntime {
           await this.executor.cancelAll();
           await this.flattenAllOpenPositions('SLOT_FLATTEN');
           this.printPendingReports();
+          this.redeemer.stop();
           await this.executor.close();
         })(),
         config.runtime.gracefulShutdownTimeoutMs
@@ -124,6 +130,7 @@ class MarketMakerRuntime {
         message: error?.message || 'Unknown error',
       });
     } finally {
+      this.redeemer.stop();
       this.fetcher.close();
     }
   }

@@ -40,6 +40,7 @@ src/
   order-executor.ts
   position-manager.ts
   reports.ts
+  auto-redeemer.ts
   risk-manager.ts
   signal-scalper.ts
   slot-reporter.ts
@@ -77,6 +78,11 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `COINS_TO_TRADE=BTC,SOL,XRP`
 - `FILTER_5MIN_ONLY=true`
 - `MIN_LIQUIDITY_USD=500`
+- `AUTO_REDEEM=true`
+- `REDEEM_INTERVAL_MS=30000`
+- `POLYMARKET_API_KEY=...`
+- `POLYMARKET_API_KEY_ADDRESS=...`
+- `POLYMARKET_RELAYER_URL=https://relayer-v2.polymarket.com`
 - `REPORTS_DIR=./reports`
 - `LATENCY_LOG=./reports/latency_YYYY-MM-DD.log`
 - `REPORTS_FOLDER=./reports`
@@ -102,6 +108,7 @@ The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) 
 8. post-only / improve / cross execution
 9. JSONL trade logging
 10. slot-end console reporting
+11. background gasless auto-redeem for resolved proxy-wallet positions
 
 ## Reports
 
@@ -117,6 +124,7 @@ What goes into `reports/`:
 - `NET PNL`
 - `TOTAL DAY PNL`
 - per-signal latency lines with `signalToOrderMs` and `roundTripMs`
+- gasless redeem activity in `redeem_log_YYYY-MM-DD.log`
 
 The runtime creates `REPORTS_DIR` automatically when needed.
 
@@ -135,6 +143,31 @@ Example latency line:
 ```text
 [2026-03-18 14:04:43] signal=FAIR_VALUE_BUY market=0xabc... title="Bitcoin Up or Down" side=BUY outcome=YES signalToOrderMs=42 roundTripMs=97 orderId=sim-buy-123 simulation=true dryRun=true testMode=false
 ```
+
+Example redeem line:
+
+```text
+[2026-03-18 14:05:12] status=REDEEMED conditionId=0xabc... title="Bitcoin Up or Down - Mar 18, 2:00PM-2:05PM ET" txId=019... txHash=0xdef... state=STATE_CONFIRMED shares=28.0000 relayType=PROXY
+```
+
+## Auto Redeem
+
+Resolved 5-minute slots can now be redeemed automatically through Polymarket's gasless relayer when the runtime is operating in proxy-wallet mode.
+
+Behavior:
+
+- polls the Data API every `REDEEM_INTERVAL_MS` for `redeemable=true` positions under the configured proxy wallet
+- groups redeemable rows by `conditionId`
+- submits a gasless redeem through the official Polymarket relayer client
+- writes append-only activity to `./reports/redeem_log_YYYY-MM-DD.log`
+
+Guardrails:
+
+- runs only when `AUTH_MODE=PROXY`
+- automatically stays disabled in `SIMULATION_MODE`, `TEST_MODE`, and `DRY_RUN`
+- uses the proxy wallet from `FUNDER_ADDRESS` for Data API polling
+- uses the configured signer key to sign the relayer request
+- authenticates relayer `/submit` with `POLYMARKET_API_KEY` and `POLYMARKET_API_KEY_ADDRESS`
 
 Helper command:
 
@@ -174,6 +207,10 @@ WHITELIST_CONDITION_IDS=
 COINS_TO_TRADE=BTC,SOL,XRP
 FILTER_5MIN_ONLY=true
 MIN_LIQUIDITY_USD=500
+AUTO_REDEEM=true
+REDEEM_INTERVAL_MS=30000
+POLYMARKET_API_KEY=your-relayer-api-key
+POLYMARKET_API_KEY_ADDRESS=0xYourKeyOwnerAddress
 npm start
 ```
 

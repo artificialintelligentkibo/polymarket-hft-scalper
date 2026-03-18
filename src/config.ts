@@ -18,6 +18,8 @@ export interface AppConfig {
   readonly TEST_MODE: boolean;
   readonly DRY_RUN: boolean;
   readonly ENABLE_SIGNAL: boolean;
+  readonly AUTO_REDEEM: boolean;
+  readonly REDEEM_INTERVAL_MS: number;
   readonly COINS_TO_TRADE: readonly TradeableCoin[];
   readonly FILTER_5MIN_ONLY: boolean;
   readonly MIN_LIQUIDITY_USD: number;
@@ -26,6 +28,9 @@ export interface AppConfig {
   readonly LATENCY_LOG: string;
   readonly REPORTS_FOLDER: string;
   readonly REPORTS_FILE_PREFIX: string;
+  readonly POLYMARKET_API_KEY: string;
+  readonly POLYMARKET_API_KEY_ADDRESS: string;
+  readonly POLYMARKET_RELAYER_URL: string;
   readonly signerPrivateKey: string;
   readonly polymarketGeoToken: string;
   readonly rpcUrl: string;
@@ -242,6 +247,8 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     TEST_MODE: parseBoolean(env.TEST_MODE, false),
     DRY_RUN: parseBoolean(env.DRY_RUN, false),
     ENABLE_SIGNAL: parseBoolean(env.ENABLE_SIGNAL, true),
+    AUTO_REDEEM: parseBoolean(env.AUTO_REDEEM, true),
+    REDEEM_INTERVAL_MS: Math.max(5_000, parseIntOrDefault(env.REDEEM_INTERVAL_MS, '30000')),
     COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
     FILTER_5MIN_ONLY: parseBoolean(
       env.FILTER_5MIN_ONLY ?? env.ONLY_FIVE_MINUTE_MARKETS,
@@ -257,6 +264,19 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       `${reportsDir}/latency_YYYY-MM-DD.log`,
     REPORTS_FOLDER: reportsDir,
     REPORTS_FILE_PREFIX: reportsFilePrefix,
+    POLYMARKET_API_KEY: (
+      env.POLYMARKET_API_KEY ||
+      env.RELAYER_API_KEY ||
+      ''
+    ).trim(),
+    POLYMARKET_API_KEY_ADDRESS: (
+      env.POLYMARKET_API_KEY_ADDRESS ||
+      env.RELAYER_API_KEY_ADDRESS ||
+      ''
+    ).trim(),
+    POLYMARKET_RELAYER_URL: (
+      env.POLYMARKET_RELAYER_URL || 'https://relayer-v2.polymarket.com'
+    ).trim(),
     signerPrivateKey: resolveSignerPrivateKey(env),
     polymarketGeoToken: (env.POLYMARKET_GEO_TOKEN || '').trim(),
     rpcUrl: (env.RPC_URL || 'https://polygon.drpc.org').trim(),

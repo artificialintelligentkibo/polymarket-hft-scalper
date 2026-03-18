@@ -22,6 +22,7 @@
   "license": "ISC",
   "description": "Dual-sided Polymarket CLOB market-maker with combined discount signals, inventory rebalancing, post-only execution, slot reporting, and backtesting.",
   "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
     "@polymarket/clob-client": "^5.2.1",
     "ccxt": "^4.4.0",
     "date-fns": "^4.1.0",
