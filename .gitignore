@@ -4,3 +4,6 @@ dist/
 logs/
 data/
 backtest/data/
+comparison/output/*.csv
+comparison/output/*.md
+!comparison/output/.gitkeep

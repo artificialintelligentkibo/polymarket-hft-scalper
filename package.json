@@ -7,6 +7,7 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "backtest": "tsx backtest/backtester.ts",
+    "compare": "ts-node comparison/compare-with-target.ts",
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test tests/**/*.test.ts"
   },
@@ -22,6 +23,7 @@
   "dependencies": {
     "@polymarket/clob-client": "^5.2.1",
     "ccxt": "^4.4.0",
+    "date-fns": "^4.1.0",
     "dotenv": "^17.2.3",
     "ethers": "^5.7.2",
     "ws": "^8.19.0"
@@ -29,7 +31,11 @@
   "devDependencies": {
     "@types/node": "^25.1.0",
     "@types/ws": "^8.5.14",
+    "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
+  },
+  "ts-node": {
+    "esm": true
   }
 }

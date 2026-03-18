@@ -14,5 +14,10 @@
     "sourceMap": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "backtest/**/*.ts", "tests/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "backtest/**/*.ts",
+    "comparison/**/*.ts",
+    "tests/**/*.ts"
+  ]
 }

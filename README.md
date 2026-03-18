@@ -46,7 +46,11 @@ src/
   trader.ts
 backtest/
   backtester.ts
+comparison/
+  compare-with-target.ts
+  output/
 tests/
+  comparison.test.ts
   monitor.test.ts
   position-manager.test.ts
   risk-manager.test.ts
@@ -193,6 +197,44 @@ Compare against observed trades:
 npm run backtest -- backtest/data/sample.jsonl path/to/observed-trades.jsonl
 ```
 
+## Comparison With Target Wallet
+
+Use the comparison module when you want to see how closely the scalper reproduces the original `vague-sourdough` trade stream from the copy-bot logs.
+
+What it does:
+
+- finds the newest copy-bot log in `../polymarket-copy-bot/logs/trades_*.jsonl` by default
+- finds the newest scalper log in `./logs/trades_*.jsonl` or falls back to `./logs/scalper_*.log`
+- filters both sides to the last `2` hours by default
+- matches trades by `market_condition_id` plus an `8s` timestamp tolerance
+- classifies each comparison row as `MATCH`, `NEAR`, `MISS`, `ONLY_TARGET`, or `ONLY_OURS`
+- writes both `comparison/output/last_comparison.csv` and `comparison/output/last_comparison.md`
+
+Run it:
+
+```bash
+npm run compare
+```
+
+Change the lookback window:
+
+```bash
+npm run compare -- --hours=6
+```
+
+If the target log lives somewhere else, set:
+
+```bash
+COMPARISON_TARGET_LOG_PATH=/absolute/path/to/trades_2026-03-18.jsonl
+```
+
+The console summary shows:
+
+- target trade count in window
+- our trade count in window
+- status counts
+- overall match rate defined as `(MATCH + NEAR) / total comparison rows`
+
 ## Tests
 
 ```bash
@@ -204,6 +246,7 @@ Current test coverage focuses on:
 - Gamma event pagination and event -> market flattening
 - current Gamma payload normalization with `clobTokenIds`
 - strict coin matching and 5-minute detection
+- target-vs-scalper trade normalization and tolerant comparison matching
 - whitelist-vs-dynamic selection behavior
 - combined discount dual-entry behavior
 - inventory rebalance generation
