@@ -59,31 +59,27 @@ export class SignalScalper {
     positionManager: PositionManager,
     riskAssessment: RiskAssessment
   ): StrategySignal[] {
-    const combinedDiscount = orderbook.combined.combinedDiscount;
-    const combinedAsk = orderbook.combined.combinedAsk;
+    const upAsk = orderbook.yes.bestAsk;
+    const downAsk = orderbook.no.bestAsk;
+    const combinedAsk =
+      upAsk !== null && downAsk !== null ? roundTo(upAsk + downAsk, 6) : null;
+    const combinedDiscount =
+      combinedAsk !== null ? roundTo(1 - combinedAsk, 6) : null;
 
-    if (combinedAsk !== null || combinedDiscount !== null) {
-      logger.debug('Evaluated combined discount metrics', {
-        marketId: market.marketId,
-        combinedAsk,
-        combinedBid: orderbook.combined.combinedBid,
-        combinedMid: orderbook.combined.combinedMid,
-        combinedDiscount,
-        minCombinedDiscount: this.runtimeConfig.strategy.minCombinedDiscount,
-      });
-    }
+    logger.debug(
+      `combined: market=${market.marketId} upAsk=${formatMaybePrice(upAsk)} downAsk=${formatMaybePrice(
+        downAsk
+      )} sum=${formatMaybePrice(combinedAsk)} discount=${formatMaybePrice(combinedDiscount)}`
+    );
 
     if (
       combinedDiscount === null ||
       combinedAsk === null ||
+      upAsk === null ||
+      downAsk === null ||
+      upAsk <= 0.01 ||
+      downAsk <= 0.01 ||
       combinedDiscount < this.runtimeConfig.strategy.minCombinedDiscount
-    ) {
-      return [];
-    }
-
-    if (
-      !isTradableEntryBook(orderbook.yes, this.runtimeConfig) ||
-      !isTradableEntryBook(orderbook.no, this.runtimeConfig)
     ) {
       return [];
     }
@@ -95,9 +91,13 @@ export class SignalScalper {
       }
 
       const book = getBookForOutcome(orderbook, outcome);
+      if (!hasValidEntryAsk(book)) {
+        continue;
+      }
       const bestAsk = book.bestAsk;
       const fairValue = estimateFairValue(orderbook, outcome);
-      if (bestAsk === null) {
+      const entryGuardMultiplier = resolveEntryGuardMultiplier(book, this.runtimeConfig);
+      if (entryGuardMultiplier <= 0) {
         continue;
       }
 
@@ -114,6 +114,7 @@ export class SignalScalper {
         price: bestAsk,
         referenceEdge: this.runtimeConfig.strategy.minCombinedDiscount,
         runtimeConfig: this.runtimeConfig,
+        entryGuardMultiplier,
       });
 
       if (size.shares < this.runtimeConfig.strategy.minShares) {
@@ -158,16 +159,18 @@ export class SignalScalper {
 
     for (const outcome of OUTCOMES as readonly Outcome[]) {
       const book = getBookForOutcome(orderbook, outcome);
-      const bestAsk = book.bestAsk;
-      const bestBid = book.bestBid;
       const openShares = positionManager.getShares(outcome);
       const fairValue = estimateFairValue(orderbook, outcome);
 
       if (
         !riskAssessment.blockedOutcomes.has(outcome) &&
-        bestAsk !== null &&
-        isTradableEntryBook(book, this.runtimeConfig)
+        hasValidEntryAsk(book)
       ) {
+        const bestAsk = book.bestAsk;
+        const entryGuardMultiplier = resolveEntryGuardMultiplier(book, this.runtimeConfig);
+        if (entryGuardMultiplier <= 0) {
+          continue;
+        }
         const edge = this.runtimeConfig.strategy.extremeBuyThreshold - bestAsk;
         if (edge >= 0) {
           const size = calculateTradeSize({
@@ -183,6 +186,7 @@ export class SignalScalper {
             price: bestAsk,
             referenceEdge: this.runtimeConfig.strategy.extremeBuyThreshold,
             runtimeConfig: this.runtimeConfig,
+            entryGuardMultiplier,
           });
 
           if (size.shares >= this.runtimeConfig.strategy.minShares) {
@@ -272,17 +276,19 @@ export class SignalScalper {
 
     for (const outcome of OUTCOMES as readonly Outcome[]) {
       const book = getBookForOutcome(orderbook, outcome);
-      const bestAsk = book.bestAsk;
-      const bestBid = book.bestBid;
       const fairValue = estimateFairValue(orderbook, outcome);
       const openShares = positionManager.getShares(outcome);
 
       if (
         !riskAssessment.blockedOutcomes.has(outcome) &&
         fairValue !== null &&
-        bestAsk !== null &&
-        isTradableEntryBook(book, this.runtimeConfig)
+        hasValidEntryAsk(book)
       ) {
+        const bestAsk = book.bestAsk;
+        const entryGuardMultiplier = resolveEntryGuardMultiplier(book, this.runtimeConfig);
+        if (entryGuardMultiplier <= 0) {
+          continue;
+        }
         const buyEdge = fairValue - bestAsk;
         if (buyEdge >= this.runtimeConfig.strategy.fairValueBuyThreshold) {
           const size = calculateTradeSize({
@@ -298,6 +304,7 @@ export class SignalScalper {
             price: bestAsk,
             referenceEdge: this.runtimeConfig.strategy.fairValueBuyThreshold,
             runtimeConfig: this.runtimeConfig,
+            entryGuardMultiplier,
           });
 
           if (size.shares >= this.runtimeConfig.strategy.minShares) {
@@ -466,6 +473,7 @@ export function calculateTradeSize(params: {
   referenceEdge: number;
   runtimeConfig?: AppConfig;
   allowBelowMin?: boolean;
+  entryGuardMultiplier?: number;
 }): SizeCalculationResult {
   const runtimeConfig = params.runtimeConfig ?? config;
   const strategy = runtimeConfig.strategy;
@@ -490,7 +498,8 @@ export function calculateTradeSize(params: {
     priceMultiplier *
     fillRatio *
     capitalClamp *
-    liquidityClamp;
+    liquidityClamp *
+    clamp(params.entryGuardMultiplier ?? 1, 0, 1);
   const minShares = params.allowBelowMin ? 0.01 : strategy.minShares;
   const shares = roundTo(
     clamp(rawShares, minShares, Math.min(strategy.maxShares, params.availableCapacity)),
@@ -620,34 +629,18 @@ function estimateFairValue(
   snapshot: MarketOrderbookSnapshot,
   outcome: Outcome
 ): number | null {
-  const own = getBookForOutcome(snapshot, outcome);
-  const opposite = getBookForOutcome(snapshot, outcome === 'YES' ? 'NO' : 'YES');
-
-  const pairedMid = parityAdjustedOwnValue(own.midPrice, opposite.midPrice);
-  if (pairedMid !== null) {
-    return pairedMid;
+  const noFairValue = estimateLegacyFairValue(snapshot, 'NO');
+  if (outcome === 'NO') {
+    return noFairValue;
   }
 
-  const pairedLastTrade = parityAdjustedOwnValue(own.lastTradePrice, opposite.lastTradePrice);
-  if (pairedLastTrade !== null) {
-    return pairedLastTrade;
+  if (noFairValue !== null) {
+    return roundTo(1 - noFairValue, 6);
   }
 
-  const ownTouchMid = deriveTouchMid(own);
-  const oppositeTouchMid = deriveTouchMid(opposite);
-  const pairedTouchMid = parityAdjustedOwnValue(ownTouchMid, oppositeTouchMid);
-  if (pairedTouchMid !== null) {
-    return pairedTouchMid;
-  }
-
-  const oppositeParity = complementaryPrice(opposite.midPrice ?? oppositeTouchMid ?? opposite.lastTradePrice);
-  if (oppositeParity !== null) {
-    return oppositeParity;
-  }
-
-  const ownDirect = own.midPrice ?? ownTouchMid ?? own.lastTradePrice;
-  if (isValidProbability(ownDirect)) {
-    return roundTo(ownDirect, 6);
+  const yesFairValue = estimateLegacyFairValue(snapshot, 'YES');
+  if (yesFairValue !== null) {
+    return yesFairValue;
   }
 
   return null;
@@ -657,66 +650,111 @@ function formatPrice(value: number): string {
   return Number.isFinite(value) ? value.toFixed(4) : 'n/a';
 }
 
-function isTradableEntryBook(book: TokenBookSnapshot, runtimeConfig: AppConfig): boolean {
-  if (
-    !isValidProbability(book.bestBid) ||
-    !isValidProbability(book.bestAsk) ||
-    book.bestAsk <= book.bestBid
-  ) {
-    return false;
-  }
-
-  if (
-    book.spread === null ||
-    !Number.isFinite(book.spread) ||
-    book.spread <= 0 ||
-    book.spread > runtimeConfig.strategy.maxEntrySpread
-  ) {
-    return false;
-  }
-
-  return book.depthNotionalAsk >= runtimeConfig.strategy.minEntryDepthUsd;
+function formatMaybePrice(value: number | null): string {
+  return value === null || !Number.isFinite(value) ? 'n/a' : value.toFixed(4);
 }
 
 function hasExecutableBid(book: TokenBookSnapshot): book is TokenBookSnapshot & { bestBid: number } {
-  return isValidProbability(book.bestBid) && book.depthNotionalBid > 0;
+  return isFinitePositivePrice(book.bestBid) && book.depthNotionalBid > 0;
 }
 
-function deriveTouchMid(book: TokenBookSnapshot): number | null {
-  if (!isValidProbability(book.bestBid) || !isValidProbability(book.bestAsk)) {
-    return null;
-  }
-
-  if (book.bestAsk <= book.bestBid) {
-    return null;
-  }
-
-  return roundTo((book.bestBid + book.bestAsk) / 2, 6);
+function hasValidEntryAsk(
+  book: TokenBookSnapshot
+): book is TokenBookSnapshot & { bestAsk: number } {
+  return isFinitePositivePrice(book.bestAsk) && book.bestAsk > 0.01;
 }
 
-function parityAdjustedOwnValue(
-  ownValue: number | null,
-  oppositeValue: number | null
+function resolveEntryGuardMultiplier(
+  book: TokenBookSnapshot,
+  runtimeConfig: AppConfig
+): number {
+  if (!hasValidEntryAsk(book)) {
+    return 0;
+  }
+
+  const depthThreshold = Math.max(runtimeConfig.strategy.minEntryDepthUsd, 0);
+  const spreadThreshold = Math.max(runtimeConfig.strategy.maxEntrySpread, 0.000001);
+  const depth = Math.max(0, book.depthNotionalAsk);
+  const spread =
+    book.spread ??
+    (isFinitePositivePrice(book.bestBid) ? book.bestAsk - book.bestBid : null);
+
+  const depthMultiplier =
+    depthThreshold <= 0
+      ? 1
+      : depth >= depthThreshold
+        ? 1
+        : depth >= depthThreshold * 0.5
+          ? 0.5
+          : depth > 0
+            ? 0.25
+            : 0;
+
+  const spreadMultiplier =
+    spread === null || !Number.isFinite(spread)
+      ? 0.5
+      : spread <= 0
+        ? 0
+        : spread <= spreadThreshold
+          ? 1
+          : spread <= spreadThreshold * 1.5
+            ? 0.5
+            : spread <= spreadThreshold * 2
+              ? 0.25
+              : 0;
+
+  return Math.min(depthMultiplier, spreadMultiplier);
+}
+
+function estimateLegacyFairValue(
+  snapshot: MarketOrderbookSnapshot,
+  outcome: Outcome
 ): number | null {
-  if (!isValidProbability(ownValue) || !isValidProbability(oppositeValue)) {
+  const own = getBookForOutcome(snapshot, outcome);
+  const opposite = getBookForOutcome(snapshot, outcome === 'YES' ? 'NO' : 'YES');
+  const normalizedMid = normalizePairedFairValues(own.midPrice, opposite.midPrice);
+  if (normalizedMid) {
+    return outcome === 'YES' ? normalizedMid.left : normalizedMid.right;
+  }
+
+  const normalizedLastTrade = normalizePairedFairValues(
+    own.lastTradePrice,
+    opposite.lastTradePrice
+  );
+  if (normalizedLastTrade) {
+    return outcome === 'YES' ? normalizedLastTrade.left : normalizedLastTrade.right;
+  }
+
+  if (opposite.midPrice !== null) {
+    return roundTo(1 - opposite.midPrice, 6);
+  }
+
+  if (opposite.lastTradePrice !== null) {
+    return roundTo(1 - opposite.lastTradePrice, 6);
+  }
+
+  return null;
+}
+
+function normalizePairedFairValues(
+  left: number | null,
+  right: number | null
+): { left: number; right: number } | null {
+  if (left === null || right === null) {
     return null;
   }
 
-  return clampProbability(ownValue + (1 - (ownValue + oppositeValue)) / 2);
-}
-
-function complementaryPrice(value: number | null): number | null {
-  if (!isValidProbability(value)) {
+  const total = left + right;
+  if (!Number.isFinite(total) || total <= 0) {
     return null;
   }
 
-  return clampProbability(1 - value);
+  return {
+    left: roundTo(left / total, 6),
+    right: roundTo(right / total, 6),
+  };
 }
 
-function clampProbability(value: number): number {
-  return roundTo(clamp(value, 0.001, 0.999), 6);
-}
-
-function isValidProbability(value: number | null): value is number {
-  return value !== null && Number.isFinite(value) && value > 0 && value < 1;
+function isFinitePositivePrice(value: number | null): value is number {
+  return value !== null && Number.isFinite(value) && value > 0;
 }

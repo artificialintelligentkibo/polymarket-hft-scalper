@@ -41,9 +41,12 @@ test('createConfig defaults to dynamic BTC/SOL/XRP market scan when whitelist is
   assert.equal(candidate.POLYMARKET_API_KEY, '');
   assert.equal(candidate.POLYMARKET_RELAYER_URL, 'https://relayer-v2.polymarket.com');
   assert.equal(candidate.strategy.minCombinedDiscount, 0.01);
+  assert.equal(candidate.strategy.extremeSellThreshold, 0.93);
   assert.equal(candidate.strategy.extremeBuyThreshold, 0.04);
-  assert.equal(candidate.strategy.minEntryDepthUsd, 5);
-  assert.equal(candidate.strategy.maxEntrySpread, 0.2);
+  assert.equal(candidate.strategy.fairValueBuyThreshold, 0.015);
+  assert.equal(candidate.strategy.fairValueSellThreshold, 0.015);
+  assert.equal(candidate.strategy.minEntryDepthUsd, 2);
+  assert.equal(candidate.strategy.maxEntrySpread, 0.3);
   assert.equal(candidate.strategy.entryImbalanceBlockThreshold, 100);
   assert.equal(candidate.strategy.maxDrawdownUsdc, -100);
   assert.equal(candidate.strategy.hardStopCooldownMs, 15000);

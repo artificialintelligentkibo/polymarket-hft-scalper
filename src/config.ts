@@ -314,9 +314,9 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     strategy: {
       minCombinedDiscount: parseFloatOrDefault(env.MIN_COMBINED_DISCOUNT, '0.01'),
-      extremeSellThreshold: parseFloatOrDefault(env.EXTREME_SELL_THRESHOLD, '0.74'),
+      extremeSellThreshold: parseFloatOrDefault(env.EXTREME_SELL_THRESHOLD, '0.93'),
       extremeBuyThreshold: parseFloatOrDefault(env.EXTREME_BUY_THRESHOLD, '0.04'),
-      fairValueBuyThreshold: parseFloatOrDefault(env.FAIR_VALUE_BUY_THRESHOLD, '0.018'),
+      fairValueBuyThreshold: parseFloatOrDefault(env.FAIR_VALUE_BUY_THRESHOLD, '0.015'),
       fairValueSellThreshold: parseFloatOrDefault(env.FAIR_VALUE_SELL_THRESHOLD, '0.015'),
       trailingTakeProfit: parseFloatOrDefault(env.TRAILING_TAKE_PROFIT, '0.012'),
       hardStopLoss: parseFloatOrDefault(env.HARD_STOP_LOSS, '0.025'),
@@ -342,8 +342,8 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       sizeLiquidityCapUsd: parseFloatOrDefault(env.SIZE_LIQUIDITY_CAP_USD, '4000'),
       depthReferenceShares: parseFloatOrDefault(env.DEPTH_REFERENCE_SHARES, '180'),
       capitalReferenceShares: parseFloatOrDefault(env.CAPITAL_REFERENCE_SHARES, '120'),
-      minEntryDepthUsd: parseFloatOrDefault(env.MIN_ENTRY_DEPTH_USD, '5'),
-      maxEntrySpread: parseFloatOrDefault(env.MAX_ENTRY_SPREAD, '0.2'),
+      minEntryDepthUsd: parseFloatOrDefault(env.MIN_ENTRY_DEPTH_USD, '2'),
+      maxEntrySpread: parseFloatOrDefault(env.MAX_ENTRY_SPREAD, '0.3'),
       entryImbalanceBlockThreshold: parseFloatOrDefault(
         env.ENTRY_IMBALANCE_BLOCK_THRESHOLD,
         '100'
