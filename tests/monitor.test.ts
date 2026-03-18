@@ -33,10 +33,21 @@ function createEvent(index: number): JsonRecord {
   const conditionSuffix = index.toString(16).padStart(64, '0');
   return {
     id: `event-${index}`,
-    title: `Bitcoin Up or Down - Mar 18, 11:${String(index % 60).padStart(2, '0')}AM-11:${String(
+    title: `Bitcoin Up or Down - Nov 21, 10:${String(index % 60).padStart(2, '0')}AM-10:${String(
       (index + 5) % 60
     ).padStart(2, '0')}AM ET`,
     slug: `bitcoin-up-or-down-${index}`,
+    startTime: '2030-11-21T15:10:00Z',
+    endDate: '2030-11-21T15:15:00Z',
+    seriesSlug: 'btc-up-or-down-5m',
+    series: [
+      {
+        id: `series-${index}`,
+        slug: 'btc-up-or-down-5m',
+        recurrence: '5m',
+        liquidity: 4236572.0073,
+      },
+    ],
     active: true,
     closed: false,
     markets: [
@@ -45,8 +56,9 @@ function createEvent(index: number): JsonRecord {
         question: `Bitcoin Up or Down - sample ${index}?`,
         conditionId: `0x${conditionSuffix}`,
         slug: `bitcoin-up-or-down-${index}`,
-        startDate: '2026-03-18T15:10:00Z',
-        endDate: '2026-03-18T15:15:00Z',
+        startDate: '2030-11-20T15:08:22Z',
+        eventStartTime: '2030-11-21T15:10:00Z',
+        endDate: '2030-11-21T15:15:00Z',
         outcomes: '["Up","Down"]',
         clobTokenIds: `["${1000 + index}","${2000 + index}"]`,
         liquidity: '1500',
@@ -81,7 +93,10 @@ test('normalizeGammaMarketSource parses current Gamma payloads that expose clobT
   );
   assert.equal(normalized?.yesLabel, 'Up');
   assert.equal(normalized?.noLabel, 'Down');
+  assert.equal(normalized?.startTime, '2030-11-21T15:10:00.000Z');
   assert.equal(normalized?.durationMinutes, 5);
+  assert.equal(normalized?.seriesSlug, 'btc-up-or-down-5m');
+  assert.equal(normalized?.recurrence, '5m');
 });
 
 test('matchesTradeableCoin uses strict regex matching for symbols and full names', () => {
@@ -96,6 +111,7 @@ test('matchesTradeableCoin uses strict regex matching for symbols and full names
         title: 'MegaETH governance token target this week?',
         eventTitle: 'MegaETH ecosystem market',
         slug: 'megaeth-governance-target',
+        seriesSlug: undefined,
       },
       ['ETH'] as const
     ),
@@ -107,6 +123,7 @@ test('matchesTradeableCoin uses strict regex matching for symbols and full names
         title: 'Ethereum Up or Down - Mar 18, 11:10AM-11:15AM ET',
         eventTitle: undefined,
         slug: 'ethereum-up-or-down',
+        seriesSlug: 'eth-up-or-down-5m',
       },
       ['ETH'] as const
     ),
@@ -125,6 +142,8 @@ test('isLikelyFiveMinuteMarket prefers parsed duration but falls back to resilie
       title: 'Solana Up or Down - 11:10AM-11:15AM ET',
       eventTitle: 'Solana Up or Down',
       slug: 'solana-up-or-down-1110am-et',
+      seriesSlug: 'sol-up-or-down-5m',
+      recurrence: null,
       durationMinutes: null,
     }),
     true
@@ -134,6 +153,8 @@ test('isLikelyFiveMinuteMarket prefers parsed duration but falls back to resilie
       title: 'Bitcoin Up or Down - hourly',
       eventTitle: 'Bitcoin Up or Down',
       slug: 'bitcoin-up-or-down-hourly',
+      seriesSlug: 'btc-up-or-down-1h',
+      recurrence: '1h',
       durationMinutes: 60,
     }),
     false
@@ -186,10 +207,37 @@ test('selectEligibleMarkets preserves whitelist-only TEST_MODE and dynamic disco
   );
 });
 
-test('fetchPaginatedGammaEventMarkets paginates /events and flattens nested markets', async () => {
+test('selectEligibleMarkets drops stale slots even when Gamma still marks them active', () => {
+  const fixture = loadFixture<JsonRecord[]>('fixtures/gamma-crypto-5min-event-page.json');
+  const baseCandidate = normalizeGammaMarketSource(flattenGammaEventMarkets(fixture)[0]);
+  assert.ok(baseCandidate);
+
+  const staleCandidate = cloneCandidate(baseCandidate!, {
+    startTime: '2020-01-01T00:00:00.000Z',
+    endTime: '2020-01-01T00:05:00.000Z',
+    durationMinutes: 5,
+  });
+
+  const selection = selectEligibleMarkets(
+    [staleCandidate],
+    createConfig({
+      ...process.env,
+      TEST_MODE: 'false',
+      FILTER_5MIN_ONLY: 'true',
+      WHITELIST_CONDITION_IDS: '',
+      COINS_TO_TRADE: 'BTC,ETH,SOL,XRP',
+      MIN_LIQUIDITY_USD: '500',
+    })
+  );
+
+  assert.equal(selection.eligible.length, 0);
+  assert.equal(selection.summary.rejectionCounts['outside-slot-window'], 1);
+});
+
+test('fetchPaginatedGammaEventMarkets paginates ordered crypto /events and flattens nested markets', async () => {
   const firstPage = Array.from({ length: 200 }, (_, index) => createEvent(index));
   const secondPage = [createEvent(999)];
-  const requestedOffsets: number[] = [];
+  const requestedUrls: URL[] = [];
 
   const fetchImpl: typeof fetch = async (input) => {
     const url =
@@ -199,7 +247,7 @@ test('fetchPaginatedGammaEventMarkets paginates /events and flattens nested mark
           ? new URL(input)
           : new URL(input.url);
     const offset = Number(url.searchParams.get('offset') ?? '0');
-    requestedOffsets.push(offset);
+    requestedUrls.push(url);
     const payload = offset === 0 ? firstPage : secondPage;
     return new Response(JSON.stringify(payload), {
       status: 200,
@@ -215,7 +263,14 @@ test('fetchPaginatedGammaEventMarkets paginates /events and flattens nested mark
     fetchImpl,
   });
 
-  assert.deepEqual(requestedOffsets, [0, 200]);
+  assert.deepEqual(
+    requestedUrls.map((url) => Number(url.searchParams.get('offset') ?? '0')),
+    [0, 200]
+  );
+  assert.equal(requestedUrls[0]?.searchParams.get('tag_id'), '21');
+  assert.equal(requestedUrls[0]?.searchParams.get('related_tags'), 'true');
+  assert.equal(requestedUrls[0]?.searchParams.get('order'), 'endDate');
+  assert.equal(requestedUrls[0]?.searchParams.get('ascending'), 'true');
   assert.equal(result.pagesFetched, 2);
   assert.equal(result.events.length, 201);
   assert.equal(result.marketSources.length, 201);

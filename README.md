@@ -81,8 +81,8 @@ Sizing is now driven by:
 
 The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) runs:
 
-1. Gamma `/events` pagination with `limit` + `offset`, then flattening nested markets
-2. robust Gamma normalization using `clobTokenIds`, `outcomes`, `question/title/slug`, and start/end timestamps
+1. Gamma `/events` pagination with `limit` + `offset`, `tag_id=21`, and upcoming-slot ordering by end time
+2. robust Gamma normalization using `clobTokenIds`, `outcomes`, `question/title/slug`, `startTime` / `eventStartTime`, and start/end timestamps
 3. whitelist filter via `WHITELIST_CONDITION_IDS` in `TEST_MODE`, otherwise dynamic `COINS_TO_TRADE` + optional 5-minute slot filter
 4. duration-first 5-minute detection with title / slug fallbacks
 5. orderbook sync from CLOB WebSocket + REST fallback
@@ -155,7 +155,9 @@ In `TEST_MODE=true`, the runtime ignores the coin filter and only trades markets
 Dynamic scan no longer depends on a stale manual whitelist. Out of the box it:
 
 - pages Gamma `/events` until enough active crypto candidates are collected or the safety cap is reached
+- orders active crypto events by the nearest ending slots first so recurring `Up or Down` markets are surfaced early
 - normalizes current payloads that expose token IDs via `clobTokenIds`
+- prefers recurring slot timestamps from `startTime` / `eventStartTime` instead of treating market `startDate` as the slot open
 - matches `BTC|Bitcoin`, `ETH|Ethereum`, `SOL|Solana`, `XRP` with strict whole-word regexes
 - detects 5-minute markets primarily from parsed duration (`<= 5.5m`) and secondarily from `Up or Down` / clock-range / slug hints
 

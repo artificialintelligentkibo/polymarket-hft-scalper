@@ -19,6 +19,8 @@ export interface MarketCandidate {
   title: string;
   eventTitle?: string;
   slug?: string;
+  seriesSlug?: string;
+  recurrence?: string | null;
   liquidityUsd: number;
   volumeUsd: number;
   startTime: string | null;
@@ -44,6 +46,7 @@ export type CandidateRejectionReason =
   | 'normalization-failed'
   | 'below-liquidity'
   | 'not-accepting-orders'
+  | 'outside-slot-window'
   | 'not-whitelisted'
   | 'coin-mismatch'
   | 'not-5-minute';
@@ -85,9 +88,11 @@ interface GammaEventFetchResult {
 type FetchLike = typeof fetch;
 
 const MAX_TRACKED_SLOTS = 2_048;
+const GAMMA_CRYPTO_TAG_ID = '21';
 const GAMMA_EVENT_PAGE_LIMIT = 200;
 const MAX_GAMMA_EVENT_PAGES = 6;
 const MARKET_DISCOVERY_BUFFER_MULTIPLIER = 6;
+const STALE_SLOT_GRACE_MS = 60_000;
 const CLOCK_RANGE_PATTERN =
   /\b\d{1,2}:\d{2}\s?(?:AM|PM)\s*-\s*\d{1,2}:\d{2}\s?(?:AM|PM)\b/i;
 const UP_OR_DOWN_PATTERN = /\bup\s+or\s+down\b/i;
@@ -324,32 +329,63 @@ export async function fetchGammaEventsPage(params: {
   fetchImpl?: FetchLike;
 }): Promise<JsonRecord[]> {
   const fetchImpl = params.fetchImpl ?? fetch;
-  const url = new URL(`${params.gammaUrl.replace(/\/+$/, '')}/events`);
-  url.searchParams.set('active', 'true');
-  url.searchParams.set('closed', 'false');
-  url.searchParams.set('tag', 'crypto');
-  url.searchParams.set('limit', String(params.limit));
-  url.searchParams.set('offset', String(params.offset));
+  const orderCandidates = ['endDate', 'end_date', null] as const;
+  let lastError: Error | null = null;
 
-  const response = await fetchImpl(url, {
-    method: 'GET',
-    headers: {
-      accept: 'application/json',
-    },
-  });
+  for (const orderField of orderCandidates) {
+    const url = new URL(`${params.gammaUrl.replace(/\/+$/, '')}/events`);
+    url.searchParams.set('active', 'true');
+    url.searchParams.set('closed', 'false');
+    url.searchParams.set('tag_id', GAMMA_CRYPTO_TAG_ID);
+    url.searchParams.set('related_tags', 'true');
+    url.searchParams.set('limit', String(params.limit));
+    url.searchParams.set('offset', String(params.offset));
 
-  if (!response.ok) {
-    throw new Error(`Gamma events API returned ${response.status}`);
+    if (orderField) {
+      url.searchParams.set('order', orderField);
+      url.searchParams.set('ascending', 'true');
+    }
+
+    const response = await fetchImpl(url, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await safeReadResponseText(response);
+      const isOrderValidationError =
+        response.status === 400 &&
+        /order fields are not valid/i.test(errorText);
+
+      if (isOrderValidationError && orderField) {
+        lastError = new Error(
+          `Gamma events API rejected order field "${orderField}": ${errorText}`
+        );
+        continue;
+      }
+
+      throw new Error(
+        `Gamma events API returned ${response.status}${errorText ? `: ${errorText}` : ''}`
+      );
+    }
+
+    const payload = (await response.json()) as unknown;
+    if (Array.isArray(payload)) {
+      return payload.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
+    }
+
+    const record = asRecord(payload);
+    const events = Array.isArray(record?.events) ? record.events : [];
+    return events.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
   }
 
-  const payload = (await response.json()) as unknown;
-  if (Array.isArray(payload)) {
-    return payload.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
+  if (lastError) {
+    throw lastError;
   }
 
-  const record = asRecord(payload);
-  const events = Array.isArray(record?.events) ? record.events : [];
-  return events.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
+  return [];
 }
 
 export function flattenGammaEventMarkets(events: readonly JsonRecord[]): GammaMarketSource[] {
@@ -405,11 +441,24 @@ export function normalizeGammaMarketSource(source: GammaMarketSource): MarketCan
     conditionId;
   const eventTitle = asString(event?.title) || asString(record.title) || undefined;
   const slug = asString(record.slug) || asString(event?.slug) || undefined;
+  const series = getPrimarySeries(event, record);
+  const seriesSlug =
+    asString(record.seriesSlug) ||
+    asString(event?.seriesSlug) ||
+    asString(series?.slug) ||
+    undefined;
+  const recurrence = asString(series?.recurrence) || null;
   const startTime = normalizeTimestamp(
-    record.startDate ??
-      record.start_date ??
+    record.eventStartTime ??
+      record.event_start_time ??
+      event?.startTime ??
+      event?.eventStartTime ??
       record.startTime ??
       record.start_time ??
+      record.gameStartTime ??
+      record.game_start_time ??
+      record.startDate ??
+      record.start_date ??
       event?.startDate ??
       event?.start_date
   );
@@ -451,6 +500,8 @@ export function normalizeGammaMarketSource(source: GammaMarketSource): MarketCan
     title,
     eventTitle,
     slug,
+    seriesSlug,
+    recurrence,
     liquidityUsd,
     volumeUsd,
     startTime,
@@ -483,6 +534,11 @@ export function selectEligibleMarkets(
   let fiveMinuteMatchedCount = 0;
 
   for (const candidate of candidates) {
+    if (isExpiredSlotCandidate(candidate)) {
+      recordRejection(rejectionStore, 'outside-slot-window', formatCandidateForLog(candidate));
+      continue;
+    }
+
     if (candidate.liquidityUsd < runtimeConfig.MIN_LIQUIDITY_USD) {
       recordRejection(rejectionStore, 'below-liquidity', formatCandidateForLog(candidate));
       continue;
@@ -566,10 +622,10 @@ export function describeDiscoveryMode(
 }
 
 export function matchesTradeableCoin(
-  candidate: Pick<MarketCandidate, 'title' | 'eventTitle' | 'slug'>,
+  candidate: Pick<MarketCandidate, 'title' | 'eventTitle' | 'slug' | 'seriesSlug'>,
   coinsToTrade: readonly TradeableCoin[]
 ): boolean {
-  const haystack = [candidate.title, candidate.eventTitle, candidate.slug]
+  const haystack = [candidate.title, candidate.eventTitle, candidate.slug, candidate.seriesSlug]
     .filter((value): value is string => Boolean(value && value.trim()))
     .join(' ');
 
@@ -577,7 +633,10 @@ export function matchesTradeableCoin(
 }
 
 export function isLikelyFiveMinuteMarket(
-  candidate: Pick<MarketCandidate, 'title' | 'eventTitle' | 'slug' | 'durationMinutes'>
+  candidate: Pick<
+    MarketCandidate,
+    'title' | 'eventTitle' | 'slug' | 'seriesSlug' | 'recurrence' | 'durationMinutes'
+  >
 ): boolean {
   const durationMinutes = candidate.durationMinutes;
   if (durationMinutes !== null && durationMinutes > 0 && durationMinutes <= 5.5) {
@@ -588,10 +647,24 @@ export function isLikelyFiveMinuteMarket(
     return false;
   }
 
+  const normalizedRecurrence = String(candidate.recurrence || '')
+    .trim()
+    .toLowerCase();
+  if (
+    normalizedRecurrence === '5m' ||
+    normalizedRecurrence === '5min' ||
+    normalizedRecurrence === '5-min' ||
+    normalizedRecurrence === 'five-minute'
+  ) {
+    return true;
+  }
+
   const titleText = [candidate.title, candidate.eventTitle].filter(Boolean).join(' ');
   const hasUpOrDown = UP_OR_DOWN_PATTERN.test(titleText);
   const hasClockRange = CLOCK_RANGE_PATTERN.test(titleText);
-  const hasSlugHint = FIVE_MINUTE_SLUG_PATTERN.test(candidate.slug ?? '');
+  const hasSlugHint = FIVE_MINUTE_SLUG_PATTERN.test(
+    [candidate.slug, candidate.seriesSlug].filter(Boolean).join(' ')
+  );
 
   return hasUpOrDown && (hasClockRange || hasSlugHint);
 }
@@ -798,10 +871,45 @@ function normalizeTimestamp(value: unknown): string | null {
   return normalizeTimestampString(value);
 }
 
+function getPrimarySeries(event: JsonRecord | null, record: JsonRecord): JsonRecord | null {
+  const eventSeries = Array.isArray(event?.series) ? event.series : [];
+  const recordSeries = Array.isArray(record.series) ? record.series : [];
+  return (
+    eventSeries.map(asRecord).find((entry): entry is JsonRecord => entry !== null) ??
+    recordSeries.map(asRecord).find((entry): entry is JsonRecord => entry !== null) ??
+    null
+  );
+}
+
+function isExpiredSlotCandidate(
+  candidate: Pick<MarketCandidate, 'endTime'>,
+  nowMs = Date.now()
+): boolean {
+  if (!candidate.endTime) {
+    return false;
+  }
+
+  const endMs = Date.parse(candidate.endTime);
+  if (!Number.isFinite(endMs)) {
+    return false;
+  }
+
+  return endMs < nowMs - STALE_SLOT_GRACE_MS;
+}
+
+async function safeReadResponseText(response: Response): Promise<string> {
+  try {
+    return (await response.text()).trim();
+  } catch {
+    return '';
+  }
+}
+
 function formatCandidateForLog(candidate: MarketCandidate): string {
   return [
     candidate.title,
     candidate.slug ? `slug=${candidate.slug}` : '',
+    candidate.seriesSlug ? `series=${candidate.seriesSlug}` : '',
     `conditionId=${candidate.conditionId}`,
     `liq=${candidate.liquidityUsd.toFixed(2)}`,
     candidate.durationMinutes !== null ? `duration=${candidate.durationMinutes.toFixed(2)}m` : '',

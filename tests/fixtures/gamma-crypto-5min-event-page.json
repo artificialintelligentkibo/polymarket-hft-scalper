@@ -1,26 +1,38 @@
 [
   {
     "id": "999001",
-    "ticker": "bitcoin-up-or-down-mar-18-1110am-et",
-    "slug": "bitcoin-up-or-down-mar-18-1110am-et",
-    "title": "Bitcoin Up or Down - Mar 18, 11:10AM-11:15AM ET",
-    "description": "Realistic current Gamma event payload shape for a 5-minute crypto market.",
-    "startDate": "2026-03-18T15:10:00Z",
-    "endDate": "2026-03-18T15:15:00Z",
+    "ticker": "bitcoin-updown-5m-1890000600",
+    "slug": "bitcoin-updown-5m-1890000600",
+    "title": "Bitcoin Up or Down - November 21, 10:10AM-10:15AM ET",
+    "description": "Realistic recurring Gamma event payload shape for a 5-minute crypto slot.",
+    "resolutionSource": "https://data.chain.link/streams/btc-usd",
+    "startDate": "2030-11-20T15:09:46.676083Z",
+    "creationDate": "2030-11-20T15:09:46.676080Z",
+    "startTime": "2030-11-21T15:10:00Z",
+    "endDate": "2030-11-21T15:15:00Z",
     "active": true,
     "closed": false,
     "archived": false,
-    "liquidity": 1825.55,
     "volume": 9250.12,
-    "liquidityClob": 1825.55,
+    "seriesSlug": "btc-up-or-down-5m",
+    "series": [
+      {
+        "id": "series-001",
+        "slug": "btc-up-or-down-5m",
+        "title": "BTC Up or Down 5m",
+        "recurrence": "5m",
+        "liquidity": 4236572.0073
+      }
+    ],
     "markets": [
       {
         "id": "888001",
-        "question": "Bitcoin Up or Down - Mar 18, 11:10AM-11:15AM ET?",
+        "question": "Bitcoin Up or Down - November 21, 10:10AM-10:15AM ET",
         "conditionId": "0x1111111111111111111111111111111111111111111111111111111111111111",
-        "slug": "bitcoin-up-or-down-mar-18-1110am-et",
-        "startDate": "2026-03-18T15:10:00Z",
-        "endDate": "2026-03-18T15:15:00Z",
+        "slug": "bitcoin-updown-5m-1890000600",
+        "startDate": "2030-11-20T15:08:22Z",
+        "eventStartTime": "2030-11-21T15:10:00Z",
+        "endDate": "2030-11-21T15:15:00Z",
         "outcomes": "[\"Up\", \"Down\"]",
         "clobTokenIds": "[\"1029384756102938475610293847561029384756102938475610293847561029384756\", \"5647382910564738291056473829105647382910564738291056473829105647382910\"]",
         "liquidity": "1825.55",
@@ -32,6 +44,23 @@
         "archived": false,
         "acceptingOrders": true,
         "enableOrderBook": true
+      }
+    ],
+    "tags": [
+      {
+        "id": "21",
+        "label": "Crypto",
+        "slug": "crypto"
+      },
+      {
+        "id": "102127",
+        "label": "Up or Down",
+        "slug": "up-or-down"
+      },
+      {
+        "id": "102892",
+        "label": "5M",
+        "slug": "5M"
       }
     ]
   }
