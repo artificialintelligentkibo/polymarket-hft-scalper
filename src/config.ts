@@ -6,6 +6,7 @@ export type SignatureType = 0 | 1 | 2;
 export type OrderMode = 'GTC' | 'FOK' | 'FAK';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 export type OrderUrgency = 'passive' | 'improve' | 'cross';
+export type TradeableCoin = 'BTC' | 'SOL' | 'XRP' | 'ETH';
 
 export interface PriceMultiplierLevel {
   readonly maxPrice: number;
@@ -17,6 +18,9 @@ export interface AppConfig {
   readonly TEST_MODE: boolean;
   readonly DRY_RUN: boolean;
   readonly ENABLE_SIGNAL: boolean;
+  readonly COINS_TO_TRADE: readonly TradeableCoin[];
+  readonly FILTER_5MIN_ONLY: boolean;
+  readonly MIN_LIQUIDITY_USD: number;
   readonly WHITELIST_CONDITION_IDS: readonly string[];
   readonly signerPrivateKey: string;
   readonly polymarketGeoToken: string;
@@ -90,23 +94,8 @@ export interface AppConfig {
   };
 }
 
-const DEFAULT_WHITELIST_CONDITION_IDS = [
-  '0x3f5dc93e734dc9f2c441882160bdf6716d8bb7953ce67962094c6b17f73210c0',
-  '0x3756c929609555f5b6cd8a8231d083400ea92397873fcd5ca24182186766e2e7',
-  '0x353c312ca497e5a3717cff6e2c9e726990b19d12ef4f92f0d3d08817e5191a5e',
-  '0x934b2c51f64502b5bd57c9dfe53bfeac741670c4f75087f3fa6ac896c4f93df2',
-  '0xfedc9d713e247326bc6b670892972d1a695ff55be3d537e84f1931a1ca8a14b2',
-  '0xf24222bdbd20e5f8d4b7a87e0819fd59f01ac03a674f82e0313d4bcbb85ced4b',
-  '0x640ca566076f4d2d1347de0ec5dd4e80adf30d4080cec3d41c97f89e8224fbc8',
-  '0xd258957f8f3a02378595e4cc6f1008475b0735b2bb54a7ee183a47d6366f2eb9',
-  '0x2a626f38a60c757f1075cbfc822de66d9695c63696ac91723cf954b5fa349759',
-  '0x240b5f2c500401a38e89d5c55552cffc2fdde3693d975248cb1857cd0b93dd22',
-  '0xf0e5ad608f1ace28b7e97d30a261f30148eb0ee4ace84749fc450a245fff6c34',
-  '0x25eb2598ab563785f8181aa0ab46598d83aa36720cc3c988b4f841c91c6445fc',
-  '0x5a8f6fb58fbc41595923b86b8f04f6955eb440cbf2b7e28091ddeb3e7843d953',
-  '0xa2cad512d328f85d05bbc659509eb9a51ee6671cfabf8535440d43ff03a92bd9',
-  '0x5d09131387b023b28ba95c5b27647dd31a5db413b75fb0c5309f9e11746d6112',
-] as const;
+const DEFAULT_WHITELIST_CONDITION_IDS = [] as const;
+const DEFAULT_COINS_TO_TRADE = ['BTC', 'SOL', 'XRP'] as const satisfies readonly TradeableCoin[];
 
 let dotenvLoaded = false;
 let configCache: AppConfig | undefined;
@@ -134,6 +123,20 @@ function parseCsv(value?: string): string[] {
           .map((entry) => entry.trim())
           .filter(Boolean)
   );
+}
+
+function parseCoinsToTrade(value?: string): TradeableCoin[] {
+  const allowedCoins = new Set<TradeableCoin>(['BTC', 'SOL', 'XRP', 'ETH']);
+  const rawCoins =
+    value?.trim() ||
+    DEFAULT_COINS_TO_TRADE.join(',');
+
+  const coins = rawCoins
+    .split(',')
+    .map((entry) => entry.trim().toUpperCase())
+    .filter((entry): entry is TradeableCoin => allowedCoins.has(entry as TradeableCoin));
+
+  return coins.length > 0 ? [...new Set(coins)] : [...DEFAULT_COINS_TO_TRADE];
 }
 
 function parseAuthMode(value?: string): AuthMode {
@@ -226,11 +229,19 @@ function resolveSignerPrivateKey(env: NodeJS.ProcessEnv): string {
 }
 
 export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const minLiquidityUsd = parseFloatOrDefault(env.MIN_LIQUIDITY_USD, '500');
+
   return {
     SIMULATION_MODE: parseBoolean(env.SIMULATION_MODE, false),
     TEST_MODE: parseBoolean(env.TEST_MODE, false),
     DRY_RUN: parseBoolean(env.DRY_RUN, false),
     ENABLE_SIGNAL: parseBoolean(env.ENABLE_SIGNAL, true),
+    COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
+    FILTER_5MIN_ONLY: parseBoolean(
+      env.FILTER_5MIN_ONLY ?? env.ONLY_FIVE_MINUTE_MARKETS,
+      true
+    ),
+    MIN_LIQUIDITY_USD: minLiquidityUsd,
     WHITELIST_CONDITION_IDS: parseCsv(
       env.WHITELIST_CONDITION_IDS || DEFAULT_WHITELIST_CONDITION_IDS.join(',')
     ),
@@ -281,7 +292,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         env.INVENTORY_REBALANCE_FRACTION,
         '0.45'
       ),
-      minLiquidityUsd: parseFloatOrDefault(env.MIN_LIQUIDITY_USD, '500'),
+      minLiquidityUsd,
       sizeLiquidityCapUsd: parseFloatOrDefault(env.SIZE_LIQUIDITY_CAP_USD, '4000'),
       depthReferenceShares: parseFloatOrDefault(env.DEPTH_REFERENCE_SHARES, '180'),
       capitalReferenceShares: parseFloatOrDefault(env.CAPITAL_REFERENCE_SHARES, '120'),

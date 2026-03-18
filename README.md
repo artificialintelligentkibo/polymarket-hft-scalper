@@ -66,6 +66,9 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `PRICE_MULTIPLIER_LEVELS`
 - `MAX_NET_YES=200`
 - `MAX_NET_NO=250`
+- `COINS_TO_TRADE=BTC,SOL,XRP`
+- `FILTER_5MIN_ONLY=true`
+- `MIN_LIQUIDITY_USD=500`
 
 Sizing is now driven by:
 
@@ -77,8 +80,8 @@ Sizing is now driven by:
 
 The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) runs:
 
-1. Gamma scan for liquid 5-minute markets
-2. whitelist filter via `WHITELIST_CONDITION_IDS`
+1. Gamma scan for active crypto markets via `tag=crypto`
+2. whitelist filter via `WHITELIST_CONDITION_IDS` in `TEST_MODE`, otherwise dynamic `COINS_TO_TRADE` + 5-minute slot filter
 3. orderbook sync from CLOB WebSocket + REST fallback
 4. risk assessment
 5. top-2 signal generation
@@ -120,6 +123,20 @@ DRY_RUN=true
 WHITELIST_CONDITION_IDS=0x3f5dc93e734dc9f2c441882160bdf6716d8bb7953ce67962094c6b17f73210c0,0x3756c929609555f5b6cd8a8231d083400ea92397873fcd5ca24182186766e2e7
 npm start
 ```
+
+Dynamic 5-minute crypto slot scan for BTC / SOL / XRP:
+
+```bash
+COINS_TO_TRADE=BTC,SOL,XRP FILTER_5MIN_ONLY=true npm start
+```
+
+Add `ETH` if you want:
+
+```bash
+COINS_TO_TRADE=BTC,SOL,XRP,ETH FILTER_5MIN_ONLY=true npm start
+```
+
+In `TEST_MODE=true`, the runtime ignores the coin filter and only trades markets from `WHITELIST_CONDITION_IDS`.
 
 Live-like runtime without simulation:
 

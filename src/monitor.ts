@@ -57,10 +57,9 @@ export class MarketMonitor extends EventEmitter {
     const eligible = markets
       .map((market) => this.normalizeMarketCandidate(market))
       .filter((candidate): candidate is MarketCandidate => candidate !== null)
-      .filter((candidate) => candidate.liquidityUsd >= config.strategy.minLiquidityUsd)
+      .filter((candidate) => candidate.liquidityUsd >= config.MIN_LIQUIDITY_USD)
       .filter((candidate) => candidate.acceptingOrders)
-      .filter((candidate) => this.passesWhitelist(candidate))
-      .filter((candidate) => this.passesFiveMinuteFilter(candidate))
+      .filter((candidate) => this.matchesConfiguredSelection(candidate))
       .sort((left, right) => {
         const leftEnd = left.endTime ? Date.parse(left.endTime) : Number.MAX_SAFE_INTEGER;
         const rightEnd = right.endTime ? Date.parse(right.endTime) : Number.MAX_SAFE_INTEGER;
@@ -73,11 +72,20 @@ export class MarketMonitor extends EventEmitter {
 
     this.emitSlotEndedEvents(eligible);
 
+    console.log(`Active 5-min slots found: ${eligible.length}`);
+    for (const market of eligible) {
+      console.log(
+        `   ${market.title} | ID: ${market.conditionId} | Liq: $${market.liquidityUsd.toFixed(2)}`
+      );
+    }
+
     logger.debug('Market scan completed', {
       fetched: markets.length,
       eligible: eligible.length,
-      minLiquidityUsd: config.strategy.minLiquidityUsd,
+      minLiquidityUsd: config.MIN_LIQUIDITY_USD,
       whitelistSize: config.WHITELIST_CONDITION_IDS.length,
+      coinsToTrade: config.COINS_TO_TRADE,
+      filterFiveMinuteOnly: config.FILTER_5MIN_ONLY,
       testMode: config.TEST_MODE,
     });
 
@@ -87,9 +95,13 @@ export class MarketMonitor extends EventEmitter {
   private async fetchMarkets(): Promise<JsonRecord[]> {
     const baseUrl = config.clob.gammaUrl.replace(/\/+$/, '');
     const url = new URL(`${baseUrl}/markets`);
-    url.searchParams.set('limit', String(config.runtime.marketQueryLimit * 2));
+    url.searchParams.set(
+      'limit',
+      String(Math.max(200, config.runtime.marketQueryLimit * 2))
+    );
     url.searchParams.set('active', 'true');
     url.searchParams.set('closed', 'false');
+    url.searchParams.set('tag', 'crypto');
 
     try {
       const response = await fetch(url, {
@@ -181,24 +193,38 @@ export class MarketMonitor extends EventEmitter {
     };
   }
 
-  private passesFiveMinuteFilter(candidate: MarketCandidate): boolean {
-    if (!config.runtime.onlyFiveMinuteMarkets) {
-      return true;
+  private matchesConfiguredSelection(candidate: MarketCandidate): boolean {
+    if (config.TEST_MODE) {
+      return (
+        this.whitelistConditionIds.size > 0 &&
+        this.whitelistConditionIds.has(candidate.conditionId.toLowerCase())
+      );
     }
 
-    if (candidate.durationMinutes !== null) {
-      return candidate.durationMinutes <= 5.5;
+    if (this.whitelistConditionIds.size > 0) {
+      return this.whitelistConditionIds.has(candidate.conditionId.toLowerCase());
     }
 
-    return /\b5\s*(?:min|minute|minutes|m)\b/i.test(candidate.title);
+    return this.passesCoinAndSlotFilter(candidate);
   }
 
-  private passesWhitelist(candidate: MarketCandidate): boolean {
-    if (config.WHITELIST_CONDITION_IDS.length === 0) {
+  private passesCoinAndSlotFilter(candidate: MarketCandidate): boolean {
+    const normalizedTitle = candidate.title.toUpperCase();
+    const hasTargetCoin = config.COINS_TO_TRADE.some((coin) => normalizedTitle.includes(coin));
+    if (!hasTargetCoin) {
+      return false;
+    }
+
+    if (!config.FILTER_5MIN_ONLY) {
       return true;
     }
 
-    return this.whitelistConditionIds.has(candidate.conditionId.toLowerCase());
+    const hasUpOrDownTitle = normalizedTitle.includes('UP OR DOWN');
+    const hasClockMarker =
+      candidate.title.includes('5:') ||
+      /\d{1,2}:\d{2}\s?(?:AM|PM)\s*-\s*\d{1,2}:\d{2}\s?(?:AM|PM)/i.test(candidate.title);
+
+    return hasUpOrDownTitle && hasClockMarker;
   }
 
   private emitSlotEndedEvents(candidates: MarketCandidate[]): void {

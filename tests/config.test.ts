@@ -17,3 +17,18 @@ test('createConfig filters invalid and duplicate whitelist condition ids', () =>
     '0x3f5dc93e734dc9f2c441882160bdf6716d8bb7953ce67962094c6b17f73210c0',
   ]);
 });
+
+test('createConfig defaults to dynamic BTC/SOL/XRP market scan when whitelist is empty', () => {
+  const candidate = createConfig({
+    ...process.env,
+    WHITELIST_CONDITION_IDS: '',
+    COINS_TO_TRADE: 'btc,sol,xrp,eth',
+    FILTER_5MIN_ONLY: 'true',
+    MIN_LIQUIDITY_USD: '500',
+  });
+
+  assert.deepEqual(candidate.WHITELIST_CONDITION_IDS, []);
+  assert.deepEqual(candidate.COINS_TO_TRADE, ['BTC', 'SOL', 'XRP', 'ETH']);
+  assert.equal(candidate.FILTER_5MIN_ONLY, true);
+  assert.equal(candidate.MIN_LIQUIDITY_USD, 500);
+});
