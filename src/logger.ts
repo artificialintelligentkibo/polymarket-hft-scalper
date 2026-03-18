@@ -3,6 +3,7 @@ import path from 'node:path';
 import { config, type LogLevel } from './config.js';
 import type { Outcome } from './clob-fetcher.js';
 import type { SignalType, SignalUrgency } from './strategy-types.js';
+import { roundTo } from './utils.js';
 
 export interface LoggerOptions {
   name?: string;
@@ -71,7 +72,7 @@ export interface TradeLogInput {
   unrealizedPnl: number;
   totalPnl: number;
   orderId?: string | null;
-  wasMaker: boolean;
+  wasMaker: boolean | null;
   simulationMode: boolean;
   dryRun: boolean;
   testMode: boolean;
@@ -89,7 +90,6 @@ const LOG_LEVEL_WEIGHT: Record<LogLevel, number> = {
   error: 40,
 };
 
-const LOGS_DIRECTORY = path.resolve(process.cwd(), config.logging.directory);
 const CACHE_WINDOW_MS = 60_000;
 const BINANCE_SYMBOLS = {
   BTC: 'BTC/USDT',
@@ -111,7 +111,9 @@ interface OhlcvCapableExchange {
 }
 
 const cryptoPriceCache = new Map<number, CryptoPricesAtTime>();
+const cryptoPriceFetches = new Map<number, Promise<void>>();
 let exchangePromise: Promise<OhlcvCapableExchange> | undefined;
+let lastKnownCryptoPrices = emptyCryptoPrices();
 
 export class StructuredLogger {
   constructor(private readonly baseOptions: LoggerOptions = {}) {}
@@ -214,7 +216,7 @@ export class StructuredLogger {
 export class TradeLogger {
   async ensureReady(): Promise<string> {
     await ensureLogsDirectory();
-    return LOGS_DIRECTORY;
+    return getLogsDirectory();
   }
 
   async logTrade(input: TradeLogInput): Promise<TradeLogRecord> {
@@ -263,8 +265,9 @@ export class TradeLogger {
 }
 
 export async function ensureLogsDirectory(): Promise<string> {
-  await mkdir(LOGS_DIRECTORY, { recursive: true });
-  return LOGS_DIRECTORY;
+  const directory = getLogsDirectory();
+  await mkdir(directory, { recursive: true });
+  return directory;
 }
 
 export async function getCryptoPrices(timestampMs: number): Promise<CryptoPricesAtTime> {
@@ -274,32 +277,8 @@ export async function getCryptoPrices(timestampMs: number): Promise<CryptoPrices
     return cached;
   }
 
-  try {
-    const exchange = await getBinanceExchange();
-    const entries = await Promise.all(
-      (Object.entries(BINANCE_SYMBOLS) as Array<[CryptoSymbol, string]>).map(
-        async ([symbolKey, symbol]) => {
-          const price = await fetchCandleClose(exchange, symbol, minuteBucket);
-          return [symbolKey, price] as const;
-        }
-      )
-    );
-
-    const snapshot = Object.fromEntries(entries) as CryptoPricesAtTime;
-    cryptoPriceCache.set(minuteBucket, snapshot);
-    pruneOldPriceCache(minuteBucket);
-    return snapshot;
-  } catch (error: any) {
-    logger.warn('Could not fetch CCXT crypto prices', {
-      timestampMs,
-      message: error?.message || 'Unknown error',
-    });
-
-    const fallback = emptyCryptoPrices();
-    cryptoPriceCache.set(minuteBucket, fallback);
-    pruneOldPriceCache(minuteBucket);
-    return fallback;
-  }
+  scheduleCryptoPriceFetch(minuteBucket);
+  return lastKnownCryptoPrices;
 }
 
 async function appendToJsonl(
@@ -308,7 +287,7 @@ async function appendToJsonl(
   timestampMs: number
 ): Promise<void> {
   const filePath = path.join(
-    LOGS_DIRECTORY,
+    getLogsDirectory(),
     `${prefix}_${new Date(timestampMs).toISOString().slice(0, 10)}.jsonl`
   );
   await appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf8');
@@ -377,6 +356,51 @@ function pruneOldPriceCache(latestBucket: number): void {
   }
 }
 
+function scheduleCryptoPriceFetch(minuteBucket: number): void {
+  if (cryptoPriceCache.has(minuteBucket) || cryptoPriceFetches.has(minuteBucket)) {
+    return;
+  }
+
+  const task = (async () => {
+    try {
+      const exchange = await getBinanceExchange();
+      const entries = await Promise.all(
+        (Object.entries(BINANCE_SYMBOLS) as Array<[CryptoSymbol, string]>).map(
+          async ([symbolKey, symbol]) => {
+            const price = await fetchCandleClose(exchange, symbol, minuteBucket);
+            return [symbolKey, price] as const;
+          }
+        )
+      );
+
+      const snapshot = Object.fromEntries(entries) as CryptoPricesAtTime;
+      cryptoPriceCache.set(minuteBucket, snapshot);
+      lastKnownCryptoPrices = snapshot;
+      pruneOldPriceCache(minuteBucket);
+      return;
+    } catch (error: any) {
+      logger.warn('Could not fetch CCXT crypto prices', {
+        timestampMs: minuteBucket,
+        message: error?.message || 'Unknown error',
+      });
+
+      if (!cryptoPriceCache.has(minuteBucket)) {
+        cryptoPriceCache.set(minuteBucket, lastKnownCryptoPrices);
+      }
+      pruneOldPriceCache(minuteBucket);
+    } finally {
+      cryptoPriceFetches.delete(minuteBucket);
+    }
+  })();
+
+  cryptoPriceFetches.set(minuteBucket, task);
+  void task;
+}
+
+function getLogsDirectory(): string {
+  return path.resolve(process.cwd(), config.logging.directory);
+}
+
 function emptyCryptoPrices(): CryptoPricesAtTime {
   return {
     BTC: 0,
@@ -388,11 +412,6 @@ function emptyCryptoPrices(): CryptoPricesAtTime {
 
 function safeNumberOrNull(value: number | null): number | null {
   return value === null || !Number.isFinite(value) ? null : value;
-}
-
-function roundTo(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  return Math.round((Number.isFinite(value) ? value : 0) * factor) / factor;
 }
 
 export const logger = new StructuredLogger();

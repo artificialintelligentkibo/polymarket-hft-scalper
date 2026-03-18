@@ -8,6 +8,7 @@ import type {
   PositionSnapshot,
 } from './position-manager.js';
 import type { StrategySignal } from './strategy-types.js';
+import { OUTCOMES } from './utils.js';
 
 export interface RiskAssessment {
   snapshot: PositionSnapshot;
@@ -30,8 +31,8 @@ export class RiskManager {
 
     positionManager.setSlotEndsAt(market.endTime);
     positionManager.markToMarket({
-      YES: orderbook.yes.bestBid ?? orderbook.yes.midPrice,
-      NO: orderbook.no.bestBid ?? orderbook.no.midPrice,
+      YES: orderbook.yes.midPrice ?? orderbook.yes.bestBid,
+      NO: orderbook.no.midPrice ?? orderbook.no.bestBid,
     });
 
     const forcedSignals: StrategySignal[] = [];
@@ -40,7 +41,7 @@ export class RiskManager {
       forcedSignals.push(this.fromBoundaryCorrection(boundary, market, orderbook));
     }
 
-    for (const outcome of ['YES', 'NO'] as Outcome[]) {
+    for (const outcome of OUTCOMES as readonly Outcome[]) {
       const exit = positionManager.getExitSignal(outcome, now, limits);
       if (exit) {
         forcedSignals.push(this.fromExitSignal(exit, market, orderbook));

@@ -1,6 +1,5 @@
 import dotenv from 'dotenv';
-
-dotenv.config();
+import { parseBooleanLoose, sanitizeConditionIds } from './utils.js';
 
 export type AuthMode = 'EOA' | 'PROXY';
 export type SignatureType = 0 | 1 | 2;
@@ -107,17 +106,13 @@ const DEFAULT_WHITELIST_CONDITION_IDS = [
   '0x5a8f6fb58fbc41595923b86b8f04f6955eb440cbf2b7e28091ddeb3e7843d953',
   '0xa2cad512d328f85d05bbc659509eb9a51ee6671cfabf8535440d43ff03a92bd9',
   '0x5d09131387b023b28ba95c5b27647dd31a5db413b75fb0c5309f9e11746d6112',
-  '0x16822849127587408787308210005791098679610832512872612902331299021053059486007',
-  '0x65774124778891553763075030217533414780319313603818995857791701704075590235276',
-  '0x84498025047147047075869954316374936502964736755858953320369252666584181295906',
 ] as const;
 
-function parseBoolean(value: string | undefined, fallback: boolean): boolean {
-  if (value === undefined || value.trim() === '') {
-    return fallback;
-  }
+let dotenvLoaded = false;
+let configCache: AppConfig | undefined;
 
-  return value.trim().toLowerCase() === 'true';
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  return parseBooleanLoose(value, fallback);
 }
 
 function parseFloatOrDefault(value: string | undefined, fallback: string): number {
@@ -131,14 +126,14 @@ function parseIntOrDefault(value: string | undefined, fallback: string): number 
 }
 
 function parseCsv(value?: string): string[] {
-  if (!value) {
-    return [];
-  }
-
-  return value
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+  return sanitizeConditionIds(
+    !value
+      ? []
+      : value
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+  );
 }
 
 function parseAuthMode(value?: string): AuthMode {
@@ -327,7 +322,32 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   };
 }
 
-export const config: AppConfig = deepFreeze(createConfig()) as AppConfig;
+export function getConfig(): AppConfig {
+  if (!configCache) {
+    if (!dotenvLoaded) {
+      dotenv.config();
+      dotenvLoaded = true;
+    }
+
+    configCache = deepFreeze(createConfig()) as AppConfig;
+  }
+
+  return configCache;
+}
+
+export function resetConfigCache(): void {
+  configCache = undefined;
+  dotenvLoaded = false;
+}
+
+export const config: AppConfig = new Proxy({} as AppConfig, {
+  get(_target, property, receiver) {
+    return Reflect.get(getConfig() as object, property, receiver);
+  },
+  has(_target, property) {
+    return property in getConfig();
+  },
+});
 
 export function validateConfig(candidate: AppConfig = config): void {
   if (!isDryRunMode(candidate) && !candidate.signerPrivateKey) {

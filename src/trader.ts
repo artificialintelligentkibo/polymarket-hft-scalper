@@ -10,6 +10,7 @@ import {
 } from './config.js';
 import { logger } from './logger.js';
 import type { Outcome } from './clob-fetcher.js';
+import { roundTo } from './utils.js';
 
 interface ApiCredentials {
   apiKey: string;
@@ -31,6 +32,8 @@ interface MarketMetadata {
   feeRateBps: number;
   updatedAt: number;
 }
+
+type ClobChainId = ConstructorParameters<typeof ClobClient>[1];
 
 export interface PlaceOrderRequest {
   marketId: string;
@@ -55,7 +58,7 @@ export interface TradeExecutionResult {
   price: number;
   notionalUsd: number;
   simulation: boolean;
-  wasMaker: boolean;
+  wasMaker: boolean | null;
   postOnly: boolean;
   orderType: OrderMode;
 }
@@ -157,7 +160,7 @@ export class Trader {
         price: validatedPrice,
         notionalUsd,
         simulation: true,
-        wasMaker: postOnly,
+        wasMaker: null,
         postOnly,
         orderType,
       };
@@ -170,7 +173,7 @@ export class Trader {
     const orderTypeValue = toOrderType(orderType);
     const side = request.side === 'BUY' ? Side.BUY : Side.SELL;
     const orderOptions = {
-      tickSize: metadata.tickSizeStr as any,
+      tickSize: metadata.tickSizeStr,
       negRisk: metadata.negRisk,
     };
 
@@ -229,7 +232,7 @@ export class Trader {
       price: validatedPrice,
       notionalUsd,
       simulation: false,
-      wasMaker: postOnly,
+      wasMaker: null,
       postOnly,
       orderType,
     };
@@ -265,7 +268,7 @@ export class Trader {
   private createUnauthenticatedClient(): ClobClient {
     return new ClobClient(
       this.runtimeConfig.clob.host,
-      this.runtimeConfig.chainId as any,
+      this.runtimeConfig.chainId as ClobChainId,
       this.signerWallet,
       undefined,
       undefined,
@@ -277,7 +280,7 @@ export class Trader {
   private createAuthenticatedClient(creds: ApiCredentials): ClobClient {
     return new ClobClient(
       this.runtimeConfig.clob.host,
-      this.runtimeConfig.chainId as any,
+      this.runtimeConfig.chainId as ClobChainId,
       this.signerWallet,
       {
         key: creds.apiKey,
@@ -363,8 +366,16 @@ export class Trader {
     const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.signerWallet);
     const ctf = new ethers.Contract(this.runtimeConfig.contracts.ctf, this.ctfAbi, this.signerWallet);
     const decimals = await usdc.decimals();
+    const boundedApprovalUsd = roundTo(
+      Math.max(
+        (this.runtimeConfig.strategy.maxNetYes + this.runtimeConfig.strategy.maxNetNo) * 1.1,
+        this.runtimeConfig.strategy.capitalReferenceShares,
+        100
+      ),
+      2
+    );
     const approvalAmount = ethers.utils.parseUnits(
-      String(Math.max(this.runtimeConfig.strategy.maxShares * 0.99, 50)),
+      String(boundedApprovalUsd),
       decimals
     );
     const gasOverrides = await this.getGasOverrides();
@@ -382,7 +393,7 @@ export class Trader {
       }
 
       logger.info('Approving USDC.e spender', spender);
-      const tx = await usdc.approve(spender.address, ethers.constants.MaxUint256, gasOverrides);
+      const tx = await usdc.approve(spender.address, approvalAmount, gasOverrides);
       await tx.wait();
     }
 
@@ -528,9 +539,4 @@ function toOrderType(orderType: OrderMode): OrderType {
     return OrderType.FAK;
   }
   return OrderType.GTC;
-}
-
-function roundTo(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
 }

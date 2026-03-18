@@ -1,6 +1,17 @@
 import { EventEmitter } from 'node:events';
 import { config } from './config.js';
 import { logger } from './logger.js';
+import {
+  asRecord,
+  asString,
+  normalizeTimestampString,
+  parseBooleanLoose,
+  parseStringArray,
+  pruneMapEntries,
+  pruneSetEntries,
+  safeNumber,
+  type JsonRecord,
+} from './utils.js';
 
 export interface MarketCandidate {
   marketId: string;
@@ -21,8 +32,6 @@ export interface MarketCandidate {
   acceptingOrders: boolean;
 }
 
-type JsonRecord = Record<string, unknown>;
-
 interface BinaryTokenSet {
   yesTokenId: string;
   noTokenId: string;
@@ -30,9 +39,14 @@ interface BinaryTokenSet {
   noLabel: string;
 }
 
+const MAX_TRACKED_SLOTS = 2_048;
+
 export class MarketMonitor extends EventEmitter {
   private readonly seenSlots = new Map<string, MarketCandidate>();
   private readonly reportedSlots = new Set<string>();
+  private readonly whitelistConditionIds = new Set(
+    config.WHITELIST_CONDITION_IDS.map((conditionId) => conditionId.toLowerCase())
+  );
 
   constructor() {
     super();
@@ -107,12 +121,13 @@ export class MarketMonitor extends EventEmitter {
 
   private normalizeMarketCandidate(record: JsonRecord): MarketCandidate | null {
     const acceptingOrders =
-      parseBoolean(record.acceptingOrders, true) && !parseBoolean(record.closed, false);
+      parseBooleanLoose(record.acceptingOrders, true) &&
+      !parseBooleanLoose(record.closed, false);
     const active =
-      parseBoolean(record.active, true) &&
-      !parseBoolean(record.archived, false) &&
-      !parseBoolean(record.closed, false) &&
-      !parseBoolean(record.resolved, false);
+      parseBooleanLoose(record.active, true) &&
+      !parseBooleanLoose(record.archived, false) &&
+      !parseBooleanLoose(record.closed, false) &&
+      !parseBooleanLoose(record.resolved, false);
 
     if (!active) {
       return null;
@@ -183,10 +198,7 @@ export class MarketMonitor extends EventEmitter {
       return true;
     }
 
-    const allowed = new Set(
-      config.WHITELIST_CONDITION_IDS.map((conditionId) => conditionId.toLowerCase())
-    );
-    return allowed.has(candidate.conditionId.toLowerCase());
+    return this.whitelistConditionIds.has(candidate.conditionId.toLowerCase());
   }
 
   private emitSlotEndedEvents(candidates: MarketCandidate[]): void {
@@ -195,6 +207,7 @@ export class MarketMonitor extends EventEmitter {
     for (const candidate of candidates) {
       const slotKey = getSlotKey(candidate);
       activeKeys.add(slotKey);
+      this.seenSlots.delete(slotKey);
       this.seenSlots.set(slotKey, candidate);
 
       if (this.isSlotEndingSoon(candidate) && !this.reportedSlots.has(slotKey)) {
@@ -215,6 +228,9 @@ export class MarketMonitor extends EventEmitter {
 
       this.seenSlots.delete(slotKey);
     }
+
+    pruneMapEntries(this.seenSlots, MAX_TRACKED_SLOTS);
+    pruneSetEntries(this.reportedSlots, MAX_TRACKED_SLOTS);
   }
 
   private isSlotEndingSoon(candidate: MarketCandidate): boolean {
@@ -341,61 +357,5 @@ function computeDurationMinutes(startTime: string | null, endTime: string | null
 }
 
 function normalizeTimestamp(value: unknown): string | null {
-  if (typeof value !== 'string' || !value.trim()) {
-    return null;
-  }
-
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
-}
-
-function parseStringArray(value: unknown): string[] {
-  if (Array.isArray(value)) {
-    return value.map((entry) => String(entry));
-  }
-
-  if (typeof value === 'string' && value.trim()) {
-    try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) {
-        return parsed.map((entry) => String(entry));
-      }
-    } catch {
-      return [];
-    }
-  }
-
-  return [];
-}
-
-function parseBoolean(value: unknown, fallback: boolean): boolean {
-  if (typeof value === 'boolean') {
-    return value;
-  }
-  if (typeof value === 'string') {
-    return value.trim().toLowerCase() === 'true';
-  }
-  return fallback;
-}
-
-function safeNumber(value: unknown): number {
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : 0;
-  }
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  return 0;
-}
-
-function asString(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function asRecord(value: unknown): JsonRecord | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return null;
-  }
-  return value as JsonRecord;
+  return normalizeTimestampString(value);
 }

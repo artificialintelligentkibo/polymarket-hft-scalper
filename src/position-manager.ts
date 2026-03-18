@@ -1,4 +1,5 @@
 import type { Outcome } from './clob-fetcher.js';
+import { roundTo } from './utils.js';
 
 export type TradeSide = 'BUY' | 'SELL';
 
@@ -343,9 +344,4 @@ export class PositionManager {
       lastFillAt: null,
     };
   }
-}
-
-function roundTo(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
 }

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { computeCombinedBookMetrics, type MarketOrderbookSnapshot, type Outcome } from '../src/clob-fetcher.js';
 import { config } from '../src/config.js';
+import { buildFlattenSignals } from '../src/flatten-signals.js';
 import { logger, TradeLogger } from '../src/logger.js';
 import type { MarketCandidate } from '../src/monitor.js';
 import { getSlotKey } from '../src/monitor.js';
@@ -10,6 +11,12 @@ import { PositionManager } from '../src/position-manager.js';
 import { RiskManager } from '../src/risk-manager.js';
 import { SignalScalper } from '../src/signal-scalper.js';
 import type { SignalType, StrategySignal } from '../src/strategy-types.js';
+import {
+  asString,
+  normalizeTimestampString,
+  roundTo,
+  toFiniteNumberOrNull,
+} from '../src/utils.js';
 
 interface RawBacktestSample {
   timestampMs: number;
@@ -208,7 +215,7 @@ export async function runBacktest(
           realizedPnl: after.realizedPnl,
           unrealizedPnl: after.unrealizedPnl,
           totalPnl: after.totalPnl,
-          wasMaker: signal.urgency !== 'cross',
+          wasMaker: null,
           simulationMode: true,
           dryRun: true,
           testMode: true,
@@ -234,7 +241,13 @@ export async function runBacktest(
       continue;
     }
 
-    for (const signal of buildForcedClosingSignals(market, orderbook, snapshot)) {
+    for (const signal of buildFlattenSignals({
+      market,
+      orderbook,
+      snapshot,
+      signalType: 'SLOT_FLATTEN',
+      reasonPrefix: 'Backtest final',
+    })) {
       const before = manager.getSnapshot();
       const executionPrice = resolveBacktestPrice(signal, orderbook);
       if (executionPrice === null || executionPrice <= 0) {
@@ -369,9 +382,10 @@ function normalizeRawSample(record: Record<string, unknown>): RawBacktestSample 
   }
 
   const liquidityUsd =
-    toNumberOrNull(record.liquidity_usd ?? record.liquidity) ?? config.strategy.minLiquidityUsd;
-  const bestBid = toNumberOrNull(record.best_bid ?? record.bestBid);
-  const bestAsk = toNumberOrNull(record.best_ask ?? record.bestAsk);
+    toFiniteNumberOrNull(record.liquidity_usd ?? record.liquidity) ??
+    config.strategy.minLiquidityUsd;
+  const bestBid = toFiniteNumberOrNull(record.best_bid ?? record.bestBid);
+  const bestAsk = toFiniteNumberOrNull(record.best_ask ?? record.bestAsk);
 
   return {
     timestampMs,
@@ -383,15 +397,21 @@ function normalizeRawSample(record: Record<string, unknown>): RawBacktestSample 
     slotEnd: normalizeTimeString(record.slot_end ?? record.slotEnd),
     liquidityUsd,
     outcome,
-    tokenPrice: toNumberOrNull(record.token_price ?? record.tokenPrice),
-    midPrice: toNumberOrNull(record.mid_price_orderbook ?? record.mid_price ?? record.midPrice),
+    tokenPrice: toFiniteNumberOrNull(record.token_price ?? record.tokenPrice),
+    midPrice: toFiniteNumberOrNull(
+      record.mid_price_orderbook ?? record.mid_price ?? record.midPrice
+    ),
     bestBid,
     bestAsk,
     depthSharesBid:
-      toNumberOrNull(record.depth_shares_bid ?? record.depthSharesBid ?? record.depth_shares) ??
+      toFiniteNumberOrNull(
+        record.depth_shares_bid ?? record.depthSharesBid ?? record.depth_shares
+      ) ??
       config.strategy.minShares,
     depthSharesAsk:
-      toNumberOrNull(record.depth_shares_ask ?? record.depthSharesAsk ?? record.depth_shares) ??
+      toFiniteNumberOrNull(
+        record.depth_shares_ask ?? record.depthSharesAsk ?? record.depth_shares
+      ) ??
       config.strategy.minShares,
   };
 }
@@ -504,76 +524,6 @@ function resolveBacktestPrice(
     return Math.max(book.bestBid ?? 0, signal.targetPrice ?? book.bestBid ?? 0);
   }
   return signal.targetPrice ?? book.bestAsk ?? book.bestBid;
-}
-
-function buildForcedClosingSignals(
-  market: MarketCandidate,
-  orderbook: MarketOrderbookSnapshot,
-  snapshot: ReturnType<PositionManager['getSnapshot']>
-): StrategySignal[] {
-  const signals: StrategySignal[] = [];
-
-  if (snapshot.yesShares > 0) {
-    signals.push({
-      marketId: market.marketId,
-      marketTitle: market.title,
-      signalType: 'SLOT_FLATTEN',
-      priority: 1000,
-      action: 'SELL',
-      outcome: 'YES',
-      outcomeIndex: 0,
-      shares: snapshot.yesShares,
-      targetPrice: orderbook.yes.bestBid ?? orderbook.yes.midPrice,
-      referencePrice: orderbook.yes.bestBid ?? orderbook.yes.midPrice,
-      tokenPrice: orderbook.yes.lastTradePrice,
-      midPrice: orderbook.yes.midPrice,
-      fairValue: orderbook.yes.midPrice,
-      edgeAmount: snapshot.yesShares,
-      combinedBid: orderbook.combined.combinedBid,
-      combinedAsk: orderbook.combined.combinedAsk,
-      combinedMid: orderbook.combined.combinedMid,
-      combinedDiscount: orderbook.combined.combinedDiscount,
-      combinedPremium: orderbook.combined.combinedPremium,
-      fillRatio: 1,
-      capitalClamp: 1,
-      priceMultiplier: 1,
-      urgency: 'cross',
-      reduceOnly: true,
-      reason: 'Backtest final flatten for YES inventory',
-    });
-  }
-
-  if (snapshot.noShares > 0) {
-    signals.push({
-      marketId: market.marketId,
-      marketTitle: market.title,
-      signalType: 'SLOT_FLATTEN',
-      priority: 1000,
-      action: 'SELL',
-      outcome: 'NO',
-      outcomeIndex: 1,
-      shares: snapshot.noShares,
-      targetPrice: orderbook.no.bestBid ?? orderbook.no.midPrice,
-      referencePrice: orderbook.no.bestBid ?? orderbook.no.midPrice,
-      tokenPrice: orderbook.no.lastTradePrice,
-      midPrice: orderbook.no.midPrice,
-      fairValue: orderbook.no.midPrice,
-      edgeAmount: snapshot.noShares,
-      combinedBid: orderbook.combined.combinedBid,
-      combinedAsk: orderbook.combined.combinedAsk,
-      combinedMid: orderbook.combined.combinedMid,
-      combinedDiscount: orderbook.combined.combinedDiscount,
-      combinedPremium: orderbook.combined.combinedPremium,
-      fillRatio: 1,
-      capitalClamp: 1,
-      priceMultiplier: 1,
-      urgency: 'cross',
-      reduceOnly: true,
-      reason: 'Backtest final flatten for NO inventory',
-    });
-  }
-
-  return signals;
 }
 
 function getManager(
@@ -753,31 +703,7 @@ function normalizeTimestamp(value: unknown): number | null {
 }
 
 function normalizeTimeString(value: unknown): string | null {
-  if (typeof value !== 'string' || !value.trim()) {
-    return null;
-  }
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
-}
-
-function toNumberOrNull(value: unknown): number | null {
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : null;
-  }
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function asString(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function roundTo(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
+  return normalizeTimestampString(value);
 }
 
 const isDirectRun =

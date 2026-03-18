@@ -1,8 +1,15 @@
 import { ClobClient } from '@polymarket/clob-client';
 import WebSocket from 'ws';
-import { config } from './config.js';
+import { config, type AppConfig } from './config.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
+import {
+  asRecord,
+  asString,
+  roundTo,
+  toFiniteNumberOrNull,
+  type JsonRecord,
+} from './utils.js';
 
 export type Outcome = 'YES' | 'NO';
 
@@ -48,21 +55,29 @@ export interface MarketOrderbookSnapshot {
   combined: CombinedBookMetrics;
 }
 
-interface TokenMarketState extends TokenBookSnapshot {}
+type ClobChainId = ConstructorParameters<typeof ClobClient>[1];
 
-type JsonRecord = Record<string, unknown>;
+const WS_CONNECT_TIMEOUT_MS = 10_000;
+const WS_RECONNECT_BASE_MS = 1_000;
+const WS_RECONNECT_MAX_MS = 30_000;
 
 export class ClobFetcher {
   private readonly client: ClobClient;
-  private readonly states = new Map<string, TokenMarketState>();
+  private readonly states = new Map<string, TokenBookSnapshot>();
   private readonly subscribedAssets = new Set<string>();
   private ws: WebSocket | null = null;
   private connectPromise: Promise<void> | undefined;
   private isConnected = false;
   private pingInterval: NodeJS.Timeout | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempt = 0;
+  private manualClose = false;
 
-  constructor() {
-    this.client = new ClobClient(config.clob.host, config.chainId as any);
+  constructor(private readonly runtimeConfig: AppConfig = config) {
+    this.client = new ClobClient(
+      runtimeConfig.clob.host,
+      runtimeConfig.chainId as ClobChainId
+    );
   }
 
   async subscribeAssets(tokenIds: string[]): Promise<void> {
@@ -75,8 +90,16 @@ export class ClobFetcher {
       this.subscribedAssets.add(tokenId);
     }
 
-    await this.ensureConnected();
-    this.sendSubscription(nextIds);
+    if (this.isConnected) {
+      this.sendSubscription(nextIds);
+      return;
+    }
+
+    void this.ensureConnected().catch((error: any) => {
+        logger.warn('CLOB WebSocket subscribe failed, REST fallback remains active', {
+          message: error?.message || 'Unknown error',
+        });
+      });
   }
 
   async getMarketSnapshot(market: MarketCandidate): Promise<MarketOrderbookSnapshot> {
@@ -98,12 +121,12 @@ export class ClobFetcher {
   }
 
   close(): void {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
+    this.manualClose = true;
+    this.clearReconnectTimer();
+    this.stopPingInterval();
 
     if (this.ws) {
+      this.ws.removeAllListeners();
       this.ws.close();
       this.ws = null;
     }
@@ -115,7 +138,10 @@ export class ClobFetcher {
     const cached = this.states.get(tokenId);
     if (cached) {
       const updatedMs = Date.parse(cached.updatedAt);
-      if (Number.isFinite(updatedMs) && Date.now() - updatedMs < config.clob.snapshotRefreshMs) {
+      if (
+        Number.isFinite(updatedMs) &&
+        Date.now() - updatedMs < this.runtimeConfig.clob.snapshotRefreshMs
+      ) {
         return cached;
       }
     }
@@ -129,8 +155,12 @@ export class ClobFetcher {
       this.fetchLastTradePrice(tokenId),
     ]);
 
-    const normalized = normalizeTokenBook(tokenId, orderbook, config.clob.bookDepthLevels);
-    const nextState: TokenMarketState = {
+    const normalized = normalizeTokenBook(
+      tokenId,
+      orderbook,
+      this.runtimeConfig.clob.bookDepthLevels
+    );
+    const nextState: TokenBookSnapshot = {
       ...normalized,
       lastTradePrice: lastTrade.price ?? normalized.lastTradePrice,
       lastTradeSize: lastTrade.size ?? normalized.lastTradeSize,
@@ -148,11 +178,11 @@ export class ClobFetcher {
     try {
       const response = await (this.client as any).getLastTradePrice?.(tokenId);
       const record = asRecord(response);
-      const price = toNumber(record?.price ?? response);
-      const size = toNumber(record?.size);
+      const price = toFiniteNumberOrNull(record?.price ?? response);
+      const size = toFiniteNumberOrNull(record?.size);
       return {
-        price: Number.isFinite(price) && price > 0 ? price : null,
-        size: Number.isFinite(size) && size > 0 ? size : null,
+        price: price && price > 0 ? price : null,
+        size: size && size > 0 ? size : null,
       };
     } catch {
       return { price: null, size: null };
@@ -174,47 +204,86 @@ export class ClobFetcher {
   }
 
   private async connect(): Promise<void> {
+    this.manualClose = false;
+    this.clearReconnectTimer();
+
     await new Promise<void>((resolve, reject) => {
-      try {
-        this.ws = new WebSocket(config.clob.wsUrl);
+      let settled = false;
+      const ws = new WebSocket(this.runtimeConfig.clob.wsUrl);
+      this.ws = ws;
 
-        this.ws.on('open', () => {
-          this.isConnected = true;
-          this.startPingInterval();
-          if (this.subscribedAssets.size > 0) {
-            this.sendSubscription(Array.from(this.subscribedAssets), true);
-          }
-          resolve();
-        });
+      const timeoutId = setTimeout(() => {
+        try {
+          ws.terminate();
+        } catch {
+          ws.close();
+        }
+        finish(new Error('WebSocket connection timeout'));
+      }, WS_CONNECT_TIMEOUT_MS);
+      timeoutId.unref?.();
 
-        this.ws.on('message', (payload: WebSocket.Data) => {
-          this.handleMessage(payload.toString());
-        });
+      const finish = (error?: Error): void => {
+        if (settled) {
+          return;
+        }
 
-        this.ws.on('close', () => {
-          this.isConnected = false;
-          this.ws = null;
-          if (this.pingInterval) {
-            clearInterval(this.pingInterval);
-            this.pingInterval = null;
-          }
-        });
+        settled = true;
+        clearTimeout(timeoutId);
 
-        this.ws.on('error', (error: Error) => {
+        if (error) {
           reject(error);
+          return;
+        }
+
+        resolve();
+      };
+
+      ws.on('open', () => {
+        this.isConnected = true;
+        this.reconnectAttempt = 0;
+        this.startPingInterval();
+        if (this.subscribedAssets.size > 0) {
+          this.sendSubscription(Array.from(this.subscribedAssets), true);
+        }
+        finish();
+      });
+
+      ws.on('message', (payload: WebSocket.Data) => {
+        this.handleMessage(payload.toString());
+      });
+
+      ws.on('close', (code, reasonBuffer) => {
+        const reason =
+          typeof reasonBuffer === 'string'
+            ? reasonBuffer
+            : reasonBuffer?.toString?.() || 'Unknown reason';
+        const wasConnected = this.isConnected;
+
+        this.handleDisconnect();
+
+        if (!settled) {
+          finish(new Error(`WebSocket closed before ready (${code}: ${reason})`));
+          return;
+        }
+
+        if (!this.manualClose && this.subscribedAssets.size > 0) {
+          logger.warn('CLOB WebSocket closed, scheduling reconnect', {
+            code,
+            reason,
+            wasConnected,
+          });
+          this.scheduleReconnect();
+        }
+      });
+
+      ws.on('error', (error: Error) => {
+        logger.warn('CLOB WebSocket error', {
+          message: error.message,
         });
 
-        setTimeout(() => {
-          if (!this.isConnected) {
-            reject(new Error('WebSocket connection timeout'));
-          }
-        }, 10_000);
-      } catch (error) {
-        reject(error);
-      }
-    }).catch((error: any) => {
-      logger.warn('CLOB WebSocket connection failed, REST fallback remains active', {
-        message: error?.message || 'Unknown error',
+        if (!settled) {
+          finish(error);
+        }
       });
     });
   }
@@ -224,13 +293,21 @@ export class ClobFetcher {
       return;
     }
 
-    this.ws.send(
-      JSON.stringify({
-        type: 'market',
-        assets_ids: tokenIds,
-        initial_dump: initialDump || config.clob.initialDump,
-      })
-    );
+    try {
+      this.ws.send(
+        JSON.stringify({
+          type: 'market',
+          assets_ids: tokenIds,
+          initial_dump: initialDump || this.runtimeConfig.clob.initialDump,
+        })
+      );
+    } catch (error: any) {
+      logger.warn('CLOB WebSocket subscription send failed', {
+        message: error?.message || 'Unknown error',
+      });
+      this.handleDisconnect();
+      this.scheduleReconnect();
+    }
   }
 
   private handleMessage(data: string): void {
@@ -277,23 +354,25 @@ export class ClobFetcher {
     }
 
     const existing = this.states.get(tokenId) ?? createEmptyState(tokenId);
-    const nextState: TokenMarketState = {
+    const nextState: TokenBookSnapshot = {
       ...existing,
       updatedAt: new Date().toISOString(),
       source: 'ws',
     };
 
     if (event === 'last_trade_price') {
-      const price = toNumber(message.price);
-      const size = toNumber(message.size);
-      nextState.lastTradePrice =
-        Number.isFinite(price) && price > 0 ? price : nextState.lastTradePrice;
-      nextState.lastTradeSize =
-        Number.isFinite(size) && size > 0 ? size : nextState.lastTradeSize;
+      const price = toFiniteNumberOrNull(message.price);
+      const size = toFiniteNumberOrNull(message.size);
+      nextState.lastTradePrice = price && price > 0 ? price : nextState.lastTradePrice;
+      nextState.lastTradeSize = size && size > 0 ? size : nextState.lastTradeSize;
     }
 
     if (message.bids || message.asks) {
-      const normalized = normalizeTokenBook(tokenId, message, config.clob.bookDepthLevels);
+      const normalized = normalizeTokenBook(
+        tokenId,
+        message,
+        this.runtimeConfig.clob.bookDepthLevels
+      );
       nextState.bids = normalized.bids;
       nextState.asks = normalized.asks;
       nextState.bestBid = normalized.bestBid;
@@ -329,6 +408,51 @@ export class ClobFetcher {
 
     this.pingInterval.unref?.();
   }
+
+  private stopPingInterval(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+  }
+
+  private handleDisconnect(): void {
+    this.isConnected = false;
+    this.stopPingInterval();
+    this.ws = null;
+  }
+
+  private scheduleReconnect(): void {
+    if (this.manualClose || this.reconnectTimer || this.connectPromise) {
+      return;
+    }
+
+    const delayMs = Math.min(
+      WS_RECONNECT_BASE_MS * 2 ** this.reconnectAttempt,
+      WS_RECONNECT_MAX_MS
+    );
+    this.reconnectAttempt += 1;
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.ensureConnected().catch((error: any) => {
+        logger.warn('CLOB WebSocket reconnect attempt failed', {
+          attempt: this.reconnectAttempt,
+          message: error?.message || 'Unknown error',
+        });
+        this.scheduleReconnect();
+      });
+    }, delayMs);
+
+    this.reconnectTimer.unref?.();
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
 }
 
 export function computeCombinedBookMetrics(
@@ -338,10 +462,8 @@ export function computeCombinedBookMetrics(
   const combinedBid = sumPair(yes.bestBid, no.bestBid);
   const combinedAsk = sumPair(yes.bestAsk, no.bestAsk);
   const combinedMid = sumPair(yes.midPrice, no.midPrice);
-  const combinedDiscount =
-    combinedAsk !== null ? roundTo(1 - combinedAsk, 6) : null;
-  const combinedPremium =
-    combinedBid !== null ? roundTo(combinedBid - 1, 6) : null;
+  const combinedDiscount = combinedAsk !== null ? roundTo(1 - combinedAsk, 6) : null;
+  const combinedPremium = combinedBid !== null ? roundTo(combinedBid - 1, 6) : null;
   const pairSpread =
     combinedAsk !== null && combinedBid !== null ? roundTo(combinedAsk - combinedBid, 6) : null;
 
@@ -401,7 +523,7 @@ export function normalizeTokenBook(
   };
 }
 
-function createEmptyState(tokenId: string): TokenMarketState {
+function createEmptyState(tokenId: string): TokenBookSnapshot {
   return {
     tokenId,
     bids: [],
@@ -441,12 +563,14 @@ function normalizeLevel(level: unknown): OrderbookLevel | null {
     return null;
   }
 
-  const price = toNumber(
-    record.price ?? record.p ?? record.rate ?? record.value ?? record.limit_price
-  );
-  const size = toNumber(
-    record.size ?? record.s ?? record.quantity ?? record.shares ?? record.amount
-  );
+  const price =
+    toFiniteNumberOrNull(
+      record.price ?? record.p ?? record.rate ?? record.value ?? record.limit_price
+    ) ?? Number.NaN;
+  const size =
+    toFiniteNumberOrNull(
+      record.size ?? record.s ?? record.quantity ?? record.shares ?? record.amount
+    ) ?? Number.NaN;
 
   if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) {
     return null;
@@ -472,30 +596,4 @@ function sumPair(left: number | null, right: number | null): number | null {
   }
 
   return roundTo(left + right, 6);
-}
-
-function toNumber(value: unknown): number {
-  if (typeof value === 'number') {
-    return value;
-  }
-  if (typeof value === 'string' && value.trim()) {
-    return Number.parseFloat(value);
-  }
-  return Number.NaN;
-}
-
-function roundTo(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
-}
-
-function asString(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function asRecord(value: unknown): JsonRecord | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return null;
-  }
-  return value as JsonRecord;
 }

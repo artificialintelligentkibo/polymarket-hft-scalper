@@ -4,6 +4,7 @@ import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
 import type { RiskAssessment } from './risk-manager.js';
 import type { StrategySignal } from './strategy-types.js';
+import { clamp, OUTCOMES, roundTo } from './utils.js';
 
 export interface SizeCalculationResult {
   shares: number;
@@ -69,13 +70,14 @@ export class SignalScalper {
     }
 
     const signals: StrategySignal[] = [];
-    for (const outcome of ['YES', 'NO'] as Outcome[]) {
+    for (const outcome of OUTCOMES as readonly Outcome[]) {
       if (riskAssessment.blockedOutcomes.has(outcome)) {
         continue;
       }
 
       const book = getBookForOutcome(orderbook, outcome);
       const bestAsk = book.bestAsk;
+      const fairValue = estimateFairValue(orderbook, outcome);
       if (bestAsk === null) {
         continue;
       }
@@ -112,7 +114,7 @@ export class SignalScalper {
           referencePrice: combinedAsk,
           tokenPrice: book.lastTradePrice ?? bestAsk,
           midPrice: book.midPrice,
-          fairValue: book.midPrice,
+          fairValue,
           edgeAmount: combinedDiscount,
           priceMultiplier: size.priceMultiplier,
           fillRatio: size.fillRatio,
@@ -135,11 +137,12 @@ export class SignalScalper {
   ): StrategySignal[] {
     const signals: StrategySignal[] = [];
 
-    for (const outcome of ['YES', 'NO'] as Outcome[]) {
+    for (const outcome of OUTCOMES as readonly Outcome[]) {
       const book = getBookForOutcome(orderbook, outcome);
       const bestAsk = book.bestAsk;
       const bestBid = book.bestBid;
       const openShares = positionManager.getShares(outcome);
+      const fairValue = estimateFairValue(orderbook, outcome);
 
       if (!riskAssessment.blockedOutcomes.has(outcome) && bestAsk !== null) {
         const edge = this.runtimeConfig.strategy.extremeBuyThreshold - bestAsk;
@@ -173,7 +176,7 @@ export class SignalScalper {
                 referencePrice: this.runtimeConfig.strategy.extremeBuyThreshold,
                 tokenPrice: book.lastTradePrice ?? bestAsk,
                 midPrice: book.midPrice,
-                fairValue: book.midPrice,
+                fairValue,
                 edgeAmount: edge,
                 priceMultiplier: size.priceMultiplier,
                 fillRatio: size.fillRatio,
@@ -217,7 +220,7 @@ export class SignalScalper {
                 referencePrice: this.runtimeConfig.strategy.extremeSellThreshold,
                 tokenPrice: book.lastTradePrice ?? bestBid,
                 midPrice: book.midPrice,
-                fairValue: book.midPrice,
+                fairValue,
                 edgeAmount: edge,
                 priceMultiplier: size.priceMultiplier,
                 fillRatio: size.fillRatio,
@@ -243,11 +246,11 @@ export class SignalScalper {
   ): StrategySignal[] {
     const signals: StrategySignal[] = [];
 
-    for (const outcome of ['YES', 'NO'] as Outcome[]) {
+    for (const outcome of OUTCOMES as readonly Outcome[]) {
       const book = getBookForOutcome(orderbook, outcome);
       const bestAsk = book.bestAsk;
       const bestBid = book.bestBid;
-      const fairValue = book.midPrice;
+      const fairValue = estimateFairValue(orderbook, outcome);
       const openShares = positionManager.getShares(outcome);
 
       if (
@@ -285,7 +288,7 @@ export class SignalScalper {
                 targetPrice: bestAsk,
                 referencePrice: fairValue,
                 tokenPrice: book.lastTradePrice ?? bestAsk,
-                midPrice: fairValue,
+                midPrice: book.midPrice,
                 fairValue,
                 edgeAmount: buyEdge,
                 priceMultiplier: size.priceMultiplier,
@@ -329,7 +332,7 @@ export class SignalScalper {
                 targetPrice: bestBid,
                 referencePrice: fairValue,
                 tokenPrice: book.lastTradePrice ?? bestBid,
-                midPrice: fairValue,
+                midPrice: book.midPrice,
                 fairValue,
                 edgeAmount: sellEdge,
                 priceMultiplier: size.priceMultiplier,
@@ -362,6 +365,7 @@ export class SignalScalper {
     const outcome = imbalanceState.dominantOutcome;
     const book = getBookForOutcome(orderbook, outcome);
     const bestBid = book.bestBid ?? book.midPrice;
+    const fairValue = estimateFairValue(orderbook, outcome);
     if (bestBid === null) {
       return [];
     }
@@ -399,7 +403,7 @@ export class SignalScalper {
         referencePrice: 0,
         tokenPrice: book.lastTradePrice ?? bestBid,
         midPrice: book.midPrice,
-        fairValue: book.midPrice,
+        fairValue,
         edgeAmount: imbalanceState.excess,
         priceMultiplier: size.priceMultiplier,
         fillRatio: size.fillRatio,
@@ -585,13 +589,53 @@ function getBookForOutcome(
   return outcome === 'YES' ? snapshot.yes : snapshot.no;
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
+function estimateFairValue(
+  snapshot: MarketOrderbookSnapshot,
+  outcome: Outcome
+): number | null {
+  const own = getBookForOutcome(snapshot, outcome);
+  const opposite = getBookForOutcome(snapshot, outcome === 'YES' ? 'NO' : 'YES');
+  const normalizedMid = normalizePairedFairValues(own.midPrice, opposite.midPrice);
+  if (normalizedMid) {
+    return outcome === 'YES' ? normalizedMid.left : normalizedMid.right;
+  }
+
+  const normalizedLastTrade = normalizePairedFairValues(
+    own.lastTradePrice,
+    opposite.lastTradePrice
+  );
+  if (normalizedLastTrade) {
+    return outcome === 'YES' ? normalizedLastTrade.left : normalizedLastTrade.right;
+  }
+
+  if (opposite.midPrice !== null) {
+    return roundTo(1 - opposite.midPrice, 6);
+  }
+
+  if (opposite.lastTradePrice !== null) {
+    return roundTo(1 - opposite.lastTradePrice, 6);
+  }
+
+  return null;
 }
 
-function roundTo(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
+function normalizePairedFairValues(
+  left: number | null,
+  right: number | null
+): { left: number; right: number } | null {
+  if (left === null || right === null) {
+    return null;
+  }
+
+  const total = left + right;
+  if (!Number.isFinite(total) || total <= 0) {
+    return null;
+  }
+
+  return {
+    left: roundTo(left / total, 6),
+    right: roundTo(right / total, 6),
+  };
 }
 
 function formatPrice(value: number): string {

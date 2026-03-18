@@ -1,3 +1,6 @@
+import { logger } from './logger.js';
+import { pruneMapEntries, roundTo } from './utils.js';
+
 export type SlotOutcome = 'Up' | 'Down';
 
 interface SlotResult {
@@ -12,6 +15,7 @@ interface SlotResult {
 }
 
 const slotResults = new Map<string, SlotResult>();
+const MAX_SLOT_RESULTS = 2_048;
 
 export function ensureSlotResult(
   slotKey: string,
@@ -40,6 +44,7 @@ export function ensureSlotResult(
   };
 
   slotResults.set(slotKey, created);
+  pruneMapEntries(slotResults, MAX_SLOT_RESULTS);
   return created;
 }
 
@@ -66,18 +71,30 @@ export function printSlotReport(slotKey?: string): void {
     ? [slotResults.get(slotKey)].filter((entry): entry is SlotResult => entry !== undefined)
     : Array.from(slotResults.values());
   const dayKey = rows[0]?.dayKey ?? getLocalDayKey(new Date());
+  const totalDayPnl = getTotalDayPnl(dayKey);
+  const tableRows = rows.map((entry) => ({
+    Slot: truncate(entry.marketTitle || entry.marketId),
+    Market: `${entry.marketId.slice(0, 12)}...`,
+    'Up PNL': entry.upPnl.toFixed(2),
+    'Down PNL': entry.downPnl.toFixed(2),
+    'NET PNL': entry.total.toFixed(2),
+  }));
 
   console.log('\n[slot-report] === SLOT REPORT ===');
-  console.table(
-    rows.map((entry) => ({
-      Slot: truncate(entry.marketTitle || entry.marketId),
-      Market: `${entry.marketId.slice(0, 12)}...`,
-      'Up PNL': entry.upPnl.toFixed(2),
-      'Down PNL': entry.downPnl.toFixed(2),
-      'NET PNL': entry.total.toFixed(2),
-    }))
-  );
-  console.log(`[slot-report] TOTAL DAY PNL (${dayKey}): $${getTotalDayPnl(dayKey).toFixed(2)}\n`);
+  console.table(tableRows);
+  console.log(`[slot-report] TOTAL DAY PNL (${dayKey}): $${totalDayPnl.toFixed(2)}\n`);
+  logger.event('slot-report', 'Slot report emitted', {
+    slotKey,
+    rows: rows.map((entry) => ({
+      slotKey: entry.slotKey,
+      marketId: entry.marketId,
+      marketTitle: entry.marketTitle,
+      upPnl: roundTo(entry.upPnl, 4),
+      downPnl: roundTo(entry.downPnl, 4),
+      netPnl: roundTo(entry.total, 4),
+    })),
+    totalDayPnl: roundTo(totalDayPnl, 4),
+  });
 }
 
 export function getTotalDayPnl(dayKey = getLocalDayKey(new Date())): number {

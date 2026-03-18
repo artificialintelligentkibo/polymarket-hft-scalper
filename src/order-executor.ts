@@ -4,6 +4,7 @@ import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import type { StrategySignal } from './strategy-types.js';
 import { Trader, type TradeExecutionResult } from './trader.js';
+import { roundTo, sleep } from './utils.js';
 
 export interface OrderExecutionReport extends TradeExecutionResult {
   attemptCount: number;
@@ -71,7 +72,7 @@ export class OrderExecutor {
         });
 
         if (attempt < this.runtimeConfig.trading.retryAttempts) {
-          await sleep(150 * attempt);
+          await sleep(Math.min(150 * 2 ** (attempt - 1), 2_000));
         }
       }
     }
@@ -182,19 +183,11 @@ function resolveOrderType(signal: StrategySignal, runtimeConfig: AppConfig): Ord
 }
 
 function inferTickSize(book: TokenBookSnapshot, fallbackPrice: number): number {
-  const levels = [...book.bids, ...book.asks];
-  const differences: number[] = [];
-
-  for (let index = 1; index < levels.length; index += 1) {
-    const previous = levels[index - 1];
-    const current = levels[index];
-    const difference = Math.abs(current.price - previous.price);
-    if (difference > 0) {
-      differences.push(difference);
-    }
-  }
-
-  const minDifference = Math.min(...differences.filter((value) => Number.isFinite(value) && value > 0));
+  const bidTick = inferSideTick(book.bids);
+  const askTick = inferSideTick(book.asks);
+  const minDifference = Math.min(
+    ...[bidTick, askTick].filter((value): value is number => Number.isFinite(value) && value > 0)
+  );
   if (Number.isFinite(minDifference) && minDifference > 0) {
     return roundTo(minDifference, 6);
   }
@@ -206,11 +199,22 @@ function inferTickSize(book: TokenBookSnapshot, fallbackPrice: number): number {
   return 0.005;
 }
 
-function roundTo(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
-}
+function inferSideTick(levels: OrderbookLevel[]): number {
+  if (levels.length <= 1) {
+    return Number.NaN;
+  }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  const sorted = [...levels].sort((left, right) => left.price - right.price);
+  const differences: number[] = [];
+
+  for (let index = 1; index < sorted.length; index += 1) {
+    const difference = Math.abs(sorted[index].price - sorted[index - 1].price);
+    if (difference > 0) {
+      differences.push(difference);
+    }
+  }
+
+  return Math.min(
+    ...differences.filter((value) => Number.isFinite(value) && value > 0)
+  );
 }

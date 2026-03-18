@@ -1,6 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
 import { config, isDryRunMode, validateConfig } from './config.js';
+import { buildFlattenSignals } from './flatten-signals.js';
 import { logger, TradeLogger } from './logger.js';
 import { MarketMonitor, getSlotKey, type MarketCandidate } from './monitor.js';
 import { OrderExecutor } from './order-executor.js';
@@ -9,6 +10,9 @@ import { RiskManager } from './risk-manager.js';
 import { SignalScalper } from './signal-scalper.js';
 import { ensureSlotResult, printSlotReport, recordTrade } from './slot-reporter.js';
 import type { StrategySignal } from './strategy-types.js';
+import { pruneSetEntries, roundTo, sleep } from './utils.js';
+
+const MAX_TRACKED_SLOT_REPORTS = 2_048;
 
 class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
@@ -30,6 +34,7 @@ class MarketMakerRuntime {
       const slotKey = getSlotKey(market);
       ensureSlotResult(slotKey, market.marketId, market.title);
       this.pendingSlotReports.add(slotKey);
+      this.pruneSlotReportState();
     });
   }
 
@@ -151,7 +156,17 @@ class MarketMakerRuntime {
     }
 
     for (const signal of signals) {
-      await this.executeSignal(market, orderbook, positionManager, signal, slotKey);
+      try {
+        await this.executeSignal(market, orderbook, positionManager, signal, slotKey);
+      } catch (error: any) {
+        logger.warn('Signal execution failed for market tick', {
+          marketId: market.marketId,
+          signalType: signal.signalType,
+          outcome: signal.outcome,
+          action: signal.action,
+          message: error?.message || 'Unknown error',
+        });
+      }
     }
 
     this.maybePrintSlotReport(slotKey);
@@ -192,7 +207,7 @@ class MarketMakerRuntime {
         slotKey,
         market.marketId,
         market.title,
-        signal.outcome === 'YES' ? 'Up' : 'Down',
+        resolveSlotOutcome(market, signal.outcome),
         realizedDelta
       );
     }
@@ -281,6 +296,7 @@ class MarketMakerRuntime {
     printSlotReport(slotKey);
     this.pendingSlotReports.delete(slotKey);
     this.printedSlotReports.add(slotKey);
+    this.pruneSlotReportState();
   }
 
   private printPendingReports(): void {
@@ -294,6 +310,8 @@ class MarketMakerRuntime {
       this.pendingSlotReports.delete(slotKey);
       this.printedSlotReports.add(slotKey);
     }
+
+    this.pruneSlotReportState();
   }
 
   private async flattenAllOpenPositions(signalType: StrategySignal['signalType']): Promise<void> {
@@ -313,12 +331,32 @@ class MarketMakerRuntime {
         this.latestBooks.get(marketId) ?? (await this.fetcher.getMarketSnapshot(market));
       const slotKey = getSlotKey(market);
 
-      for (const signal of buildFlattenSignals(market, orderbook, snapshot, signalType)) {
-        await this.executeSignal(market, orderbook, positionManager, signal, slotKey);
+      for (const signal of buildFlattenSignals({
+        market,
+        orderbook,
+        snapshot,
+        signalType,
+        reasonPrefix: 'Graceful shutdown',
+      })) {
+        try {
+          await this.executeSignal(market, orderbook, positionManager, signal, slotKey);
+        } catch (error: any) {
+          logger.warn('Shutdown flatten signal failed', {
+            marketId,
+            signalType: signal.signalType,
+            outcome: signal.outcome,
+            message: error?.message || 'Unknown error',
+          });
+        }
       }
 
       this.maybePrintSlotReport(slotKey);
     }
+  }
+
+  private pruneSlotReportState(): void {
+    pruneSetEntries(this.pendingSlotReports, MAX_TRACKED_SLOT_REPORTS);
+    pruneSetEntries(this.printedSlotReports, MAX_TRACKED_SLOT_REPORTS);
   }
 }
 
@@ -337,77 +375,6 @@ export async function main(): Promise<void> {
 
   await runtime.initialize();
   await runtime.run();
-}
-
-function buildFlattenSignals(
-  market: MarketCandidate,
-  orderbook: MarketOrderbookSnapshot,
-  snapshot: ReturnType<PositionManager['getSnapshot']>,
-  signalType: StrategySignal['signalType']
-): StrategySignal[] {
-  const signals: StrategySignal[] = [];
-
-  if (snapshot.yesShares > 0) {
-    signals.push({
-      marketId: market.marketId,
-      marketTitle: market.title,
-      signalType,
-      priority: 1000,
-      action: 'SELL',
-      outcome: 'YES',
-      outcomeIndex: 0,
-      shares: snapshot.yesShares,
-      targetPrice: orderbook.yes.bestBid ?? orderbook.yes.midPrice,
-      referencePrice: orderbook.yes.bestBid ?? orderbook.yes.midPrice,
-      tokenPrice: orderbook.yes.lastTradePrice,
-      midPrice: orderbook.yes.midPrice,
-      fairValue: orderbook.yes.midPrice,
-      edgeAmount: snapshot.yesShares,
-      combinedBid: orderbook.combined.combinedBid,
-      combinedAsk: orderbook.combined.combinedAsk,
-      combinedMid: orderbook.combined.combinedMid,
-      combinedDiscount: orderbook.combined.combinedDiscount,
-      combinedPremium: orderbook.combined.combinedPremium,
-      fillRatio: 1,
-      capitalClamp: 1,
-      priceMultiplier: 1,
-      urgency: 'cross',
-      reduceOnly: true,
-      reason: 'Graceful shutdown flatten for YES inventory',
-    });
-  }
-
-  if (snapshot.noShares > 0) {
-    signals.push({
-      marketId: market.marketId,
-      marketTitle: market.title,
-      signalType,
-      priority: 1000,
-      action: 'SELL',
-      outcome: 'NO',
-      outcomeIndex: 1,
-      shares: snapshot.noShares,
-      targetPrice: orderbook.no.bestBid ?? orderbook.no.midPrice,
-      referencePrice: orderbook.no.bestBid ?? orderbook.no.midPrice,
-      tokenPrice: orderbook.no.lastTradePrice,
-      midPrice: orderbook.no.midPrice,
-      fairValue: orderbook.no.midPrice,
-      edgeAmount: snapshot.noShares,
-      combinedBid: orderbook.combined.combinedBid,
-      combinedAsk: orderbook.combined.combinedAsk,
-      combinedMid: orderbook.combined.combinedMid,
-      combinedDiscount: orderbook.combined.combinedDiscount,
-      combinedPremium: orderbook.combined.combinedPremium,
-      fillRatio: 1,
-      capitalClamp: 1,
-      priceMultiplier: 1,
-      urgency: 'cross',
-      reduceOnly: true,
-      reason: 'Graceful shutdown flatten for NO inventory',
-    });
-  }
-
-  return signals;
 }
 
 async function runWithConcurrency<T>(
@@ -447,13 +414,31 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+function resolveSlotOutcome(
+  market: Pick<MarketCandidate, 'yesLabel' | 'noLabel'>,
+  outcome: StrategySignal['outcome']
+): 'Up' | 'Down' {
+  const label = outcome === 'YES' ? market.yesLabel : market.noLabel;
+  const normalized = String(label || '').trim().toUpperCase();
+  if (
+    normalized === 'DOWN' ||
+    normalized === 'NO' ||
+    normalized === 'FALSE' ||
+    normalized === 'SHORT'
+  ) {
+    return 'Down';
+  }
 
-function roundTo(value: number, decimals: number): number {
-  const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
+  if (
+    normalized === 'UP' ||
+    normalized === 'YES' ||
+    normalized === 'TRUE' ||
+    normalized === 'LONG'
+  ) {
+    return 'Up';
+  }
+
+  return outcome === 'YES' ? 'Up' : 'Down';
 }
 
 const isDirectRun =
