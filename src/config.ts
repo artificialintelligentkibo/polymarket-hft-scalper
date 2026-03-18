@@ -22,6 +22,8 @@ export interface AppConfig {
   readonly FILTER_5MIN_ONLY: boolean;
   readonly MIN_LIQUIDITY_USD: number;
   readonly WHITELIST_CONDITION_IDS: readonly string[];
+  readonly REPORTS_FOLDER: string;
+  readonly REPORTS_FILE_PREFIX: string;
   readonly signerPrivateKey: string;
   readonly polymarketGeoToken: string;
   readonly rpcUrl: string;
@@ -245,6 +247,8 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     WHITELIST_CONDITION_IDS: parseCsv(
       env.WHITELIST_CONDITION_IDS || DEFAULT_WHITELIST_CONDITION_IDS.join(',')
     ),
+    REPORTS_FOLDER: (env.REPORTS_FOLDER || './reports').trim() || './reports',
+    REPORTS_FILE_PREFIX: (env.REPORTS_FILE_PREFIX || 'slot-reports').trim() || 'slot-reports',
     signerPrivateKey: resolveSignerPrivateKey(env),
     polymarketGeoToken: (env.POLYMARKET_GEO_TOKEN || '').trim(),
     rpcUrl: (env.RPC_URL || 'https://polygon.drpc.org').trim(),

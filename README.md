@@ -49,6 +49,8 @@ backtest/
 comparison/
   compare-with-target.ts
   output/
+reports/
+  .gitignore
 tests/
   comparison.test.ts
   monitor.test.ts
@@ -74,6 +76,8 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `COINS_TO_TRADE=BTC,SOL,XRP`
 - `FILTER_5MIN_ONLY=true`
 - `MIN_LIQUIDITY_USD=500`
+- `REPORTS_FOLDER=./reports`
+- `REPORTS_FILE_PREFIX=slot-reports`
 
 Sizing is now driven by:
 
@@ -96,16 +100,31 @@ The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) 
 9. JSONL trade logging
 10. slot-end console reporting
 
-## Slot Reports
+## Reports
 
-The slot reporter aggregates realized PnL per slot and prints:
+Slot reports are now written only to `./reports/slot-reports_YYYY-MM-DD.log`.
 
+What goes there:
+
+- timestamped slot report blocks
 - `Up PNL`
 - `Down PNL`
 - `NET PNL`
 - `TOTAL DAY PNL`
 
-This is triggered when the monitor emits `slot-ended` and also during graceful shutdown.
+The runtime creates `REPORTS_FOLDER` automatically when needed and appends new blocks to `REPORTS_FILE_PREFIX_YYYY-MM-DD.log`.
+
+Example block:
+
+```text
+[2026-03-18 14:04:43] === SLOT REPORT ===
+Slot                           | Market                  |    Up PNL |  Down PNL |    NET PNL
+Solana 10:00-10:05             | 0x5f34c201...           |    +46.02 |      -5.91 |    +40.10
+XRP 10:00-10:05                | 0xcb43642c...           |     -0.54 |     +67.61 |    +67.06
+TOTAL DAY PNL: +390.53
+```
+
+Slot-report output no longer uses the main runtime console log stream.
 
 ## Running
 
