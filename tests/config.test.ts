@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createConfig } from '../src/config.js';
+import { createConfig, isDryRunMode } from '../src/config.js';
 
 test('createConfig filters invalid and duplicate whitelist condition ids', () => {
   const candidate = createConfig({
@@ -36,6 +36,9 @@ test('createConfig defaults to dynamic BTC/SOL/XRP market scan when whitelist is
   assert.equal(candidate.STATE_FILE, './reports/state.json');
   assert.equal(candidate.REPORTS_FOLDER, './reports');
   assert.equal(candidate.REPORTS_FILE_PREFIX, 'slot-reports');
+  assert.equal(candidate.PRODUCT_TEST_MODE, false);
+  assert.equal(candidate.TEST_MIN_TRADE_USDC, 1);
+  assert.equal(candidate.TEST_MAX_SLOTS, 1);
   assert.equal(candidate.AUTO_REDEEM, true);
   assert.equal(candidate.REDEEM_INTERVAL_MS, 30000);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
@@ -50,4 +53,22 @@ test('createConfig defaults to dynamic BTC/SOL/XRP market scan when whitelist is
   assert.equal(candidate.strategy.entryImbalanceBlockThreshold, 100);
   assert.equal(candidate.strategy.maxDrawdownUsdc, -100);
   assert.equal(candidate.strategy.hardStopCooldownMs, 15000);
+});
+
+test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () => {
+  const candidate = createConfig({
+    ...process.env,
+    PRODUCT_TEST_MODE: 'true',
+    SIMULATION_MODE: 'true',
+    DRY_RUN: 'true',
+    TEST_MODE: 'false',
+    AUTO_REDEEM: 'true',
+    AUTH_MODE: 'PROXY',
+    SIGNATURE_TYPE: '1',
+    FUNDER_ADDRESS: '0x1111111111111111111111111111111111111111',
+    SIGNER_PRIVATE_KEY: '0x0123456789012345678901234567890123456789012345678901234567890123',
+  });
+
+  assert.equal(candidate.PRODUCT_TEST_MODE, true);
+  assert.equal(isDryRunMode(candidate), false);
 });

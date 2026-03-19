@@ -13,6 +13,7 @@ import {
 } from './monitor.js';
 import { OrderExecutor } from './order-executor.js';
 import { PositionManager } from './position-manager.js';
+import { ProductTestModeController } from './product-test-mode.js';
 import { writeLatencyLog } from './reports.js';
 import { RiskManager } from './risk-manager.js';
 import { SignalScalper } from './signal-scalper.js';
@@ -36,6 +37,7 @@ class MarketMakerRuntime {
   private readonly riskManager = new RiskManager();
   private readonly signalEngine = new SignalScalper();
   private readonly redeemer = new AutoRedeemer();
+  private readonly productTestMode = new ProductTestModeController();
   private readonly positions = new Map<string, PositionManager>();
   private readonly markets = new Map<string, MarketCandidate>();
   private readonly latestBooks = new Map<string, MarketOrderbookSnapshot>();
@@ -57,6 +59,25 @@ class MarketMakerRuntime {
       this.pendingSlotReports.add(slotKey);
       this.pruneSlotReportState();
     });
+
+    this.redeemer.on('redeem-success', (payload) => {
+      this.productTestMode.recordRedeemSuccess(payload);
+      if (this.productTestMode.isCompleted()) {
+        logger.info('PRODUCT_TEST_MODE completed after redeem success');
+        this.stop();
+      }
+    });
+
+    this.redeemer.on('redeem-failed', (payload) => {
+      this.productTestMode.recordRedeemFailure(
+        String(payload?.conditionId ?? ''),
+        String(payload?.message ?? 'Unknown redeem error')
+      );
+      if (this.productTestMode.isCompleted()) {
+        logger.warn('PRODUCT_TEST_MODE completed with redeem failure');
+        this.stop();
+      }
+    });
   }
 
   async initialize(): Promise<void> {
@@ -69,6 +90,10 @@ class MarketMakerRuntime {
       simulationMode: config.SIMULATION_MODE,
       testMode: config.TEST_MODE,
       dryRun: config.DRY_RUN,
+      effectiveDryRun: isDryRunMode(config),
+      productTestMode: config.PRODUCT_TEST_MODE,
+      testMinTradeUsdc: config.TEST_MIN_TRADE_USDC,
+      testMaxSlots: config.TEST_MAX_SLOTS,
       enableSignal: config.ENABLE_SIGNAL,
       minCombinedDiscount: config.strategy.minCombinedDiscount,
       extremeBuyThreshold: config.strategy.extremeBuyThreshold,
@@ -103,6 +128,10 @@ class MarketMakerRuntime {
       }
 
       await sleep(config.runtime.marketScanIntervalMs);
+    }
+
+    if (!this.stopping) {
+      await this.shutdown('RUN_LOOP_STOPPED');
     }
   }
 
@@ -142,9 +171,15 @@ class MarketMakerRuntime {
   }
 
   private async runCycle(): Promise<void> {
-    const markets = await this.monitor.scanEligibleMarkets();
+    const scannedMarkets = await this.monitor.scanEligibleMarkets();
+    const markets = this.productTestMode.selectMarkets(scannedMarkets);
     if (markets.length === 0) {
-      logger.debug('No eligible markets found for this cycle');
+      if (this.productTestMode.maybeFinalizePending()) {
+        logger.info('PRODUCT_TEST_MODE finalized without additional market activity');
+        this.stop();
+      } else {
+        logger.debug('No eligible markets found for this cycle');
+      }
       this.printPendingReports();
       return;
     }
@@ -190,6 +225,9 @@ class MarketMakerRuntime {
       try {
         await this.executeSignal(market, orderbook, positionManager, signal, slotKey);
       } catch (error: any) {
+        this.productTestMode.recordExecutionError(
+          `Signal execution failed for ${market.marketId} ${signal.signalType} ${signal.outcome}: ${error?.message || 'Unknown error'}`
+        );
         logger.warn('Signal execution failed for market tick', {
           marketId: market.marketId,
           signalType: signal.signalType,
@@ -268,6 +306,13 @@ class MarketMakerRuntime {
     const latencyRoundTripMs =
       signal.generatedAt !== undefined ? Math.max(0, completedAt - signal.generatedAt) : undefined;
 
+    this.productTestMode.recordExecution({
+      market,
+      signal,
+      latencySignalToOrderMs: execution.latencySignalToOrderMs,
+      latencyRoundTripMs,
+    });
+
     writeLatencyLog({
       timestampMs: completedAt,
       marketId: market.marketId,
@@ -298,7 +343,7 @@ class MarketMakerRuntime {
       reason: signal.reason,
       signalType: signal.signalType,
       priority: signal.priority,
-      urgency: signal.urgency,
+      urgency: execution.urgency,
       reduceOnly: signal.reduceOnly,
       tokenPrice: signal.tokenPrice,
       referencePrice: signal.referencePrice,
@@ -349,7 +394,7 @@ class MarketMakerRuntime {
       action: signal.action,
       shares: execution.shares,
       price: execution.price,
-      urgency: signal.urgency,
+      urgency: execution.urgency,
       wasMaker: execution.wasMaker,
       latencySignalToOrderMs: execution.latencySignalToOrderMs,
       latencyRoundTripMs,
@@ -377,6 +422,7 @@ class MarketMakerRuntime {
     }
 
     printSlotReport(slotKey);
+    this.notifyProductTestSlotReport(slotKey);
     this.pendingSlotReports.delete(slotKey);
     this.printedSlotReports.add(slotKey);
     this.pruneSlotReportState();
@@ -390,6 +436,7 @@ class MarketMakerRuntime {
       }
 
       printSlotReport(slotKey);
+      this.notifyProductTestSlotReport(slotKey);
       this.pendingSlotReports.delete(slotKey);
       this.printedSlotReports.add(slotKey);
     }
@@ -440,6 +487,30 @@ class MarketMakerRuntime {
   private pruneSlotReportState(): void {
     pruneSetEntries(this.pendingSlotReports, MAX_TRACKED_SLOT_REPORTS);
     pruneSetEntries(this.printedSlotReports, MAX_TRACKED_SLOT_REPORTS);
+  }
+
+  private notifyProductTestSlotReport(slotKey: string): void {
+    const metrics = getSlotMetrics(slotKey);
+    const market = this.findMarketBySlotKey(slotKey);
+    if (!market) {
+      return;
+    }
+
+    this.productTestMode.recordSlotReport(market, metrics);
+    if (this.productTestMode.isCompleted()) {
+      logger.info('PRODUCT_TEST_MODE completed after slot reporting');
+      this.stop();
+    }
+  }
+
+  private findMarketBySlotKey(slotKey: string): MarketCandidate | undefined {
+    for (const market of this.markets.values()) {
+      if (getSlotKey(market) === slotKey) {
+        return market;
+      }
+    }
+
+    return undefined;
   }
 }
 

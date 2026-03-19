@@ -14,9 +14,12 @@ export interface PriceMultiplierLevel {
 }
 
 export interface AppConfig {
+  readonly PRODUCT_TEST_MODE: boolean;
   readonly SIMULATION_MODE: boolean;
   readonly TEST_MODE: boolean;
   readonly DRY_RUN: boolean;
+  readonly TEST_MIN_TRADE_USDC: number;
+  readonly TEST_MAX_SLOTS: number;
   readonly ENABLE_SIGNAL: boolean;
   readonly AUTO_REDEEM: boolean;
   readonly REDEEM_INTERVAL_MS: number;
@@ -249,9 +252,12 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const reportsFilePrefix = (env.REPORTS_FILE_PREFIX || 'slot-reports').trim() || 'slot-reports';
 
   return {
+    PRODUCT_TEST_MODE: parseBoolean(env.PRODUCT_TEST_MODE, false),
     SIMULATION_MODE: parseBoolean(env.SIMULATION_MODE, false),
     TEST_MODE: parseBoolean(env.TEST_MODE, false),
     DRY_RUN: parseBoolean(env.DRY_RUN, false),
+    TEST_MIN_TRADE_USDC: Math.max(0.1, parseFloatOrDefault(env.TEST_MIN_TRADE_USDC, '1')),
+    TEST_MAX_SLOTS: Math.max(1, parseIntOrDefault(env.TEST_MAX_SLOTS, '1')),
     ENABLE_SIGNAL: parseBoolean(env.ENABLE_SIGNAL, true),
     AUTO_REDEEM: parseBoolean(env.AUTO_REDEEM, true),
     REDEEM_INTERVAL_MS: Math.max(5_000, parseIntOrDefault(env.REDEEM_INTERVAL_MS, '30000')),
@@ -430,6 +436,16 @@ export function validateConfig(candidate: AppConfig = config): void {
     }
   }
 
+  if (candidate.PRODUCT_TEST_MODE) {
+    if (candidate.auth.mode !== 'PROXY') {
+      throw new Error('PRODUCT_TEST_MODE requires AUTH_MODE=PROXY for safe live redeem coverage.');
+    }
+
+    if (!candidate.AUTO_REDEEM) {
+      throw new Error('PRODUCT_TEST_MODE requires AUTO_REDEEM=true.');
+    }
+  }
+
   if (candidate.strategy.minShares <= 0 || candidate.strategy.maxShares <= 0) {
     throw new Error('MIN_SHARES and MAX_SHARES must be positive.');
   }
@@ -476,9 +492,21 @@ export function validateConfig(candidate: AppConfig = config): void {
   if (candidate.strategy.maxSignalsPerTick < 1 || candidate.strategy.maxSignalsPerTick > 10) {
     throw new Error('MAX_SIGNALS_PER_TICK must be between 1 and 10.');
   }
+
+  if (candidate.TEST_MIN_TRADE_USDC <= 0) {
+    throw new Error('TEST_MIN_TRADE_USDC must be positive.');
+  }
+
+  if (candidate.TEST_MAX_SLOTS < 1) {
+    throw new Error('TEST_MAX_SLOTS must be at least 1.');
+  }
 }
 
 export function isDryRunMode(candidate: AppConfig = config): boolean {
+  if (candidate.PRODUCT_TEST_MODE) {
+    return false;
+  }
+
   return candidate.SIMULATION_MODE || candidate.TEST_MODE || candidate.DRY_RUN;
 }
 

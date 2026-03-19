@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { RelayClient, RelayerTxType, type Transaction } from '@polymarket/builder-relayer-client';
 import { ethers } from 'ethers';
 import { config, isDryRunMode, type AppConfig } from './config.js';
@@ -79,7 +80,7 @@ interface RedeemExecutionResult {
   readonly state: string | null;
 }
 
-export class AutoRedeemer {
+export class AutoRedeemer extends EventEmitter {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly relayerUrl: string;
@@ -95,6 +96,7 @@ export class AutoRedeemer {
     private readonly runtimeConfig: AppConfig = config,
     options: AutoRedeemerOptions = {}
   ) {
+    super();
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.now = options.now ?? (() => Date.now());
     this.relayerUrl = options.relayerUrl ?? runtimeConfig.POLYMARKET_RELAYER_URL;
@@ -307,6 +309,15 @@ export class AutoRedeemer {
           `relayType=${this.status.relayTxType ?? 'n/a'}`,
         ].join(' '),
       });
+      this.emit('redeem-success', {
+        timestampMs: this.now(),
+        conditionId: group.conditionId,
+        title: group.title,
+        redeemedAmount: roundTo(group.totalShares, 4),
+        transactionId: execution.transactionId,
+        transactionHash: execution.transactionHash,
+        state: execution.state,
+      });
     } catch (error: any) {
       const message = getErrorMessage(error);
       logger.warn('Gasless redeem failed', {
@@ -318,6 +329,12 @@ export class AutoRedeemer {
         conditionId: group.conditionId,
         title: group.title,
         detail: message,
+      });
+      this.emit('redeem-failed', {
+        timestampMs: this.now(),
+        conditionId: group.conditionId,
+        title: group.title,
+        message,
       });
     }
   }

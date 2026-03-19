@@ -39,6 +39,7 @@ src/
   monitor.ts
   order-executor.ts
   position-manager.ts
+  product-test-mode.ts
   reports.ts
   auto-redeemer.ts
   risk-manager.ts
@@ -85,6 +86,9 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `MIN_LIQUIDITY_USD=500`
 - `AUTO_REDEEM=true`
 - `REDEEM_INTERVAL_MS=30000`
+- `PRODUCT_TEST_MODE=false`
+- `TEST_MIN_TRADE_USDC=1`
+- `TEST_MAX_SLOTS=1`
 - `POLYMARKET_API_KEY=...`
 - `POLYMARKET_API_KEY_ADDRESS=...`
 - `POLYMARKET_RELAYER_URL=https://relayer-v2.polymarket.com`
@@ -132,6 +136,7 @@ What goes into `reports/`:
 - persisted `state.json` with day PnL / peak PnL / drawdown for restart-safe risk limits
 - per-signal latency lines with `signalToOrderMs` and `roundTripMs`
 - gasless redeem activity in `redeem_log_YYYY-MM-DD.log`
+- product-test coverage summaries in `product-test-summary_YYYY-MM-DD.log`
 
 The runtime creates `REPORTS_DIR` automatically when needed.
 
@@ -155,6 +160,18 @@ Example redeem line:
 
 ```text
 [2026-03-18 14:05:12] status=REDEEMED conditionId=0xabc... title="Bitcoin Up or Down - Mar 18, 2:00PM-2:05PM ET" txId=019... txHash=0xdef... state=STATE_CONFIRMED shares=28.0000 relayType=PROXY
+```
+
+Example product-test summary:
+
+```text
+[2026-03-19 10:05:42] PRODUCT TEST SUMMARY - PASSED 9/9 features
+Slot: Bitcoin Up or Down - Mar 19, 10:00AM-10:05AM ET | conditionId=0xabc...
+Tested: FAIR_VALUE_BUY, FAIR_VALUE_SELL, EXTREME_BUY, EXTREME_SELL, INVENTORY_REBALANCE, TRAILING_TAKE_PROFIT, HARD_STOP, SLOT_FLATTEN, AUTO_REDEEM
+Final PnL: +$3.24 | Redeemed: +$12.87
+Avg latency: 214ms | Day PnL: +$3.24 | Drawdown: -$0.00
+Success rate: 100.00%
+Status: PASSED
 ```
 
 ## Auto Redeem
@@ -226,6 +243,50 @@ One-liner:
 ```bash
 COINS_TO_TRADE=BTC,SOL,XRP FILTER_5MIN_ONLY=true npm start
 ```
+
+## Product Test Mode (Safe Live Testing)
+
+`PRODUCT_TEST_MODE` is a live safety overlay for validating the full runtime against a real 5-minute market with tiny size.
+
+What it does:
+
+- overrides `SIMULATION_MODE` and `DRY_RUN`, so real post-only gasless orders are placed
+- pins the runtime to a single active 5-minute slot
+- keeps size tiny with a `$1` target and a hard safety clamp around `1-3` shares / roughly `$1-3` notional per order
+- caps inventory to `YES<=30` and `NO<=40`
+- never crosses the spread in this mode; `cross` urgency is downgraded to `improve`
+- waits for slot flatten, then tracks gasless auto-redeem and writes a dedicated summary file
+
+Requirements:
+
+- `AUTH_MODE=PROXY`
+- `AUTO_REDEEM=true`
+- valid `SIGNER_PRIVATE_KEY`, `FUNDER_ADDRESS`, `POLYMARKET_API_KEY`, and `POLYMARKET_API_KEY_ADDRESS`
+
+Run:
+
+```bash
+PRODUCT_TEST_MODE=true
+SIMULATION_MODE=true
+DRY_RUN=true
+TEST_MODE=false
+COINS_TO_TRADE=BTC,SOL,XRP
+FILTER_5MIN_ONLY=true
+AUTH_MODE=PROXY
+SIGNATURE_TYPE=1
+AUTO_REDEEM=true
+TEST_MIN_TRADE_USDC=1
+TEST_MAX_SLOTS=1
+npm start
+```
+
+You can also launch it as a one-liner:
+
+```bash
+PRODUCT_TEST_MODE=true npm start
+```
+
+When enabled, the bot will stop after the selected slot is summarized in `./reports/product-test-summary_YYYY-MM-DD.log`.
 
 Add `ETH` if you want:
 

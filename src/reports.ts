@@ -23,7 +23,11 @@ export interface LatencyLogEntry {
 let slotReportQueue = Promise.resolve();
 let latencyQueue = Promise.resolve();
 let redeemQueue = Promise.resolve();
-const reportWriteFailures = new Map<'slot-report' | 'latency' | 'redeem', number>();
+let productTestQueue = Promise.resolve();
+const reportWriteFailures = new Map<
+  'slot-report' | 'latency' | 'redeem' | 'product-test',
+  number
+>();
 
 export function getReportsDirectory(): string {
   return path.resolve(process.cwd(), config.REPORTS_DIR);
@@ -57,6 +61,19 @@ export function writeRedeemLog(line: string, timestampMs = Date.now()): void {
   redeemQueue = enqueueAppend(redeemQueue, filePath, ensureTrailingNewline(line), 'redeem');
 }
 
+export function writeProductTestSummary(payload: string, timestampMs = Date.now()): void {
+  const filePath = path.join(
+    getReportsDirectory(),
+    `product-test-summary_${formatDayKey(new Date(timestampMs))}.log`
+  );
+  productTestQueue = enqueueAppend(
+    productTestQueue,
+    filePath,
+    ensureTrailingNewline(payload),
+    'product-test'
+  );
+}
+
 function resolveLatencyLogPath(value: Date): string {
   const relativePath = config.LATENCY_LOG.replace('YYYY-MM-DD', formatDayKey(value));
   return path.resolve(process.cwd(), relativePath);
@@ -83,7 +100,7 @@ function enqueueAppend(
   queue: Promise<void>,
   filePath: string,
   payload: string,
-  channel: 'slot-report' | 'latency' | 'redeem'
+  channel: 'slot-report' | 'latency' | 'redeem' | 'product-test'
 ): Promise<void> {
   const task = queue.then(async () => {
     await mkdir(path.dirname(filePath), { recursive: true });

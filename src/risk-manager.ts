@@ -4,6 +4,7 @@ import { evaluateDayDrawdown } from './day-pnl-state.js';
 import { buildFlattenSignals } from './flatten-signals.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
+import { getEffectiveStrategyConfig, resolveProductTestUrgency } from './product-test-mode.js';
 import type {
   BoundaryCorrection,
   ExitSignal,
@@ -30,7 +31,7 @@ export class RiskManager {
   }): RiskAssessment {
     const now = params.now ?? new Date();
     const { market, orderbook, positionManager } = params;
-    const limits = this.runtimeConfig.strategy;
+    const limits = getEffectiveStrategyConfig(this.runtimeConfig);
 
     positionManager.setSlotEndsAt(market.endTime);
     positionManager.markToMarket({
@@ -84,14 +85,14 @@ export class RiskManager {
 
     if (
       positionManager.getAvailableEntryCapacity('YES', limits) <
-        this.runtimeConfig.strategy.minShares ||
+        limits.minShares ||
       positionManager.isEntryCoolingDown('YES', now)
     ) {
       blockedOutcomes.add('YES');
     }
     if (
       positionManager.getAvailableEntryCapacity('NO', limits) <
-        this.runtimeConfig.strategy.minShares ||
+        limits.minShares ||
       positionManager.isEntryCoolingDown('NO', now)
     ) {
       blockedOutcomes.add('NO');
@@ -144,7 +145,7 @@ export class RiskManager {
       fillRatio: 1,
       capitalClamp: 1,
       priceMultiplier: 1,
-      urgency: 'cross',
+      urgency: resolveProductTestUrgency('cross', this.runtimeConfig),
       reduceOnly: true,
       reason: correction.reason,
     };
@@ -182,7 +183,7 @@ export class RiskManager {
       fillRatio: 1,
       capitalClamp: 1,
       priceMultiplier: 1,
-      urgency: 'cross',
+      urgency: resolveProductTestUrgency('cross', this.runtimeConfig),
       reduceOnly: true,
       reason: exit.reason,
     };

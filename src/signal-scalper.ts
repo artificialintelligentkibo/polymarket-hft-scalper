@@ -3,6 +3,11 @@ import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
+import {
+  clampProductTestShares,
+  getEffectiveStrategyConfig,
+  resolveProductTestUrgency,
+} from './product-test-mode.js';
 import type { RiskAssessment } from './risk-manager.js';
 import type { StrategySignal } from './strategy-types.js';
 import { clamp, OUTCOMES, roundTo } from './utils.js';
@@ -26,12 +31,10 @@ export class SignalScalper {
   }): StrategySignal[] {
     const now = params.now ?? new Date();
     const { market, orderbook, positionManager, riskAssessment } = params;
+    const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
 
     if (riskAssessment.forcedSignals.length > 0) {
-      return takeTopSignals(
-        riskAssessment.forcedSignals,
-        this.runtimeConfig.strategy.maxSignalsPerTick
-      );
+      return takeTopSignals(riskAssessment.forcedSignals, strategy.maxSignalsPerTick);
     }
 
     if (!this.runtimeConfig.ENABLE_SIGNAL) {
@@ -50,7 +53,7 @@ export class SignalScalper {
     ];
 
     const flattened = mergeSignals(groups.flat());
-    return takeTopSignals(flattened, this.runtimeConfig.strategy.maxSignalsPerTick);
+    return takeTopSignals(flattened, strategy.maxSignalsPerTick);
   }
 
   private getCombinedDiscountSignals(
@@ -59,6 +62,7 @@ export class SignalScalper {
     positionManager: PositionManager,
     riskAssessment: RiskAssessment
   ): StrategySignal[] {
+    const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
     const upAsk = orderbook.yes.bestAsk;
     const downAsk = orderbook.no.bestAsk;
     const combinedAsk =
@@ -79,7 +83,7 @@ export class SignalScalper {
       downAsk === null ||
       upAsk <= 0.01 ||
       downAsk <= 0.01 ||
-      combinedDiscount < this.runtimeConfig.strategy.minCombinedDiscount
+      combinedDiscount < strategy.minCombinedDiscount
     ) {
       return [];
     }
@@ -105,19 +109,16 @@ export class SignalScalper {
         action: 'BUY',
         signalType: 'COMBINED_DISCOUNT_BUY_BOTH',
         edgeAmount: combinedDiscount,
-        availableCapacity: positionManager.getAvailableEntryCapacity(
-          outcome,
-          this.runtimeConfig.strategy
-        ),
+        availableCapacity: positionManager.getAvailableEntryCapacity(outcome, strategy),
         depthShares: book.depthSharesAsk,
         liquidityUsd: market.liquidityUsd,
         price: bestAsk,
-        referenceEdge: this.runtimeConfig.strategy.minCombinedDiscount,
+        referenceEdge: strategy.minCombinedDiscount,
         runtimeConfig: this.runtimeConfig,
         entryGuardMultiplier,
       });
 
-      if (size.shares < this.runtimeConfig.strategy.minShares) {
+      if (size.shares < strategy.minShares) {
         continue;
       }
 
@@ -139,7 +140,7 @@ export class SignalScalper {
           priceMultiplier: size.priceMultiplier,
           fillRatio: size.fillRatio,
           capitalClamp: size.capitalClamp,
-          urgency: 'improve',
+          urgency: resolveProductTestUrgency('improve', this.runtimeConfig),
           reduceOnly: false,
           reason: `Combined ask ${formatPrice(combinedAsk)} is discounted by ${formatPrice(combinedDiscount)} versus parity`,
         })
@@ -155,6 +156,7 @@ export class SignalScalper {
     positionManager: PositionManager,
     riskAssessment: RiskAssessment
   ): StrategySignal[] {
+    const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
     const signals: StrategySignal[] = [];
 
     for (const outcome of OUTCOMES as readonly Outcome[]) {
@@ -171,25 +173,22 @@ export class SignalScalper {
         if (entryGuardMultiplier <= 0) {
           continue;
         }
-        const edge = this.runtimeConfig.strategy.extremeBuyThreshold - bestAsk;
+        const edge = strategy.extremeBuyThreshold - bestAsk;
         if (edge >= 0) {
           const size = calculateTradeSize({
             action: 'BUY',
             signalType: 'EXTREME_BUY',
             edgeAmount: edge,
-            availableCapacity: positionManager.getAvailableEntryCapacity(
-              outcome,
-              this.runtimeConfig.strategy
-            ),
+            availableCapacity: positionManager.getAvailableEntryCapacity(outcome, strategy),
             depthShares: book.depthSharesAsk,
             liquidityUsd: market.liquidityUsd,
             price: bestAsk,
-            referenceEdge: this.runtimeConfig.strategy.extremeBuyThreshold,
+            referenceEdge: strategy.extremeBuyThreshold,
             runtimeConfig: this.runtimeConfig,
             entryGuardMultiplier,
           });
 
-          if (size.shares >= this.runtimeConfig.strategy.minShares) {
+          if (size.shares >= strategy.minShares) {
             signals.push(
               buildSignal({
                 market,
@@ -200,7 +199,7 @@ export class SignalScalper {
                 outcome,
                 shares: size.shares,
                 targetPrice: bestAsk,
-                referencePrice: this.runtimeConfig.strategy.extremeBuyThreshold,
+                referencePrice: strategy.extremeBuyThreshold,
                 tokenPrice: book.lastTradePrice ?? bestAsk,
                 midPrice: book.midPrice,
                 fairValue,
@@ -208,7 +207,7 @@ export class SignalScalper {
                 priceMultiplier: size.priceMultiplier,
                 fillRatio: size.fillRatio,
                 capitalClamp: size.capitalClamp,
-                urgency: 'improve',
+                urgency: resolveProductTestUrgency('improve', this.runtimeConfig),
                 reduceOnly: false,
                 reason: `${outcome} ask ${formatPrice(bestAsk)} is inside the extreme buy zone`,
               })
@@ -219,7 +218,7 @@ export class SignalScalper {
 
       if (openShares > 0 && hasExecutableBid(book)) {
         const executableBid = book.bestBid;
-        const edge = executableBid - this.runtimeConfig.strategy.extremeSellThreshold;
+        const edge = executableBid - strategy.extremeSellThreshold;
         if (edge >= 0) {
           const size = calculateTradeSize({
             action: 'SELL',
@@ -229,7 +228,7 @@ export class SignalScalper {
             depthShares: book.depthSharesBid,
             liquidityUsd: market.liquidityUsd,
             price: executableBid,
-            referenceEdge: 1 - this.runtimeConfig.strategy.extremeSellThreshold,
+            referenceEdge: 1 - strategy.extremeSellThreshold,
             runtimeConfig: this.runtimeConfig,
             allowBelowMin: true,
           });
@@ -245,7 +244,7 @@ export class SignalScalper {
                 outcome,
                 shares: size.shares,
                 targetPrice: executableBid,
-                referencePrice: this.runtimeConfig.strategy.extremeSellThreshold,
+                referencePrice: strategy.extremeSellThreshold,
                 tokenPrice: book.lastTradePrice ?? executableBid,
                 midPrice: book.midPrice,
                 fairValue,
@@ -253,7 +252,7 @@ export class SignalScalper {
                 priceMultiplier: size.priceMultiplier,
                 fillRatio: size.fillRatio,
                 capitalClamp: size.capitalClamp,
-                urgency: 'cross',
+                urgency: resolveProductTestUrgency('cross', this.runtimeConfig),
                 reduceOnly: true,
                 reason: `${outcome} bid ${formatPrice(executableBid)} is inside the extreme sell zone`,
               })
@@ -272,6 +271,7 @@ export class SignalScalper {
     positionManager: PositionManager,
     riskAssessment: RiskAssessment
   ): StrategySignal[] {
+    const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
     const signals: StrategySignal[] = [];
 
     for (const outcome of OUTCOMES as readonly Outcome[]) {
@@ -290,24 +290,21 @@ export class SignalScalper {
           continue;
         }
         const buyEdge = fairValue - bestAsk;
-        if (buyEdge >= this.runtimeConfig.strategy.fairValueBuyThreshold) {
+        if (buyEdge >= strategy.fairValueBuyThreshold) {
           const size = calculateTradeSize({
             action: 'BUY',
             signalType: 'FAIR_VALUE_BUY',
             edgeAmount: buyEdge,
-            availableCapacity: positionManager.getAvailableEntryCapacity(
-              outcome,
-              this.runtimeConfig.strategy
-            ),
+            availableCapacity: positionManager.getAvailableEntryCapacity(outcome, strategy),
             depthShares: book.depthSharesAsk,
             liquidityUsd: market.liquidityUsd,
             price: bestAsk,
-            referenceEdge: this.runtimeConfig.strategy.fairValueBuyThreshold,
+            referenceEdge: strategy.fairValueBuyThreshold,
             runtimeConfig: this.runtimeConfig,
             entryGuardMultiplier,
           });
 
-          if (size.shares >= this.runtimeConfig.strategy.minShares) {
+          if (size.shares >= strategy.minShares) {
             signals.push(
               buildSignal({
                 market,
@@ -326,7 +323,7 @@ export class SignalScalper {
                 priceMultiplier: size.priceMultiplier,
                 fillRatio: size.fillRatio,
                 capitalClamp: size.capitalClamp,
-                urgency: 'passive',
+                urgency: resolveProductTestUrgency('passive', this.runtimeConfig),
                 reduceOnly: false,
                 reason: `${outcome} ask ${formatPrice(bestAsk)} is below fair value ${formatPrice(fairValue)}`,
               })
@@ -338,7 +335,7 @@ export class SignalScalper {
       if (fairValue !== null && hasExecutableBid(book) && openShares > 0) {
         const executableBid = book.bestBid;
         const sellEdge = executableBid - fairValue;
-        if (sellEdge >= this.runtimeConfig.strategy.fairValueSellThreshold) {
+        if (sellEdge >= strategy.fairValueSellThreshold) {
           const size = calculateTradeSize({
             action: 'SELL',
             signalType: 'FAIR_VALUE_SELL',
@@ -347,7 +344,7 @@ export class SignalScalper {
             depthShares: book.depthSharesBid,
             liquidityUsd: market.liquidityUsd,
             price: executableBid,
-            referenceEdge: this.runtimeConfig.strategy.fairValueSellThreshold,
+            referenceEdge: strategy.fairValueSellThreshold,
             runtimeConfig: this.runtimeConfig,
             allowBelowMin: true,
           });
@@ -371,7 +368,7 @@ export class SignalScalper {
                 priceMultiplier: size.priceMultiplier,
                 fillRatio: size.fillRatio,
                 capitalClamp: size.capitalClamp,
-                urgency: 'improve',
+                urgency: resolveProductTestUrgency('improve', this.runtimeConfig),
                 reduceOnly: true,
                 reason: `${outcome} bid ${formatPrice(executableBid)} is above fair value ${formatPrice(fairValue)}`,
               })
@@ -390,7 +387,8 @@ export class SignalScalper {
     positionManager: PositionManager,
     riskAssessment: RiskAssessment
   ): StrategySignal[] {
-    const imbalanceState = positionManager.getInventoryImbalanceState(this.runtimeConfig.strategy);
+    const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
+    const imbalanceState = positionManager.getInventoryImbalanceState(strategy);
     if (!imbalanceState.dominantOutcome || imbalanceState.suggestedReduceShares <= 0) {
       return [];
     }
@@ -414,7 +412,7 @@ export class SignalScalper {
       depthShares: book.depthSharesBid,
       liquidityUsd: market.liquidityUsd,
       price: bestBid,
-      referenceEdge: this.runtimeConfig.strategy.inventoryImbalanceThreshold,
+      referenceEdge: strategy.inventoryImbalanceThreshold,
       runtimeConfig: this.runtimeConfig,
       allowBelowMin: true,
     });
@@ -441,9 +439,9 @@ export class SignalScalper {
         priceMultiplier: size.priceMultiplier,
         fillRatio: size.fillRatio,
         capitalClamp: size.capitalClamp,
-        urgency: 'improve',
+        urgency: resolveProductTestUrgency('improve', this.runtimeConfig),
         reduceOnly: true,
-        reason: `Inventory imbalance ${formatPrice(imbalanceState.imbalance)} exceeded threshold ${this.runtimeConfig.strategy.inventoryImbalanceThreshold}`,
+        reason: `Inventory imbalance ${formatPrice(imbalanceState.imbalance)} exceeded threshold ${strategy.inventoryImbalanceThreshold}`,
       }),
     ];
   }
@@ -476,7 +474,7 @@ export function calculateTradeSize(params: {
   entryGuardMultiplier?: number;
 }): SizeCalculationResult {
   const runtimeConfig = params.runtimeConfig ?? config;
-  const strategy = runtimeConfig.strategy;
+  const strategy = getEffectiveStrategyConfig(runtimeConfig);
   const priceMultiplier = resolvePriceMultiplier(params.price, runtimeConfig);
   const normalizedDepth = params.depthShares / Math.max(1, strategy.depthReferenceShares);
   const normalizedEdge =
@@ -501,9 +499,14 @@ export function calculateTradeSize(params: {
     liquidityClamp *
     clamp(params.entryGuardMultiplier ?? 1, 0, 1);
   const minShares = params.allowBelowMin ? 0.01 : strategy.minShares;
-  const shares = roundTo(
+  const preliminaryShares = roundTo(
     clamp(rawShares, minShares, Math.min(strategy.maxShares, params.availableCapacity)),
     4
+  );
+  const shares = clampProductTestShares(
+    preliminaryShares,
+    params.price ?? params.referenceEdge ?? 1,
+    runtimeConfig
   );
 
   return {

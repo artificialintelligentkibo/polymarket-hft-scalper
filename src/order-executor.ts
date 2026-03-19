@@ -2,6 +2,7 @@ import { config, type AppConfig, type OrderMode } from './config.js';
 import type { MarketOrderbookSnapshot, OrderbookLevel, TokenBookSnapshot } from './clob-fetcher.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
+import { resolveProductTestUrgency } from './product-test-mode.js';
 import type { StrategySignal } from './strategy-types.js';
 import { Trader, type TradeExecutionResult } from './trader.js';
 import { roundTo, sleep } from './utils.js';
@@ -72,7 +73,7 @@ export class OrderExecutor {
         return {
           ...execution,
           attemptCount: attempt,
-          urgency: signal.urgency,
+          urgency: executionPlan.urgency,
           latencySignalToOrderMs,
           latencyRoundTripMs,
         };
@@ -109,14 +110,17 @@ export class OrderExecutor {
     price: number | null;
     postOnly: boolean;
     orderType: OrderMode;
+    urgency: StrategySignal['urgency'];
   } {
+    const effectiveUrgency = resolveProductTestUrgency(signal.urgency, this.runtimeConfig);
     const fallbackPrice =
       signal.targetPrice ?? signal.midPrice ?? signal.referencePrice ?? signal.tokenPrice;
     if (fallbackPrice === null) {
       return {
         price: null,
-        postOnly: signal.urgency !== 'cross',
+        postOnly: effectiveUrgency !== 'cross',
         orderType: this.runtimeConfig.trading.orderType,
+        urgency: effectiveUrgency,
       };
     }
 
@@ -125,21 +129,23 @@ export class OrderExecutor {
     const bestAsk = book.bestAsk;
 
     if (signal.action === 'BUY') {
-      if (signal.urgency === 'cross') {
+      if (effectiveUrgency === 'cross') {
         return {
           price: bestAsk ?? fallbackPrice,
           postOnly: false,
           orderType: resolveOrderType(signal, this.runtimeConfig),
+          urgency: effectiveUrgency,
         };
       }
 
-      if (signal.urgency === 'improve') {
+      if (effectiveUrgency === 'improve') {
         const improvedBid = (bestBid ?? fallbackPrice) + tick * this.runtimeConfig.trading.improveTicks;
         const makerCap = bestAsk !== null ? Math.max(0.01, bestAsk - tick) : improvedBid;
         return {
           price: roundTo(Math.min(improvedBid, makerCap), 6),
           postOnly: true,
           orderType: resolveOrderType(signal, this.runtimeConfig),
+          urgency: effectiveUrgency,
         };
       }
 
@@ -149,24 +155,27 @@ export class OrderExecutor {
         price: roundTo(Math.min(passiveBid, makerCap), 6),
         postOnly: true,
         orderType: resolveOrderType(signal, this.runtimeConfig),
+        urgency: effectiveUrgency,
       };
     }
 
-    if (signal.urgency === 'cross') {
+    if (effectiveUrgency === 'cross') {
       return {
         price: bestBid ?? fallbackPrice,
         postOnly: false,
         orderType: resolveOrderType(signal, this.runtimeConfig),
+        urgency: effectiveUrgency,
       };
     }
 
-    if (signal.urgency === 'improve') {
+    if (effectiveUrgency === 'improve') {
       const improvedAsk = (bestAsk ?? fallbackPrice) - tick * this.runtimeConfig.trading.improveTicks;
       const makerFloor = bestBid !== null ? bestBid + tick : improvedAsk;
       return {
         price: roundTo(Math.max(improvedAsk, makerFloor), 6),
         postOnly: true,
         orderType: resolveOrderType(signal, this.runtimeConfig),
+        urgency: effectiveUrgency,
       };
     }
 
@@ -176,6 +185,7 @@ export class OrderExecutor {
       price: roundTo(Math.max(passiveAsk, makerFloor), 6),
       postOnly: true,
       orderType: resolveOrderType(signal, this.runtimeConfig),
+      urgency: effectiveUrgency,
     };
   }
 
@@ -190,7 +200,8 @@ export class OrderExecutor {
 }
 
 function resolveOrderType(signal: StrategySignal, runtimeConfig: AppConfig): OrderMode {
-  if (signal.urgency === 'cross' && runtimeConfig.trading.orderTypeFallback !== 'NONE') {
+  const urgency = resolveProductTestUrgency(signal.urgency, runtimeConfig);
+  if (urgency === 'cross' && runtimeConfig.trading.orderTypeFallback !== 'NONE') {
     return runtimeConfig.trading.orderTypeFallback;
   }
   return runtimeConfig.trading.orderType;

@@ -163,7 +163,12 @@ export class MarketMonitor extends EventEmitter {
         }
         return right.liquidityUsd - left.liquidityUsd;
       })
-      .slice(0, this.runtimeConfig.runtime.marketQueryLimit);
+      .slice(
+        0,
+        this.runtimeConfig.PRODUCT_TEST_MODE
+          ? this.runtimeConfig.TEST_MAX_SLOTS
+          : this.runtimeConfig.runtime.marketQueryLimit
+      );
 
     this.emitSlotEndedEvents(eligible);
 
@@ -188,6 +193,15 @@ export class MarketMonitor extends EventEmitter {
       console.log(
         `   ${market.title} | ID: ${market.conditionId} | Liq: $${market.liquidityUsd.toFixed(2)}`
       );
+    }
+
+    if (this.runtimeConfig.PRODUCT_TEST_MODE && eligible[0]) {
+      logger.debug('PRODUCT_TEST_MODE pinned a single active slot', {
+        conditionId: eligible[0].conditionId,
+        title: eligible[0].title,
+        testMaxSlots: this.runtimeConfig.TEST_MAX_SLOTS,
+        testMinTradeUsdc: this.runtimeConfig.TEST_MIN_TRADE_USDC,
+      });
     }
 
     logger.debug('Gamma market scan stage counts', {

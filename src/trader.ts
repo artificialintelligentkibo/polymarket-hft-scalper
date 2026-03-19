@@ -9,6 +9,7 @@ import {
   type SignatureType,
 } from './config.js';
 import { logger } from './logger.js';
+import { clampProductTestShares } from './product-test-mode.js';
 import type { Outcome } from './clob-fetcher.js';
 import { roundTo } from './utils.js';
 
@@ -120,12 +121,19 @@ export class Trader {
   async placeOrder(request: PlaceOrderRequest): Promise<TradeExecutionResult> {
     await this.initialize();
 
-    const validatedShares = roundTo(request.shares, 4);
     const metadata = await this.getMarketMetadata(request.tokenId);
     const validatedPrice = this.validatePrice(request.price, metadata.tickSize);
+    const validatedShares = clampProductTestShares(
+      roundTo(request.shares, 4),
+      validatedPrice,
+      this.runtimeConfig
+    );
     const notionalUsd = roundTo(validatedShares * validatedPrice, 2);
     const orderType = request.orderType ?? this.runtimeConfig.trading.orderType;
-    const postOnly = request.postOnly ?? this.runtimeConfig.trading.defaultPostOnly;
+    const postOnly =
+      this.runtimeConfig.PRODUCT_TEST_MODE
+        ? true
+        : request.postOnly ?? this.runtimeConfig.trading.defaultPostOnly;
 
     if (!Number.isFinite(validatedShares) || validatedShares <= 0) {
       throw new Error('Order shares must be positive.');
@@ -133,6 +141,12 @@ export class Trader {
 
     if (!Number.isFinite(validatedPrice) || validatedPrice <= 0) {
       throw new Error('Order price must be positive.');
+    }
+
+    if (this.runtimeConfig.PRODUCT_TEST_MODE && notionalUsd > this.runtimeConfig.TEST_MIN_TRADE_USDC * 3) {
+      throw new Error(
+        `PRODUCT_TEST_MODE rejected order notional $${notionalUsd.toFixed(2)} above safe cap`
+      );
     }
 
     if (isDryRunMode(this.runtimeConfig)) {
@@ -148,6 +162,7 @@ export class Trader {
           : this.runtimeConfig.SIMULATION_MODE
             ? 'SIMULATION_MODE'
             : 'DRY_RUN',
+        productTestMode: this.runtimeConfig.PRODUCT_TEST_MODE,
       });
 
       return {
@@ -187,6 +202,7 @@ export class Trader {
       feeRateBps: metadata.feeRateBps,
       orderType,
       postOnly,
+      productTestMode: this.runtimeConfig.PRODUCT_TEST_MODE,
     });
 
     const response =
