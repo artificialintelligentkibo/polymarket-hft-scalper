@@ -317,7 +317,7 @@ export async function runBacktest(
     });
   }
 
-  logger.info('Backtest completed', summary);
+  logger.info('Backtest completed', { ...summary });
   return summary;
 }
 
