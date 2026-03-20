@@ -1,14 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   buildModeOverrides,
   applyEnvUpdatesToText,
   collectTodayResetTargets,
 } from '../cli/helpers.js';
 import { createConfig } from '../src/config.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const repoRoot = path.resolve(__dirname, '..');
 
 test('buildModeOverrides returns safe simulation and product-test presets', () => {
   const simulation = buildModeOverrides('simulation');
@@ -85,4 +90,18 @@ test('collectTodayResetTargets includes dated logs plus state and pid files', ()
   } finally {
     process.chdir(originalCwd);
   }
+});
+
+test('package CLI entrypoints use source-first tsx execution and valid bin wrapper', () => {
+  const packageJson = JSON.parse(
+    readFileSync(path.join(repoRoot, 'package.json'), 'utf8')
+  ) as {
+    scripts?: Record<string, string>;
+    bin?: Record<string, string>;
+  };
+
+  assert.equal(packageJson.scripts?.scalper, 'tsx cli/index.ts');
+  assert.equal(packageJson.bin?.scalper, 'cli/index.js');
+  assert.equal(existsSync(path.join(repoRoot, 'cli', 'index.ts')), true);
+  assert.equal(existsSync(path.join(repoRoot, 'cli', 'index.js')), true);
 });
