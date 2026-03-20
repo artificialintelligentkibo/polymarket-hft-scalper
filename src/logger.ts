@@ -308,7 +308,14 @@ async function appendToJsonl(
     getLogsDirectory(),
     `${prefix}_${new Date(timestampMs).toISOString().slice(0, 10)}.jsonl`
   );
-  await appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf8');
+  try {
+    await appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf8');
+  } catch (error) {
+    console.error(
+      `[${new Date().toISOString()}] [error] [trade-logger] Failed to append ${prefix} entry`,
+      error
+    );
+  }
 }
 
 async function getBinanceExchange(): Promise<OhlcvCapableExchange> {

@@ -505,7 +505,7 @@ export function calculateTradeSize(params: {
   );
   const shares = clampProductTestShares(
     preliminaryShares,
-    params.price ?? params.referenceEdge ?? 1,
+    params.price ?? 1,
     runtimeConfig
   );
 

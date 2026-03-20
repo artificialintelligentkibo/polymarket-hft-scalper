@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createConfig, isDryRunMode } from '../src/config.js';
+import { config, createConfig, isDryRunMode } from '../src/config.js';
 
 test('createConfig filters invalid and duplicate whitelist condition ids', () => {
   const candidate = createConfig({
@@ -71,4 +71,14 @@ test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () =
 
   assert.equal(candidate.PRODUCT_TEST_MODE, true);
   assert.equal(isDryRunMode(candidate), false);
+});
+
+test('config proxy supports key enumeration and spreading', () => {
+  const keys = Object.keys(config);
+  assert.equal(keys.includes('SIMULATION_MODE'), true);
+  assert.equal(keys.includes('strategy'), true);
+
+  const clone = { ...config };
+  assert.equal(typeof clone.SIMULATION_MODE, 'boolean');
+  assert.equal(typeof clone.strategy, 'object');
 });

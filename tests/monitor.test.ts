@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createConfig } from '../src/config.js';
 import {
+  fetchGammaEventsPage,
   fetchPaginatedGammaEventMarkets,
   flattenGammaEventMarkets,
   isLikelyFiveMinuteMarket,
@@ -274,4 +275,30 @@ test('fetchPaginatedGammaEventMarkets paginates ordered crypto /events and flatt
   assert.equal(result.pagesFetched, 2);
   assert.equal(result.events.length, 201);
   assert.equal(result.marketSources.length, 201);
+});
+
+test('fetchGammaEventsPage aborts hung Gamma requests with a timeout', async () => {
+  const hangingFetch = ((_: URL | RequestInfo, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      signal?.addEventListener(
+        'abort',
+        () => {
+          reject(signal.reason ?? new Error('aborted'));
+        },
+        { once: true }
+      );
+    })) as typeof fetch;
+
+  await assert.rejects(
+    () =>
+      fetchGammaEventsPage({
+        gammaUrl: 'https://gamma-api.polymarket.com',
+        limit: 10,
+        offset: 0,
+        fetchImpl: hangingFetch,
+        requestTimeoutMs: 5,
+      }),
+    /timed out/i
+  );
 });

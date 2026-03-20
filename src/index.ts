@@ -29,6 +29,7 @@ import type { StrategySignal } from './strategy-types.js';
 import { pruneSetEntries, roundTo, sleep } from './utils.js';
 
 const MAX_TRACKED_SLOT_REPORTS = 2_048;
+const UNCONFIRMED_ORDER_COOLDOWN_MS = 15_000;
 
 class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
@@ -42,8 +43,10 @@ class MarketMakerRuntime {
   private readonly positions = new Map<string, PositionManager>();
   private readonly markets = new Map<string, MarketCandidate>();
   private readonly latestBooks = new Map<string, MarketOrderbookSnapshot>();
+  private readonly marketWork = new Map<string, Promise<void>>();
   private readonly pendingSlotReports = new Set<string>();
   private readonly printedSlotReports = new Set<string>();
+  private readonly pendingLiveOrders = new Map<string, number>();
   private readonly recentSignals: RuntimeSignalSnapshot[] = [];
   private readonly recentLatencySamples: number[] = [];
   private running = false;
@@ -180,6 +183,7 @@ class MarketMakerRuntime {
         pid: process.pid,
         activeSlotsCount: 0,
       });
+      this.pendingLiveOrders.clear();
       this.redeemer.stop();
       this.fetcher.close();
     }
@@ -211,7 +215,9 @@ class MarketMakerRuntime {
     await this.fetcher.subscribeAssets(tokenIds);
 
     await runWithConcurrency(markets, config.runtime.maxConcurrentMarkets, async (market) => {
-      await this.processMarket(market);
+      await this.runSerializedMarketTask(market.marketId, async () => {
+        await this.processMarket(market);
+      });
     });
 
     this.printPendingReports();
@@ -271,6 +277,17 @@ class MarketMakerRuntime {
       return;
     }
 
+    const pendingOrderKey = this.getPendingOrderKey(market.marketId, signal.outcome);
+    if (this.hasPendingLiveOrder(pendingOrderKey)) {
+      logger.debug('Skipping signal because live resting order is still pending', {
+        marketId: market.marketId,
+        signalType: signal.signalType,
+        outcome: signal.outcome,
+        action: signal.action,
+      });
+      return;
+    }
+
     const tokenId = signal.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
     const book = signal.outcome === 'YES' ? orderbook.yes : orderbook.no;
     const beforeSnapshot = positionManager.getSnapshot();
@@ -280,25 +297,52 @@ class MarketMakerRuntime {
       orderbook,
       signal,
     });
-    const afterSnapshot = positionManager.applyFill({
-      outcome: signal.outcome,
-      side: signal.action,
-      shares: execution.shares,
-      price: execution.price,
-      timestamp: new Date().toISOString(),
-      orderId: execution.orderId,
-    });
-    recordExecution({
-      slotKey,
-      marketId: market.marketId,
-      marketTitle: market.title,
-      outcome: resolveSlotOutcome(market, signal.outcome),
-      action: signal.action,
-      notionalUsd: execution.notionalUsd,
-      slotStart: market.startTime,
-      slotEnd: market.endTime,
-    });
-    const realizedDelta = roundTo(afterSnapshot.realizedPnl - beforeSnapshot.realizedPnl, 4);
+    const effectiveShares = execution.fillConfirmed ? execution.filledShares : 0;
+    const effectivePrice = execution.fillPrice ?? execution.price;
+    const effectiveNotionalUsd = execution.fillConfirmed
+      ? roundTo(effectiveShares * effectivePrice, 2)
+      : 0;
+    const afterSnapshot =
+      effectiveShares > 0
+        ? positionManager.applyFill({
+            outcome: signal.outcome,
+            side: signal.action,
+            shares: effectiveShares,
+            price: effectivePrice,
+            timestamp: new Date().toISOString(),
+            orderId: execution.orderId,
+          })
+        : beforeSnapshot;
+
+    if (effectiveShares > 0) {
+      this.clearPendingLiveOrder(pendingOrderKey);
+      recordExecution({
+        slotKey,
+        marketId: market.marketId,
+        marketTitle: market.title,
+        outcome: resolveSlotOutcome(market, signal.outcome),
+        action: signal.action,
+        notionalUsd: effectiveNotionalUsd,
+        slotStart: market.startTime,
+        slotEnd: market.endTime,
+      });
+    } else if (!execution.simulation) {
+      this.rememberPendingLiveOrder(pendingOrderKey);
+      logger.warn('Live order submitted without confirmed fill; skipped position mutation', {
+        marketId: market.marketId,
+        signalType: signal.signalType,
+        outcome: signal.outcome,
+        action: signal.action,
+        orderId: execution.orderId,
+        submittedShares: execution.shares,
+        submittedPrice: execution.price,
+      });
+    }
+
+    const realizedDelta =
+      effectiveShares > 0
+        ? roundTo(afterSnapshot.realizedPnl - beforeSnapshot.realizedPnl, 4)
+        : 0;
 
     if (realizedDelta !== 0) {
       recordTrade(
@@ -312,7 +356,7 @@ class MarketMakerRuntime {
       );
     }
     const completedAt = Date.now();
-    if (signal.signalType === 'HARD_STOP' && signal.action === 'SELL') {
+    if (effectiveShares > 0 && signal.signalType === 'HARD_STOP' && signal.action === 'SELL') {
       positionManager.setEntryCooldown(
         signal.outcome,
         config.strategy.hardStopCooldownMs,
@@ -376,8 +420,8 @@ class MarketMakerRuntime {
       combinedDiscount: signal.combinedDiscount,
       combinedPremium: signal.combinedPremium,
       edgeAmount: signal.edgeAmount,
-      shares: execution.shares,
-      notionalUsd: execution.notionalUsd,
+      shares: effectiveShares,
+      notionalUsd: effectiveNotionalUsd,
       liquidityUsd: market.liquidityUsd,
       fillRatio: signal.fillRatio,
       capitalClamp: signal.capitalClamp,
@@ -411,10 +455,12 @@ class MarketMakerRuntime {
       signalType: signal.signalType,
       outcome: signal.outcome,
       action: signal.action,
-      shares: execution.shares,
-      price: execution.price,
+      shares: effectiveShares,
+      submittedShares: execution.shares,
+      price: effectivePrice,
       urgency: execution.urgency,
       wasMaker: execution.wasMaker,
+      fillConfirmed: execution.fillConfirmed,
       latencySignalToOrderMs: execution.latencySignalToOrderMs,
       latencyRoundTripMs,
       signedNetShares: afterSnapshot.signedNetShares,
@@ -507,6 +553,55 @@ class MarketMakerRuntime {
     const created = new PositionManager(market.marketId, market.endTime);
     this.positions.set(market.marketId, created);
     return created;
+  }
+
+  private getPendingOrderKey(marketId: string, outcome: StrategySignal['outcome']): string {
+    return `${marketId}:${outcome}`;
+  }
+
+  private async runSerializedMarketTask(
+    marketId: string,
+    task: () => Promise<void>
+  ): Promise<void> {
+    const previous = this.marketWork.get(marketId) ?? Promise.resolve();
+    let releaseCurrent!: () => void;
+    const current = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+    const chain = previous.then(() => current);
+    this.marketWork.set(marketId, chain);
+    await previous;
+
+    try {
+      await task();
+    } finally {
+      releaseCurrent();
+      if (this.marketWork.get(marketId) === chain) {
+        this.marketWork.delete(marketId);
+      }
+    }
+  }
+
+  private hasPendingLiveOrder(key: string): boolean {
+    const pendingUntil = this.pendingLiveOrders.get(key);
+    if (!pendingUntil) {
+      return false;
+    }
+
+    if (pendingUntil <= Date.now()) {
+      this.pendingLiveOrders.delete(key);
+      return false;
+    }
+
+    return true;
+  }
+
+  private rememberPendingLiveOrder(key: string): void {
+    this.pendingLiveOrders.set(key, Date.now() + UNCONFIRMED_ORDER_COOLDOWN_MS);
+  }
+
+  private clearPendingLiveOrder(key: string): void {
+    this.pendingLiveOrders.delete(key);
   }
 
   private maybePrintSlotReport(slotKey: string): void {
@@ -694,5 +789,10 @@ const isDirectRun =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isDirectRun) {
-  void main();
+  void main().catch((error) => {
+    logger.error('Fatal runtime error', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    process.exitCode = 1;
+  });
 }

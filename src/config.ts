@@ -416,6 +416,20 @@ export const config: AppConfig = new Proxy({} as AppConfig, {
   has(_target, property) {
     return property in getConfig();
   },
+  ownKeys() {
+    return Reflect.ownKeys(getConfig() as object);
+  },
+  getOwnPropertyDescriptor(_target, property) {
+    const descriptor = Object.getOwnPropertyDescriptor(getConfig() as object, property);
+    if (!descriptor) {
+      return undefined;
+    }
+
+    return {
+      ...descriptor,
+      configurable: true,
+    };
+  },
 });
 
 export function validateConfig(candidate: AppConfig = config): void {

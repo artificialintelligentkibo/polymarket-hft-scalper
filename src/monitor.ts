@@ -93,6 +93,7 @@ const GAMMA_EVENT_PAGE_LIMIT = 200;
 const MAX_GAMMA_EVENT_PAGES = 6;
 const MARKET_DISCOVERY_BUFFER_MULTIPLIER = 6;
 const STALE_SLOT_GRACE_MS = 60_000;
+const GAMMA_REQUEST_TIMEOUT_MS = 8_000;
 let preferredGammaOrderField: 'endDate' | 'end_date' | null | undefined;
 const CLOCK_RANGE_PATTERN =
   /\b\d{1,2}:\d{2}\s?(?:AM|PM)\s*-\s*\d{1,2}:\d{2}\s?(?:AM|PM)\b/i;
@@ -342,8 +343,10 @@ export async function fetchGammaEventsPage(params: {
   limit: number;
   offset: number;
   fetchImpl?: FetchLike;
+  requestTimeoutMs?: number;
 }): Promise<JsonRecord[]> {
   const fetchImpl = params.fetchImpl ?? fetch;
+  const requestTimeoutMs = params.requestTimeoutMs ?? GAMMA_REQUEST_TIMEOUT_MS;
   const orderCandidates = buildOrderCandidates(preferredGammaOrderField);
   let lastError: Error | null = null;
 
@@ -361,12 +364,17 @@ export async function fetchGammaEventsPage(params: {
       url.searchParams.set('ascending', 'true');
     }
 
-    const response = await fetchImpl(url, {
-      method: 'GET',
-      headers: {
-        accept: 'application/json',
+    const response = await fetchWithTimeout(
+      fetchImpl,
+      url,
+      {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+        },
       },
-    });
+      requestTimeoutMs
+    );
 
     if (!response.ok) {
       const errorText = await safeReadResponseText(response);
@@ -405,6 +413,33 @@ export async function fetchGammaEventsPage(params: {
   }
 
   return [];
+}
+
+async function fetchWithTimeout(
+  fetchImpl: FetchLike,
+  url: URL,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort(new Error(`Gamma API request timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  timeoutId.unref?.();
+
+  try {
+    return await fetchImpl(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`Gamma API request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 function buildOrderCandidates(

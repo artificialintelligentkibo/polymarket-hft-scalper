@@ -239,7 +239,12 @@ function inferSideTick(levels: OrderbookLevel[]): number {
     }
   }
 
-  return Math.min(
-    ...differences.filter((value) => Number.isFinite(value) && value > 0)
+  const finitePositiveDifferences = differences.filter(
+    (value) => Number.isFinite(value) && value > 0
   );
+  if (finitePositiveDifferences.length === 0) {
+    return Number.NaN;
+  }
+
+  return Math.min(...finitePositiveDifferences);
 }

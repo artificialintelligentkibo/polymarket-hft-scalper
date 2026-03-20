@@ -35,8 +35,8 @@ export class RiskManager {
 
     positionManager.setSlotEndsAt(market.endTime);
     positionManager.markToMarket({
-      YES: orderbook.yes.midPrice ?? orderbook.yes.bestBid,
-      NO: orderbook.no.midPrice ?? orderbook.no.bestBid,
+      YES: orderbook.yes.midPrice ?? orderbook.yes.bestBid ?? orderbook.yes.lastTradePrice,
+      NO: orderbook.no.midPrice ?? orderbook.no.bestBid ?? orderbook.no.lastTradePrice,
     });
 
     const blockedOutcomes = new Set<Outcome>();

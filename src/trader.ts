@@ -58,6 +58,9 @@ export interface TradeExecutionResult {
   shares: number;
   price: number;
   notionalUsd: number;
+  filledShares: number;
+  fillPrice: number | null;
+  fillConfirmed: boolean;
   simulation: boolean;
   wasMaker: boolean | null;
   postOnly: boolean;
@@ -87,6 +90,9 @@ export class Trader {
 
   constructor(private readonly runtimeConfig: AppConfig = config) {
     this.provider = new ethers.providers.JsonRpcProvider(runtimeConfig.rpcUrl);
+    if (!runtimeConfig.signerPrivateKey && !isDryRunMode(runtimeConfig)) {
+      throw new Error('Missing signer private key for live trading.');
+    }
     this.signerWallet = (
       runtimeConfig.signerPrivateKey
         ? new ethers.Wallet(runtimeConfig.signerPrivateKey, this.provider)
@@ -174,6 +180,9 @@ export class Trader {
         shares: validatedShares,
         price: validatedPrice,
         notionalUsd,
+        filledShares: validatedShares,
+        fillPrice: validatedPrice,
+        fillConfirmed: true,
         simulation: true,
         wasMaker: null,
         postOnly,
@@ -238,6 +247,14 @@ export class Trader {
       throw new Error(`Order placement failed: ${message}`);
     }
 
+    const fillSummary = extractFillSummary({
+      response,
+      submittedShares: validatedShares,
+      submittedPrice: validatedPrice,
+      orderType,
+      postOnly,
+    });
+
     return {
       orderId: response.orderID,
       marketId: request.marketId,
@@ -247,8 +264,11 @@ export class Trader {
       shares: validatedShares,
       price: validatedPrice,
       notionalUsd,
+      filledShares: fillSummary.filledShares,
+      fillPrice: fillSummary.fillPrice,
+      fillConfirmed: fillSummary.fillConfirmed,
       simulation: false,
-      wasMaker: null,
+      wasMaker: fillSummary.wasMaker,
       postOnly,
       orderType,
     };
@@ -508,6 +528,101 @@ function normalizeFeeRateBps(raw: unknown): number {
   return 0;
 }
 
+function extractFillSummary(params: {
+  response: Record<string, unknown>;
+  submittedShares: number;
+  submittedPrice: number;
+  orderType: OrderMode;
+  postOnly: boolean;
+}): {
+  filledShares: number;
+  fillPrice: number | null;
+  fillConfirmed: boolean;
+  wasMaker: boolean | null;
+} {
+  const { response, submittedShares, submittedPrice, orderType, postOnly } = params;
+  const numericShareCandidates = [
+    response.sizeMatched,
+    response.size_matched,
+    response.filledSize,
+    response.filled_size,
+    response.matchedSize,
+    response.matched_size,
+    response.executedSize,
+    response.executed_size,
+    (response.order as Record<string, unknown> | undefined)?.filledSize,
+    (response.order as Record<string, unknown> | undefined)?.filled_size,
+  ];
+  const numericPriceCandidates = [
+    response.avgPrice,
+    response.averagePrice,
+    response.average_price,
+    response.fillPrice,
+    response.fill_price,
+    (response.order as Record<string, unknown> | undefined)?.avgPrice,
+    (response.order as Record<string, unknown> | undefined)?.averagePrice,
+  ];
+
+  const explicitFilledShares = numericShareCandidates
+    .map(toFiniteNumberOrNull)
+    .find((value): value is number => value !== null && value >= 0);
+  const explicitFillPrice = numericPriceCandidates
+    .map(toFiniteNumberOrNull)
+    .find((value): value is number => value !== null && value > 0);
+  const rawStatus = String(
+    response.status ??
+      response.orderStatus ??
+      (response.order as Record<string, unknown> | undefined)?.status ??
+      ''
+  )
+    .trim()
+    .toLowerCase();
+
+  if (explicitFilledShares !== undefined) {
+    return {
+      filledShares: roundTo(explicitFilledShares, 4),
+      fillPrice: explicitFilledShares > 0 ? roundTo(explicitFillPrice ?? submittedPrice, 6) : null,
+      fillConfirmed: explicitFilledShares > 0,
+      wasMaker: explicitFilledShares > 0 ? (postOnly ? true : null) : null,
+    };
+  }
+
+  if (rawStatus === 'filled' || rawStatus === 'matched' || rawStatus === 'executed') {
+    return {
+      filledShares: roundTo(submittedShares, 4),
+      fillPrice: roundTo(explicitFillPrice ?? submittedPrice, 6),
+      fillConfirmed: true,
+      wasMaker: postOnly ? true : null,
+    };
+  }
+
+  const assumeImmediateFill = orderType !== 'GTC' || !postOnly;
+  if (assumeImmediateFill) {
+    return {
+      filledShares: roundTo(submittedShares, 4),
+      fillPrice: roundTo(explicitFillPrice ?? submittedPrice, 6),
+      fillConfirmed: true,
+      wasMaker: postOnly ? true : null,
+    };
+  }
+
+  logger.warn('Live order accepted without explicit fill confirmation; treating as resting order', {
+    orderId: String(response.orderID ?? response.orderId ?? ''),
+    status: rawStatus || 'unknown',
+    submittedShares,
+    submittedPrice,
+    orderType,
+    postOnly,
+  });
+
+  return {
+    filledShares: 0,
+    fillPrice: null,
+    fillConfirmed: false,
+    wasMaker: null,
+  };
+}
+
 function resolveSignerAddress(candidate: AppConfig, signerAddress: string): string {
   if (isDryRunMode(candidate) && !candidate.signerPrivateKey) {
     return ethers.constants.AddressZero;
@@ -555,4 +670,17 @@ function toOrderType(orderType: OrderMode): OrderType {
     return OrderType.FAK;
   }
   return OrderType.GTC;
+}
+
+function toFiniteNumberOrNull(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
 }

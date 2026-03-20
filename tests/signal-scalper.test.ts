@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
+import { createConfig } from '../src/config.js';
 import type { MarketCandidate } from '../src/monitor.js';
 import { PositionManager } from '../src/position-manager.js';
 import { RiskManager } from '../src/risk-manager.js';
@@ -172,6 +173,26 @@ test('trade size uses price multiplier, fill ratio, and capital clamp', () => {
   assert.equal(size.priceMultiplier > 1, true);
   assert.equal(size.fillRatio > 0, true);
   assert.equal(size.capitalClamp > 0, true);
+});
+
+test('trade size does not use referenceEdge as a synthetic price fallback', () => {
+  const size = calculateTradeSize({
+    action: 'BUY',
+    signalType: 'FAIR_VALUE_BUY',
+    edgeAmount: 0.03,
+    availableCapacity: 80,
+    depthShares: 150,
+    liquidityUsd: 2500,
+    price: null,
+    referenceEdge: 0.018,
+    runtimeConfig: createConfig({
+      ...process.env,
+      PRODUCT_TEST_MODE: 'true',
+      TEST_MIN_TRADE_USDC: '1',
+    }),
+  });
+
+  assert.equal(size.shares <= 1, true);
 });
 
 test('fair value buy uses paired normalization rather than raw single-book mid', () => {
