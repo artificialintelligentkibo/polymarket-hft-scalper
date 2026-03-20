@@ -7,7 +7,6 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
 import { Command } from 'commander';
@@ -127,10 +126,11 @@ async function startBot(runtimeConfig: AppConfig, fromSwitch: boolean): Promise<
   mkdirSync(path.resolve(process.cwd(), runtimeConfig.REPORTS_DIR), { recursive: true });
 
   let manager: 'pm2' | 'nohup' | 'detached' = 'detached';
+  const npmCommand = resolveNpmCommand();
   if (commandExists('pm2')) {
     const pm2Result = spawnSync(
       'pm2',
-      ['start', 'npm', '--name', PROCESS_NAME, '--cwd', process.cwd(), '--', 'run', 'start'],
+      ['start', npmCommand, '--name', PROCESS_NAME, '--cwd', process.cwd(), '--', 'run', 'start'],
       {
         cwd: process.cwd(),
         encoding: 'utf8',
@@ -142,16 +142,14 @@ async function startBot(runtimeConfig: AppConfig, fromSwitch: boolean): Promise<
     }
     manager = 'pm2';
   } else {
-    const tsxCliPath = resolveTsxCliPath();
-    const entryPath = path.resolve(process.cwd(), 'src', 'index.ts');
     const child =
       process.platform !== 'win32' && commandExists('nohup')
-        ? spawn('nohup', [process.execPath, tsxCliPath, entryPath], {
+        ? spawn('nohup', [npmCommand, 'run', 'start'], {
             cwd: process.cwd(),
             detached: true,
             stdio: 'ignore',
           })
-        : spawn(process.execPath, [tsxCliPath, entryPath], {
+        : spawn(npmCommand, ['run', 'start'], {
             cwd: process.cwd(),
             detached: true,
             stdio: 'ignore',
@@ -490,9 +488,8 @@ function commandExists(command: string): boolean {
   }).status === 0;
 }
 
-function resolveTsxCliPath(): string {
-  const requireFromProject = createRequire(path.resolve(process.cwd(), 'package.json'));
-  return requireFromProject.resolve('tsx/dist/cli.mjs');
+function resolveNpmCommand(): string {
+  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
 }
 
 function formatModeLabel(mode: RuntimeMode): string {

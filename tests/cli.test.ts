@@ -104,4 +104,12 @@ test('package CLI entrypoints use source-first tsx execution and valid bin wrapp
   assert.equal(packageJson.bin?.scalper, 'cli/index.js');
   assert.equal(existsSync(path.join(repoRoot, 'cli', 'index.ts')), true);
   assert.equal(existsSync(path.join(repoRoot, 'cli', 'index.js')), true);
+  assert.equal(
+    readFileSync(path.join(repoRoot, 'cli', 'index.ts'), 'utf8').includes('tsx/dist/cli.mjs'),
+    false
+  );
+  assert.equal(
+    readFileSync(path.join(repoRoot, 'cli', 'index.js'), 'utf8').includes('tsx/dist/cli.mjs'),
+    false
+  );
 });
