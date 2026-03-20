@@ -628,7 +628,7 @@ function getBookForOutcome(
   return outcome === 'YES' ? snapshot.yes : snapshot.no;
 }
 
-function estimateFairValue(
+export function estimateFairValue(
   snapshot: MarketOrderbookSnapshot,
   outcome: Outcome
 ): number | null {
@@ -717,7 +717,7 @@ function estimateLegacyFairValue(
   const opposite = getBookForOutcome(snapshot, outcome === 'YES' ? 'NO' : 'YES');
   const normalizedMid = normalizePairedFairValues(own.midPrice, opposite.midPrice);
   if (normalizedMid) {
-    return outcome === 'YES' ? normalizedMid.left : normalizedMid.right;
+    return normalizedMid.left;
   }
 
   const normalizedLastTrade = normalizePairedFairValues(
@@ -725,7 +725,7 @@ function estimateLegacyFairValue(
     opposite.lastTradePrice
   );
   if (normalizedLastTrade) {
-    return outcome === 'YES' ? normalizedLastTrade.left : normalizedLastTrade.right;
+    return normalizedLastTrade.left;
   }
 
   if (opposite.midPrice !== null) {

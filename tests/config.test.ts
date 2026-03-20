@@ -18,19 +18,18 @@ test('createConfig filters invalid and duplicate whitelist condition ids', () =>
   ]);
 });
 
-test('createConfig defaults to dynamic BTC/SOL/XRP market scan when whitelist is empty', () => {
+test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelist is empty', () => {
   const candidate = createConfig({
     ...process.env,
     WHITELIST_CONDITION_IDS: '',
-    COINS_TO_TRADE: 'btc,sol,xrp,eth',
-    FILTER_5MIN_ONLY: 'true',
-    MIN_LIQUIDITY_USD: '500',
   });
 
   assert.deepEqual(candidate.WHITELIST_CONDITION_IDS, []);
   assert.deepEqual(candidate.COINS_TO_TRADE, ['BTC', 'SOL', 'XRP', 'ETH']);
   assert.equal(candidate.FILTER_5MIN_ONLY, true);
   assert.equal(candidate.MIN_LIQUIDITY_USD, 500);
+  assert.equal(candidate.SIMULATION_MODE, true);
+  assert.equal(candidate.DRY_RUN, true);
   assert.equal(candidate.REPORTS_DIR, './reports');
   assert.equal(candidate.LATENCY_LOG, './reports/latency_YYYY-MM-DD.log');
   assert.equal(candidate.STATE_FILE, './reports/state.json');
@@ -39,14 +38,14 @@ test('createConfig defaults to dynamic BTC/SOL/XRP market scan when whitelist is
   assert.equal(candidate.PRODUCT_TEST_MODE, false);
   assert.equal(candidate.TEST_MIN_TRADE_USDC, 1);
   assert.equal(candidate.TEST_MAX_SLOTS, 1);
-  assert.equal(candidate.AUTO_REDEEM, true);
+  assert.equal(candidate.AUTO_REDEEM, false);
   assert.equal(candidate.REDEEM_INTERVAL_MS, 30000);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
   assert.equal(candidate.POLYMARKET_RELAYER_URL, 'https://relayer-v2.polymarket.com');
   assert.equal(candidate.strategy.minCombinedDiscount, 0.01);
   assert.equal(candidate.strategy.extremeSellThreshold, 0.93);
   assert.equal(candidate.strategy.extremeBuyThreshold, 0.04);
-  assert.equal(candidate.strategy.fairValueBuyThreshold, 0.015);
+  assert.equal(candidate.strategy.fairValueBuyThreshold, 0.018);
   assert.equal(candidate.strategy.fairValueSellThreshold, 0.015);
   assert.equal(candidate.strategy.minEntryDepthUsd, 2);
   assert.equal(candidate.strategy.maxEntrySpread, 0.3);

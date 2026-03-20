@@ -5,7 +5,12 @@ import { createConfig } from '../src/config.js';
 import type { MarketCandidate } from '../src/monitor.js';
 import { PositionManager } from '../src/position-manager.js';
 import { RiskManager } from '../src/risk-manager.js';
-import { SignalScalper, calculateTradeSize, resolvePriceMultiplier } from '../src/signal-scalper.js';
+import {
+  SignalScalper,
+  calculateTradeSize,
+  estimateFairValue,
+  resolvePriceMultiplier,
+} from '../src/signal-scalper.js';
 
 function createMarket(): MarketCandidate {
   return {
@@ -293,6 +298,26 @@ test('fair value sell can reduce YES inventory when YES is rich versus parity', 
   assert.ok(fairValueSell);
   assert.equal(fairValueSell?.action, 'SELL');
   assert.equal((fairValueSell?.fairValue ?? 0) < (orderbook.yes.bestBid ?? 0), true);
+});
+
+test('estimateFairValue keeps each outcome on its own normalized side', () => {
+  const orderbook = createOrderbook();
+  orderbook.yes.midPrice = 0.37;
+  orderbook.no.midPrice = 0.63;
+  orderbook.yes.lastTradePrice = 0.37;
+  orderbook.no.lastTradePrice = 0.63;
+  orderbook.yes.bestAsk = 0.39;
+  orderbook.no.bestAsk = 0.65;
+
+  const yesFairValue = estimateFairValue(orderbook, 'YES');
+  const noFairValue = estimateFairValue(orderbook, 'NO');
+
+  assert.ok(yesFairValue !== null);
+  assert.ok(noFairValue !== null);
+  assert.equal(Math.abs((yesFairValue ?? 0) - 0.37) < 0.000001, true);
+  assert.equal(Math.abs((noFairValue ?? 0) - 0.63) < 0.000001, true);
+  assert.equal(Math.abs((yesFairValue ?? 0) - orderbook.yes.bestAsk) < 0.05, true);
+  assert.equal(Math.abs((noFairValue ?? 0) - orderbook.no.bestAsk) < 0.05, true);
 });
 
 test('extreme buy skips degenerate entry books with negligible ask depth', () => {

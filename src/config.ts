@@ -113,7 +113,7 @@ export interface AppConfig {
 }
 
 const DEFAULT_WHITELIST_CONDITION_IDS = [] as const;
-const DEFAULT_COINS_TO_TRADE = ['BTC', 'SOL', 'XRP'] as const satisfies readonly TradeableCoin[];
+const DEFAULT_COINS_TO_TRADE = ['BTC', 'SOL', 'XRP', 'ETH'] as const satisfies readonly TradeableCoin[];
 
 let dotenvLoaded = false;
 let configCache: AppConfig | undefined;
@@ -253,13 +253,13 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
   return {
     PRODUCT_TEST_MODE: parseBoolean(env.PRODUCT_TEST_MODE, false),
-    SIMULATION_MODE: parseBoolean(env.SIMULATION_MODE, false),
+    SIMULATION_MODE: parseBoolean(env.SIMULATION_MODE, true),
     TEST_MODE: parseBoolean(env.TEST_MODE, false),
-    DRY_RUN: parseBoolean(env.DRY_RUN, false),
+    DRY_RUN: parseBoolean(env.DRY_RUN, true),
     TEST_MIN_TRADE_USDC: Math.max(0.1, parseFloatOrDefault(env.TEST_MIN_TRADE_USDC, '1')),
     TEST_MAX_SLOTS: Math.max(1, parseIntOrDefault(env.TEST_MAX_SLOTS, '1')),
     ENABLE_SIGNAL: parseBoolean(env.ENABLE_SIGNAL, true),
-    AUTO_REDEEM: parseBoolean(env.AUTO_REDEEM, true),
+    AUTO_REDEEM: parseBoolean(env.AUTO_REDEEM, false),
     REDEEM_INTERVAL_MS: Math.max(5_000, parseIntOrDefault(env.REDEEM_INTERVAL_MS, '30000')),
     COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
     FILTER_5MIN_ONLY: parseBoolean(
@@ -322,7 +322,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       minCombinedDiscount: parseFloatOrDefault(env.MIN_COMBINED_DISCOUNT, '0.01'),
       extremeSellThreshold: parseFloatOrDefault(env.EXTREME_SELL_THRESHOLD, '0.93'),
       extremeBuyThreshold: parseFloatOrDefault(env.EXTREME_BUY_THRESHOLD, '0.04'),
-      fairValueBuyThreshold: parseFloatOrDefault(env.FAIR_VALUE_BUY_THRESHOLD, '0.015'),
+      fairValueBuyThreshold: parseFloatOrDefault(env.FAIR_VALUE_BUY_THRESHOLD, '0.018'),
       fairValueSellThreshold: parseFloatOrDefault(env.FAIR_VALUE_SELL_THRESHOLD, '0.015'),
       trailingTakeProfit: parseFloatOrDefault(env.TRAILING_TAKE_PROFIT, '0.012'),
       hardStopLoss: parseFloatOrDefault(env.HARD_STOP_LOSS, '0.025'),
