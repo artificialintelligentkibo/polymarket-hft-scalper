@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { config, type AppConfig } from './config.js';
 import { formatDayKey, roundTo } from './utils.js';
@@ -72,6 +72,25 @@ export function evaluateDayDrawdown(
 
 export function resetDayPnlStateCache(): void {
   stateCache = null;
+}
+
+export function resetDayPnlState(
+  now: Date = new Date(),
+  runtimeConfig: AppConfig = config
+): DayPnlStateSnapshot {
+  const next = createEmptyState(formatDayKey(now), now.toISOString());
+  stateCache = next;
+  persistState(next, runtimeConfig);
+  return { ...next };
+}
+
+export function clearDayPnlStateFile(runtimeConfig: AppConfig = config): void {
+  stateCache = null;
+  try {
+    rmSync(resolveStateFilePath(runtimeConfig), { force: true });
+  } catch {
+    // ignore reset cleanup failures
+  }
 }
 
 function loadOrCreateState(

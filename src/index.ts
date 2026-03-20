@@ -16,6 +16,7 @@ import { PositionManager } from './position-manager.js';
 import { ProductTestModeController } from './product-test-mode.js';
 import { writeLatencyLog } from './reports.js';
 import { RiskManager } from './risk-manager.js';
+import { writeRuntimeStatus, type RuntimeSignalSnapshot } from './runtime-status.js';
 import { SignalScalper } from './signal-scalper.js';
 import {
   ensureSlotResult,
@@ -43,6 +44,8 @@ class MarketMakerRuntime {
   private readonly latestBooks = new Map<string, MarketOrderbookSnapshot>();
   private readonly pendingSlotReports = new Set<string>();
   private readonly printedSlotReports = new Set<string>();
+  private readonly recentSignals: RuntimeSignalSnapshot[] = [];
+  private readonly recentLatencySamples: number[] = [];
   private running = false;
   private stopping = false;
 
@@ -108,6 +111,13 @@ class MarketMakerRuntime {
       autoRedeem: config.AUTO_REDEEM,
       redeemIntervalMs: config.REDEEM_INTERVAL_MS,
     });
+    this.syncRuntimeStatus({
+      running: true,
+      pid: process.pid,
+      activeSlotsCount: 0,
+      lastSignals: [],
+      averageLatencyMs: null,
+    });
     this.redeemer.start();
   }
 
@@ -165,6 +175,11 @@ class MarketMakerRuntime {
         message: error?.message || 'Unknown error',
       });
     } finally {
+      this.syncRuntimeStatus({
+        running: false,
+        pid: process.pid,
+        activeSlotsCount: 0,
+      });
       this.redeemer.stop();
       this.fetcher.close();
     }
@@ -173,6 +188,10 @@ class MarketMakerRuntime {
   private async runCycle(): Promise<void> {
     const scannedMarkets = await this.monitor.scanEligibleMarkets();
     const markets = this.productTestMode.selectMarkets(scannedMarkets);
+    this.syncRuntimeStatus({
+      running: true,
+      activeSlotsCount: markets.length,
+    });
     if (markets.length === 0) {
       if (this.productTestMode.maybeFinalizePending()) {
         logger.info('PRODUCT_TEST_MODE finalized without additional market activity');
@@ -402,6 +421,80 @@ class MarketMakerRuntime {
       totalPnl: afterSnapshot.totalPnl,
       dayDrawdown: dayState.drawdown,
     });
+
+    this.recordRuntimeSignal({
+      timestamp: new Date(completedAt).toISOString(),
+      marketId: market.marketId,
+      signalType: signal.signalType,
+      action: signal.action,
+      outcome: signal.outcome,
+      latencyMs:
+        latencyRoundTripMs ?? execution.latencySignalToOrderMs ?? null,
+    });
+    this.syncRuntimeStatus({
+      totalDayPnl: dayState.dayPnl,
+      dayDrawdown: dayState.drawdown,
+      lastSignals: this.recentSignals,
+      averageLatencyMs: this.getAverageLatencyMs(),
+    });
+  }
+
+  private recordRuntimeSignal(signal: RuntimeSignalSnapshot): void {
+    this.recentSignals.push(signal);
+    while (this.recentSignals.length > 3) {
+      this.recentSignals.shift();
+    }
+
+    if (signal.latencyMs !== null && Number.isFinite(signal.latencyMs)) {
+      this.recentLatencySamples.push(Math.max(0, signal.latencyMs));
+      while (this.recentLatencySamples.length > 64) {
+        this.recentLatencySamples.shift();
+      }
+    }
+  }
+
+  private getAverageLatencyMs(): number | null {
+    if (this.recentLatencySamples.length === 0) {
+      return null;
+    }
+
+    const total = this.recentLatencySamples.reduce((sum, value) => sum + value, 0);
+    return roundTo(total / this.recentLatencySamples.length, 2);
+  }
+
+  private syncRuntimeStatus(overrides: Parameters<typeof writeRuntimeStatus>[0]): void {
+    writeRuntimeStatus(
+      {
+        running: this.running && !this.stopping,
+        pid: process.pid,
+        totalDayPnl: getDayPnlState().dayPnl,
+        dayDrawdown: getDayPnlState().drawdown,
+        lastSignals: this.recentSignals,
+        averageLatencyMs: this.getAverageLatencyMs(),
+        ...overrides,
+      },
+      config
+    );
+  }
+
+  private recordRuntimeSlotReport(slotKey: string): void {
+    const metrics = getSlotMetrics(slotKey);
+    if (!metrics) {
+      return;
+    }
+
+    this.syncRuntimeStatus({
+      lastSlotReport: {
+        slotLabel: metrics.marketTitle || slotKey,
+        marketId: metrics.marketId,
+        upPnl: metrics.upPnl,
+        downPnl: metrics.downPnl,
+        netPnl: metrics.total,
+        entries: metrics.entryCount,
+        fills: metrics.fillCount,
+        reportedAt: metrics.updatedAt,
+      },
+    });
   }
 
   private getPositionManager(market: MarketCandidate): PositionManager {
@@ -422,6 +515,7 @@ class MarketMakerRuntime {
     }
 
     printSlotReport(slotKey);
+    this.recordRuntimeSlotReport(slotKey);
     this.notifyProductTestSlotReport(slotKey);
     this.pendingSlotReports.delete(slotKey);
     this.printedSlotReports.add(slotKey);
@@ -436,6 +530,7 @@ class MarketMakerRuntime {
       }
 
       printSlotReport(slotKey);
+      this.recordRuntimeSlotReport(slotKey);
       this.notifyProductTestSlotReport(slotKey);
       this.pendingSlotReports.delete(slotKey);
       this.printedSlotReports.add(slotKey);

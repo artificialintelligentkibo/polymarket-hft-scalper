@@ -145,6 +145,10 @@ export function getSlotMetrics(slotKey: string): SlotMetrics | null {
   return entry ? { ...entry } : null;
 }
 
+export function resetSlotReporterState(): void {
+  slotResults.clear();
+}
+
 export function getTotalDayPnl(dayKey = formatDayKey(new Date())): number {
   if (dayKey === formatDayKey(new Date())) {
     return getDayPnlState().dayPnl;

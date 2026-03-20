@@ -134,6 +134,7 @@ What goes into `reports/`:
 - `NET PNL`
 - `TOTAL DAY PNL`
 - persisted `state.json` with day PnL / peak PnL / drawdown for restart-safe risk limits
+- `runtime-status.json` for the CLI (`scalper status`) with current mode, PID, active slots, recent signals, and last slot report
 - per-signal latency lines with `signalToOrderMs` and `roundTripMs`
 - gasless redeem activity in `redeem_log_YYYY-MM-DD.log`
 - product-test coverage summaries in `product-test-summary_YYYY-MM-DD.log`
@@ -198,6 +199,47 @@ Helper command:
 ```bash
 npm run reports
 ```
+
+## CLI Control
+
+The repo now ships with a single `scalper` CLI so you can manage the bot without hand-editing `.env` for every run.
+
+Install dependencies first:
+
+```bash
+npm install
+```
+
+Available commands:
+
+```bash
+npm run scalper -- status
+npm run scalper -- start
+npm run scalper -- stop
+npm run scalper -- reset
+npm run scalper -- switch --mode simulation
+npm run scalper -- switch --mode product_test
+npm run scalper -- switch --mode production
+```
+
+What each command does:
+
+- `scalper reset`
+  Deletes today’s files from `./logs/` and `./reports/`, resets persisted day PnL / drawdown state to zero, clears runtime status, and stops the bot first so in-memory positions and slot-report state are dropped safely.
+- `scalper switch --mode simulation`
+  Updates `.env` to safe dry-run simulation settings, then restarts the bot.
+- `scalper switch --mode product_test`
+  Updates `.env` to tiny-size live `PRODUCT_TEST_MODE` settings, then restarts the bot.
+- `scalper switch --mode production`
+  Updates `.env` to live production settings, then restarts the bot.
+- `scalper start`
+  Stops any existing `polymarket-scalper` process, then starts the bot in the background with `pm2` when available. If `pm2` is not installed, it falls back to `nohup` on Unix-like systems or a detached background process otherwise.
+- `scalper stop`
+  Sends a graceful stop so the runtime can cancel open orders and flatten through its normal shutdown path.
+- `scalper status`
+  Prints a colorized summary with running state, PID, current mode, day PnL, active slots, last slot report, average latency, and the last 3 executed signals.
+
+The CLI reads `.env` if present; otherwise it seeds settings from `.env.example` and writes the first real `.env` during `scalper switch`.
 
 ## Running
 
