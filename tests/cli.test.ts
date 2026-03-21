@@ -116,8 +116,9 @@ test('package CLI entrypoints use source-first tsx execution and valid bin wrapp
   );
 });
 
-test('CLI source registers pause and resume commands', () => {
+test('CLI source registers pause, resume, and monitor commands', () => {
   const cliSource = readFileSync(path.join(repoRoot, 'cli', 'index.ts'), 'utf8');
   assert.equal(cliSource.includes(".command('pause')"), true);
   assert.equal(cliSource.includes(".command('resume')"), true);
+  assert.equal(cliSource.includes(".command('monitor')"), true);
 });

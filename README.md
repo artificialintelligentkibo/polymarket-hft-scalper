@@ -231,6 +231,7 @@ npm run scalper -- start
 npm run scalper -- stop
 npm run scalper -- pause
 npm run scalper -- resume
+npm run scalper -- monitor
 npm run scalper -- reset
 npm run scalper -- switch --mode simulation
 npm run scalper -- switch --mode product_test
@@ -255,6 +256,8 @@ What each command does:
   Forces the bot into pause mode. New entries are blocked, but safety exits and redeem continue to work.
 - `scalper resume`
   Clears a manual pause and lets the bot resume entries if there is no active Polymarket incident.
+- `scalper monitor`
+  Runs a one-shot Polymarket status check and prints any active incidents that match trading-impact keywords.
 - `scalper status`
   Prints a colorized summary with running state, PID, current mode, pause status, day PnL, active slots, last slot report, average latency, and the last 3 executed signals.
 

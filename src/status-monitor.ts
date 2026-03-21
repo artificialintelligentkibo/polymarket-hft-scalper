@@ -239,6 +239,29 @@ export class StatusMonitor extends EventEmitter {
   }
 }
 
+export interface PolymarketStatusCheckResult {
+  readonly checkedAt: string;
+  readonly incidents: readonly IncidentSummary[];
+  readonly ok: boolean;
+}
+
+export async function checkPolymarketStatus(
+  fetchImpl: FetchLike = fetch
+): Promise<PolymarketStatusCheckResult> {
+  const response = await fetchStatusSummary(fetchImpl);
+  if (!response.ok) {
+    throw new Error(`Status API returned ${response.status}`);
+  }
+
+  const payload = (await response.json()) as StatusSummaryPayload;
+  const incidents = extractRelevantIncidents(payload);
+  return {
+    checkedAt: new Date().toISOString(),
+    incidents,
+    ok: incidents.length === 0,
+  };
+}
+
 async function fetchStatusSummary(fetchImpl: FetchLike): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {

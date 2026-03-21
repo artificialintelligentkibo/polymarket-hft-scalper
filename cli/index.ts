@@ -25,7 +25,7 @@ import {
   type RuntimeMode,
   type RuntimeStatusSnapshot,
 } from '../src/runtime-status.js';
-import { writeStatusControlCommand } from '../src/status-monitor.js';
+import { checkPolymarketStatus, writeStatusControlCommand } from '../src/status-monitor.js';
 import { resetSlotReporterState } from '../src/slot-reporter.js';
 import { roundTo, sleep } from '../src/utils.js';
 import {
@@ -143,6 +143,28 @@ async function resumeCommand(): Promise<void> {
   await waitForPauseState(document.runtimeConfig, false, 6_000);
   console.log(color.green('Resume command sent to polymarket-scalper.'));
   printStatus(document.runtimeConfig);
+}
+
+async function monitorCommand(): Promise<void> {
+  const status = await checkPolymarketStatus();
+
+  console.log('');
+  console.log(color.bold(color.cyan('Polymarket Status Monitor')));
+  console.log(`${label('Checked at')} ${status.checkedAt}`);
+  console.log(`${label('Status')} ${status.ok ? color.green('OK') : color.red('INCIDENT')}`);
+
+  if (status.incidents.length === 0) {
+    console.log(color.green('No active Polymarket incidents matched the trading-impact keywords.'));
+    return;
+  }
+
+  console.table(
+    status.incidents.map((incident) => ({
+      Incident: incident.title,
+      Updated: incident.updatedAt ?? 'n/a',
+      Keywords: incident.matchedKeywords.join(', '),
+    }))
+  );
 }
 
 function statusCommand(): void {
@@ -624,6 +646,11 @@ program
   .command('resume')
   .description('Resume entries after a manual pause')
   .action(() => resumeCommand());
+
+program
+  .command('monitor')
+  .description('Run a one-shot Polymarket status check for trading-impact incidents')
+  .action(() => monitorCommand());
 
 program
   .command('status')
