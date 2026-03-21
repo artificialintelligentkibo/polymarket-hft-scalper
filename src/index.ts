@@ -63,6 +63,11 @@ export interface LatencyPauseEvaluation {
   readonly transition: 'pause' | 'resume' | 'none';
 }
 
+export interface LatencySample {
+  readonly valueMs: number;
+  readonly recordedAtMs: number;
+}
+
 class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
   private readonly fetcher = new ClobFetcher();
@@ -84,7 +89,7 @@ class MarketMakerRuntime {
   private readonly pendingLiveOrders = new Map<string, number>();
   private readonly recentSignals: RuntimeSignalSnapshot[] = [];
   private readonly recentLatencySamples: number[] = [];
-  private readonly latencyWindow: number[] = [];
+  private readonly latencyWindow: LatencySample[] = [];
   private latencyPaused = false;
   private readonly activeMarketIds = new Set<string>();
   private running = false;
@@ -275,6 +280,7 @@ class MarketMakerRuntime {
 
   private async runCycle(): Promise<void> {
     this.consumeControlCommands();
+    this.refreshLatencyPauseState();
     const scannedMarkets = await this.monitor.scanEligibleMarkets();
     const markets = this.productTestMode.selectMarkets(scannedMarkets);
     this.setActiveMarkets(markets);
@@ -650,26 +656,46 @@ class MarketMakerRuntime {
   }
 
   private getLatencyPauseAverageMs(): number | null {
-    if (this.latencyWindow.length === 0) {
+    const samples = pruneLatencyPauseSamples(
+      this.latencyWindow,
+      Date.now(),
+      config.strategy.latencyPauseSampleTtlMs
+    );
+    if (samples.length === 0) {
       return null;
     }
 
-    const total = this.latencyWindow.reduce((sum, value) => sum + value, 0);
-    return roundTo(total / this.latencyWindow.length, 2);
+    const total = samples.reduce((sum, sample) => sum + sample.valueMs, 0);
+    return roundTo(total / samples.length, 2);
   }
 
-  private updateLatencyPause(latencyMs: number | undefined): void {
-    if (latencyMs === undefined || !Number.isFinite(latencyMs)) {
+  private refreshLatencyPauseState(nowMs = Date.now()): void {
+    const prunedSamples = pruneLatencyPauseSamples(
+      this.latencyWindow,
+      nowMs,
+      config.strategy.latencyPauseSampleTtlMs
+    );
+    if (prunedSamples.length !== this.latencyWindow.length) {
+      this.latencyWindow.splice(0, this.latencyWindow.length, ...prunedSamples);
+    }
+
+    if (this.latencyWindow.length < 3) {
+      if (this.latencyPaused) {
+        this.latencyPaused = false;
+        logger.info('LATENCY_PAUSE_OFF: stale latency samples expired, resuming entries', {
+          sampleCount: this.latencyWindow.length,
+          ttlMs: config.strategy.latencyPauseSampleTtlMs,
+        });
+        this.syncRuntimeStatus({
+          latencyPaused: false,
+          latencyPauseAverageMs: null,
+        });
+      }
       return;
     }
 
-    this.latencyWindow.push(latencyMs);
-    while (this.latencyWindow.length > config.strategy.latencyPauseWindowSize) {
-      this.latencyWindow.shift();
-    }
-
     const evaluation = evaluateLatencyPauseState({
-      samples: this.latencyWindow,
+      samples: this.latencyWindow.map((sample) => sample.valueMs),
       latencyPaused: this.latencyPaused,
       pauseThresholdMs: config.strategy.latencyPauseThresholdMs,
       resumeThresholdMs: config.strategy.latencyResumeThresholdMs,
@@ -703,6 +729,22 @@ class MarketMakerRuntime {
         latencyPauseAverageMs: evaluation.averageLatencyMs,
       });
     }
+  }
+
+  private updateLatencyPause(latencyMs: number | undefined): void {
+    if (latencyMs === undefined || !Number.isFinite(latencyMs)) {
+      return;
+    }
+
+    this.latencyWindow.push({
+      valueMs: latencyMs,
+      recordedAtMs: Date.now(),
+    });
+    while (this.latencyWindow.length > config.strategy.latencyPauseWindowSize) {
+      this.latencyWindow.shift();
+    }
+
+    this.refreshLatencyPauseState();
   }
 
   private syncRuntimeStatus(overrides: Parameters<typeof writeRuntimeStatus>[0]): void {
@@ -1310,6 +1352,20 @@ export function filterSignalsForLatencyPause(
   }
 
   return signals.filter((signal) => signal.reduceOnly || signal.action === 'SELL');
+}
+
+export function pruneLatencyPauseSamples(
+  samples: readonly LatencySample[],
+  nowMs: number,
+  ttlMs: number
+): LatencySample[] {
+  return samples.filter(
+    (sample) =>
+      Number.isFinite(sample.valueMs) &&
+      sample.valueMs >= 0 &&
+      Number.isFinite(sample.recordedAtMs) &&
+      nowMs - sample.recordedAtMs <= ttlMs
+  );
 }
 
 export function evaluateLatencyPauseState(params: {

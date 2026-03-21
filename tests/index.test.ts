@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   evaluateLatencyPauseState,
   filterSignalsForLatencyPause,
+  pruneLatencyPauseSamples,
 } from '../src/index.js';
 import type { StrategySignal } from '../src/strategy-types.js';
 
@@ -74,6 +75,43 @@ test('hysteresis prevents flapping between pause and resume', () => {
   });
 
   assert.equal(evaluation.latencyPaused, true);
+  assert.equal(evaluation.transition, 'none');
+});
+
+test('pruneLatencyPauseSamples removes stale latency history', () => {
+  const samples = pruneLatencyPauseSamples(
+    [
+      { valueMs: 1100, recordedAtMs: 10_000 },
+      { valueMs: 900, recordedAtMs: 40_000 },
+      { valueMs: 320, recordedAtMs: 96_000 },
+    ],
+    100_000,
+    30_000
+  );
+
+  assert.deepEqual(samples, [{ valueMs: 320, recordedAtMs: 96_000 }]);
+});
+
+test('stale latency samples no longer justify keeping the gate paused', () => {
+  const staleSamples = pruneLatencyPauseSamples(
+    [
+      { valueMs: 1200, recordedAtMs: 5_000 },
+      { valueMs: 1150, recordedAtMs: 6_000 },
+      { valueMs: 1000, recordedAtMs: 7_000 },
+    ],
+    120_000,
+    30_000
+  );
+
+  const evaluation = evaluateLatencyPauseState({
+    samples: staleSamples.map((sample) => sample.valueMs),
+    latencyPaused: true,
+    pauseThresholdMs: 800,
+    resumeThresholdMs: 400,
+  });
+
+  assert.equal(staleSamples.length, 0);
+  assert.equal(evaluation.averageLatencyMs, null);
   assert.equal(evaluation.transition, 'none');
 });
 
