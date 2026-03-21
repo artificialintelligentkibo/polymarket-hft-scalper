@@ -24,8 +24,55 @@ export interface FairValueBinanceAdjustment {
   movePct: number;
 }
 
+interface FairValueBuyCadenceState {
+  count: number;
+  lastExecutedAtMs: number;
+  expiresAtMs: number;
+}
+
+interface InventoryRebalanceBlockState {
+  blockedUntilMs: number;
+  expiresAtMs: number;
+}
+
 export class SignalScalper {
+  private readonly fairValueBuyCadence = new Map<string, FairValueBuyCadenceState>();
+  private readonly inventoryRebalanceBlocks = new Map<string, InventoryRebalanceBlockState>();
+
   constructor(private readonly runtimeConfig: AppConfig = config) {}
+
+  recordExecution(params: {
+    market: MarketCandidate;
+    signal: StrategySignal;
+    executedAtMs?: number;
+  }): void {
+    const executedAtMs = params.executedAtMs ?? Date.now();
+    this.pruneFairValueControlState(executedAtMs);
+    const key = buildFairValueControlKey(params.market, params.signal.outcome);
+    const expiresAtMs = resolveFairValueControlExpiryMs(params.market, executedAtMs);
+
+    if (params.signal.signalType === 'FAIR_VALUE_BUY' && params.signal.action === 'BUY') {
+      const current = this.fairValueBuyCadence.get(key);
+      this.fairValueBuyCadence.set(key, {
+        count: (current?.count ?? 0) + 1,
+        lastExecutedAtMs: executedAtMs,
+        expiresAtMs,
+      });
+      return;
+    }
+
+    if (
+      params.signal.signalType === 'INVENTORY_REBALANCE' &&
+      params.signal.action === 'SELL' &&
+      this.runtimeConfig.strategy.inventoryRebalanceFvBlockMs > 0
+    ) {
+      this.inventoryRebalanceBlocks.set(key, {
+        blockedUntilMs:
+          executedAtMs + this.runtimeConfig.strategy.inventoryRebalanceFvBlockMs,
+        expiresAtMs,
+      });
+    }
+  }
 
   generateSignals(params: {
     market: MarketCandidate;
@@ -43,6 +90,7 @@ export class SignalScalper {
       riskAssessment,
       binanceFairValueAdjustment,
     } = params;
+    this.pruneFairValueControlState(now.getTime());
     const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
 
     if (riskAssessment.forcedSignals.length > 0) {
@@ -65,6 +113,7 @@ export class SignalScalper {
         orderbook,
         positionManager,
         riskAssessment,
+        now,
         binanceFairValueAdjustment
       ),
       this.getInventoryRebalanceSignals(market, orderbook, positionManager, riskAssessment),
@@ -288,17 +337,25 @@ export class SignalScalper {
     orderbook: MarketOrderbookSnapshot,
     positionManager: PositionManager,
     riskAssessment: RiskAssessment,
+    now: Date,
     binanceFairValueAdjustment?: FairValueBinanceAdjustment
   ): StrategySignal[] {
     const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
     const signals: StrategySignal[] = [];
+    const effectiveBinanceAdjustment = applyBinanceFairValueDecay(
+      binanceFairValueAdjustment,
+      market.startTime,
+      now,
+      this.runtimeConfig
+    );
+    const nowMs = now.getTime();
 
     for (const outcome of OUTCOMES as readonly Outcome[]) {
       const book = getBookForOutcome(orderbook, outcome);
       const fairValue = estimateFairValue(
         orderbook,
         outcome,
-        binanceFairValueAdjustment,
+        effectiveBinanceAdjustment,
         this.runtimeConfig
       );
       const openShares = positionManager.getShares(outcome);
@@ -309,6 +366,16 @@ export class SignalScalper {
         hasValidEntryAsk(book)
       ) {
         const bestAsk = book.bestAsk;
+        const fairValueBuyBlock = this.getFairValueBuyBlockState(market, outcome, nowMs);
+        if (fairValueBuyBlock) {
+          logger.debug('FAIR_VALUE_BUY blocked by cadence control', {
+            marketId: market.marketId,
+            outcome,
+            reason: fairValueBuyBlock.reason,
+            remainingMs: fairValueBuyBlock.remainingMs,
+          });
+          continue;
+        }
         const adaptedBuyThreshold = adaptiveFairValueThreshold(
           strategy.fairValueBuyThreshold,
           bestAsk
@@ -489,6 +556,48 @@ export class SignalScalper {
     }
 
     return endMs - now.getTime() > this.runtimeConfig.strategy.exitBeforeEndMs;
+  }
+
+  private getFairValueBuyBlockState(
+    market: MarketCandidate,
+    outcome: Outcome,
+    nowMs: number
+  ): { reason: 'rebalance-block' | 'cooldown' | 'slot-cap'; remainingMs: number | null } | null {
+    const key = buildFairValueControlKey(market, outcome);
+    const rebalanceBlock = this.inventoryRebalanceBlocks.get(key);
+    if (rebalanceBlock && rebalanceBlock.blockedUntilMs > nowMs) {
+      return {
+        reason: 'rebalance-block',
+        remainingMs: Math.max(0, rebalanceBlock.blockedUntilMs - nowMs),
+      };
+    }
+
+    const cadenceState = this.fairValueBuyCadence.get(key);
+    if (!cadenceState) {
+      return null;
+    }
+
+    if (cadenceState.count >= this.runtimeConfig.strategy.fairValueBuyMaxPerSlot) {
+      return {
+        reason: 'slot-cap',
+        remainingMs: null,
+      };
+    }
+
+    const cooldownMs = this.runtimeConfig.strategy.fairValueBuyCooldownMs;
+    if (cooldownMs > 0 && nowMs - cadenceState.lastExecutedAtMs < cooldownMs) {
+      return {
+        reason: 'cooldown',
+        remainingMs: Math.max(0, cooldownMs - (nowMs - cadenceState.lastExecutedAtMs)),
+      };
+    }
+
+    return null;
+  }
+
+  private pruneFairValueControlState(nowMs: number): void {
+    pruneControlStateMap(this.fairValueBuyCadence, nowMs);
+    pruneControlStateMap(this.inventoryRebalanceBlocks, nowMs);
   }
 }
 
@@ -672,6 +781,68 @@ function takeTopSignals(signals: StrategySignal[], maxSignals: number): Strategy
       return right.edgeAmount - left.edgeAmount;
     })
     .slice(0, Math.max(1, maxSignals));
+}
+
+function buildFairValueControlKey(market: MarketCandidate, outcome: Outcome): string {
+  return `${market.marketId}:${market.startTime ?? 'no-start'}:${outcome}`;
+}
+
+function resolveFairValueControlExpiryMs(
+  market: MarketCandidate,
+  nowMs: number
+): number {
+  const endMs = market.endTime ? Date.parse(market.endTime) : Number.NaN;
+  if (Number.isFinite(endMs)) {
+    return endMs + 2 * 60_000;
+  }
+
+  const startMs = market.startTime ? Date.parse(market.startTime) : Number.NaN;
+  if (Number.isFinite(startMs)) {
+    return startMs + 15 * 60_000;
+  }
+
+  return nowMs + 10 * 60_000;
+}
+
+function pruneControlStateMap<T extends { expiresAtMs: number }>(
+  state: Map<string, T>,
+  nowMs: number
+): void {
+  for (const [key, value] of state.entries()) {
+    if (!Number.isFinite(value.expiresAtMs) || value.expiresAtMs <= nowMs) {
+      state.delete(key);
+    }
+  }
+}
+
+function applyBinanceFairValueDecay(
+  adjustment: FairValueBinanceAdjustment | undefined,
+  slotStartTime: string | null,
+  now: Date,
+  runtimeConfig: AppConfig
+): FairValueBinanceAdjustment | undefined {
+  if (!adjustment || adjustment.direction === 'FLAT') {
+    return adjustment;
+  }
+
+  const slotStartMs = slotStartTime ? Date.parse(slotStartTime) : Number.NaN;
+  if (!Number.isFinite(slotStartMs)) {
+    return adjustment;
+  }
+
+  const elapsedMs = Math.max(0, now.getTime() - slotStartMs);
+  const decayWindowMs = runtimeConfig.strategy.binanceFvDecayWindowMs;
+  const minMultiplier = runtimeConfig.strategy.binanceFvDecayMinMultiplier;
+  const decayProgress = clamp(elapsedMs / Math.max(1, decayWindowMs), 0, 1);
+  const decayMultiplier = roundTo(
+    clamp(1 - decayProgress * (1 - minMultiplier), minMultiplier, 1),
+    6
+  );
+
+  return {
+    ...adjustment,
+    movePct: roundTo(adjustment.movePct * decayMultiplier, 6),
+  };
 }
 
 function getBookForOutcome(

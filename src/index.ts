@@ -494,6 +494,13 @@ class MarketMakerRuntime {
         new Date(completedAt)
       );
     }
+    if (effectiveShares > 0) {
+      this.signalEngine.recordExecution({
+        market,
+        signal,
+        executedAtMs: completedAt,
+      });
+    }
 
     const slotMetrics = getSlotMetrics(slotKey);
     const dayState = getDayPnlState(new Date(completedAt));

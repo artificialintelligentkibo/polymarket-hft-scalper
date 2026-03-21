@@ -51,6 +51,11 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.strategy.fairValueBuyThreshold, 0.018);
   assert.equal(candidate.strategy.fairValueSellThreshold, 0.015);
   assert.equal(candidate.strategy.binanceFvSensitivity, 0.1);
+  assert.equal(candidate.strategy.fairValueBuyMaxPerSlot, 4);
+  assert.equal(candidate.strategy.fairValueBuyCooldownMs, 30000);
+  assert.equal(candidate.strategy.inventoryRebalanceFvBlockMs, 60000);
+  assert.equal(candidate.strategy.binanceFvDecayWindowMs, 300000);
+  assert.equal(candidate.strategy.binanceFvDecayMinMultiplier, 0.25);
   assert.equal(candidate.strategy.minEntryDepthUsd, 2);
   assert.equal(candidate.strategy.maxEntrySpread, 0.3);
   assert.equal(candidate.strategy.entryImbalanceBlockThreshold, 100);

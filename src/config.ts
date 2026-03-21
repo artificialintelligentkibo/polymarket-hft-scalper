@@ -69,6 +69,11 @@ export interface AppConfig {
     readonly fairValueBuyThreshold: number;
     readonly fairValueSellThreshold: number;
     readonly binanceFvSensitivity: number;
+    readonly fairValueBuyMaxPerSlot: number;
+    readonly fairValueBuyCooldownMs: number;
+    readonly inventoryRebalanceFvBlockMs: number;
+    readonly binanceFvDecayWindowMs: number;
+    readonly binanceFvDecayMinMultiplier: number;
     readonly trailingTakeProfit: number;
     readonly hardStopLoss: number;
     readonly hardStopCooldownMs: number;
@@ -361,6 +366,23 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       fairValueBuyThreshold: parseFloatOrDefault(env.FAIR_VALUE_BUY_THRESHOLD, '0.018'),
       fairValueSellThreshold: parseFloatOrDefault(env.FAIR_VALUE_SELL_THRESHOLD, '0.015'),
       binanceFvSensitivity: parseFloatOrDefault(env.BINANCE_FV_SENSITIVITY, '0.10'),
+      fairValueBuyMaxPerSlot: Math.max(1, parseIntOrDefault(env.FV_BUY_MAX_PER_SLOT, '4')),
+      fairValueBuyCooldownMs: Math.max(
+        0,
+        parseIntOrDefault(env.FV_BUY_COOLDOWN_MS, '30000')
+      ),
+      inventoryRebalanceFvBlockMs: Math.max(
+        0,
+        parseIntOrDefault(env.INVENTORY_REBALANCE_FV_BLOCK_MS, '60000')
+      ),
+      binanceFvDecayWindowMs: Math.max(
+        1_000,
+        parseIntOrDefault(env.BINANCE_FV_DECAY_WINDOW_MS, '300000')
+      ),
+      binanceFvDecayMinMultiplier: parseFloatOrDefault(
+        env.BINANCE_FV_DECAY_MIN_MULTIPLIER,
+        '0.25'
+      ),
       trailingTakeProfit: parseFloatOrDefault(env.TRAILING_TAKE_PROFIT, '0.012'),
       hardStopLoss: parseFloatOrDefault(env.HARD_STOP_LOSS, '0.025'),
       hardStopCooldownMs: Math.max(
@@ -561,6 +583,29 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.strategy.binanceFvSensitivity < 0) {
     throw new Error('BINANCE_FV_SENSITIVITY must be zero or positive.');
+  }
+
+  if (candidate.strategy.fairValueBuyMaxPerSlot < 1) {
+    throw new Error('FV_BUY_MAX_PER_SLOT must be at least 1.');
+  }
+
+  if (candidate.strategy.fairValueBuyCooldownMs < 0) {
+    throw new Error('FV_BUY_COOLDOWN_MS must be zero or positive.');
+  }
+
+  if (candidate.strategy.inventoryRebalanceFvBlockMs < 0) {
+    throw new Error('INVENTORY_REBALANCE_FV_BLOCK_MS must be zero or positive.');
+  }
+
+  if (candidate.strategy.binanceFvDecayWindowMs < 1_000) {
+    throw new Error('BINANCE_FV_DECAY_WINDOW_MS must be at least 1000.');
+  }
+
+  if (
+    candidate.strategy.binanceFvDecayMinMultiplier <= 0 ||
+    candidate.strategy.binanceFvDecayMinMultiplier > 1
+  ) {
+    throw new Error('BINANCE_FV_DECAY_MIN_MULTIPLIER must be in the range (0, 1].');
   }
 
   if (candidate.strategy.latencyPauseThresholdMs <= 0) {

@@ -85,6 +85,46 @@ function createOrderbook(): MarketOrderbookSnapshot {
   };
 }
 
+function createLowPriceFairValueOrderbook(): MarketOrderbookSnapshot {
+  const orderbook = createOrderbook();
+  orderbook.combined = {
+    combinedBid: 0.99,
+    combinedAsk: 1.01,
+    combinedMid: 1,
+    combinedDiscount: -0.01,
+    combinedPremium: 0.01,
+    pairSpread: 0.02,
+  };
+  orderbook.yes.bestBid = 0.024;
+  orderbook.yes.bestAsk = 0.03;
+  orderbook.yes.midPrice = 0.025;
+  orderbook.yes.lastTradePrice = 0.025;
+  orderbook.yes.spread = 0.006;
+  orderbook.yes.depthSharesAsk = 120;
+  orderbook.yes.depthNotionalAsk = 3.6;
+  orderbook.no.bestBid = 0.97;
+  orderbook.no.bestAsk = 0.98;
+  orderbook.no.midPrice = 0.975;
+  orderbook.no.lastTradePrice = 0.975;
+  orderbook.no.spread = 0.01;
+  orderbook.no.depthSharesAsk = 110;
+  orderbook.no.depthNotionalAsk = 107.8;
+  return orderbook;
+}
+
+function createBinanceFvSignalEngine(
+  overrides: Record<string, string> = {}
+): SignalScalper {
+  return new SignalScalper(
+    createConfig({
+      ...process.env,
+      EXTREME_BUY_THRESHOLD: '0.02',
+      BINANCE_FV_SENSITIVITY: '0.10',
+      ...overrides,
+    })
+  );
+}
+
 test('combined discount emits dual-sided BUY signals capped at two', () => {
   const market = createMarket();
   const orderbook = createOrderbook();
@@ -432,39 +472,11 @@ test('estimateFairValue ignores flat Binance moves', () => {
 
 test('binance-informed fair value can create a YES buy signal in the low-price zone', () => {
   const market = createMarket();
-  const orderbook = createOrderbook();
-  orderbook.combined = {
-    combinedBid: 0.99,
-    combinedAsk: 1.01,
-    combinedMid: 1,
-    combinedDiscount: -0.01,
-    combinedPremium: 0.01,
-    pairSpread: 0.02,
-  };
-  orderbook.yes.bestBid = 0.024;
-  orderbook.yes.bestAsk = 0.03;
-  orderbook.yes.midPrice = 0.025;
-  orderbook.yes.lastTradePrice = 0.025;
-  orderbook.yes.spread = 0.006;
-  orderbook.yes.depthSharesAsk = 120;
-  orderbook.yes.depthNotionalAsk = 3.6;
-  orderbook.no.bestBid = 0.97;
-  orderbook.no.bestAsk = 0.98;
-  orderbook.no.midPrice = 0.975;
-  orderbook.no.lastTradePrice = 0.975;
-  orderbook.no.spread = 0.01;
-  orderbook.no.depthSharesAsk = 110;
-  orderbook.no.depthNotionalAsk = 107.8;
+  const orderbook = createLowPriceFairValueOrderbook();
 
   const positionManager = new PositionManager(market.marketId, market.endTime);
   const riskManager = new RiskManager();
-  const signalEngine = new SignalScalper(
-    createConfig({
-      ...process.env,
-      EXTREME_BUY_THRESHOLD: '0.02',
-      BINANCE_FV_SENSITIVITY: '0.10',
-    })
-  );
+  const signalEngine = createBinanceFvSignalEngine();
 
   const riskAssessment = riskManager.checkRiskLimits({
     market,
@@ -491,6 +503,258 @@ test('binance-informed fair value can create a YES buy signal in the low-price z
 
   assert.ok(fairValueBuy);
   assert.equal((fairValueBuy?.fairValue ?? 0) > (orderbook.yes.bestAsk ?? 0), true);
+});
+
+test('fair value buy cooldown blocks repeated same-slot entries for 30 seconds', () => {
+  const market = createMarket();
+  const orderbook = createLowPriceFairValueOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+  const signalEngine = createBinanceFvSignalEngine();
+  const binanceFairValueAdjustment = {
+    direction: 'UP' as const,
+    movePct: 0.25,
+  };
+
+  const firstNow = new Date('2026-03-18T10:02:00.000Z');
+  const riskAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: firstNow,
+  });
+  const firstSignals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    binanceFairValueAdjustment,
+    now: firstNow,
+  });
+  const fairValueBuy = firstSignals.find(
+    (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+  );
+
+  assert.ok(fairValueBuy);
+  signalEngine.recordExecution({
+    market,
+    signal: fairValueBuy!,
+    executedAtMs: firstNow.getTime(),
+  });
+
+  const blockedSignals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    binanceFairValueAdjustment,
+    now: new Date('2026-03-18T10:02:10.000Z'),
+  });
+  assert.equal(
+    blockedSignals.some(
+      (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+    ),
+    false
+  );
+
+  const resumedSignals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    binanceFairValueAdjustment,
+    now: new Date('2026-03-18T10:02:31.000Z'),
+  });
+  assert.equal(
+    resumedSignals.some(
+      (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+    ),
+    true
+  );
+});
+
+test('fair value buy per-slot cap blocks further entries after the configured max', () => {
+  const market = createMarket();
+  const orderbook = createLowPriceFairValueOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+  const signalEngine = createBinanceFvSignalEngine({
+    FV_BUY_MAX_PER_SLOT: '3',
+  });
+  const binanceFairValueAdjustment = {
+    direction: 'UP' as const,
+    movePct: 0.25,
+  };
+
+  for (const timestamp of [
+    '2026-03-18T10:02:00.000Z',
+    '2026-03-18T10:02:31.000Z',
+    '2026-03-18T10:03:02.000Z',
+  ]) {
+    const now = new Date(timestamp);
+    const riskAssessment = riskManager.checkRiskLimits({
+      market,
+      orderbook,
+      positionManager,
+      now,
+    });
+    const signals = signalEngine.generateSignals({
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment,
+      binanceFairValueAdjustment,
+      now,
+    });
+    const fairValueBuy = signals.find(
+      (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+    );
+    assert.ok(fairValueBuy);
+    signalEngine.recordExecution({
+      market,
+      signal: fairValueBuy!,
+      executedAtMs: now.getTime(),
+    });
+  }
+
+  const cappedSignals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment: riskManager.checkRiskLimits({
+      market,
+      orderbook,
+      positionManager,
+      now: new Date('2026-03-18T10:03:40.000Z'),
+    }),
+    binanceFairValueAdjustment,
+    now: new Date('2026-03-18T10:03:40.000Z'),
+  });
+
+  assert.equal(
+    cappedSignals.some(
+      (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+    ),
+    false
+  );
+});
+
+test('inventory rebalance blocks same-outcome fair value buy for 60 seconds', () => {
+  const market = createMarket();
+  const orderbook = createLowPriceFairValueOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+  const signalEngine = createBinanceFvSignalEngine();
+  const riskAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  signalEngine.recordExecution({
+    market,
+    signal: {
+      marketId: market.marketId,
+      marketTitle: market.title,
+      signalType: 'INVENTORY_REBALANCE',
+      priority: 100,
+      generatedAt: Date.parse('2026-03-18T10:02:00.000Z'),
+      action: 'SELL',
+      outcome: 'YES',
+      outcomeIndex: 0,
+      shares: 12,
+      targetPrice: 0.03,
+      referencePrice: 0,
+      tokenPrice: 0.03,
+      midPrice: 0.025,
+      fairValue: 0.03,
+      edgeAmount: 1,
+      combinedBid: orderbook.combined.combinedBid,
+      combinedAsk: orderbook.combined.combinedAsk,
+      combinedMid: orderbook.combined.combinedMid,
+      combinedDiscount: orderbook.combined.combinedDiscount,
+      combinedPremium: orderbook.combined.combinedPremium,
+      fillRatio: 1,
+      capitalClamp: 1,
+      priceMultiplier: 1,
+      urgency: 'improve',
+      reduceOnly: true,
+      reason: 'rebalance',
+    },
+    executedAtMs: Date.parse('2026-03-18T10:02:00.000Z'),
+  });
+
+  const blockedSignals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    binanceFairValueAdjustment: {
+      direction: 'UP',
+      movePct: 0.25,
+    },
+    now: new Date('2026-03-18T10:02:30.000Z'),
+  });
+
+  assert.equal(
+    blockedSignals.some(
+      (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+    ),
+    false
+  );
+});
+
+test('binance fair value boost decays as the slot ages', () => {
+  const market = createMarket();
+  const orderbook = createLowPriceFairValueOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+  const signalEngine = createBinanceFvSignalEngine();
+  const binanceFairValueAdjustment = {
+    direction: 'UP' as const,
+    movePct: 0.25,
+  };
+
+  const earlySignals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment: riskManager.checkRiskLimits({
+      market,
+      orderbook,
+      positionManager,
+      now: new Date('2026-03-18T10:00:05.000Z'),
+    }),
+    binanceFairValueAdjustment,
+    now: new Date('2026-03-18T10:00:05.000Z'),
+  });
+  const lateSignals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment: riskManager.checkRiskLimits({
+      market,
+      orderbook,
+      positionManager,
+      now: new Date('2026-03-18T10:04:50.000Z'),
+    }),
+    binanceFairValueAdjustment,
+    now: new Date('2026-03-18T10:04:50.000Z'),
+  });
+
+  assert.equal(
+    earlySignals.some(
+      (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+    ),
+    true
+  );
+  assert.equal(
+    lateSignals.some(
+      (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+    ),
+    false
+  );
 });
 
 test('extreme buy skips degenerate entry books with negligible ask depth', () => {
