@@ -335,6 +335,164 @@ test('estimateFairValue keeps each outcome on its own normalized side', () => {
   assert.equal(Math.abs((noFairValue ?? 0) - orderbook.no.bestAsk) < 0.05, true);
 });
 
+test('Binance UP boosts YES fair value above the base fair value', () => {
+  const orderbook = createOrderbook();
+  orderbook.yes.midPrice = 0.5;
+  orderbook.no.midPrice = 0.5;
+  orderbook.yes.lastTradePrice = 0.5;
+  orderbook.no.lastTradePrice = 0.5;
+  orderbook.yes.bestAsk = 0.52;
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    BINANCE_FV_SENSITIVITY: '0.10',
+  });
+  const baseFairValue = estimateFairValue(orderbook, 'YES', undefined, runtimeConfig);
+  const adjustedFairValue = estimateFairValue(
+    orderbook,
+    'YES',
+    {
+      direction: 'UP',
+      movePct: 0.25,
+    },
+    runtimeConfig
+  );
+
+  assert.equal(baseFairValue, 0.5);
+  assert.equal(adjustedFairValue, 0.525);
+  assert.equal((adjustedFairValue ?? 0) > (orderbook.yes.bestAsk ?? 0), true);
+});
+
+test('Binance DOWN reduces YES fair value below the base fair value', () => {
+  const orderbook = createOrderbook();
+  orderbook.yes.midPrice = 0.5;
+  orderbook.no.midPrice = 0.5;
+  orderbook.yes.lastTradePrice = 0.5;
+  orderbook.no.lastTradePrice = 0.5;
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    BINANCE_FV_SENSITIVITY: '0.10',
+  });
+  const adjustedFairValue = estimateFairValue(
+    orderbook,
+    'YES',
+    {
+      direction: 'DOWN',
+      movePct: -0.3,
+    },
+    runtimeConfig
+  );
+
+  assert.equal(adjustedFairValue, 0.47);
+  assert.equal((adjustedFairValue ?? 0) < 0.5, true);
+});
+
+test('estimateFairValue returns base fair value when Binance data is unavailable', () => {
+  const orderbook = createOrderbook();
+  orderbook.yes.midPrice = 0.5;
+  orderbook.no.midPrice = 0.5;
+  orderbook.yes.lastTradePrice = 0.5;
+  orderbook.no.lastTradePrice = 0.5;
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    BINANCE_FV_SENSITIVITY: '0.10',
+  });
+  const baseFairValue = estimateFairValue(orderbook, 'YES', undefined, runtimeConfig);
+  const unchangedFairValue = estimateFairValue(orderbook, 'YES', undefined, runtimeConfig);
+
+  assert.equal(unchangedFairValue, baseFairValue);
+});
+
+test('estimateFairValue ignores flat Binance moves', () => {
+  const orderbook = createOrderbook();
+  orderbook.yes.midPrice = 0.5;
+  orderbook.no.midPrice = 0.5;
+  orderbook.yes.lastTradePrice = 0.5;
+  orderbook.no.lastTradePrice = 0.5;
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    BINANCE_FV_SENSITIVITY: '0.10',
+  });
+  const baseFairValue = estimateFairValue(orderbook, 'YES', undefined, runtimeConfig);
+  const flatAdjustedFairValue = estimateFairValue(
+    orderbook,
+    'YES',
+    {
+      direction: 'FLAT',
+      movePct: 0.02,
+    },
+    runtimeConfig
+  );
+
+  assert.equal(flatAdjustedFairValue, baseFairValue);
+});
+
+test('binance-informed fair value can create a YES buy signal in the low-price zone', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.combined = {
+    combinedBid: 0.99,
+    combinedAsk: 1.01,
+    combinedMid: 1,
+    combinedDiscount: -0.01,
+    combinedPremium: 0.01,
+    pairSpread: 0.02,
+  };
+  orderbook.yes.bestBid = 0.024;
+  orderbook.yes.bestAsk = 0.03;
+  orderbook.yes.midPrice = 0.025;
+  orderbook.yes.lastTradePrice = 0.025;
+  orderbook.yes.spread = 0.006;
+  orderbook.yes.depthSharesAsk = 120;
+  orderbook.yes.depthNotionalAsk = 3.6;
+  orderbook.no.bestBid = 0.97;
+  orderbook.no.bestAsk = 0.98;
+  orderbook.no.midPrice = 0.975;
+  orderbook.no.lastTradePrice = 0.975;
+  orderbook.no.spread = 0.01;
+  orderbook.no.depthSharesAsk = 110;
+  orderbook.no.depthNotionalAsk = 107.8;
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+  const signalEngine = new SignalScalper(
+    createConfig({
+      ...process.env,
+      EXTREME_BUY_THRESHOLD: '0.02',
+      BINANCE_FV_SENSITIVITY: '0.10',
+    })
+  );
+
+  const riskAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    binanceFairValueAdjustment: {
+      direction: 'UP',
+      movePct: 0.25,
+    },
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  const fairValueBuy = signals.find(
+    (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+  );
+
+  assert.ok(fairValueBuy);
+  assert.equal((fairValueBuy?.fairValue ?? 0) > (orderbook.yes.bestAsk ?? 0), true);
+});
+
 test('extreme buy skips degenerate entry books with negligible ask depth', () => {
   const market = createMarket();
   const orderbook = createOrderbook();

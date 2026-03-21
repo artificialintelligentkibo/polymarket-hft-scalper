@@ -19,6 +19,11 @@ export interface SizeCalculationResult {
   capitalClamp: number;
 }
 
+export interface FairValueBinanceAdjustment {
+  direction: 'UP' | 'DOWN' | 'FLAT';
+  movePct: number;
+}
+
 export class SignalScalper {
   constructor(private readonly runtimeConfig: AppConfig = config) {}
 
@@ -27,10 +32,17 @@ export class SignalScalper {
     orderbook: MarketOrderbookSnapshot;
     positionManager: PositionManager;
     riskAssessment: RiskAssessment;
+    binanceFairValueAdjustment?: FairValueBinanceAdjustment;
     now?: Date;
   }): StrategySignal[] {
     const now = params.now ?? new Date();
-    const { market, orderbook, positionManager, riskAssessment } = params;
+    const {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment,
+      binanceFairValueAdjustment,
+    } = params;
     const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
 
     if (riskAssessment.forcedSignals.length > 0) {
@@ -48,7 +60,13 @@ export class SignalScalper {
     const groups: StrategySignal[][] = [
       this.getCombinedDiscountSignals(market, orderbook, positionManager, riskAssessment),
       this.getExtremeSignals(market, orderbook, positionManager, riskAssessment),
-      this.getFairValueSignals(market, orderbook, positionManager, riskAssessment),
+      this.getFairValueSignals(
+        market,
+        orderbook,
+        positionManager,
+        riskAssessment,
+        binanceFairValueAdjustment
+      ),
       this.getInventoryRebalanceSignals(market, orderbook, positionManager, riskAssessment),
     ];
 
@@ -269,14 +287,20 @@ export class SignalScalper {
     market: MarketCandidate,
     orderbook: MarketOrderbookSnapshot,
     positionManager: PositionManager,
-    riskAssessment: RiskAssessment
+    riskAssessment: RiskAssessment,
+    binanceFairValueAdjustment?: FairValueBinanceAdjustment
   ): StrategySignal[] {
     const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
     const signals: StrategySignal[] = [];
 
     for (const outcome of OUTCOMES as readonly Outcome[]) {
       const book = getBookForOutcome(orderbook, outcome);
-      const fairValue = estimateFairValue(orderbook, outcome);
+      const fairValue = estimateFairValue(
+        orderbook,
+        outcome,
+        binanceFairValueAdjustment,
+        this.runtimeConfig
+      );
       const openShares = positionManager.getShares(outcome);
 
       if (
@@ -659,23 +683,46 @@ function getBookForOutcome(
 
 export function estimateFairValue(
   snapshot: MarketOrderbookSnapshot,
-  outcome: Outcome
+  outcome: Outcome,
+  binanceAdjustment?: FairValueBinanceAdjustment,
+  runtimeConfig: AppConfig = config
 ): number | null {
   const noFairValue = estimateLegacyFairValue(snapshot, 'NO');
+  let baseFairValue: number | null = null;
+
   if (outcome === 'NO') {
-    return noFairValue;
+    baseFairValue = noFairValue;
+  } else if (noFairValue !== null) {
+    baseFairValue = roundTo(1 - noFairValue, 6);
+  } else {
+    const yesFairValue = estimateLegacyFairValue(snapshot, 'YES');
+    if (yesFairValue !== null) {
+      baseFairValue = yesFairValue;
+    }
   }
 
-  if (noFairValue !== null) {
-    return roundTo(1 - noFairValue, 6);
+  if (baseFairValue === null) {
+    return null;
   }
 
-  const yesFairValue = estimateLegacyFairValue(snapshot, 'YES');
-  if (yesFairValue !== null) {
-    return yesFairValue;
+  if (
+    !binanceAdjustment ||
+    binanceAdjustment.direction === 'FLAT' ||
+    !Number.isFinite(binanceAdjustment.movePct) ||
+    runtimeConfig.strategy.binanceFvSensitivity <= 0
+  ) {
+    return baseFairValue;
   }
 
-  return null;
+  const binanceFvBoost =
+    binanceAdjustment.movePct * runtimeConfig.strategy.binanceFvSensitivity;
+  const isYes = outcome === 'YES';
+  const binanceUp = binanceAdjustment.direction === 'UP';
+  const adjustmentSign = isYes === binanceUp ? 1 : -1;
+  const adjustedFairValue =
+    baseFairValue + adjustmentSign * Math.abs(binanceFvBoost);
+
+  return roundTo(clamp(adjustedFairValue, 0.001, 0.999), 6);
 }
 
 function formatPrice(value: number): string {

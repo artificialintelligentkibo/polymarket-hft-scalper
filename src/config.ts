@@ -68,6 +68,7 @@ export interface AppConfig {
     readonly extremeBuyThreshold: number;
     readonly fairValueBuyThreshold: number;
     readonly fairValueSellThreshold: number;
+    readonly binanceFvSensitivity: number;
     readonly trailingTakeProfit: number;
     readonly hardStopLoss: number;
     readonly hardStopCooldownMs: number;
@@ -358,6 +359,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       extremeBuyThreshold: parseFloatOrDefault(env.EXTREME_BUY_THRESHOLD, '0.04'),
       fairValueBuyThreshold: parseFloatOrDefault(env.FAIR_VALUE_BUY_THRESHOLD, '0.018'),
       fairValueSellThreshold: parseFloatOrDefault(env.FAIR_VALUE_SELL_THRESHOLD, '0.015'),
+      binanceFvSensitivity: parseFloatOrDefault(env.BINANCE_FV_SENSITIVITY, '0.10'),
       trailingTakeProfit: parseFloatOrDefault(env.TRAILING_TAKE_PROFIT, '0.012'),
       hardStopLoss: parseFloatOrDefault(env.HARD_STOP_LOSS, '0.025'),
       hardStopCooldownMs: Math.max(
@@ -550,6 +552,10 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.strategy.entryImbalanceBlockThreshold <= 0) {
     throw new Error('ENTRY_IMBALANCE_BLOCK_THRESHOLD must be positive.');
+  }
+
+  if (candidate.strategy.binanceFvSensitivity < 0) {
+    throw new Error('BINANCE_FV_SENSITIVITY must be zero or positive.');
   }
 
   if (candidate.strategy.latencyPauseThresholdMs <= 0) {

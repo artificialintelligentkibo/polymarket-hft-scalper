@@ -24,7 +24,10 @@ import {
   type RuntimePositionSnapshot,
   type RuntimeSignalSnapshot,
 } from './runtime-status.js';
-import { SignalScalper } from './signal-scalper.js';
+import {
+  SignalScalper,
+  type FairValueBinanceAdjustment,
+} from './signal-scalper.js';
 import {
   StatusMonitor,
   consumeStatusControlCommand,
@@ -324,11 +327,13 @@ class MarketMakerRuntime {
       orderbook,
       positionManager,
     });
+    const binanceFairValueAdjustment = this.getBinanceFairValueAdjustment(market, orderbook);
     const signals = this.signalEngine.generateSignals({
       market,
       orderbook,
       positionManager,
       riskAssessment,
+      binanceFairValueAdjustment,
     });
     const statusPausedSignals = this.applyPauseFilter(market, signals);
     const latencyPausedSignals = this.applyLatencyPauseFilter(
@@ -1046,6 +1051,38 @@ class MarketMakerRuntime {
         };
       })
       .filter((candidate): candidate is SignalExecutionCandidate => candidate !== null);
+  }
+
+  private getBinanceFairValueAdjustment(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot
+  ): FairValueBinanceAdjustment | undefined {
+    if (!config.binance.edgeEnabled) {
+      return undefined;
+    }
+
+    const coin = extractCoinFromTitle(market.title);
+    if (!coin) {
+      return undefined;
+    }
+
+    this.binanceEdge.recordSlotOpen(coin, market.startTime);
+    const assessment = this.binanceEdge.assess({
+      coin,
+      slotStartTime: market.startTime,
+      pmUpMid: orderbook.yes.midPrice,
+      signalAction: 'BUY',
+      signalOutcome: 'YES',
+    });
+
+    if (!assessment.available) {
+      return undefined;
+    }
+
+    return {
+      direction: assessment.direction,
+      movePct: assessment.binanceMovePct,
+    };
   }
 
   private rememberMarketAction(
