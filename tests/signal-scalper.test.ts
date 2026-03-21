@@ -7,6 +7,7 @@ import { PositionManager } from '../src/position-manager.js';
 import { RiskManager } from '../src/risk-manager.js';
 import {
   SignalScalper,
+  adaptiveFairValueThreshold,
   calculateTradeSize,
   estimateFairValue,
   resolvePriceMultiplier,
@@ -178,6 +179,20 @@ test('trade size uses price multiplier, fill ratio, and capital clamp', () => {
   assert.equal(size.priceMultiplier > 1, true);
   assert.equal(size.fillRatio > 0, true);
   assert.equal(size.capitalClamp > 0, true);
+});
+
+test('adaptiveFairValueThreshold returns reduced threshold for extreme prices', () => {
+  const base = 0.018;
+  const extremeLow = adaptiveFairValueThreshold(base, 0.03);
+  const extremeHigh = adaptiveFairValueThreshold(base, 0.97);
+  const transition = adaptiveFairValueThreshold(base, 0.2);
+
+  assert.equal(extremeLow < 0.005, true);
+  assert.equal(extremeLow >= 0.002, true);
+  assert.equal(Math.abs(extremeLow - extremeHigh) < 0.0001, true);
+  assert.equal(adaptiveFairValueThreshold(base, 0.5), base);
+  assert.equal(transition > extremeLow, true);
+  assert.equal(transition < base, true);
 });
 
 test('trade size does not use referenceEdge as a synthetic price fallback', () => {

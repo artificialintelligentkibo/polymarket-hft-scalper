@@ -285,12 +285,16 @@ export class SignalScalper {
         hasValidEntryAsk(book)
       ) {
         const bestAsk = book.bestAsk;
+        const adaptedBuyThreshold = adaptiveFairValueThreshold(
+          strategy.fairValueBuyThreshold,
+          bestAsk
+        );
         const entryGuardMultiplier = resolveEntryGuardMultiplier(book, this.runtimeConfig);
         if (entryGuardMultiplier <= 0) {
           continue;
         }
         const buyEdge = fairValue - bestAsk;
-        if (buyEdge >= strategy.fairValueBuyThreshold) {
+        if (buyEdge >= adaptedBuyThreshold) {
           const size = calculateTradeSize({
             action: 'BUY',
             signalType: 'FAIR_VALUE_BUY',
@@ -299,7 +303,7 @@ export class SignalScalper {
             depthShares: book.depthSharesAsk,
             liquidityUsd: market.liquidityUsd,
             price: bestAsk,
-            referenceEdge: strategy.fairValueBuyThreshold,
+            referenceEdge: adaptedBuyThreshold,
             runtimeConfig: this.runtimeConfig,
             entryGuardMultiplier,
           });
@@ -334,8 +338,12 @@ export class SignalScalper {
 
       if (fairValue !== null && hasExecutableBid(book) && openShares > 0) {
         const executableBid = book.bestBid;
+        const adaptedSellThreshold = adaptiveFairValueThreshold(
+          strategy.fairValueSellThreshold,
+          executableBid
+        );
         const sellEdge = executableBid - fairValue;
-        if (sellEdge >= strategy.fairValueSellThreshold) {
+        if (sellEdge >= adaptedSellThreshold) {
           const size = calculateTradeSize({
             action: 'SELL',
             signalType: 'FAIR_VALUE_SELL',
@@ -344,7 +352,7 @@ export class SignalScalper {
             depthShares: book.depthSharesBid,
             liquidityUsd: market.liquidityUsd,
             price: executableBid,
-            referenceEdge: strategy.fairValueSellThreshold,
+            referenceEdge: adaptedSellThreshold,
             runtimeConfig: this.runtimeConfig,
             allowBelowMin: true,
           });
@@ -515,6 +523,27 @@ export function calculateTradeSize(params: {
     fillRatio,
     capitalClamp,
   };
+}
+
+export function adaptiveFairValueThreshold(
+  baseThreshold: number,
+  price: number
+): number {
+  if (!Number.isFinite(price) || price <= 0) {
+    return baseThreshold;
+  }
+
+  const distanceFromExtreme = Math.min(price, 1 - price);
+  if (distanceFromExtreme < 0.1) {
+    return Math.max(0.002, roundTo(baseThreshold * 0.15, 6));
+  }
+
+  if (distanceFromExtreme < 0.3) {
+    const transition = (distanceFromExtreme - 0.1) / 0.2;
+    return roundTo(baseThreshold * (0.15 + transition * 0.85), 6);
+  }
+
+  return roundTo(baseThreshold, 6);
 }
 
 export function resolvePriceMultiplier(

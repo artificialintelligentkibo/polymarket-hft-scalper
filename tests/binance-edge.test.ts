@@ -138,3 +138,38 @@ test('tracks slot open price correctly across slot boundaries', () => {
   assert.equal(Math.abs(slotTwoAssessment.binanceMovePct) < 0.1, true);
   assert.equal(slotTwoAssessment.direction, 'DOWN');
 });
+
+test('assess remains available during reconnect gaps when cached prices exist', () => {
+  const provider = createEdgeProvider();
+  provider.ingestPriceTick('btcusdt', 100);
+  provider.recordSlotOpen('BTC', '2026-03-21T10:30:00.000Z');
+  provider.ingestPriceTick('btcusdt', 100.25);
+  Reflect.set(provider as unknown as object, 'connected', false);
+
+  const assessment = provider.assess({
+    coin: 'BTC',
+    slotStartTime: '2026-03-21T10:30:00.000Z',
+    pmUpMid: 0.54,
+    signalAction: 'BUY',
+    signalOutcome: 'YES',
+  });
+
+  assert.equal(assessment.available, true);
+  assert.equal(assessment.direction, 'UP');
+});
+
+test('assess reports explicit reason when slot open is missing', () => {
+  const provider = createEdgeProvider();
+  provider.ingestPriceTick('btcusdt', 100);
+
+  const assessment = provider.assess({
+    coin: 'BTC',
+    slotStartTime: '2026-03-21T10:35:00.000Z',
+    pmUpMid: 0.52,
+    signalAction: 'BUY',
+    signalOutcome: 'YES',
+  });
+
+  assert.equal(assessment.available, false);
+  assert.equal(assessment.unavailableReason, 'no_slot_open_price');
+});

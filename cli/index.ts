@@ -360,6 +360,15 @@ function printStatus(runtimeConfig: AppConfig): void {
         : 'n/a'
     }`
   );
+  console.log(
+    `${label('Latency gate')} ${
+      runtimeStatus?.latencyPaused
+        ? color.yellow(
+            `ON (${runtimeStatus.latencyPauseAverageMs?.toFixed(0) ?? 'n/a'}ms rolling avg)`
+          )
+        : color.green('OFF')
+    }`
+  );
 
   if (runtimeStatus?.lastSlotReport) {
     console.log('');
@@ -424,6 +433,17 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   if (runtimeStatus?.isPaused) {
     lines.push('');
     lines.push(color.red(color.bold('BOT PAUSED - Polymarket status issue or manual pause')));
+  }
+
+  if (runtimeStatus?.latencyPaused) {
+    lines.push('');
+    lines.push(
+      color.yellow(
+        color.bold(
+          `ENTRY GATE ACTIVE - latency rolling avg ${runtimeStatus.latencyPauseAverageMs?.toFixed(0) ?? 'n/a'}ms`
+        )
+      )
+    );
   }
 
   lines.push('');
@@ -535,6 +555,11 @@ function renderPerformance(
     runtimeStatus?.averageLatencyMs !== null && runtimeStatus?.averageLatencyMs !== undefined
       ? `${runtimeStatus.averageLatencyMs.toFixed(0)}ms`
       : 'n/a';
+  const latencyGate = runtimeStatus?.latencyPaused
+    ? color.yellow(
+        `ON (${runtimeStatus.latencyPauseAverageMs?.toFixed(0) ?? 'n/a'}ms)`
+      )
+    : color.green('OFF');
   const lastSlotNet = runtimeStatus?.lastSlotReport
     ? formatSignedCurrency(runtimeStatus.lastSlotReport.netPnl)
     : color.dim('n/a');
@@ -549,7 +574,8 @@ function renderPerformance(
       ['Running', inspection.running ? color.green('YES') : color.red('NO'), 'Mode', formatModeLabel(inspection.mode)],
       ['Day PnL', formatSignedCurrency(totalDayPnl), 'Drawdown', formatSignedCurrency(drawdown)],
       ['Active slots', color.bold(String(activeSlots)), 'Open positions', color.bold(String(openPositions))],
-      ['Avg latency', color.bold(averageLatency), 'Manager', color.bold(inspection.manager ?? 'n/a')],
+      ['Avg latency', color.bold(averageLatency), 'Latency gate', latencyGate],
+      ['Manager', color.bold(inspection.manager ?? 'n/a'), 'Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK')],
       ['Last slot', lastSlotNet, 'Slot label', lastSlotLabel],
     ]
   );

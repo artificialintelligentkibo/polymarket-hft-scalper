@@ -17,6 +17,7 @@ export interface BinanceEdgeAssessment {
   sizeMultiplier: number;
   urgencyBoost: boolean;
   contraSignal: boolean;
+  unavailableReason?: string;
 }
 
 interface SlotOpenReference {
@@ -41,6 +42,7 @@ export class BinanceEdgeProvider {
   private ws: WebSocket | undefined;
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | undefined;
+  private heartbeatTimer: NodeJS.Timeout | undefined;
   private connected = false;
   private readonly lastPrices = new Map<string, number>();
   private readonly slotOpenPrices = new Map<string, SlotOpenReference>();
@@ -52,6 +54,7 @@ export class BinanceEdgeProvider {
       return;
     }
 
+    this.startHeartbeat();
     this.connect();
   }
 
@@ -61,6 +64,10 @@ export class BinanceEdgeProvider {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
     if (this.ws) {
       this.ws.removeAllListeners();
       this.ws.close();
@@ -69,7 +76,7 @@ export class BinanceEdgeProvider {
   }
 
   isReady(): boolean {
-    return this.runtimeConfig.binance.edgeEnabled && this.connected && this.lastPrices.size > 0;
+    return this.runtimeConfig.binance.edgeEnabled && this.lastPrices.size > 0;
   }
 
   assess(params: {
@@ -84,8 +91,16 @@ export class BinanceEdgeProvider {
     const binancePrice = symbol ? this.lastPrices.get(symbol) ?? null : null;
     const slotOpenPrice = this.getSlotOpenPrice(coin, params.slotStartTime);
 
-    if (!symbol || !this.connected || binancePrice === null || slotOpenPrice === null) {
-      return createUnavailableAssessment(coin, params.pmUpMid);
+    if (!symbol) {
+      return createUnavailableAssessment(coin, params.pmUpMid, 'no_binance_symbol');
+    }
+
+    if (binancePrice === null) {
+      return createUnavailableAssessment(coin, params.pmUpMid, 'no_binance_price');
+    }
+
+    if (slotOpenPrice === null) {
+      return createUnavailableAssessment(coin, params.pmUpMid, 'no_slot_open_price');
     }
 
     const binanceMovePct = roundTo(((binancePrice - slotOpenPrice) / slotOpenPrice) * 100, 4);
@@ -150,18 +165,21 @@ export class BinanceEdgeProvider {
       return;
     }
 
+    const key = buildSlotKey(normalizedCoin, slotStartTime);
+    if (this.slotOpenPrices.has(key)) {
+      this.pruneSlotOpens();
+      return;
+    }
+
     const price = this.lastPrices.get(symbol);
     if (!price || !Number.isFinite(price) || price <= 0) {
       return;
     }
 
-    const key = buildSlotKey(normalizedCoin, slotStartTime);
-    if (!this.slotOpenPrices.has(key)) {
-      this.slotOpenPrices.set(key, {
-        openPrice: price,
-        createdAt: Date.now(),
-      });
-    }
+    this.slotOpenPrices.set(key, {
+      openPrice: price,
+      createdAt: Date.now(),
+    });
 
     this.pruneSlotOpens();
   }
@@ -285,6 +303,22 @@ export class BinanceEdgeProvider {
       }
     }
   }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      return;
+    }
+
+    this.heartbeatTimer = setInterval(() => {
+      logger.debug('Binance WS health', {
+        connected: this.connected,
+        symbols: this.lastPrices.size,
+        slotOpenPrices: this.slotOpenPrices.size,
+        reconnectAttempts: this.reconnectAttempts,
+      });
+    }, 60_000);
+    this.heartbeatTimer.unref?.();
+  }
 }
 
 export function extractCoinFromTitle(title: string): string | null {
@@ -312,8 +346,16 @@ function buildSlotKey(coin: string, slotStartTime: string): string {
 
 function createUnavailableAssessment(
   coin: string,
-  pmUpMid: number | null
+  pmUpMid: number | null,
+  reason?: string
 ): BinanceEdgeAssessment {
+  if (reason) {
+    logger.debug('Binance edge unavailable', {
+      coin,
+      reason,
+    });
+  }
+
   return {
     available: false,
     coin,
@@ -328,6 +370,7 @@ function createUnavailableAssessment(
     sizeMultiplier: 1,
     urgencyBoost: false,
     contraSignal: false,
+    unavailableReason: reason,
   };
 }
 

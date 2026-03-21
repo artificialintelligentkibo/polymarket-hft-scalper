@@ -70,6 +70,8 @@ export interface RuntimeStatusSnapshot {
   readonly pauseSource: 'manual' | 'incident' | null;
   readonly activeSlotsCount: number;
   readonly openPositionsCount: number;
+  readonly latencyPaused: boolean;
+  readonly latencyPauseAverageMs: number | null;
   readonly totalDayPnl: number;
   readonly dayDrawdown: number;
   readonly averageLatencyMs: number | null;
@@ -111,6 +113,8 @@ export function createRuntimeStatusSnapshot(
     pauseSource: null,
     activeSlotsCount: 0,
     openPositionsCount: 0,
+    latencyPaused: false,
+    latencyPauseAverageMs: null,
     totalDayPnl: dayState.dayPnl,
     dayDrawdown: dayState.drawdown,
     averageLatencyMs: null,
@@ -206,6 +210,8 @@ function normalizeRuntimeStatus(
       normalizeCount(value.openPositionsCount),
       openPositions.length
     ),
+    latencyPaused: Boolean(value.latencyPaused),
+    latencyPauseAverageMs: normalizeNullableNumber(value.latencyPauseAverageMs),
     totalDayPnl: normalizeNumber(value.totalDayPnl, dayState.dayPnl),
     dayDrawdown: normalizeNumber(value.dayDrawdown, dayState.drawdown),
     averageLatencyMs: normalizeNullableNumber(value.averageLatencyMs),

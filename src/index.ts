@@ -54,6 +54,12 @@ interface RuntimeMarketActionSnapshot {
   readonly updatedAt: string;
 }
 
+export interface LatencyPauseEvaluation {
+  readonly latencyPaused: boolean;
+  readonly averageLatencyMs: number | null;
+  readonly transition: 'pause' | 'resume' | 'none';
+}
+
 class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
   private readonly fetcher = new ClobFetcher();
@@ -75,6 +81,8 @@ class MarketMakerRuntime {
   private readonly pendingLiveOrders = new Map<string, number>();
   private readonly recentSignals: RuntimeSignalSnapshot[] = [];
   private readonly recentLatencySamples: number[] = [];
+  private readonly latencyWindow: number[] = [];
+  private latencyPaused = false;
   private readonly activeMarketIds = new Set<string>();
   private running = false;
   private stopping = false;
@@ -175,6 +183,8 @@ class MarketMakerRuntime {
       pauseSource: this.statusMonitor.getState().source,
       activeSlotsCount: 0,
       openPositionsCount: 0,
+      latencyPaused: false,
+      latencyPauseAverageMs: null,
       activeMarkets: [],
       openPositions: [],
       lastSignals: [],
@@ -320,8 +330,16 @@ class MarketMakerRuntime {
       positionManager,
       riskAssessment,
     });
-    const pausedSignals = this.applyPauseFilter(market, signals);
-    const executionCandidates = this.applyBinanceEdge(market, orderbook, pausedSignals);
+    const statusPausedSignals = this.applyPauseFilter(market, signals);
+    const latencyPausedSignals = this.applyLatencyPauseFilter(
+      market,
+      statusPausedSignals
+    );
+    const executionCandidates = this.applyBinanceEdge(
+      market,
+      orderbook,
+      latencyPausedSignals
+    );
     this.rememberMarketAction(market, signals, executionCandidates, positionManager);
 
     if (executionCandidates.length === 0) {
@@ -470,6 +488,7 @@ class MarketMakerRuntime {
     const dayState = getDayPnlState(new Date(completedAt));
     const latencyRoundTripMs =
       signal.generatedAt !== undefined ? Math.max(0, completedAt - signal.generatedAt) : undefined;
+    this.updateLatencyPause(latencyRoundTripMs ?? execution.latencySignalToOrderMs);
 
     this.productTestMode.recordExecution({
       market,
@@ -597,6 +616,8 @@ class MarketMakerRuntime {
       dayDrawdown: dayState.drawdown,
       lastSignals: this.recentSignals,
       averageLatencyMs: this.getAverageLatencyMs(),
+      latencyPaused: this.latencyPaused,
+      latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
     });
   }
 
@@ -623,6 +644,62 @@ class MarketMakerRuntime {
     return roundTo(total / this.recentLatencySamples.length, 2);
   }
 
+  private getLatencyPauseAverageMs(): number | null {
+    if (this.latencyWindow.length === 0) {
+      return null;
+    }
+
+    const total = this.latencyWindow.reduce((sum, value) => sum + value, 0);
+    return roundTo(total / this.latencyWindow.length, 2);
+  }
+
+  private updateLatencyPause(latencyMs: number | undefined): void {
+    if (latencyMs === undefined || !Number.isFinite(latencyMs)) {
+      return;
+    }
+
+    this.latencyWindow.push(latencyMs);
+    while (this.latencyWindow.length > config.strategy.latencyPauseWindowSize) {
+      this.latencyWindow.shift();
+    }
+
+    const evaluation = evaluateLatencyPauseState({
+      samples: this.latencyWindow,
+      latencyPaused: this.latencyPaused,
+      pauseThresholdMs: config.strategy.latencyPauseThresholdMs,
+      resumeThresholdMs: config.strategy.latencyResumeThresholdMs,
+    });
+    if (evaluation.averageLatencyMs === null || evaluation.transition === 'none') {
+      return;
+    }
+
+    if (evaluation.transition === 'pause') {
+      this.latencyPaused = true;
+      logger.warn('LATENCY_PAUSE_ON: blocking new entries due to high latency', {
+        avgLatencyMs: roundTo(evaluation.averageLatencyMs, 0),
+        threshold: config.strategy.latencyPauseThresholdMs,
+        window: this.latencyWindow.length,
+      });
+      this.syncRuntimeStatus({
+        latencyPaused: true,
+        latencyPauseAverageMs: evaluation.averageLatencyMs,
+      });
+      return;
+    }
+
+    if (evaluation.transition === 'resume') {
+      this.latencyPaused = false;
+      logger.info('LATENCY_PAUSE_OFF: latency recovered, resuming entries', {
+        avgLatencyMs: roundTo(evaluation.averageLatencyMs, 0),
+        threshold: config.strategy.latencyResumeThresholdMs,
+      });
+      this.syncRuntimeStatus({
+        latencyPaused: false,
+        latencyPauseAverageMs: evaluation.averageLatencyMs,
+      });
+    }
+  }
+
   private syncRuntimeStatus(overrides: Parameters<typeof writeRuntimeStatus>[0]): void {
     const openPositions = this.buildRuntimePositionSnapshots();
     writeRuntimeStatus(
@@ -637,6 +714,8 @@ class MarketMakerRuntime {
         dayDrawdown: getDayPnlState().drawdown,
         lastSignals: this.recentSignals,
         averageLatencyMs: this.getAverageLatencyMs(),
+        latencyPaused: this.latencyPaused,
+        latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
         activeMarkets: this.buildRuntimeMarketSnapshots(),
         openPositions,
         openPositionsCount: openPositions.length,
@@ -868,6 +947,24 @@ class MarketMakerRuntime {
         marketId: market.marketId,
         blockedSignals: blockedCount,
         reason: this.statusMonitor.getState().reason,
+      });
+    }
+
+    return allowed;
+  }
+
+  private applyLatencyPauseFilter(
+    market: MarketCandidate,
+    signals: StrategySignal[]
+  ): StrategySignal[] {
+    const allowed = filterSignalsForLatencyPause(signals, this.latencyPaused);
+    if (allowed.length < signals.length) {
+      logger.debug('Latency pause filtered entry signals', {
+        marketId: market.marketId,
+        original: signals.length,
+        remaining: allowed.length,
+        blocked: signals.length - allowed.length,
+        avgLatencyMs: this.getLatencyPauseAverageMs(),
       });
     }
 
@@ -1165,6 +1262,59 @@ function resolveSlotOutcome(
   }
 
   return outcome === 'YES' ? 'Up' : 'Down';
+}
+
+export function filterSignalsForLatencyPause(
+  signals: readonly StrategySignal[],
+  latencyPaused: boolean
+): StrategySignal[] {
+  if (!latencyPaused) {
+    return [...signals];
+  }
+
+  return signals.filter((signal) => signal.reduceOnly || signal.action === 'SELL');
+}
+
+export function evaluateLatencyPauseState(params: {
+  samples: readonly number[];
+  latencyPaused: boolean;
+  pauseThresholdMs: number;
+  resumeThresholdMs: number;
+}): LatencyPauseEvaluation {
+  const samples = params.samples.filter((value) => Number.isFinite(value) && value >= 0);
+  if (samples.length < 3) {
+    return {
+      latencyPaused: params.latencyPaused,
+      averageLatencyMs: null,
+      transition: 'none',
+    };
+  }
+
+  const averageLatencyMs = roundTo(
+    samples.reduce((sum, value) => sum + value, 0) / samples.length,
+    2
+  );
+  if (!params.latencyPaused && averageLatencyMs > params.pauseThresholdMs) {
+    return {
+      latencyPaused: true,
+      averageLatencyMs,
+      transition: 'pause',
+    };
+  }
+
+  if (params.latencyPaused && averageLatencyMs < params.resumeThresholdMs) {
+    return {
+      latencyPaused: false,
+      averageLatencyMs,
+      transition: 'resume',
+    };
+  }
+
+  return {
+    latencyPaused: params.latencyPaused,
+    averageLatencyMs,
+    transition: 'none',
+  };
 }
 
 const isDirectRun =

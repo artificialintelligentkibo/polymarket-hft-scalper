@@ -86,6 +86,9 @@ export interface AppConfig {
     readonly minEntryDepthUsd: number;
     readonly maxEntrySpread: number;
     readonly entryImbalanceBlockThreshold: number;
+    readonly latencyPauseThresholdMs: number;
+    readonly latencyResumeThresholdMs: number;
+    readonly latencyPauseWindowSize: number;
     readonly maxSignalsPerTick: number;
     readonly priceMultiplierLevels: readonly PriceMultiplierLevel[];
     readonly exitBeforeEndMs: number;
@@ -385,6 +388,18 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         env.ENTRY_IMBALANCE_BLOCK_THRESHOLD,
         '100'
       ),
+      latencyPauseThresholdMs: Math.max(
+        1,
+        parseIntOrDefault(env.LATENCY_PAUSE_THRESHOLD_MS, '800')
+      ),
+      latencyResumeThresholdMs: Math.max(
+        1,
+        parseIntOrDefault(env.LATENCY_RESUME_THRESHOLD_MS, '400')
+      ),
+      latencyPauseWindowSize: Math.max(
+        1,
+        parseIntOrDefault(env.LATENCY_PAUSE_WINDOW_SIZE, '10')
+      ),
       maxSignalsPerTick: Math.max(1, parseIntOrDefault(env.MAX_SIGNALS_PER_TICK, '2')),
       priceMultiplierLevels: parsePriceMultiplierLevels(env.PRICE_MULTIPLIER_LEVELS),
       exitBeforeEndMs: Math.max(0, parseIntOrDefault(env.EXIT_BEFORE_END_MS, '20000')),
@@ -535,6 +550,27 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.strategy.entryImbalanceBlockThreshold <= 0) {
     throw new Error('ENTRY_IMBALANCE_BLOCK_THRESHOLD must be positive.');
+  }
+
+  if (candidate.strategy.latencyPauseThresholdMs <= 0) {
+    throw new Error('LATENCY_PAUSE_THRESHOLD_MS must be positive.');
+  }
+
+  if (candidate.strategy.latencyResumeThresholdMs <= 0) {
+    throw new Error('LATENCY_RESUME_THRESHOLD_MS must be positive.');
+  }
+
+  if (
+    candidate.strategy.latencyResumeThresholdMs >=
+    candidate.strategy.latencyPauseThresholdMs
+  ) {
+    throw new Error(
+      'LATENCY_RESUME_THRESHOLD_MS must be lower than LATENCY_PAUSE_THRESHOLD_MS.'
+    );
+  }
+
+  if (candidate.strategy.latencyPauseWindowSize < 1) {
+    throw new Error('LATENCY_PAUSE_WINDOW_SIZE must be at least 1.');
   }
 
   if (candidate.strategy.maxDrawdownUsdc >= 0) {
