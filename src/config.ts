@@ -21,6 +21,9 @@ export interface AppConfig {
   readonly TEST_MIN_TRADE_USDC: number;
   readonly TEST_MAX_SLOTS: number;
   readonly ENABLE_SIGNAL: boolean;
+  readonly STATUS_CHECK_INTERVAL_MS: number;
+  readonly AUTO_PAUSE_ON_INCIDENT: boolean;
+  readonly PAUSE_GRACE_PERIOD_MS: number;
   readonly AUTO_REDEEM: boolean;
   readonly REDEEM_INTERVAL_MS: number;
   readonly COINS_TO_TRADE: readonly TradeableCoin[];
@@ -110,6 +113,17 @@ export interface AppConfig {
     readonly directory: string;
     readonly logToFile: boolean;
   };
+  readonly binance: {
+    readonly edgeEnabled: boolean;
+    readonly symbols: readonly string[];
+    readonly flatThreshold: number;
+    readonly strongThreshold: number;
+    readonly boostMultiplier: number;
+    readonly reduceMultiplier: number;
+    readonly blockOnStrongContra: boolean;
+    readonly wsReconnectMs: number;
+    readonly maxReconnectAttempts: number;
+  };
 }
 
 const DEFAULT_WHITELIST_CONDITION_IDS = [] as const;
@@ -141,6 +155,14 @@ function parseCsv(value?: string): string[] {
           .map((entry) => entry.trim())
           .filter(Boolean)
   );
+}
+
+function parseStringCsv(value: string | undefined, fallback: string): string[] {
+  const raw = value?.trim() || fallback;
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function parseCoinsToTrade(value?: string): TradeableCoin[] {
@@ -259,6 +281,15 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     TEST_MIN_TRADE_USDC: Math.max(0.1, parseFloatOrDefault(env.TEST_MIN_TRADE_USDC, '1')),
     TEST_MAX_SLOTS: Math.max(1, parseIntOrDefault(env.TEST_MAX_SLOTS, '1')),
     ENABLE_SIGNAL: parseBoolean(env.ENABLE_SIGNAL, true),
+    STATUS_CHECK_INTERVAL_MS: Math.max(
+      60_000,
+      parseIntOrDefault(env.STATUS_CHECK_INTERVAL_MS, '300000')
+    ),
+    AUTO_PAUSE_ON_INCIDENT: parseBoolean(env.AUTO_PAUSE_ON_INCIDENT, true),
+    PAUSE_GRACE_PERIOD_MS: Math.max(
+      0,
+      parseIntOrDefault(env.PAUSE_GRACE_PERIOD_MS, '60000')
+    ),
     AUTO_REDEEM: parseBoolean(env.AUTO_REDEEM, false),
     REDEEM_INTERVAL_MS: Math.max(5_000, parseIntOrDefault(env.REDEEM_INTERVAL_MS, '30000')),
     COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
@@ -387,6 +418,20 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       level: parseLogLevel(env.LOG_LEVEL),
       directory: (env.LOG_DIRECTORY || 'logs').trim(),
       logToFile: parseBoolean(env.LOG_TO_FILE, true),
+    },
+    binance: {
+      edgeEnabled: parseBoolean(env.BINANCE_EDGE_ENABLED, false),
+      symbols: parseStringCsv(
+        env.BINANCE_SYMBOLS,
+        'btcusdt,ethusdt,solusdt,xrpusdt,dogeusdt,bnbusdt,linkusdt'
+      ),
+      flatThreshold: parseFloatOrDefault(env.BINANCE_FLAT_THRESHOLD, '0.05'),
+      strongThreshold: parseFloatOrDefault(env.BINANCE_STRONG_THRESHOLD, '0.20'),
+      boostMultiplier: parseFloatOrDefault(env.BINANCE_BOOST_MULTIPLIER, '1.5'),
+      reduceMultiplier: parseFloatOrDefault(env.BINANCE_REDUCE_MULTIPLIER, '0.5'),
+      blockOnStrongContra: parseBoolean(env.BINANCE_BLOCK_STRONG_CONTRA, true),
+      wsReconnectMs: Math.max(500, parseIntOrDefault(env.BINANCE_WS_RECONNECT_MS, '5000')),
+      maxReconnectAttempts: Math.max(1, parseIntOrDefault(env.BINANCE_MAX_RECONNECT, '10')),
     },
   };
 }

@@ -105,6 +105,7 @@ export function collectTodayResetTargets(
   const alwaysReset = [
     path.resolve(process.cwd(), runtimeConfig.STATE_FILE),
     path.resolve(process.cwd(), runtimeConfig.REPORTS_DIR, 'runtime-status.json'),
+    path.resolve(process.cwd(), runtimeConfig.REPORTS_DIR, 'status-control.json'),
     path.resolve(process.cwd(), runtimeConfig.REPORTS_DIR, 'polymarket-scalper.pid'),
   ];
 

@@ -1,5 +1,7 @@
 import { AutoRedeemer } from './auto-redeemer.js';
 import { pathToFileURL } from 'node:url';
+import type { BinanceEdgeAssessment } from './binance-edge.js';
+import { BinanceEdgeProvider, extractCoinFromTitle } from './binance-edge.js';
 import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
 import { config, isDryRunMode, validateConfig } from './config.js';
 import { getDayPnlState } from './day-pnl-state.js';
@@ -19,6 +21,11 @@ import { RiskManager } from './risk-manager.js';
 import { writeRuntimeStatus, type RuntimeSignalSnapshot } from './runtime-status.js';
 import { SignalScalper } from './signal-scalper.js';
 import {
+  StatusMonitor,
+  consumeStatusControlCommand,
+  type PauseStateSnapshot,
+} from './status-monitor.js';
+import {
   ensureSlotResult,
   getSlotMetrics,
   printSlotReport,
@@ -31,10 +38,17 @@ import { pruneSetEntries, roundTo, sleep } from './utils.js';
 const MAX_TRACKED_SLOT_REPORTS = 2_048;
 const UNCONFIRMED_ORDER_COOLDOWN_MS = 15_000;
 
+interface SignalExecutionCandidate {
+  readonly signal: StrategySignal;
+  readonly binanceAssessment?: BinanceEdgeAssessment;
+}
+
 class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
   private readonly fetcher = new ClobFetcher();
   private readonly executor = new OrderExecutor();
+  private readonly statusMonitor = new StatusMonitor();
+  private readonly binanceEdge = new BinanceEdgeProvider();
   private readonly tradeLogger = new TradeLogger();
   private readonly riskManager = new RiskManager();
   private readonly signalEngine = new SignalScalper();
@@ -84,6 +98,31 @@ class MarketMakerRuntime {
         this.stop();
       }
     });
+
+    this.statusMonitor.on('pause', (state: PauseStateSnapshot) => {
+      logger.warn('BOT PAUSED', {
+        source: state.source,
+        reason: state.reason,
+      });
+      this.syncRuntimeStatus({
+        isPaused: true,
+        systemStatus: 'PAUSED',
+        pauseReason: state.reason,
+        pauseSource: state.source,
+      });
+    });
+
+    this.statusMonitor.on('resume', (state: PauseStateSnapshot) => {
+      logger.info('BOT RESUMED', {
+        source: state.source,
+      });
+      this.syncRuntimeStatus({
+        isPaused: false,
+        systemStatus: 'OK',
+        pauseReason: null,
+        pauseSource: null,
+      });
+    });
   }
 
   async initialize(): Promise<void> {
@@ -117,10 +156,16 @@ class MarketMakerRuntime {
     this.syncRuntimeStatus({
       running: true,
       pid: process.pid,
+      isPaused: this.statusMonitor.isPaused(),
+      systemStatus: this.statusMonitor.isPaused() ? 'PAUSED' : 'OK',
+      pauseReason: this.statusMonitor.getState().reason,
+      pauseSource: this.statusMonitor.getState().source,
       activeSlotsCount: 0,
       lastSignals: [],
       averageLatencyMs: null,
     });
+    this.statusMonitor.start();
+    this.binanceEdge.start();
     this.redeemer.start();
   }
 
@@ -140,6 +185,7 @@ class MarketMakerRuntime {
         break;
       }
 
+      this.consumeControlCommands();
       await sleep(config.runtime.marketScanIntervalMs);
     }
 
@@ -181,19 +227,30 @@ class MarketMakerRuntime {
       this.syncRuntimeStatus({
         running: false,
         pid: process.pid,
+        isPaused: this.statusMonitor.isPaused(),
+        systemStatus: this.statusMonitor.isPaused() ? 'PAUSED' : 'OK',
+        pauseReason: this.statusMonitor.getState().reason,
+        pauseSource: this.statusMonitor.getState().source,
         activeSlotsCount: 0,
       });
       this.pendingLiveOrders.clear();
       this.redeemer.stop();
+      this.statusMonitor.stop();
+      this.binanceEdge.stop();
       this.fetcher.close();
     }
   }
 
   private async runCycle(): Promise<void> {
+    this.consumeControlCommands();
     const scannedMarkets = await this.monitor.scanEligibleMarkets();
     const markets = this.productTestMode.selectMarkets(scannedMarkets);
     this.syncRuntimeStatus({
       running: true,
+      isPaused: this.statusMonitor.isPaused(),
+      systemStatus: this.statusMonitor.isPaused() ? 'PAUSED' : 'OK',
+      pauseReason: this.statusMonitor.getState().reason,
+      pauseSource: this.statusMonitor.getState().source,
       activeSlotsCount: markets.length,
     });
     if (markets.length === 0) {
@@ -240,24 +297,33 @@ class MarketMakerRuntime {
       positionManager,
       riskAssessment,
     });
+    const pausedSignals = this.applyPauseFilter(market, signals);
+    const executionCandidates = this.applyBinanceEdge(market, orderbook, pausedSignals);
 
-    if (signals.length === 0) {
+    if (executionCandidates.length === 0) {
       this.maybePrintSlotReport(slotKey);
       return;
     }
 
-    for (const signal of signals) {
+    for (const candidate of executionCandidates) {
       try {
-        await this.executeSignal(market, orderbook, positionManager, signal, slotKey);
+        await this.executeSignal(
+          market,
+          orderbook,
+          positionManager,
+          candidate.signal,
+          slotKey,
+          candidate.binanceAssessment
+        );
       } catch (error: any) {
         this.productTestMode.recordExecutionError(
-          `Signal execution failed for ${market.marketId} ${signal.signalType} ${signal.outcome}: ${error?.message || 'Unknown error'}`
+          `Signal execution failed for ${market.marketId} ${candidate.signal.signalType} ${candidate.signal.outcome}: ${error?.message || 'Unknown error'}`
         );
         logger.warn('Signal execution failed for market tick', {
           marketId: market.marketId,
-          signalType: signal.signalType,
-          outcome: signal.outcome,
-          action: signal.action,
+          signalType: candidate.signal.signalType,
+          outcome: candidate.signal.outcome,
+          action: candidate.signal.action,
           message: error?.message || 'Unknown error',
         });
       }
@@ -271,9 +337,21 @@ class MarketMakerRuntime {
     orderbook: MarketOrderbookSnapshot,
     positionManager: PositionManager,
     signal: StrategySignal,
-    slotKey: string
+    slotKey: string,
+    binanceAssessment?: BinanceEdgeAssessment
   ): Promise<void> {
     if (signal.targetPrice === null || signal.shares <= 0) {
+      return;
+    }
+
+    if (this.statusMonitor.isPaused() && !signal.reduceOnly) {
+      logger.warn('Execution skipped because bot is paused', {
+        marketId: market.marketId,
+        signalType: signal.signalType,
+        outcome: signal.outcome,
+        action: signal.action,
+        reason: this.statusMonitor.getState().reason,
+      });
       return;
     }
 
@@ -386,6 +464,8 @@ class MarketMakerRuntime {
       orderId: execution.orderId,
       latencySignalToOrderMs: execution.latencySignalToOrderMs,
       latencyRoundTripMs,
+      binanceEdge: binanceAssessment?.available,
+      binanceMovePct: binanceAssessment?.available ? binanceAssessment.binanceMovePct : undefined,
       simulationMode: execution.simulation,
       dryRun: isDryRunMode(config),
       testMode: config.TEST_MODE,
@@ -443,6 +523,13 @@ class MarketMakerRuntime {
       dayDrawdown: dayState.drawdown,
       latencySignalToOrderMs: execution.latencySignalToOrderMs,
       latencyRoundTripMs,
+      binanceEdgeAvailable: binanceAssessment?.available,
+      binanceMovePct: binanceAssessment?.available ? binanceAssessment.binanceMovePct : undefined,
+      binanceDirection: binanceAssessment?.available ? binanceAssessment.direction : undefined,
+      binanceSizeMultiplier:
+        binanceAssessment?.available ? binanceAssessment.sizeMultiplier : undefined,
+      binanceContraSignal:
+        binanceAssessment?.available ? binanceAssessment.contraSignal : undefined,
       orderId: execution.orderId,
       wasMaker: execution.wasMaker,
       simulationMode: execution.simulation,
@@ -463,6 +550,10 @@ class MarketMakerRuntime {
       fillConfirmed: execution.fillConfirmed,
       latencySignalToOrderMs: execution.latencySignalToOrderMs,
       latencyRoundTripMs,
+      binanceDirection: binanceAssessment?.available ? binanceAssessment.direction : undefined,
+      binanceMovePct: binanceAssessment?.available ? binanceAssessment.binanceMovePct : undefined,
+      binanceSizeMultiplier:
+        binanceAssessment?.available ? binanceAssessment.sizeMultiplier : undefined,
       signedNetShares: afterSnapshot.signedNetShares,
       totalPnl: afterSnapshot.totalPnl,
       dayDrawdown: dayState.drawdown,
@@ -513,6 +604,10 @@ class MarketMakerRuntime {
       {
         running: this.running && !this.stopping,
         pid: process.pid,
+        systemStatus: this.statusMonitor.isPaused() ? 'PAUSED' : 'OK',
+        isPaused: this.statusMonitor.isPaused(),
+        pauseReason: this.statusMonitor.getState().reason,
+        pauseSource: this.statusMonitor.getState().source,
         totalDayPnl: getDayPnlState().dayPnl,
         dayDrawdown: getDayPnlState().drawdown,
         lastSignals: this.recentSignals,
@@ -701,6 +796,118 @@ class MarketMakerRuntime {
     }
 
     return undefined;
+  }
+
+  private consumeControlCommands(): void {
+    const command = consumeStatusControlCommand(config);
+    if (!command) {
+      return;
+    }
+
+    if (command.command === 'pause') {
+      this.statusMonitor.pauseManually(command.reason);
+      return;
+    }
+
+    this.statusMonitor.resumeManually();
+  }
+
+  private applyPauseFilter(
+    market: MarketCandidate,
+    signals: StrategySignal[]
+  ): StrategySignal[] {
+    if (!this.statusMonitor.isPaused()) {
+      return signals;
+    }
+
+    const allowed = signals.filter((signal) => signal.reduceOnly);
+    const blockedCount = signals.length - allowed.length;
+    if (blockedCount > 0) {
+      logger.warn('Skipping new entry signals because bot is paused', {
+        marketId: market.marketId,
+        blockedSignals: blockedCount,
+        reason: this.statusMonitor.getState().reason,
+      });
+    }
+
+    return allowed;
+  }
+
+  private applyBinanceEdge(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot,
+    signals: StrategySignal[]
+  ): SignalExecutionCandidate[] {
+    if (!this.binanceEdge.isReady()) {
+      return signals.map((signal) => ({ signal }));
+    }
+
+    const coin = extractCoinFromTitle(market.title);
+    if (!coin) {
+      return signals.map((signal) => ({ signal }));
+    }
+
+    this.binanceEdge.recordSlotOpen(coin, market.startTime);
+
+    return signals
+      .map((signal): SignalExecutionCandidate | null => {
+        if (signal.reduceOnly) {
+          return { signal };
+        }
+
+        const assessment = this.binanceEdge.assess({
+          coin,
+          slotStartTime: market.startTime,
+          pmUpMid: orderbook.yes.midPrice,
+          signalAction: signal.action,
+          signalOutcome: signal.outcome,
+        });
+
+        if (!assessment.available) {
+          return { signal };
+        }
+
+        if (assessment.edgeStrength >= config.binance.flatThreshold) {
+          logger.info('Binance edge assessed', {
+            coin,
+            binanceMovePct: assessment.binanceMovePct,
+            direction: assessment.direction,
+            pmDirection: assessment.pmImpliedDirection,
+            agreement: assessment.directionalAgreement,
+            sizeMultiplier: assessment.sizeMultiplier,
+            contraSignal: assessment.contraSignal,
+            signalType: signal.signalType,
+            signalOutcome: signal.outcome,
+          });
+        }
+
+        if (assessment.sizeMultiplier === 0) {
+          logger.info('Binance edge BLOCKED signal', {
+            signalType: signal.signalType,
+            outcome: signal.outcome,
+            reason: `Binance ${assessment.direction} contradicts ${signal.action} ${signal.outcome}`,
+          });
+          return null;
+        }
+
+        const adjustedShares = roundTo(signal.shares * assessment.sizeMultiplier, 4);
+        if (adjustedShares <= 0) {
+          return null;
+        }
+
+        return {
+          signal: {
+            ...signal,
+            shares: adjustedShares,
+            urgency:
+              assessment.urgencyBoost && signal.urgency === 'passive'
+                ? 'improve'
+                : signal.urgency,
+          },
+          binanceAssessment: assessment,
+        };
+      })
+      .filter((candidate): candidate is SignalExecutionCandidate => candidate !== null);
   }
 }
 

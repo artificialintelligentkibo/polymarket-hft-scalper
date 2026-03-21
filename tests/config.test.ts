@@ -38,6 +38,9 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.PRODUCT_TEST_MODE, false);
   assert.equal(candidate.TEST_MIN_TRADE_USDC, 1);
   assert.equal(candidate.TEST_MAX_SLOTS, 1);
+  assert.equal(candidate.STATUS_CHECK_INTERVAL_MS, 300000);
+  assert.equal(candidate.AUTO_PAUSE_ON_INCIDENT, true);
+  assert.equal(candidate.PAUSE_GRACE_PERIOD_MS, 60000);
   assert.equal(candidate.AUTO_REDEEM, false);
   assert.equal(candidate.REDEEM_INTERVAL_MS, 30000);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
@@ -52,6 +55,21 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.strategy.entryImbalanceBlockThreshold, 100);
   assert.equal(candidate.strategy.maxDrawdownUsdc, -100);
   assert.equal(candidate.strategy.hardStopCooldownMs, 15000);
+  assert.equal(candidate.binance.edgeEnabled, false);
+  assert.deepEqual(candidate.binance.symbols, [
+    'btcusdt',
+    'ethusdt',
+    'solusdt',
+    'xrpusdt',
+    'dogeusdt',
+    'bnbusdt',
+    'linkusdt',
+  ]);
+  assert.equal(candidate.binance.flatThreshold, 0.05);
+  assert.equal(candidate.binance.strongThreshold, 0.2);
+  assert.equal(candidate.binance.boostMultiplier, 1.5);
+  assert.equal(candidate.binance.reduceMultiplier, 0.5);
+  assert.equal(candidate.binance.blockOnStrongContra, true);
 });
 
 test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () => {

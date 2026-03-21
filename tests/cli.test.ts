@@ -63,6 +63,7 @@ test('collectTodayResetTargets includes dated logs plus state and pid files', ()
     writeFileSync(path.join('reports', `slot-reports_${dayKey}.log`), 'report\n', 'utf8');
     writeFileSync(path.join('reports', 'state.json'), '{}\n', 'utf8');
     writeFileSync(path.join('reports', 'runtime-status.json'), '{}\n', 'utf8');
+    writeFileSync(path.join('reports', 'status-control.json'), '{}\n', 'utf8');
     writeFileSync(path.join('reports', 'polymarket-scalper.pid'), '123\n', 'utf8');
     writeFileSync(path.join('logs', 'events_2029-01-01.jsonl'), '{}\n', 'utf8');
 
@@ -83,6 +84,7 @@ test('collectTodayResetTargets includes dated logs plus state and pid files', ()
         `logs/trades_${dayKey}.jsonl`,
         'reports/polymarket-scalper.pid',
         'reports/runtime-status.json',
+        'reports/status-control.json',
         `reports/slot-reports_${dayKey}.log`,
         'reports/state.json',
       ].sort()
@@ -112,4 +114,10 @@ test('package CLI entrypoints use source-first tsx execution and valid bin wrapp
     readFileSync(path.join(repoRoot, 'cli', 'index.js'), 'utf8').includes('tsx/dist/cli.mjs'),
     false
   );
+});
+
+test('CLI source registers pause and resume commands', () => {
+  const cliSource = readFileSync(path.join(repoRoot, 'cli', 'index.ts'), 'utf8');
+  assert.equal(cliSource.includes(".command('pause')"), true);
+  assert.equal(cliSource.includes(".command('resume')"), true);
 });

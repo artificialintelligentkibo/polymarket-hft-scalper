@@ -25,6 +25,7 @@ import {
   type RuntimeMode,
   type RuntimeStatusSnapshot,
 } from '../src/runtime-status.js';
+import { writeStatusControlCommand } from '../src/status-monitor.js';
 import { resetSlotReporterState } from '../src/slot-reporter.js';
 import { roundTo, sleep } from '../src/utils.js';
 import {
@@ -114,6 +115,34 @@ async function stopCommand(): Promise<void> {
       console.warn(`${color.yellow('Warning:')} ${warning}`);
     }
   }
+}
+
+async function pauseCommand(): Promise<void> {
+  const document = loadEnvDocument();
+  const inspection = inspectBot(document.runtimeConfig);
+  if (!inspection.running) {
+    console.log(color.yellow('Bot is not running; nothing to pause.'));
+    return;
+  }
+
+  writeStatusControlCommand('pause', document.runtimeConfig, 'Manual pause requested from CLI');
+  await waitForPauseState(document.runtimeConfig, true, 6_000);
+  console.log(color.yellow('Pause command sent to polymarket-scalper.'));
+  printStatus(document.runtimeConfig);
+}
+
+async function resumeCommand(): Promise<void> {
+  const document = loadEnvDocument();
+  const inspection = inspectBot(document.runtimeConfig);
+  if (!inspection.running) {
+    console.log(color.yellow('Bot is not running; nothing to resume.'));
+    return;
+  }
+
+  writeStatusControlCommand('resume', document.runtimeConfig, 'Manual resume requested from CLI');
+  await waitForPauseState(document.runtimeConfig, false, 6_000);
+  console.log(color.green('Resume command sent to polymarket-scalper.'));
+  printStatus(document.runtimeConfig);
 }
 
 function statusCommand(): void {
@@ -217,6 +246,10 @@ async function stopBot(
     {
       running: false,
       pid: null,
+      isPaused: false,
+      systemStatus: 'OK',
+      pauseReason: null,
+      pauseSource: null,
       activeSlotsCount: 0,
     },
     runtimeConfig
@@ -243,6 +276,13 @@ function printStatus(runtimeConfig: AppConfig): void {
     `${label('PID')} ${inspection.pid !== null ? color.bold(String(inspection.pid)) : color.dim('n/a')}`
   );
   console.log(`${label('Mode')} ${formatModeLabel(inspection.mode)}`);
+  console.log(
+    `${label('Status')} ${
+      runtimeStatus?.isPaused
+        ? color.red(`PAUSED (${runtimeStatus.pauseReason ?? 'manual'})`)
+        : color.green('OK')
+    }`
+  );
   console.log(`${label('Manager')} ${inspection.manager ?? 'n/a'}`);
   console.log(`${label('Day PnL')} ${formatSignedCurrency(totalDayPnl)}`);
   console.log(`${label('Drawdown')} ${formatSignedCurrency(drawdown)}`);
@@ -416,6 +456,22 @@ async function waitForRuntimeReady(
   return false;
 }
 
+async function waitForPauseState(
+  runtimeConfig: AppConfig,
+  paused: boolean,
+  timeoutMs: number
+): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const snapshot = readRuntimeStatus(runtimeConfig);
+    if (snapshot?.isPaused === paused) {
+      return true;
+    }
+    await sleep(250);
+  }
+  return false;
+}
+
 function getPm2ProcessInfo(): Pm2ProcessInfo {
   if (!commandExists('pm2')) {
     return {
@@ -560,8 +616,18 @@ program
   .action(() => stopCommand());
 
 program
+  .command('pause')
+  .description('Pause new entries while keeping safety exits active')
+  .action(() => pauseCommand());
+
+program
+  .command('resume')
+  .description('Resume entries after a manual pause')
+  .action(() => resumeCommand());
+
+program
   .command('status')
-  .description('Show current runtime status, PnL, latency, and recent signals')
+  .description('Show current runtime status, pause state, PnL, latency, and recent signals')
   .action(() => {
     statusCommand();
   });

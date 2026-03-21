@@ -1,0 +1,358 @@
+import WebSocket from 'ws';
+import { config, type AppConfig } from './config.js';
+import { logger } from './logger.js';
+import { asRecord, asString, roundTo } from './utils.js';
+
+export interface BinanceEdgeAssessment {
+  available: boolean;
+  coin: string;
+  binancePrice: number | null;
+  slotOpenPrice: number | null;
+  binanceMovePct: number;
+  direction: 'UP' | 'DOWN' | 'FLAT';
+  pmUpMid: number | null;
+  pmImpliedDirection: 'UP' | 'DOWN' | 'FLAT';
+  directionalAgreement: boolean;
+  edgeStrength: number;
+  sizeMultiplier: number;
+  urgencyBoost: boolean;
+  contraSignal: boolean;
+}
+
+interface SlotOpenReference {
+  readonly openPrice: number;
+  readonly createdAt: number;
+}
+
+const BINANCE_STREAM_BASE = 'wss://stream.binance.com:9443/stream?streams=';
+const SLOT_OPEN_TTL_MS = 10 * 60_000;
+
+export const COIN_TO_BINANCE: Record<string, string> = {
+  BTC: 'btcusdt',
+  ETH: 'ethusdt',
+  SOL: 'solusdt',
+  XRP: 'xrpusdt',
+  DOGE: 'dogeusdt',
+  BNB: 'bnbusdt',
+  LINK: 'linkusdt',
+};
+
+export class BinanceEdgeProvider {
+  private ws: WebSocket | undefined;
+  private reconnectAttempts = 0;
+  private reconnectTimer: NodeJS.Timeout | undefined;
+  private connected = false;
+  private readonly lastPrices = new Map<string, number>();
+  private readonly slotOpenPrices = new Map<string, SlotOpenReference>();
+
+  constructor(private readonly runtimeConfig: AppConfig = config) {}
+
+  start(): void {
+    if (!this.runtimeConfig.binance.edgeEnabled || this.ws || this.reconnectTimer) {
+      return;
+    }
+
+    this.connect();
+  }
+
+  stop(): void {
+    this.connected = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws.close();
+      this.ws = undefined;
+    }
+  }
+
+  isReady(): boolean {
+    return this.runtimeConfig.binance.edgeEnabled && this.connected && this.lastPrices.size > 0;
+  }
+
+  assess(params: {
+    coin: string;
+    slotStartTime: string | null;
+    pmUpMid: number | null;
+    signalAction: 'BUY' | 'SELL';
+    signalOutcome: 'YES' | 'NO';
+  }): BinanceEdgeAssessment {
+    const coin = params.coin.toUpperCase();
+    const symbol = COIN_TO_BINANCE[coin];
+    const binancePrice = symbol ? this.lastPrices.get(symbol) ?? null : null;
+    const slotOpenPrice = this.getSlotOpenPrice(coin, params.slotStartTime);
+
+    if (!symbol || !this.connected || binancePrice === null || slotOpenPrice === null) {
+      return createUnavailableAssessment(coin, params.pmUpMid);
+    }
+
+    const binanceMovePct = roundTo(((binancePrice - slotOpenPrice) / slotOpenPrice) * 100, 4);
+    const direction = resolveMoveDirection(
+      binanceMovePct,
+      this.runtimeConfig.binance.flatThreshold
+    );
+    const pmImpliedDirection = resolvePmDirection(params.pmUpMid);
+    const signalBetsUp =
+      (params.signalAction === 'BUY' && params.signalOutcome === 'YES') ||
+      (params.signalAction === 'SELL' && params.signalOutcome === 'NO');
+    const binanceSaysUp = direction === 'UP';
+    const directionalAgreement = direction === 'FLAT' || signalBetsUp === binanceSaysUp;
+    const edgeStrength = Math.abs(binanceMovePct);
+
+    let sizeMultiplier = 1;
+    let urgencyBoost = false;
+    let contraSignal = false;
+
+    if (edgeStrength < this.runtimeConfig.binance.flatThreshold) {
+      sizeMultiplier = 1;
+    } else if (directionalAgreement) {
+      if (edgeStrength >= this.runtimeConfig.binance.strongThreshold) {
+        sizeMultiplier = this.runtimeConfig.binance.boostMultiplier;
+        urgencyBoost = true;
+      } else {
+        sizeMultiplier = roundTo(1 + (this.runtimeConfig.binance.boostMultiplier - 1) * 0.4, 4);
+      }
+    } else {
+      contraSignal = true;
+      if (
+        edgeStrength >= this.runtimeConfig.binance.strongThreshold &&
+        this.runtimeConfig.binance.blockOnStrongContra
+      ) {
+        sizeMultiplier = 0;
+      } else {
+        sizeMultiplier = this.runtimeConfig.binance.reduceMultiplier;
+      }
+    }
+
+    return {
+      available: true,
+      coin,
+      binancePrice,
+      slotOpenPrice,
+      binanceMovePct,
+      direction,
+      pmUpMid: params.pmUpMid,
+      pmImpliedDirection,
+      directionalAgreement,
+      edgeStrength,
+      sizeMultiplier,
+      urgencyBoost,
+      contraSignal,
+    };
+  }
+
+  recordSlotOpen(coin: string, slotStartTime: string | null): void {
+    const normalizedCoin = coin.toUpperCase();
+    const symbol = COIN_TO_BINANCE[normalizedCoin];
+    if (!symbol || !slotStartTime) {
+      return;
+    }
+
+    const price = this.lastPrices.get(symbol);
+    if (!price || !Number.isFinite(price) || price <= 0) {
+      return;
+    }
+
+    const key = buildSlotKey(normalizedCoin, slotStartTime);
+    if (!this.slotOpenPrices.has(key)) {
+      this.slotOpenPrices.set(key, {
+        openPrice: price,
+        createdAt: Date.now(),
+      });
+    }
+
+    this.pruneSlotOpens();
+  }
+
+  getSlotOpenPrice(coin: string, slotStartTime: string | null): number | null {
+    if (!slotStartTime) {
+      return null;
+    }
+
+    this.pruneSlotOpens();
+    return this.slotOpenPrices.get(buildSlotKey(coin.toUpperCase(), slotStartTime))?.openPrice ?? null;
+  }
+
+  ingestPriceTick(symbol: string, price: number): void {
+    if (!Number.isFinite(price) || price <= 0) {
+      return;
+    }
+
+    this.connected = true;
+    this.lastPrices.set(symbol.toLowerCase(), price);
+  }
+
+  private connect(): void {
+    const streamUrl = `${BINANCE_STREAM_BASE}${this.runtimeConfig.binance.symbols
+      .map((symbol) => `${symbol.toLowerCase()}@miniTicker`)
+      .join('/')}`;
+    const ws = new WebSocket(streamUrl);
+    this.ws = ws;
+
+    ws.on('open', () => {
+      this.connected = true;
+      this.reconnectAttempts = 0;
+      logger.info('Binance WebSocket connected', {
+        symbols: this.runtimeConfig.binance.symbols,
+      });
+    });
+
+    ws.on('message', (payload) => {
+      this.handleMessage(payload.toString());
+    });
+
+    ws.on('ping', (data) => {
+      ws.pong(data);
+    });
+
+    ws.on('close', (code, reason) => {
+      this.connected = false;
+      this.ws = undefined;
+      logger.warn('Binance WebSocket closed', {
+        code,
+        reason: reason.toString(),
+      });
+      this.scheduleReconnect();
+    });
+
+    ws.on('error', (error) => {
+      this.connected = false;
+      logger.warn('Binance WebSocket error', {
+        message: error.message,
+      });
+    });
+  }
+
+  private handleMessage(raw: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    const payload = asRecord(parsed);
+    const data = asRecord(payload?.data);
+    if (!data) {
+      return;
+    }
+
+    const symbol = asString(data.s).toLowerCase() || asString(payload?.stream).split('@')[0]?.toLowerCase();
+    const price = Number.parseFloat(asString(data.c));
+    if (!symbol || !Number.isFinite(price) || price <= 0) {
+      return;
+    }
+
+    this.ingestPriceTick(symbol, price);
+  }
+
+  private scheduleReconnect(): void {
+    if (!this.runtimeConfig.binance.edgeEnabled) {
+      return;
+    }
+    if (this.reconnectTimer) {
+      return;
+    }
+    if (this.reconnectAttempts >= this.runtimeConfig.binance.maxReconnectAttempts) {
+      logger.error('Binance WebSocket reconnect limit reached', {
+        maxReconnectAttempts: this.runtimeConfig.binance.maxReconnectAttempts,
+      });
+      return;
+    }
+
+    const attempt = this.reconnectAttempts + 1;
+    const delay = this.runtimeConfig.binance.wsReconnectMs * 2 ** this.reconnectAttempts;
+    this.reconnectAttempts = attempt;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.connect();
+    }, delay);
+    this.reconnectTimer.unref?.();
+
+    logger.warn('Scheduling Binance WebSocket reconnect', {
+      attempt,
+      delayMs: delay,
+    });
+  }
+
+  private pruneSlotOpens(): void {
+    const cutoff = Date.now() - SLOT_OPEN_TTL_MS;
+    for (const [key, reference] of this.slotOpenPrices.entries()) {
+      if (reference.createdAt < cutoff) {
+        this.slotOpenPrices.delete(key);
+      }
+    }
+  }
+}
+
+export function extractCoinFromTitle(title: string): string | null {
+  const upper = String(title || '').toUpperCase();
+  for (const coin of Object.keys(COIN_TO_BINANCE)) {
+    if (upper.includes(coin)) {
+      return coin;
+    }
+  }
+  if (/\bBITCOIN\b/i.test(title)) {
+    return 'BTC';
+  }
+  if (/\bETHEREUM\b/i.test(title)) {
+    return 'ETH';
+  }
+  if (/\bSOLANA\b/i.test(title)) {
+    return 'SOL';
+  }
+  return null;
+}
+
+function buildSlotKey(coin: string, slotStartTime: string): string {
+  return `${coin}:${slotStartTime}`;
+}
+
+function createUnavailableAssessment(
+  coin: string,
+  pmUpMid: number | null
+): BinanceEdgeAssessment {
+  return {
+    available: false,
+    coin,
+    binancePrice: null,
+    slotOpenPrice: null,
+    binanceMovePct: 0,
+    direction: 'FLAT',
+    pmUpMid,
+    pmImpliedDirection: resolvePmDirection(pmUpMid),
+    directionalAgreement: true,
+    edgeStrength: 0,
+    sizeMultiplier: 1,
+    urgencyBoost: false,
+    contraSignal: false,
+  };
+}
+
+function resolveMoveDirection(
+  movePct: number,
+  flatThreshold: number
+): 'UP' | 'DOWN' | 'FLAT' {
+  if (movePct > flatThreshold) {
+    return 'UP';
+  }
+  if (movePct < -flatThreshold) {
+    return 'DOWN';
+  }
+  return 'FLAT';
+}
+
+function resolvePmDirection(pmUpMid: number | null): 'UP' | 'DOWN' | 'FLAT' {
+  if (pmUpMid === null || !Number.isFinite(pmUpMid)) {
+    return 'FLAT';
+  }
+  if (pmUpMid > 0.52) {
+    return 'UP';
+  }
+  if (pmUpMid < 0.48) {
+    return 'DOWN';
+  }
+  return 'FLAT';
+}

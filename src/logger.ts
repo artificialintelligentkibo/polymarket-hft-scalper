@@ -80,6 +80,11 @@ export interface TradeLogInput {
   dayDrawdown?: number;
   latencySignalToOrderMs?: number;
   latencyRoundTripMs?: number;
+  binanceEdgeAvailable?: boolean;
+  binanceMovePct?: number;
+  binanceDirection?: string;
+  binanceSizeMultiplier?: number;
+  binanceContraSignal?: boolean;
   orderId?: string | null;
   wasMaker: boolean | null;
   simulationMode: boolean;
@@ -269,6 +274,13 @@ export class TradeLogger {
       dayDrawdown: safeNumberOrNull(input.dayDrawdown ?? null),
       latencySignalToOrderMs: safeLatency(input.latencySignalToOrderMs),
       latencyRoundTripMs: safeLatency(input.latencyRoundTripMs),
+      binanceEdgeAvailable:
+        input.binanceEdgeAvailable === undefined ? undefined : Boolean(input.binanceEdgeAvailable),
+      binanceMovePct: safeNumberOrNull(input.binanceMovePct ?? null),
+      binanceDirection: input.binanceDirection || undefined,
+      binanceSizeMultiplier: safeNumberOrNull(input.binanceSizeMultiplier ?? null),
+      binanceContraSignal:
+        input.binanceContraSignal === undefined ? undefined : Boolean(input.binanceContraSignal),
       crypto_prices_at_time: await getCryptoPrices(input.timestampMs),
     };
 

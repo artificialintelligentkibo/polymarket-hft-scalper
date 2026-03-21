@@ -31,6 +31,10 @@ export interface RuntimeStatusSnapshot {
   readonly pid: number | null;
   readonly running: boolean;
   readonly mode: RuntimeMode;
+  readonly systemStatus: 'OK' | 'PAUSED';
+  readonly isPaused: boolean;
+  readonly pauseReason: string | null;
+  readonly pauseSource: 'manual' | 'incident' | null;
   readonly activeSlotsCount: number;
   readonly totalDayPnl: number;
   readonly dayDrawdown: number;
@@ -65,6 +69,10 @@ export function createRuntimeStatusSnapshot(
     pid: process.pid,
     running: false,
     mode: resolveRuntimeMode(runtimeConfig),
+    systemStatus: 'OK',
+    isPaused: false,
+    pauseReason: null,
+    pauseSource: null,
     activeSlotsCount: 0,
     totalDayPnl: dayState.dayPnl,
     dayDrawdown: dayState.drawdown,
@@ -123,6 +131,7 @@ function normalizeRuntimeStatus(
   runtimeConfig: AppConfig
 ): RuntimeStatusSnapshot {
   const dayState = getDayPnlState(new Date(), runtimeConfig);
+  const isPaused = Boolean(value.isPaused);
   return {
     updatedAt:
       typeof value.updatedAt === 'string' && value.updatedAt.trim()
@@ -134,6 +143,13 @@ function normalizeRuntimeStatus(
       value.mode === 'simulation' || value.mode === 'product_test' || value.mode === 'production'
         ? value.mode
         : resolveRuntimeMode(runtimeConfig),
+    systemStatus: isPaused ? 'PAUSED' : 'OK',
+    isPaused,
+    pauseReason: typeof value.pauseReason === 'string' && value.pauseReason.trim() ? value.pauseReason : null,
+    pauseSource:
+      value.pauseSource === 'manual' || value.pauseSource === 'incident'
+        ? value.pauseSource
+        : null,
     activeSlotsCount: normalizeCount(value.activeSlotsCount),
     totalDayPnl: normalizeNumber(value.totalDayPnl, dayState.dayPnl),
     dayDrawdown: normalizeNumber(value.dayDrawdown, dayState.drawdown),

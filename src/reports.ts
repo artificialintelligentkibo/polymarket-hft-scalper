@@ -15,6 +15,8 @@ export interface LatencyLogEntry {
   readonly orderId?: string | null;
   readonly latencySignalToOrderMs?: number;
   readonly latencyRoundTripMs?: number;
+  readonly binanceEdge?: boolean;
+  readonly binanceMovePct?: number;
   readonly simulationMode: boolean;
   readonly dryRun: boolean;
   readonly testMode: boolean;
@@ -24,8 +26,9 @@ let slotReportQueue = Promise.resolve();
 let latencyQueue = Promise.resolve();
 let redeemQueue = Promise.resolve();
 let productTestQueue = Promise.resolve();
+let statusIncidentQueue = Promise.resolve();
 const reportWriteFailures = new Map<
-  'slot-report' | 'latency' | 'redeem' | 'product-test',
+  'slot-report' | 'latency' | 'redeem' | 'product-test' | 'status-incident',
   number
 >();
 
@@ -74,6 +77,17 @@ export function writeProductTestSummary(payload: string, timestampMs = Date.now(
   );
 }
 
+export function writeStatusIncidentLog(line: string, timestampMs = Date.now()): void {
+  const filePath = path.join(getReportsDirectory(), 'status-incidents.log');
+  const payload = `[${formatLogTimestamp(new Date(timestampMs))}] ${sanitizeInlineText(line)}\n`;
+  statusIncidentQueue = enqueueAppend(
+    statusIncidentQueue,
+    filePath,
+    payload,
+    'status-incident'
+  );
+}
+
 function resolveLatencyLogPath(value: Date): string {
   const relativePath = config.LATENCY_LOG.replace('YYYY-MM-DD', formatDayKey(value));
   return path.resolve(process.cwd(), relativePath);
@@ -89,6 +103,8 @@ function formatLatencyLogEntry(entry: LatencyLogEntry): string {
     `outcome=${entry.outcome}`,
     `signalToOrderMs=${formatLatencyValue(entry.latencySignalToOrderMs)}`,
     `roundTripMs=${formatLatencyValue(entry.latencyRoundTripMs)}`,
+    `binanceEdge=${entry.binanceEdge === true}`,
+    `binanceMovePct=${formatPercentValue(entry.binanceMovePct)}`,
     `orderId=${entry.orderId || 'n/a'}`,
     `simulation=${entry.simulationMode}`,
     `dryRun=${entry.dryRun}`,
@@ -100,7 +116,7 @@ function enqueueAppend(
   queue: Promise<void>,
   filePath: string,
   payload: string,
-  channel: 'slot-report' | 'latency' | 'redeem' | 'product-test'
+  channel: 'slot-report' | 'latency' | 'redeem' | 'product-test' | 'status-incident'
 ): Promise<void> {
   const task = queue.then(async () => {
     await mkdir(path.dirname(filePath), { recursive: true });
@@ -135,6 +151,15 @@ function formatLatencyValue(value: number | undefined): string {
     return 'n/a';
   }
   return `${Math.max(0, Math.round(value))}`;
+}
+
+function formatPercentValue(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value)) {
+    return 'n/a';
+  }
+
+  const normalized = value >= 0 ? `+${value.toFixed(4)}` : value.toFixed(4);
+  return `${normalized}%`;
 }
 
 function ensureTrailingNewline(value: string): string {

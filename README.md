@@ -42,9 +42,11 @@ src/
   product-test-mode.ts
   reports.ts
   auto-redeemer.ts
+  binance-edge.ts
   risk-manager.ts
   signal-scalper.ts
   slot-reporter.ts
+  status-monitor.ts
   strategy-types.ts
   trader.ts
 backtest/
@@ -81,14 +83,22 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `PRICE_MULTIPLIER_LEVELS`
 - `MAX_NET_YES=200`
 - `MAX_NET_NO=250`
-- `COINS_TO_TRADE=BTC,SOL,XRP`
+- `COINS_TO_TRADE=BTC,SOL,XRP,ETH`
 - `FILTER_5MIN_ONLY=true`
 - `MIN_LIQUIDITY_USD=500`
-- `AUTO_REDEEM=true`
+- `AUTO_REDEEM=false`
 - `REDEEM_INTERVAL_MS=30000`
 - `PRODUCT_TEST_MODE=false`
 - `TEST_MIN_TRADE_USDC=1`
 - `TEST_MAX_SLOTS=1`
+- `STATUS_CHECK_INTERVAL_MS=300000`
+- `AUTO_PAUSE_ON_INCIDENT=true`
+- `PAUSE_GRACE_PERIOD_MS=60000`
+- `BINANCE_EDGE_ENABLED=false`
+- `BINANCE_FLAT_THRESHOLD=0.05`
+- `BINANCE_STRONG_THRESHOLD=0.20`
+- `BINANCE_BOOST_MULTIPLIER=1.5`
+- `BINANCE_REDUCE_MULTIPLIER=0.5`
 - `POLYMARKET_API_KEY=...`
 - `POLYMARKET_API_KEY_ADDRESS=...`
 - `POLYMARKET_RELAYER_URL=https://relayer-v2.polymarket.com`
@@ -119,6 +129,8 @@ The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) 
 9. JSONL trade logging
 10. slot-end console reporting
 11. background gasless auto-redeem for resolved proxy-wallet positions
+12. Polymarket status monitoring with auto-pause / auto-resume
+13. optional Binance latency-edge post-filter for entry signals
 
 ## Reports
 
@@ -138,6 +150,7 @@ What goes into `reports/`:
 - per-signal latency lines with `signalToOrderMs` and `roundTripMs`
 - gasless redeem activity in `redeem_log_YYYY-MM-DD.log`
 - product-test coverage summaries in `product-test-summary_YYYY-MM-DD.log`
+- Polymarket incident events in `status-incidents.log`
 
 The runtime creates `REPORTS_DIR` automatically when needed.
 
@@ -216,6 +229,8 @@ Available commands:
 npm run scalper -- status
 npm run scalper -- start
 npm run scalper -- stop
+npm run scalper -- pause
+npm run scalper -- resume
 npm run scalper -- reset
 npm run scalper -- switch --mode simulation
 npm run scalper -- switch --mode product_test
@@ -236,8 +251,49 @@ What each command does:
   Stops any existing `polymarket-scalper` process, then starts the bot in the background with `pm2` when available. If `pm2` is not installed, it falls back to `nohup` on Unix-like systems or a detached background process otherwise.
 - `scalper stop`
   Sends a graceful stop so the runtime can cancel open orders and flatten through its normal shutdown path.
+- `scalper pause`
+  Forces the bot into pause mode. New entries are blocked, but safety exits and redeem continue to work.
+- `scalper resume`
+  Clears a manual pause and lets the bot resume entries if there is no active Polymarket incident.
 - `scalper status`
-  Prints a colorized summary with running state, PID, current mode, day PnL, active slots, last slot report, average latency, and the last 3 executed signals.
+  Prints a colorized summary with running state, PID, current mode, pause status, day PnL, active slots, last slot report, average latency, and the last 3 executed signals.
+
+## System Status Monitor
+
+The runtime now polls `https://status.polymarket.com/summary.json` every `STATUS_CHECK_INTERVAL_MS`.
+
+If an active incident mentions CLOB, order flow, confirmation delays, latency, API issues, inserts, or execution problems, the bot:
+
+- prints a large red warning in the console
+- writes an entry to `./reports/status-incidents.log`
+- pauses new entries automatically
+- keeps safety exits (`HARD_STOP`, `TRAILING_TAKE_PROFIT`, `SLOT_FLATTEN`, risk flatten) and redeem enabled
+
+When incidents clear, the bot auto-resumes after `PAUSE_GRACE_PERIOD_MS`.
+
+## Binance Latency Edge
+
+`BINANCE_EDGE_ENABLED=true` enables a Binance WebSocket enhancement layer on top of the existing Polymarket signal engine.
+
+What it does:
+
+- subscribes to Binance `@miniTicker` spot streams
+- snapshots Binance price at slot open per coin / slot
+- compares current Binance move vs Polymarket `YES` mid
+- boosts, reduces, or blocks entry signals after they are generated
+- never blocks reduce-only safety exits
+
+Relevant env vars:
+
+```bash
+BINANCE_EDGE_ENABLED=false
+BINANCE_SYMBOLS=btcusdt,ethusdt,solusdt,xrpusdt,dogeusdt,bnbusdt,linkusdt
+BINANCE_FLAT_THRESHOLD=0.05
+BINANCE_STRONG_THRESHOLD=0.20
+BINANCE_BOOST_MULTIPLIER=1.5
+BINANCE_REDUCE_MULTIPLIER=0.5
+BINANCE_BLOCK_STRONG_CONTRA=true
+```
 
 The CLI reads `.env` if present; otherwise it seeds settings from `.env.example` and writes the first real `.env` during `scalper switch`.
 
