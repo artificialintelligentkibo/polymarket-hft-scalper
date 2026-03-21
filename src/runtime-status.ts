@@ -26,6 +26,39 @@ export interface RuntimeSlotSnapshot {
   readonly reportedAt: string;
 }
 
+export interface RuntimeMarketSnapshot {
+  readonly marketId: string;
+  readonly title: string;
+  readonly coin: string | null;
+  readonly slotStart: string | null;
+  readonly slotEnd: string | null;
+  readonly liquidityUsd: number;
+  readonly pmUpMid: number | null;
+  readonly pmDownMid: number | null;
+  readonly combinedDiscount: number | null;
+  readonly binanceMovePct: number | null;
+  readonly binanceDirection: 'UP' | 'DOWN' | 'FLAT' | null;
+  readonly pmDirection: 'UP' | 'DOWN' | 'FLAT';
+  readonly action: string;
+  readonly signalCount: number;
+  readonly updatedAt: string;
+}
+
+export interface RuntimePositionSnapshot {
+  readonly marketId: string;
+  readonly title: string;
+  readonly slotStart: string | null;
+  readonly slotEnd: string | null;
+  readonly yesShares: number;
+  readonly noShares: number;
+  readonly grossExposureShares: number;
+  readonly markValueUsd: number;
+  readonly unrealizedPnl: number;
+  readonly totalPnl: number;
+  readonly roiPct: number | null;
+  readonly updatedAt: string | null;
+}
+
 export interface RuntimeStatusSnapshot {
   readonly updatedAt: string;
   readonly pid: number | null;
@@ -36,9 +69,12 @@ export interface RuntimeStatusSnapshot {
   readonly pauseReason: string | null;
   readonly pauseSource: 'manual' | 'incident' | null;
   readonly activeSlotsCount: number;
+  readonly openPositionsCount: number;
   readonly totalDayPnl: number;
   readonly dayDrawdown: number;
   readonly averageLatencyMs: number | null;
+  readonly activeMarkets: readonly RuntimeMarketSnapshot[];
+  readonly openPositions: readonly RuntimePositionSnapshot[];
   readonly lastSignals: readonly RuntimeSignalSnapshot[];
   readonly lastSlotReport: RuntimeSlotSnapshot | null;
 }
@@ -74,9 +110,12 @@ export function createRuntimeStatusSnapshot(
     pauseReason: null,
     pauseSource: null,
     activeSlotsCount: 0,
+    openPositionsCount: 0,
     totalDayPnl: dayState.dayPnl,
     dayDrawdown: dayState.drawdown,
     averageLatencyMs: null,
+    activeMarkets: [],
+    openPositions: [],
     lastSignals: [],
     lastSlotReport: null,
     ...overrides,
@@ -132,6 +171,18 @@ function normalizeRuntimeStatus(
 ): RuntimeStatusSnapshot {
   const dayState = getDayPnlState(new Date(), runtimeConfig);
   const isPaused = Boolean(value.isPaused);
+  const activeMarkets = Array.isArray(value.activeMarkets)
+    ? value.activeMarkets
+        .map(normalizeRuntimeMarket)
+        .filter((entry): entry is RuntimeMarketSnapshot => entry !== null)
+        .slice(0, 12)
+    : [];
+  const openPositions = Array.isArray(value.openPositions)
+    ? value.openPositions
+        .map(normalizeRuntimePosition)
+        .filter((entry): entry is RuntimePositionSnapshot => entry !== null)
+        .slice(0, 8)
+    : [];
   return {
     updatedAt:
       typeof value.updatedAt === 'string' && value.updatedAt.trim()
@@ -151,9 +202,15 @@ function normalizeRuntimeStatus(
         ? value.pauseSource
         : null,
     activeSlotsCount: normalizeCount(value.activeSlotsCount),
+    openPositionsCount: Math.max(
+      normalizeCount(value.openPositionsCount),
+      openPositions.length
+    ),
     totalDayPnl: normalizeNumber(value.totalDayPnl, dayState.dayPnl),
     dayDrawdown: normalizeNumber(value.dayDrawdown, dayState.drawdown),
     averageLatencyMs: normalizeNullableNumber(value.averageLatencyMs),
+    activeMarkets,
+    openPositions,
     lastSignals: Array.isArray(value.lastSignals)
       ? value.lastSignals
           .map(normalizeRuntimeSignal)
@@ -213,6 +270,73 @@ function normalizeRuntimeSlot(value: unknown): RuntimeSlotSnapshot | null {
     entries: normalizeCount(record.entries),
     fills: normalizeCount(record.fills),
     reportedAt: record.reportedAt,
+  };
+}
+
+function normalizeRuntimeMarket(value: unknown): RuntimeMarketSnapshot | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Partial<RuntimeMarketSnapshot>;
+  if (typeof record.marketId !== 'string' || typeof record.title !== 'string') {
+    return null;
+  }
+
+  return {
+    marketId: record.marketId,
+    title: record.title,
+    coin: typeof record.coin === 'string' && record.coin.trim() ? record.coin.trim() : null,
+    slotStart: typeof record.slotStart === 'string' && record.slotStart.trim() ? record.slotStart : null,
+    slotEnd: typeof record.slotEnd === 'string' && record.slotEnd.trim() ? record.slotEnd : null,
+    liquidityUsd: normalizeNumber(record.liquidityUsd, 0),
+    pmUpMid: normalizeNullableNumber(record.pmUpMid),
+    pmDownMid: normalizeNullableNumber(record.pmDownMid),
+    combinedDiscount: normalizeNullableNumber(record.combinedDiscount),
+    binanceMovePct: normalizeNullableNumber(record.binanceMovePct),
+    binanceDirection:
+      record.binanceDirection === 'UP' ||
+      record.binanceDirection === 'DOWN' ||
+      record.binanceDirection === 'FLAT'
+        ? record.binanceDirection
+        : null,
+    pmDirection:
+      record.pmDirection === 'UP' || record.pmDirection === 'DOWN' || record.pmDirection === 'FLAT'
+        ? record.pmDirection
+        : 'FLAT',
+    action: typeof record.action === 'string' && record.action.trim() ? record.action : 'SCAN',
+    signalCount: normalizeCount(record.signalCount),
+    updatedAt:
+      typeof record.updatedAt === 'string' && record.updatedAt.trim()
+        ? record.updatedAt
+        : new Date().toISOString(),
+  };
+}
+
+function normalizeRuntimePosition(value: unknown): RuntimePositionSnapshot | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Partial<RuntimePositionSnapshot>;
+  if (typeof record.marketId !== 'string' || typeof record.title !== 'string') {
+    return null;
+  }
+
+  return {
+    marketId: record.marketId,
+    title: record.title,
+    slotStart: typeof record.slotStart === 'string' && record.slotStart.trim() ? record.slotStart : null,
+    slotEnd: typeof record.slotEnd === 'string' && record.slotEnd.trim() ? record.slotEnd : null,
+    yesShares: normalizeNumber(record.yesShares, 0),
+    noShares: normalizeNumber(record.noShares, 0),
+    grossExposureShares: normalizeNumber(record.grossExposureShares, 0),
+    markValueUsd: normalizeNumber(record.markValueUsd, 0),
+    unrealizedPnl: normalizeNumber(record.unrealizedPnl, 0),
+    totalPnl: normalizeNumber(record.totalPnl, 0),
+    roiPct: normalizeNullableNumber(record.roiPct),
+    updatedAt:
+      typeof record.updatedAt === 'string' && record.updatedAt.trim() ? record.updatedAt : null,
   };
 }
 

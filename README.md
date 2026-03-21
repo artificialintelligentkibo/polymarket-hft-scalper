@@ -227,11 +227,13 @@ Available commands:
 
 ```bash
 npm run scalper -- status
+npm run scalper -- dashboard
 npm run scalper -- start
 npm run scalper -- stop
 npm run scalper -- pause
 npm run scalper -- resume
 npm run scalper -- monitor
+npm run scalper -- monitor --watch
 npm run scalper -- reset
 npm run scalper -- switch --mode simulation
 npm run scalper -- switch --mode product_test
@@ -258,6 +260,16 @@ What each command does:
   Clears a manual pause and lets the bot resume entries if there is no active Polymarket incident.
 - `scalper monitor`
   Runs a one-shot Polymarket status check and prints any active incidents that match trading-impact keywords.
+- `scalper monitor --watch`
+  Launches the live terminal monitor/dashboard and refreshes it continuously.
+- `scalper dashboard`
+  Opens the live runtime dashboard directly. The screen is styled like a trading console and shows active markets, current positions, performance stats, pause state, and recent signals from `runtime-status.json`.
+
+Example:
+
+```bash
+npm run scalper -- dashboard
+```
 - `scalper status`
   Prints a colorized summary with running state, PID, current mode, pause status, day PnL, active slots, last slot report, average latency, and the last 3 executed signals.
 

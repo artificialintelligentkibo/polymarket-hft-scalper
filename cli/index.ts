@@ -22,7 +22,9 @@ import {
   resetRuntimeStatus,
   resolveRuntimeMode,
   writeRuntimeStatus,
+  type RuntimeMarketSnapshot,
   type RuntimeMode,
+  type RuntimePositionSnapshot,
   type RuntimeStatusSnapshot,
 } from '../src/runtime-status.js';
 import { checkPolymarketStatus, writeStatusControlCommand } from '../src/status-monitor.js';
@@ -59,6 +61,7 @@ interface BotInspection {
 const PROCESS_NAME = 'polymarket-scalper';
 const PID_FILE_NAME = `${PROCESS_NAME}.pid`;
 const RUNTIME_READY_TIMEOUT_MS = 12_000;
+const DASHBOARD_REFRESH_MS = 2_000;
 
 async function resetCommand(): Promise<void> {
   const document = loadEnvDocument();
@@ -145,7 +148,12 @@ async function resumeCommand(): Promise<void> {
   printStatus(document.runtimeConfig);
 }
 
-async function monitorCommand(): Promise<void> {
+async function monitorCommand(options: { watch?: boolean; refresh?: string }): Promise<void> {
+  if (options.watch) {
+    await dashboardCommand(options.refresh);
+    return;
+  }
+
   const status = await checkPolymarketStatus();
 
   console.log('');
@@ -170,6 +178,39 @@ async function monitorCommand(): Promise<void> {
 function statusCommand(): void {
   const document = loadEnvDocument();
   printStatus(document.runtimeConfig);
+}
+
+async function dashboardCommand(refreshValue?: string): Promise<void> {
+  const document = loadEnvDocument();
+  const refreshMs = resolveDashboardRefreshMs(refreshValue);
+
+  if (!process.stdout.isTTY) {
+    console.log(renderDashboardFrame(document.runtimeConfig));
+    return;
+  }
+
+  let stopping = false;
+  const handleStop = () => {
+    stopping = true;
+  };
+
+  process.once('SIGINT', handleStop);
+  process.once('SIGTERM', handleStop);
+
+  try {
+    while (!stopping) {
+      console.clear();
+      console.log(renderDashboardFrame(document.runtimeConfig));
+      console.log('');
+      console.log(color.dim(`Refreshing every ${refreshMs}ms. Press Ctrl+C to exit.`));
+      await sleep(refreshMs);
+    }
+  } finally {
+    process.removeListener('SIGINT', handleStop);
+    process.removeListener('SIGTERM', handleStop);
+    console.log('');
+    console.log(color.dim('Dashboard stopped.'));
+  }
 }
 
 async function startBot(runtimeConfig: AppConfig, fromSwitch: boolean): Promise<void> {
@@ -273,6 +314,9 @@ async function stopBot(
       pauseReason: null,
       pauseSource: null,
       activeSlotsCount: 0,
+      openPositionsCount: 0,
+      activeMarkets: [],
+      openPositions: [],
     },
     runtimeConfig
   );
@@ -353,6 +397,361 @@ function printStatus(runtimeConfig: AppConfig): void {
     console.log('');
     console.log(color.dim('No recent signals recorded yet.'));
   }
+}
+
+function renderDashboardFrame(runtimeConfig: AppConfig): string {
+  const inspection = inspectBot(runtimeConfig);
+  const runtimeStatus = inspection.runtimeStatus;
+  const now = formatDashboardTimestamp(new Date());
+  const statusLabel = runtimeStatus?.isPaused
+    ? color.red(`PAUSED - ${runtimeStatus.pauseReason ?? 'manual'}`)
+    : color.green('OK');
+
+  const lines = [
+    renderBanner(
+      'POLYMARKET SCALPER  |  LIVE RUNTIME DASHBOARD',
+      color.dim('5-minute slots  •  dual-sided market-maker  •  real-time monitor')
+    ),
+    renderInfoBar([
+      ['time', now],
+      ['mode', stripAnsi(formatModeLabel(inspection.mode))],
+      ['status', stripAnsi(statusLabel)],
+      ['process', inspection.runtimeStatus?.pid ? `pid ${inspection.runtimeStatus.pid}` : 'n/a'],
+      ['manager', inspection.manager ?? 'n/a'],
+    ]),
+  ];
+
+  if (runtimeStatus?.isPaused) {
+    lines.push('');
+    lines.push(color.red(color.bold('BOT PAUSED - Polymarket status issue or manual pause')));
+  }
+
+  lines.push('');
+  lines.push(
+    renderSection(
+      'ACTIVE MARKETS  -  SCANNING LIVE SIGNALS',
+      renderActiveMarkets(runtimeStatus?.activeMarkets ?? [])
+    )
+  );
+  lines.push('');
+  lines.push(
+    renderSection(
+      'LIVE POSITIONS  -  OPEN INVENTORY NOW',
+      renderOpenPositions(runtimeStatus?.openPositions ?? [])
+    )
+  );
+  lines.push('');
+  lines.push(
+    renderSection(
+      'BOT PERFORMANCE STATS',
+      renderPerformance(inspection, runtimeStatus, runtimeConfig)
+    )
+  );
+  lines.push('');
+  lines.push(
+    renderSection(
+      'RECENT SIGNALS',
+      renderRecentSignals(runtimeStatus?.lastSignals ?? [])
+    )
+  );
+
+  return lines.join('\n');
+}
+
+function renderBanner(title: string, subtitle: string): string {
+  const width = 92;
+  const normalizedSubtitle = stripAnsi(subtitle)
+    .replaceAll('вЂў', '|')
+    .replaceAll('•', '|');
+  const top = `+${'-'.repeat(width - 2)}+`;
+  const middle = `| ${color.cyan(color.bold(title.padEnd(width - 4, ' ')))} |`;
+  const subtitleLine = `| ${normalizedSubtitle.padEnd(width - 4, ' ')} |`;
+  const bottom = `+${'-'.repeat(width - 2)}+`;
+  return [top, middle, subtitleLine, bottom].join('\n');
+}
+
+function renderInfoBar(entries: Array<readonly [string, string]>): string {
+  const rendered = entries
+    .map(([key, value]) => `${color.dim(`${key}`)} ${color.bold(value)}`)
+    .join('   ');
+  return rendered;
+}
+
+function renderSection(title: string, body: string): string {
+  const heading = color.yellow(color.bold(`== ${title} ==`));
+  return [heading, body].join('\n');
+}
+
+function renderActiveMarkets(markets: readonly RuntimeMarketSnapshot[]): string {
+  if (markets.length === 0) {
+    return color.dim('No active markets in the current runtime snapshot.');
+  }
+
+  return renderTable(
+    ['MARKET', 'PM UP', 'PM DOWN', 'BINANCE', 'DISC', 'ACTION'],
+    [28, 8, 8, 14, 8, 14],
+    markets.map((market) => [
+      truncateDashboardLabel(buildMarketLabel(market), 28),
+      formatMidPrice(market.pmUpMid),
+      formatMidPrice(market.pmDownMid),
+      formatBinanceMove(market.binanceMovePct, market.binanceDirection),
+      formatDiscount(market.combinedDiscount),
+      colorizeAction(market.action, market.signalCount),
+    ])
+  );
+}
+
+function renderOpenPositions(positions: readonly RuntimePositionSnapshot[]): string {
+  if (positions.length === 0) {
+    return color.dim('No live inventory open right now.');
+  }
+
+  return renderTable(
+    ['POSITION', 'YES', 'NO', 'VALUE', 'UNRL P&L', 'TOTAL', 'ROI'],
+    [28, 8, 8, 11, 11, 11, 8],
+    positions.map((position) => [
+      truncateDashboardLabel(buildPositionLabel(position), 28),
+      formatShares(position.yesShares),
+      formatShares(position.noShares),
+      formatPlainCurrency(position.markValueUsd),
+      formatSignedCurrency(position.unrealizedPnl),
+      formatSignedCurrency(position.totalPnl),
+      position.roiPct !== null ? colorizeSignedPercent(position.roiPct) : color.dim('n/a'),
+    ])
+  );
+}
+
+function renderPerformance(
+  inspection: BotInspection,
+  runtimeStatus: RuntimeStatusSnapshot | null,
+  runtimeConfig: AppConfig
+): string {
+  const dayState = getDayPnlState(new Date(), runtimeConfig);
+  const totalDayPnl = runtimeStatus?.totalDayPnl ?? dayState.dayPnl;
+  const drawdown = runtimeStatus?.dayDrawdown ?? dayState.drawdown;
+  const activeSlots = runtimeStatus?.activeSlotsCount ?? 0;
+  const openPositions = runtimeStatus?.openPositionsCount ?? 0;
+  const averageLatency =
+    runtimeStatus?.averageLatencyMs !== null && runtimeStatus?.averageLatencyMs !== undefined
+      ? `${runtimeStatus.averageLatencyMs.toFixed(0)}ms`
+      : 'n/a';
+  const lastSlotNet = runtimeStatus?.lastSlotReport
+    ? formatSignedCurrency(runtimeStatus.lastSlotReport.netPnl)
+    : color.dim('n/a');
+  const lastSlotLabel = runtimeStatus?.lastSlotReport?.slotLabel
+    ? truncateDashboardLabel(runtimeStatus.lastSlotReport.slotLabel, 32)
+    : 'n/a';
+
+  return renderTable(
+    ['METRIC', 'VALUE', 'METRIC', 'VALUE'],
+    [20, 18, 20, 28],
+    [
+      ['Running', inspection.running ? color.green('YES') : color.red('NO'), 'Mode', formatModeLabel(inspection.mode)],
+      ['Day PnL', formatSignedCurrency(totalDayPnl), 'Drawdown', formatSignedCurrency(drawdown)],
+      ['Active slots', color.bold(String(activeSlots)), 'Open positions', color.bold(String(openPositions))],
+      ['Avg latency', color.bold(averageLatency), 'Manager', color.bold(inspection.manager ?? 'n/a')],
+      ['Last slot', lastSlotNet, 'Slot label', lastSlotLabel],
+    ]
+  );
+}
+
+function renderRecentSignals(signals: RuntimeStatusSnapshot['lastSignals']): string {
+  if (signals.length === 0) {
+    return color.dim('No recent signals recorded yet.');
+  }
+
+  return renderTable(
+    ['TIME', 'MARKET', 'SIGNAL', 'SIDE', 'OUT', 'LAT'],
+    [20, 18, 20, 8, 6, 8],
+    [...signals]
+      .slice()
+      .reverse()
+      .map((signal) => [
+        formatSignalTimestamp(signal.timestamp),
+        truncateDashboardLabel(signal.marketId, 18),
+        truncateDashboardLabel(signal.signalType, 20),
+        signal.action,
+        signal.outcome,
+        signal.latencyMs !== null ? `${signal.latencyMs.toFixed(0)}ms` : 'n/a',
+      ])
+  );
+}
+
+function renderTable(headers: string[], widths: number[], rows: string[][]): string {
+  const headerLine = headers
+    .map((header, index) => padTableCell(color.bold(header), widths[index] ?? header.length))
+    .join('  ');
+  const separator = widths.map((width) => color.dim('-'.repeat(width))).join('  ');
+  const body = rows.map((row) =>
+    row.map((cell, index) => padTableCell(cell, widths[index] ?? String(cell).length)).join('  ')
+  );
+
+  return [headerLine, separator, ...body].join('\n');
+}
+
+function padTableCell(value: string, width: number): string {
+  const visible = stripAnsi(value);
+  if (visible.length >= width) {
+    return `${value}${' '.repeat(Math.max(0, width - visible.length))}`;
+  }
+  return `${value}${' '.repeat(width - visible.length)}`;
+}
+
+function buildMarketLabel(market: RuntimeMarketSnapshot): string {
+  const coin = market.coin ?? 'Market';
+  const slot = formatSlotWindow(market.slotStart, market.slotEnd);
+  return slot ? `${coin} ${slot}` : market.title;
+}
+
+function buildPositionLabel(position: RuntimePositionSnapshot): string {
+  const slot = formatSlotWindow(position.slotStart, position.slotEnd);
+  return slot ? `${truncateDashboardLabel(position.title, 18)} ${slot}` : position.title;
+}
+
+function formatSlotWindow(start: string | null, end: string | null): string {
+  const startDate = parseFiniteDate(start);
+  const endDate = parseFiniteDate(end);
+  if (!startDate || !endDate) {
+    return '';
+  }
+  return `${formatClock(startDate)}-${formatClock(endDate)}`;
+}
+
+function parseFiniteDate(value: string | null): Date | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatClock(value: Date): string {
+  return `${String(value.getHours()).padStart(2, '0')}:${String(value.getMinutes()).padStart(2, '0')}`;
+}
+
+function formatMidPrice(value: number | null): string {
+  if (value === null) {
+    return color.dim('n/a');
+  }
+  return `${roundTo(value * 100, 1).toFixed(1)}c`;
+}
+
+function formatDiscount(value: number | null): string {
+  if (value === null) {
+    return color.dim('n/a');
+  }
+  return colorizeSignedCents(roundTo(value * 100, 2));
+}
+
+function formatBinanceMove(
+  value: number | null,
+  direction: RuntimeMarketSnapshot['binanceDirection']
+): string {
+  if (value === null || !direction) {
+    return color.dim('n/a');
+  }
+  const rendered = `${value >= 0 ? '+' : ''}${value.toFixed(2)}% ${direction}`;
+  if (direction === 'UP') {
+    return color.green(rendered);
+  }
+  if (direction === 'DOWN') {
+    return color.red(rendered);
+  }
+  return color.dim(rendered);
+}
+
+function colorizeAction(action: string, signalCount: number): string {
+  const rendered = signalCount > 0 ? `${action} [${signalCount}]` : action;
+  if (action.startsWith('ENTER')) {
+    return color.green(rendered);
+  }
+  if (action.startsWith('EXIT')) {
+    return color.yellow(rendered);
+  }
+  if (action === 'PAUSED') {
+    return color.red(rendered);
+  }
+  if (action === 'MONITOR') {
+    return color.cyan(rendered);
+  }
+  return color.dim(rendered);
+}
+
+function formatShares(value: number): string {
+  return value > 0 ? color.bold(roundTo(value, 2).toFixed(2)) : color.dim('0.00');
+}
+
+function formatPlainCurrency(value: number): string {
+  return color.bold(`$${roundTo(value, 2).toFixed(2)}`);
+}
+
+function colorizeSignedPercent(value: number): string {
+  const rendered = `${value >= 0 ? '+' : ''}${roundTo(value, 2).toFixed(2)}%`;
+  if (value > 0) {
+    return color.green(rendered);
+  }
+  if (value < 0) {
+    return color.red(rendered);
+  }
+  return color.dim(rendered);
+}
+
+function colorizeSignedCents(value: number): string {
+  const rendered = `${value >= 0 ? '+' : ''}${roundTo(value, 2).toFixed(2)}c`;
+  if (value > 0) {
+    return color.green(rendered);
+  }
+  if (value < 0) {
+    return color.red(rendered);
+  }
+  return color.dim(rendered);
+}
+
+function formatSignalTimestamp(value: string): string {
+  const parsed = parseFiniteDate(value);
+  if (!parsed) {
+    return value;
+  }
+  return formatDashboardTimestamp(parsed);
+}
+
+function formatDashboardTimestamp(value: Date): string {
+  const date = [
+    value.getFullYear(),
+    String(value.getMonth() + 1).padStart(2, '0'),
+    String(value.getDate()).padStart(2, '0'),
+  ].join('-');
+  const time = [
+    String(value.getHours()).padStart(2, '0'),
+    String(value.getMinutes()).padStart(2, '0'),
+    String(value.getSeconds()).padStart(2, '0'),
+  ].join(':');
+  return `${date} ${time}`;
+}
+
+function resolveDashboardRefreshMs(value: string | undefined): number {
+  if (!value) {
+    return DASHBOARD_REFRESH_MS;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 500) {
+    return DASHBOARD_REFRESH_MS;
+  }
+
+  return parsed;
+}
+
+function truncateDashboardLabel(value: string, maxLength: number): string {
+  const normalized = String(value || '').trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(1, maxLength - 3))}...`;
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\u001b\[[0-9;]*m/g, '');
 }
 
 function inspectBot(runtimeConfig: AppConfig): BotInspection {
@@ -649,8 +1048,16 @@ program
 
 program
   .command('monitor')
-  .description('Run a one-shot Polymarket status check for trading-impact incidents')
-  .action(() => monitorCommand());
+  .description('Run a one-shot Polymarket status check or launch the live dashboard')
+  .option('--watch', 'Keep refreshing a live terminal dashboard')
+  .option('--refresh <ms>', 'Dashboard refresh interval in milliseconds')
+  .action((options: { watch?: boolean; refresh?: string }) => monitorCommand(options));
+
+program
+  .command('dashboard')
+  .description('Render a live terminal dashboard for markets, positions, and performance')
+  .option('--refresh <ms>', 'Dashboard refresh interval in milliseconds')
+  .action((options: { refresh?: string }) => dashboardCommand(options.refresh));
 
 program
   .command('status')

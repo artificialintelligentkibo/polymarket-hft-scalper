@@ -18,7 +18,12 @@ import { PositionManager } from './position-manager.js';
 import { ProductTestModeController } from './product-test-mode.js';
 import { writeLatencyLog } from './reports.js';
 import { RiskManager } from './risk-manager.js';
-import { writeRuntimeStatus, type RuntimeSignalSnapshot } from './runtime-status.js';
+import {
+  writeRuntimeStatus,
+  type RuntimeMarketSnapshot,
+  type RuntimePositionSnapshot,
+  type RuntimeSignalSnapshot,
+} from './runtime-status.js';
 import { SignalScalper } from './signal-scalper.js';
 import {
   StatusMonitor,
@@ -43,6 +48,12 @@ interface SignalExecutionCandidate {
   readonly binanceAssessment?: BinanceEdgeAssessment;
 }
 
+interface RuntimeMarketActionSnapshot {
+  readonly action: string;
+  readonly signalCount: number;
+  readonly updatedAt: string;
+}
+
 class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
   private readonly fetcher = new ClobFetcher();
@@ -57,12 +68,14 @@ class MarketMakerRuntime {
   private readonly positions = new Map<string, PositionManager>();
   private readonly markets = new Map<string, MarketCandidate>();
   private readonly latestBooks = new Map<string, MarketOrderbookSnapshot>();
+  private readonly marketActions = new Map<string, RuntimeMarketActionSnapshot>();
   private readonly marketWork = new Map<string, Promise<void>>();
   private readonly pendingSlotReports = new Set<string>();
   private readonly printedSlotReports = new Set<string>();
   private readonly pendingLiveOrders = new Map<string, number>();
   private readonly recentSignals: RuntimeSignalSnapshot[] = [];
   private readonly recentLatencySamples: number[] = [];
+  private readonly activeMarketIds = new Set<string>();
   private running = false;
   private stopping = false;
 
@@ -161,6 +174,9 @@ class MarketMakerRuntime {
       pauseReason: this.statusMonitor.getState().reason,
       pauseSource: this.statusMonitor.getState().source,
       activeSlotsCount: 0,
+      openPositionsCount: 0,
+      activeMarkets: [],
+      openPositions: [],
       lastSignals: [],
       averageLatencyMs: null,
     });
@@ -224,6 +240,8 @@ class MarketMakerRuntime {
         message: error?.message || 'Unknown error',
       });
     } finally {
+      this.activeMarketIds.clear();
+      this.marketActions.clear();
       this.syncRuntimeStatus({
         running: false,
         pid: process.pid,
@@ -232,6 +250,7 @@ class MarketMakerRuntime {
         pauseReason: this.statusMonitor.getState().reason,
         pauseSource: this.statusMonitor.getState().source,
         activeSlotsCount: 0,
+        activeMarkets: [],
       });
       this.pendingLiveOrders.clear();
       this.redeemer.stop();
@@ -245,6 +264,7 @@ class MarketMakerRuntime {
     this.consumeControlCommands();
     const scannedMarkets = await this.monitor.scanEligibleMarkets();
     const markets = this.productTestMode.selectMarkets(scannedMarkets);
+    this.setActiveMarkets(markets);
     this.syncRuntimeStatus({
       running: true,
       isPaused: this.statusMonitor.isPaused(),
@@ -277,6 +297,9 @@ class MarketMakerRuntime {
       });
     });
 
+    this.syncRuntimeStatus({
+      activeSlotsCount: markets.length,
+    });
     this.printPendingReports();
   }
 
@@ -299,6 +322,7 @@ class MarketMakerRuntime {
     });
     const pausedSignals = this.applyPauseFilter(market, signals);
     const executionCandidates = this.applyBinanceEdge(market, orderbook, pausedSignals);
+    this.rememberMarketAction(market, signals, executionCandidates, positionManager);
 
     if (executionCandidates.length === 0) {
       this.maybePrintSlotReport(slotKey);
@@ -600,6 +624,7 @@ class MarketMakerRuntime {
   }
 
   private syncRuntimeStatus(overrides: Parameters<typeof writeRuntimeStatus>[0]): void {
+    const openPositions = this.buildRuntimePositionSnapshots();
     writeRuntimeStatus(
       {
         running: this.running && !this.stopping,
@@ -612,6 +637,9 @@ class MarketMakerRuntime {
         dayDrawdown: getDayPnlState().drawdown,
         lastSignals: this.recentSignals,
         averageLatencyMs: this.getAverageLatencyMs(),
+        activeMarkets: this.buildRuntimeMarketSnapshots(),
+        openPositions,
+        openPositionsCount: openPositions.length,
         ...overrides,
       },
       config
@@ -788,6 +816,19 @@ class MarketMakerRuntime {
     }
   }
 
+  private setActiveMarkets(markets: readonly MarketCandidate[]): void {
+    this.activeMarketIds.clear();
+    for (const market of markets) {
+      this.activeMarketIds.add(market.marketId);
+    }
+
+    for (const marketId of Array.from(this.marketActions.keys())) {
+      if (!this.activeMarketIds.has(marketId)) {
+        this.marketActions.delete(marketId);
+      }
+    }
+  }
+
   private findMarketBySlotKey(slotKey: string): MarketCandidate | undefined {
     for (const market of this.markets.values()) {
       if (getSlotKey(market) === slotKey) {
@@ -909,6 +950,136 @@ class MarketMakerRuntime {
       })
       .filter((candidate): candidate is SignalExecutionCandidate => candidate !== null);
   }
+
+  private rememberMarketAction(
+    market: MarketCandidate,
+    signals: readonly StrategySignal[],
+    executionCandidates: readonly SignalExecutionCandidate[],
+    positionManager: PositionManager
+  ): void {
+    const snapshot = positionManager.getSnapshot();
+    const entrySignals = signals.filter((signal) => !signal.reduceOnly);
+    const nextCandidate = executionCandidates[0]?.signal;
+
+    let action = 'SCAN';
+    if (this.statusMonitor.isPaused() && entrySignals.length > 0) {
+      action = 'PAUSED';
+    } else if (nextCandidate) {
+      action =
+        nextCandidate.action === 'BUY'
+          ? `ENTER ${nextCandidate.outcome}`
+          : `EXIT ${nextCandidate.outcome}`;
+    } else if (snapshot.grossExposureShares > 0) {
+      action = 'MONITOR';
+    }
+
+    this.marketActions.set(market.marketId, {
+      action,
+      signalCount: executionCandidates.length,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  private buildRuntimeMarketSnapshots(): RuntimeMarketSnapshot[] {
+    return Array.from(this.activeMarketIds)
+      .map((marketId) => {
+        const market = this.markets.get(marketId);
+        if (!market) {
+          return null;
+        }
+
+        const orderbook = this.latestBooks.get(marketId);
+        const coin = extractCoinFromTitle(market.title);
+        const pmUpMid = normalizeRuntimeNumber(orderbook?.yes.midPrice);
+        const pmDownMid = normalizeRuntimeNumber(orderbook?.no.midPrice);
+        const combinedDiscount = normalizeRuntimeNumber(orderbook?.combinedDiscount);
+        const assessment =
+          coin && orderbook
+            ? this.binanceEdge.assess({
+                coin,
+                slotStartTime: market.startTime,
+                pmUpMid,
+                signalAction: 'BUY',
+                signalOutcome: 'YES',
+              })
+            : undefined;
+        const actionSnapshot = this.marketActions.get(marketId);
+
+        return {
+          marketId: market.marketId,
+          title: market.title,
+          coin,
+          slotStart: market.startTime,
+          slotEnd: market.endTime,
+          liquidityUsd: roundTo(market.liquidityUsd, 2),
+          pmUpMid,
+          pmDownMid,
+          combinedDiscount,
+          binanceMovePct:
+            assessment && assessment.available ? assessment.binanceMovePct : null,
+          binanceDirection:
+            assessment && assessment.available ? assessment.direction : null,
+          pmDirection:
+            assessment?.pmImpliedDirection ??
+            (pmUpMid === null ? 'FLAT' : pmUpMid > 0.52 ? 'UP' : pmUpMid < 0.48 ? 'DOWN' : 'FLAT'),
+          action: actionSnapshot?.action ?? 'SCAN',
+          signalCount: actionSnapshot?.signalCount ?? 0,
+          updatedAt: actionSnapshot?.updatedAt ?? new Date().toISOString(),
+        } satisfies RuntimeMarketSnapshot;
+      })
+      .filter((entry): entry is RuntimeMarketSnapshot => entry !== null)
+      .sort((left, right) => {
+        const leftEnd = left.slotEnd ? Date.parse(left.slotEnd) : Number.POSITIVE_INFINITY;
+        const rightEnd = right.slotEnd ? Date.parse(right.slotEnd) : Number.POSITIVE_INFINITY;
+        return leftEnd - rightEnd;
+      })
+      .slice(0, 8);
+  }
+
+  private buildRuntimePositionSnapshots(): RuntimePositionSnapshot[] {
+    return Array.from(this.positions.entries())
+      .map(([marketId, positionManager]) => {
+        const snapshot = positionManager.getSnapshot();
+        if (snapshot.grossExposureShares <= 0) {
+          return null;
+        }
+
+        const market = this.markets.get(marketId);
+        const orderbook = this.latestBooks.get(marketId);
+        const yesMark =
+          normalizeRuntimeNumber(orderbook?.yes.midPrice) ??
+          normalizeRuntimeNumber(orderbook?.yes.bestBid) ??
+          (snapshot.yesShares > 0 ? snapshot.yesAvgEntryPrice : null);
+        const noMark =
+          normalizeRuntimeNumber(orderbook?.no.midPrice) ??
+          normalizeRuntimeNumber(orderbook?.no.bestBid) ??
+          (snapshot.noShares > 0 ? snapshot.noAvgEntryPrice : null);
+        const markValueUsd = roundTo(
+          snapshot.yesShares * (yesMark ?? 0) + snapshot.noShares * (noMark ?? 0),
+          2
+        );
+        const roiPct =
+          markValueUsd > 0 ? roundTo((snapshot.totalPnl / markValueUsd) * 100, 2) : null;
+
+        return {
+          marketId,
+          title: market?.title ?? marketId,
+          slotStart: market?.startTime ?? null,
+          slotEnd: market?.endTime ?? null,
+          yesShares: snapshot.yesShares,
+          noShares: snapshot.noShares,
+          grossExposureShares: snapshot.grossExposureShares,
+          markValueUsd,
+          unrealizedPnl: snapshot.unrealizedPnl,
+          totalPnl: snapshot.totalPnl,
+          roiPct,
+          updatedAt: snapshot.lastUpdatedAt,
+        } satisfies RuntimePositionSnapshot;
+      })
+      .filter((entry): entry is RuntimePositionSnapshot => entry !== null)
+      .sort((left, right) => Math.abs(right.markValueUsd) - Math.abs(left.markValueUsd))
+      .slice(0, 8);
+  }
 }
 
 export async function main(): Promise<void> {
@@ -963,6 +1134,10 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
       clearTimeout(timeoutId);
     }
   }
+}
+
+function normalizeRuntimeNumber(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? roundTo(value, 4) : null;
 }
 
 function resolveSlotOutcome(
