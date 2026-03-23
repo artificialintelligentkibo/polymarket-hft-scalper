@@ -121,6 +121,15 @@ test('createConfig resolves dedicated relayer credentials with backward-compatib
   );
 });
 
+test('createConfig clamps fill cancel guard to at least 10 seconds', () => {
+  const candidate = createConfig({
+    ...process.env,
+    FILL_CANCEL_BEFORE_END_MS: '5000',
+  });
+
+  assert.equal(candidate.FILL_CANCEL_BEFORE_END_MS, 10000);
+});
+
 test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () => {
   const candidate = createConfig({
     ...process.env,

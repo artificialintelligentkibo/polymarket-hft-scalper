@@ -318,7 +318,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       parseIntOrDefault(env.FILL_POLL_TIMEOUT_MS, '120000')
     ),
     FILL_CANCEL_BEFORE_END_MS: Math.max(
-      5_000,
+      10_000,
       parseIntOrDefault(env.FILL_CANCEL_BEFORE_END_MS, '20000')
     ),
     COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
@@ -709,8 +709,8 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error('FILL_POLL_TIMEOUT_MS must be at least 5000.');
   }
 
-  if (candidate.FILL_CANCEL_BEFORE_END_MS < 5_000) {
-    throw new Error('FILL_CANCEL_BEFORE_END_MS must be at least 5000.');
+  if (candidate.FILL_CANCEL_BEFORE_END_MS < 10_000) {
+    throw new Error('FILL_CANCEL_BEFORE_END_MS must be at least 10000.');
   }
 }
 
