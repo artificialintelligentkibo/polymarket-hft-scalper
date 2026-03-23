@@ -37,6 +37,10 @@ export interface AppConfig {
   readonly REPORTS_FILE_PREFIX: string;
   readonly POLYMARKET_API_KEY: string;
   readonly POLYMARKET_API_KEY_ADDRESS: string;
+  readonly POLYMARKET_API_SECRET: string;
+  readonly POLYMARKET_API_PASSPHRASE: string;
+  readonly POLYMARKET_RELAYER_KEY: string;
+  readonly POLYMARKET_RELAYER_KEY_ADDRESS: string;
   readonly POLYMARKET_RELAYER_URL: string;
   readonly signerPrivateKey: string;
   readonly polymarketGeoToken: string;
@@ -330,6 +334,19 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       env.RELAYER_API_KEY_ADDRESS ||
       ''
     ).trim(),
+    POLYMARKET_API_SECRET: (env.POLYMARKET_API_SECRET || '').trim(),
+    POLYMARKET_API_PASSPHRASE: (env.POLYMARKET_API_PASSPHRASE || '').trim(),
+    POLYMARKET_RELAYER_KEY: (
+      env.POLYMARKET_RELAYER_KEY ||
+      env.RELAYER_API_KEY ||
+      ''
+    ).trim(),
+    POLYMARKET_RELAYER_KEY_ADDRESS: (
+      env.POLYMARKET_RELAYER_KEY_ADDRESS ||
+      env.RELAYER_API_KEY_ADDRESS ||
+      env.POLYMARKET_API_KEY_ADDRESS ||
+      ''
+    ).trim(),
     POLYMARKET_RELAYER_URL: (
       env.POLYMARKET_RELAYER_URL || 'https://relayer-v2.polymarket.com'
     ).trim(),
@@ -535,6 +552,19 @@ export function validateConfig(candidate: AppConfig = config): void {
     if (candidate.auth.signatureType === undefined || candidate.auth.signatureType === 0) {
       throw new Error(
         'PROXY mode requires SIGNATURE_TYPE to be set to 1 (POLY_PROXY) or 2 (GNOSIS_SAFE).'
+      );
+    }
+  }
+
+  if (!isDryRunMode(candidate) && candidate.auth.mode === 'PROXY') {
+    if (!candidate.POLYMARKET_API_KEY) {
+      console.warn(
+        'WARNING: POLYMARKET_API_KEY not set. Bot will attempt runtime derive (may fail with { privateKey } signer).'
+      );
+    }
+    if (!candidate.POLYMARKET_RELAYER_KEY && candidate.AUTO_REDEEM) {
+      console.warn(
+        'WARNING: AUTO_REDEEM=true but POLYMARKET_RELAYER_KEY not set. Redeem will fail with 401.'
       );
     }
   }

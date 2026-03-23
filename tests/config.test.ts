@@ -44,7 +44,11 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.AUTO_REDEEM, false);
   assert.equal(candidate.REDEEM_INTERVAL_MS, 30000);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
+  assert.equal(candidate.POLYMARKET_API_SECRET, '');
+  assert.equal(candidate.POLYMARKET_API_PASSPHRASE, '');
   assert.equal(candidate.POLYMARKET_RELAYER_URL, 'https://relayer-v2.polymarket.com');
+  assert.equal(candidate.POLYMARKET_RELAYER_KEY, '');
+  assert.equal(candidate.POLYMARKET_RELAYER_KEY_ADDRESS, '');
   assert.equal(candidate.strategy.minCombinedDiscount, 0.01);
   assert.equal(candidate.strategy.extremeSellThreshold, 0.93);
   assert.equal(candidate.strategy.extremeBuyThreshold, 0.04);
@@ -80,6 +84,38 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.binance.boostMultiplier, 1.5);
   assert.equal(candidate.binance.reduceMultiplier, 0.5);
   assert.equal(candidate.binance.blockOnStrongContra, true);
+});
+
+test('createConfig resolves dedicated relayer credentials with backward-compatible fallbacks', () => {
+  const explicit = createConfig({
+    ...process.env,
+    POLYMARKET_RELAYER_KEY: 'relayer-key',
+    POLYMARKET_RELAYER_KEY_ADDRESS: '0x1111111111111111111111111111111111111111',
+    RELAYER_API_KEY: 'legacy-relayer-key',
+    RELAYER_API_KEY_ADDRESS: '0x2222222222222222222222222222222222222222',
+    POLYMARKET_API_KEY_ADDRESS: '0x3333333333333333333333333333333333333333',
+  });
+
+  assert.equal(explicit.POLYMARKET_RELAYER_KEY, 'relayer-key');
+  assert.equal(
+    explicit.POLYMARKET_RELAYER_KEY_ADDRESS,
+    '0x1111111111111111111111111111111111111111'
+  );
+
+  const fallback = createConfig({
+    ...process.env,
+    POLYMARKET_RELAYER_KEY: '',
+    POLYMARKET_RELAYER_KEY_ADDRESS: '',
+    RELAYER_API_KEY: 'legacy-relayer-key',
+    RELAYER_API_KEY_ADDRESS: '0x2222222222222222222222222222222222222222',
+    POLYMARKET_API_KEY_ADDRESS: '0x3333333333333333333333333333333333333333',
+  });
+
+  assert.equal(fallback.POLYMARKET_RELAYER_KEY, 'legacy-relayer-key');
+  assert.equal(
+    fallback.POLYMARKET_RELAYER_KEY_ADDRESS,
+    '0x2222222222222222222222222222222222222222'
+  );
 });
 
 test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () => {

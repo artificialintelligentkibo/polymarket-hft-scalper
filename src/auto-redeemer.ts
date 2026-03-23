@@ -347,8 +347,14 @@ export class AutoRedeemer extends EventEmitter {
       throw new Error('Relayer client is not initialized.');
     }
 
-    if (!this.runtimeConfig.POLYMARKET_API_KEY || !this.status.apiKeyAddress) {
-      throw new Error('POLYMARKET_API_KEY and POLYMARKET_API_KEY_ADDRESS are required.');
+    const relayerKey =
+      this.runtimeConfig.POLYMARKET_RELAYER_KEY || this.runtimeConfig.POLYMARKET_API_KEY;
+    const relayerKeyAddress =
+      this.runtimeConfig.POLYMARKET_RELAYER_KEY_ADDRESS || this.status.apiKeyAddress;
+    if (!relayerKey || !relayerKeyAddress) {
+      throw new Error(
+        'Relayer credentials required. Set POLYMARKET_RELAYER_KEY and POLYMARKET_RELAYER_KEY_ADDRESS in .env. Get these from Polymarket -> Settings -> Relayer API Keys.'
+      );
     }
 
     const request =
@@ -360,8 +366,12 @@ export class AutoRedeemer extends EventEmitter {
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        RELAYER_API_KEY: this.runtimeConfig.POLYMARKET_API_KEY,
-        RELAYER_API_KEY_ADDRESS: this.status.apiKeyAddress,
+        RELAYER_API_KEY:
+          this.runtimeConfig.POLYMARKET_RELAYER_KEY || this.runtimeConfig.POLYMARKET_API_KEY,
+        RELAYER_API_KEY_ADDRESS:
+          this.runtimeConfig.POLYMARKET_RELAYER_KEY_ADDRESS ||
+          this.status.apiKeyAddress ||
+          '',
       },
       body: JSON.stringify(request),
     });
@@ -540,6 +550,18 @@ export class AutoRedeemer extends EventEmitter {
       throw new Error('Signer wallet is not initialized.');
     }
 
+    const relayerKey =
+      this.runtimeConfig.POLYMARKET_RELAYER_KEY || this.runtimeConfig.POLYMARKET_API_KEY;
+    const relayerKeyAddress =
+      this.runtimeConfig.POLYMARKET_RELAYER_KEY_ADDRESS ||
+      this.status.apiKeyAddress ||
+      from;
+    if (!relayerKey || !relayerKeyAddress) {
+      throw new Error(
+        'Relayer credentials required. Set POLYMARKET_RELAYER_KEY and POLYMARKET_RELAYER_KEY_ADDRESS in .env. Get these from Polymarket -> Settings -> Relayer API Keys.'
+      );
+    }
+
     logger.info('Deploying Safe before redeem', {
       signer: from,
       safeAddress,
@@ -570,8 +592,8 @@ export class AutoRedeemer extends EventEmitter {
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
-        RELAYER_API_KEY: this.runtimeConfig.POLYMARKET_API_KEY,
-        RELAYER_API_KEY_ADDRESS: this.status.apiKeyAddress ?? from,
+        RELAYER_API_KEY: relayerKey,
+        RELAYER_API_KEY_ADDRESS: relayerKeyAddress,
       },
       body: JSON.stringify({
         from,
@@ -720,10 +742,10 @@ export function resolveAutoRedeemerStatus(
     };
   }
 
-  if (!runtimeConfig.POLYMARKET_API_KEY) {
+  if (!runtimeConfig.POLYMARKET_RELAYER_KEY && !runtimeConfig.POLYMARKET_API_KEY) {
     return {
       enabled: false,
-      reason: 'missing POLYMARKET_API_KEY for relayer submit',
+      reason: 'missing POLYMARKET_RELAYER_KEY (or POLYMARKET_API_KEY fallback) for relayer submit',
       relayTxType: null,
       positionsUser: null,
       apiKeyAddress: null,
@@ -738,7 +760,9 @@ export function resolveAutoRedeemerStatus(
         runtimeConfig.auth.signatureType === 2 ? RelayerTxType.SAFE : RelayerTxType.PROXY,
       positionsUser: ethers.utils.getAddress(runtimeConfig.auth.funderAddress),
       apiKeyAddress: ethers.utils.getAddress(
-        runtimeConfig.POLYMARKET_API_KEY_ADDRESS || signerAddress
+        runtimeConfig.POLYMARKET_RELAYER_KEY_ADDRESS ||
+          runtimeConfig.POLYMARKET_API_KEY_ADDRESS ||
+          signerAddress
       ),
     };
   } catch (error: any) {

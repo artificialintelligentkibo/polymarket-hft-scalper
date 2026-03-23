@@ -70,6 +70,7 @@ export interface TradeExecutionResult {
 export class Trader {
   private readonly provider: ethers.providers.JsonRpcProvider;
   private readonly signerWallet: ethers.Wallet;
+  private readonly clobSigner: ethers.Wallet;
   private readonly executionContext: ExecutionContext;
   private clobClient: ClobClient;
   private apiCreds?: ApiCredentials;
@@ -98,6 +99,9 @@ export class Trader {
         ? new ethers.Wallet(runtimeConfig.signerPrivateKey, this.provider)
         : ethers.Wallet.createRandom().connect(this.provider)
     ) as ethers.Wallet;
+    this.clobSigner = new ethers.Wallet(
+      runtimeConfig.signerPrivateKey || ethers.Wallet.createRandom().privateKey
+    );
     this.executionContext = createExecutionContext(runtimeConfig, this.signerWallet.address);
     this.clobClient = this.createUnauthenticatedClient();
   }
@@ -305,7 +309,7 @@ export class Trader {
     return new ClobClient(
       this.runtimeConfig.clob.host,
       this.runtimeConfig.chainId as ClobChainId,
-      this.signerWallet,
+      this.clobSigner,
       undefined,
       undefined,
       undefined,
@@ -317,7 +321,7 @@ export class Trader {
     return new ClobClient(
       this.runtimeConfig.clob.host,
       this.runtimeConfig.chainId as ClobChainId,
-      this.signerWallet,
+      this.clobSigner,
       {
         key: creds.apiKey,
         secret: creds.secret,
@@ -330,6 +334,22 @@ export class Trader {
   }
 
   private async deriveApiCredentials(): Promise<void> {
+    const envKey = this.runtimeConfig.POLYMARKET_API_KEY;
+    const envSecret = this.runtimeConfig.POLYMARKET_API_SECRET;
+    const envPassphrase = this.runtimeConfig.POLYMARKET_API_PASSPHRASE;
+
+    if (envKey && envSecret && envPassphrase) {
+      this.apiCreds = {
+        apiKey: envKey,
+        secret: envSecret,
+        passphrase: envPassphrase,
+      };
+      this.clobClient = this.createAuthenticatedClient(this.apiCreds);
+      logger.info('Using CLOB API credentials from environment variables');
+      return;
+    }
+
+    logger.warn('No CLOB API credentials in .env - attempting runtime derive');
     const bootstrapClient = this.createUnauthenticatedClient();
     const createOrDeriveApiKey = (bootstrapClient as any).createOrDeriveApiKey?.bind(
       bootstrapClient
