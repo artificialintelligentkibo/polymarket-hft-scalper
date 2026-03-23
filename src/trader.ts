@@ -301,6 +301,38 @@ export class Trader {
     logger.warn('Authenticated client does not expose cancel-all functionality');
   }
 
+  async getOrderStatus(orderId: string): Promise<unknown> {
+    await this.initialize();
+
+    const client = this.clobClient as any;
+    if (typeof client.getOrder === 'function') {
+      return client.getOrder(orderId);
+    }
+
+    throw new Error('Authenticated client does not expose getOrder');
+  }
+
+  async cancelOrder(orderId: string): Promise<void> {
+    await this.initialize();
+
+    if (isDryRunMode(this.runtimeConfig)) {
+      logger.info('Dry-run mode: skipping cancelOrder', { orderId });
+      return;
+    }
+
+    const client = this.clobClient as any;
+    if (typeof client.cancelOrder === 'function') {
+      await client.cancelOrder({ orderID: orderId });
+      return;
+    }
+
+    throw new Error('Authenticated client does not expose cancelOrder');
+  }
+
+  getAuthenticatedClient(): ClobClient {
+    return this.clobClient;
+  }
+
   async close(): Promise<void> {
     return Promise.resolve();
   }

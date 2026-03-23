@@ -26,6 +26,9 @@ export interface AppConfig {
   readonly PAUSE_GRACE_PERIOD_MS: number;
   readonly AUTO_REDEEM: boolean;
   readonly REDEEM_INTERVAL_MS: number;
+  readonly FILL_POLL_INTERVAL_MS: number;
+  readonly FILL_POLL_TIMEOUT_MS: number;
+  readonly FILL_CANCEL_BEFORE_END_MS: number;
   readonly COINS_TO_TRADE: readonly TradeableCoin[];
   readonly FILTER_5MIN_ONLY: boolean;
   readonly MIN_LIQUIDITY_USD: number;
@@ -306,6 +309,18 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ),
     AUTO_REDEEM: parseBoolean(env.AUTO_REDEEM, false),
     REDEEM_INTERVAL_MS: Math.max(5_000, parseIntOrDefault(env.REDEEM_INTERVAL_MS, '30000')),
+    FILL_POLL_INTERVAL_MS: Math.max(
+      500,
+      parseIntOrDefault(env.FILL_POLL_INTERVAL_MS, '2500')
+    ),
+    FILL_POLL_TIMEOUT_MS: Math.max(
+      5_000,
+      parseIntOrDefault(env.FILL_POLL_TIMEOUT_MS, '120000')
+    ),
+    FILL_CANCEL_BEFORE_END_MS: Math.max(
+      5_000,
+      parseIntOrDefault(env.FILL_CANCEL_BEFORE_END_MS, '20000')
+    ),
     COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
     FILTER_5MIN_ONLY: parseBoolean(
       env.FILTER_5MIN_ONLY ?? env.ONLY_FIVE_MINUTE_MARKETS,
@@ -684,6 +699,18 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.TEST_MAX_SLOTS < 1) {
     throw new Error('TEST_MAX_SLOTS must be at least 1.');
+  }
+
+  if (candidate.FILL_POLL_INTERVAL_MS < 500) {
+    throw new Error('FILL_POLL_INTERVAL_MS must be at least 500.');
+  }
+
+  if (candidate.FILL_POLL_TIMEOUT_MS < 5_000) {
+    throw new Error('FILL_POLL_TIMEOUT_MS must be at least 5000.');
+  }
+
+  if (candidate.FILL_CANCEL_BEFORE_END_MS < 5_000) {
+    throw new Error('FILL_CANCEL_BEFORE_END_MS must be at least 5000.');
   }
 }
 

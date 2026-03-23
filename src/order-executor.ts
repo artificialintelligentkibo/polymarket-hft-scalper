@@ -1,3 +1,4 @@
+import type { ClobClient } from '@polymarket/clob-client';
 import { config, type AppConfig, type OrderMode } from './config.js';
 import type { MarketOrderbookSnapshot, OrderbookLevel, TokenBookSnapshot } from './clob-fetcher.js';
 import { logger } from './logger.js';
@@ -97,6 +98,18 @@ export class OrderExecutor {
 
   async cancelAll(): Promise<void> {
     await this.trader.cancelAllOrders();
+  }
+
+  async getOrderStatus(orderId: string): Promise<unknown> {
+    return this.trader.getOrderStatus(orderId);
+  }
+
+  async cancelOrder(orderId: string): Promise<void> {
+    await this.trader.cancelOrder(orderId);
+  }
+
+  getAuthenticatedClient(): ClobClient {
+    return this.trader.getAuthenticatedClient();
   }
 
   async close(): Promise<void> {

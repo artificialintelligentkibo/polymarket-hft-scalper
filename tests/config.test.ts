@@ -43,6 +43,9 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.PAUSE_GRACE_PERIOD_MS, 60000);
   assert.equal(candidate.AUTO_REDEEM, false);
   assert.equal(candidate.REDEEM_INTERVAL_MS, 30000);
+  assert.equal(candidate.FILL_POLL_INTERVAL_MS, 2500);
+  assert.equal(candidate.FILL_POLL_TIMEOUT_MS, 120000);
+  assert.equal(candidate.FILL_CANCEL_BEFORE_END_MS, 20000);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
   assert.equal(candidate.POLYMARKET_API_SECRET, '');
   assert.equal(candidate.POLYMARKET_API_PASSPHRASE, '');

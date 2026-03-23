@@ -5,6 +5,7 @@ import { BinanceEdgeProvider, extractCoinFromTitle } from './binance-edge.js';
 import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
 import { config, isDryRunMode, validateConfig } from './config.js';
 import { getDayPnlState } from './day-pnl-state.js';
+import { FillTracker, type ConfirmedFill } from './fill-tracker.js';
 import { buildFlattenSignals } from './flatten-signals.js';
 import { logger, TradeLogger } from './logger.js';
 import {
@@ -78,6 +79,13 @@ class MarketMakerRuntime {
   private readonly riskManager = new RiskManager();
   private readonly signalEngine = new SignalScalper();
   private readonly redeemer = new AutoRedeemer();
+  private readonly fillTracker = new FillTracker(
+    {
+      getOrderStatus: (orderId) => this.executor.getOrderStatus(orderId),
+      cancelOrder: (orderId) => this.executor.cancelOrder(orderId),
+    },
+    config
+  );
   private readonly productTestMode = new ProductTestModeController();
   private readonly positions = new Map<string, PositionManager>();
   private readonly markets = new Map<string, MarketCandidate>();
@@ -200,6 +208,9 @@ class MarketMakerRuntime {
     });
     this.statusMonitor.start();
     this.binanceEdge.start();
+    if (!isDryRunMode(config)) {
+      this.fillTracker.start();
+    }
     this.redeemer.start();
   }
 
@@ -241,6 +252,7 @@ class MarketMakerRuntime {
     this.running = false;
 
     logger.info('Graceful shutdown started', { reason });
+    this.fillTracker.stop();
 
     try {
       await withTimeout(
@@ -279,6 +291,10 @@ class MarketMakerRuntime {
   }
 
   private async runCycle(): Promise<void> {
+    for (const fill of this.fillTracker.drainConfirmedFills()) {
+      this.applyConfirmedFill(fill);
+    }
+
     this.consumeControlCommands();
     this.refreshLatencyPauseState();
     const scannedMarkets = await this.monitor.scanEligibleMarkets();
@@ -409,7 +425,12 @@ class MarketMakerRuntime {
     }
 
     const pendingOrderKey = this.getPendingOrderKey(market.marketId, signal.outcome);
-    if (this.hasPendingLiveOrder(pendingOrderKey)) {
+    const trackerPending = this.fillTracker.hasPendingOrderFor(market.marketId, signal.outcome);
+    if (!trackerPending) {
+      this.clearPendingLiveOrder(pendingOrderKey);
+    }
+
+    if (this.hasPendingLiveOrder(pendingOrderKey) || trackerPending) {
       logger.debug('Skipping signal because live resting order is still pending', {
         marketId: market.marketId,
         signalType: signal.signalType,
@@ -459,6 +480,21 @@ class MarketMakerRuntime {
       });
     } else if (!execution.simulation) {
       this.rememberPendingLiveOrder(pendingOrderKey);
+      this.fillTracker.registerPendingOrder({
+        orderId: execution.orderId,
+        marketId: market.marketId,
+        slotKey,
+        tokenId,
+        outcome: signal.outcome,
+        side: signal.action,
+        submittedShares: execution.shares,
+        submittedPrice: execution.price,
+        signalType: signal.signalType,
+        placedAt: startedAt,
+        slotEndTime: market.endTime,
+        lastCheckedAt: 0,
+        filledSharesSoFar: 0,
+      });
       logger.warn('Live order submitted without confirmed fill; skipped position mutation', {
         marketId: market.marketId,
         signalType: signal.signalType,
@@ -633,6 +669,96 @@ class MarketMakerRuntime {
       totalDayPnl: dayState.dayPnl,
       dayDrawdown: dayState.drawdown,
       lastSignals: this.recentSignals,
+      averageLatencyMs: this.getAverageLatencyMs(),
+      latencyPaused: this.latencyPaused,
+      latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
+    });
+  }
+
+  private applyConfirmedFill(fill: ConfirmedFill): void {
+    const market = this.markets.get(fill.marketId);
+    if (!market) {
+      if (!this.fillTracker.hasPendingOrderFor(fill.marketId, fill.outcome)) {
+        this.clearPendingLiveOrder(this.getPendingOrderKey(fill.marketId, fill.outcome));
+      }
+      logger.warn('Skipping confirmed fill because market metadata is missing', {
+        orderId: fill.orderId,
+        marketId: fill.marketId,
+        signalType: fill.signalType,
+      });
+      return;
+    }
+
+    const positionManager = this.getPositionManager(market);
+    const beforeSnapshot = positionManager.getSnapshot();
+    const afterSnapshot = positionManager.applyFill({
+      outcome: fill.outcome,
+      side: fill.side,
+      shares: fill.filledShares,
+      price: fill.fillPrice,
+      timestamp: new Date(fill.filledAt).toISOString(),
+      orderId: fill.orderId,
+    });
+    const notionalUsd = roundTo(fill.filledShares * fill.fillPrice, 2);
+    const pendingOrderKey = this.getPendingOrderKey(fill.marketId, fill.outcome);
+    if (!this.fillTracker.hasPendingOrderFor(fill.marketId, fill.outcome)) {
+      this.clearPendingLiveOrder(pendingOrderKey);
+    }
+
+    recordExecution({
+      slotKey: fill.slotKey,
+      marketId: fill.marketId,
+      marketTitle: market.title,
+      outcome: resolveSlotOutcome(market, fill.outcome),
+      action: fill.side,
+      notionalUsd,
+      slotStart: market.startTime,
+      slotEnd: market.endTime,
+    });
+
+    const realizedDelta = roundTo(afterSnapshot.realizedPnl - beforeSnapshot.realizedPnl, 4);
+    if (realizedDelta !== 0) {
+      recordTrade(
+        fill.slotKey,
+        fill.marketId,
+        market.title,
+        resolveSlotOutcome(market, fill.outcome),
+        realizedDelta,
+        market.startTime,
+        market.endTime
+      );
+    }
+
+    if (fill.signalType === 'HARD_STOP' && fill.side === 'SELL') {
+      positionManager.setEntryCooldown(
+        fill.outcome,
+        config.strategy.hardStopCooldownMs,
+        new Date(fill.filledAt)
+      );
+    }
+
+    this.signalEngine.recordExecution({
+      market,
+      signal: createTrackedSignal(market, fill),
+      executedAtMs: fill.filledAt,
+    });
+
+    const dayState = getDayPnlState(new Date(fill.filledAt));
+    logger.info('Applied confirmed fill from fill tracker', {
+      orderId: fill.orderId,
+      marketId: fill.marketId,
+      outcome: fill.outcome,
+      side: fill.side,
+      filledShares: fill.filledShares,
+      fillPrice: fill.fillPrice,
+      signalType: fill.signalType,
+      netYesAfter: afterSnapshot.yesShares,
+      netNoAfter: afterSnapshot.noShares,
+      totalPnl: afterSnapshot.totalPnl,
+    });
+    this.syncRuntimeStatus({
+      totalDayPnl: dayState.dayPnl,
+      dayDrawdown: dayState.drawdown,
       averageLatencyMs: this.getAverageLatencyMs(),
       latencyPaused: this.latencyPaused,
       latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
@@ -1348,6 +1474,40 @@ function resolveSlotOutcome(
   }
 
   return outcome === 'YES' ? 'Up' : 'Down';
+}
+
+function createTrackedSignal(
+  market: MarketCandidate,
+  fill: ConfirmedFill
+): StrategySignal {
+  return {
+    marketId: fill.marketId,
+    marketTitle: market.title,
+    signalType: fill.signalType,
+    priority: 0,
+    action: fill.side,
+    outcome: fill.outcome,
+    outcomeIndex: fill.outcome === 'YES' ? 0 : 1,
+    shares: fill.filledShares,
+    targetPrice: fill.fillPrice,
+    referencePrice: fill.fillPrice,
+    tokenPrice: fill.fillPrice,
+    midPrice: fill.fillPrice,
+    fairValue: null,
+    edgeAmount: 0,
+    combinedBid: null,
+    combinedAsk: null,
+    combinedMid: null,
+    combinedDiscount: null,
+    combinedPremium: null,
+    fillRatio: 1,
+    capitalClamp: 1,
+    priceMultiplier: 1,
+    urgency: 'passive',
+    reduceOnly: fill.side === 'SELL',
+    reason: 'Confirmed via fill tracker',
+    generatedAt: fill.filledAt,
+  };
 }
 
 export function filterSignalsForLatencyPause(
