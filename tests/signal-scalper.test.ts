@@ -639,6 +639,46 @@ test('fair value buy per-slot cap blocks further entries after the configured ma
   );
 });
 
+test('market-maker mode rewrites non-risk entry signals into quoting signal types', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager(
+    createConfig({
+      ...process.env,
+      MARKET_MAKER_MODE: 'true',
+      DYNAMIC_QUOTING_ENABLED: 'true',
+    })
+  );
+  const signalEngine = new SignalScalper(
+    createConfig({
+      ...process.env,
+      MARKET_MAKER_MODE: 'true',
+      DYNAMIC_QUOTING_ENABLED: 'true',
+    })
+  );
+
+  const riskAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  assert.equal(
+    signals.some((signal) => signal.signalType === 'DYNAMIC_QUOTE_BOTH'),
+    true
+  );
+});
+
 test('inventory rebalance blocks same-outcome fair value buy for 60 seconds', () => {
   const market = createMarket();
   const orderbook = createLowPriceFairValueOrderbook();

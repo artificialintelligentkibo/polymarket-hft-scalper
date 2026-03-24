@@ -47,7 +47,7 @@ export interface ExitSignal {
 }
 
 export interface BoundaryCorrection {
-  signalType: 'RISK_LIMIT';
+  signalType: 'RISK_LIMIT' | 'INVENTORY_REBALANCE_QUOTE';
   action: TradeSide;
   outcome: Outcome;
   shares: number;
@@ -210,11 +210,16 @@ export class PositionManager {
     return this.getSnapshot();
   }
 
-  getBoundaryCorrection(limits: PositionRiskLimits): BoundaryCorrection | null {
+  getBoundaryCorrection(
+    limits: PositionRiskLimits,
+    options: { useQuoteRebalance?: boolean } = {}
+  ): BoundaryCorrection | null {
     if (this.yes.shares > limits.maxNetYes + EPSILON) {
       const excessShares = roundTo(this.yes.shares - limits.maxNetYes, 4);
       return {
-        signalType: 'RISK_LIMIT',
+        signalType: options.useQuoteRebalance
+          ? 'INVENTORY_REBALANCE_QUOTE'
+          : 'RISK_LIMIT',
         action: 'SELL',
         outcome: 'YES',
         shares: excessShares,
@@ -225,7 +230,9 @@ export class PositionManager {
     if (this.no.shares > limits.maxNetNo + EPSILON) {
       const excessShares = roundTo(this.no.shares - limits.maxNetNo, 4);
       return {
-        signalType: 'RISK_LIMIT',
+        signalType: options.useQuoteRebalance
+          ? 'INVENTORY_REBALANCE_QUOTE'
+          : 'RISK_LIMIT',
         action: 'SELL',
         outcome: 'NO',
         shares: excessShares,

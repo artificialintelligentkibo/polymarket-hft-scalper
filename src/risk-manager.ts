@@ -1,4 +1,4 @@
-import { config, type AppConfig } from './config.js';
+import { config, isDynamicQuotingEnabled, type AppConfig } from './config.js';
 import type { MarketOrderbookSnapshot, Outcome } from './clob-fetcher.js';
 import { evaluateDayDrawdown } from './day-pnl-state.js';
 import { buildFlattenSignals } from './flatten-signals.js';
@@ -71,7 +71,11 @@ export class RiskManager {
     }
 
     const forcedSignals: StrategySignal[] = [];
-    const boundary = positionManager.getBoundaryCorrection(limits);
+    const boundary = positionManager.getBoundaryCorrection(limits, {
+      useQuoteRebalance:
+        isDynamicQuotingEnabled(this.runtimeConfig) &&
+        this.runtimeConfig.REBALANCE_ON_IMBALANCE,
+    });
     if (boundary) {
       forcedSignals.push(this.fromBoundaryCorrection(boundary, market, orderbook));
     }
@@ -145,7 +149,10 @@ export class RiskManager {
       fillRatio: 1,
       capitalClamp: 1,
       priceMultiplier: 1,
-      urgency: resolveProductTestUrgency('cross', this.runtimeConfig),
+      urgency: resolveProductTestUrgency(
+        correction.signalType === 'INVENTORY_REBALANCE_QUOTE' ? 'passive' : 'cross',
+        this.runtimeConfig
+      ),
       reduceOnly: true,
       reason: correction.reason,
     };

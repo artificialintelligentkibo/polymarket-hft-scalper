@@ -167,6 +167,10 @@ export class FillTracker {
     return false;
   }
 
+  forgetPendingOrder(orderId: string): void {
+    this.pendingOrders.delete(orderId);
+  }
+
   getPendingCount(): number {
     return this.pendingOrders.size;
   }

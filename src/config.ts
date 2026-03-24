@@ -30,6 +30,51 @@ export interface AppConfig {
   readonly FILL_POLL_TIMEOUT_MS: number;
   readonly FILL_CANCEL_BEFORE_END_MS: number;
   readonly SELL_AFTER_FILL_DELAY_MS: number;
+  /**
+   * Enables the 2026 market-maker overlay while preserving the legacy scalper.
+   * Recommended production default (2026): false until quoting has been
+   * explicitly validated in PRODUCT_TEST_MODE and then promoted gradually.
+   */
+  readonly MARKET_MAKER_MODE: boolean;
+  /**
+   * Starts the dedicated quoting engine loop. This should normally be enabled
+   * together with MARKET_MAKER_MODE; keeping it false leaves the legacy
+   * per-signal execution path untouched.
+   * Recommended production default (2026): false for backward compatibility.
+   */
+  readonly DYNAMIC_QUOTING_ENABLED: boolean;
+  /**
+   * When true, market-maker execution must remain passive/improve-only and
+   * never intentionally cross the spread. In this codebase, `passive` is the
+   * post-only quoting mode.
+   * Recommended production default (2026): true.
+   */
+  readonly POST_ONLY_ONLY: boolean;
+  /**
+   * Quote refresh cadence for the dedicated market-maker loop.
+   * Lower values are more competitive but increase cancel/repost pressure.
+   * Recommended production default (2026): 150ms on stable infrastructure.
+   */
+  readonly QUOTING_INTERVAL_MS: number;
+  /**
+   * Inventory imbalance limit expressed as a percentage of gross exposure.
+   * Above this threshold the quoting engine starts re-centering quotes to
+   * reduce one-sided inventory accumulation.
+   * Recommended production default (2026): 35.
+   */
+  readonly MAX_IMBALANCE_PERCENT: number;
+  /**
+   * Distance in ticks from the current best prices when reposting passive
+   * market-maker quotes. Higher values are safer but less competitive.
+   * Recommended production default (2026): 2.
+   */
+  readonly QUOTING_SPREAD_TICKS: number;
+  /**
+   * When true, inventory imbalance can be worked back into the book via
+   * passive quote updates instead of forcing the legacy immediate rebalance.
+   * Recommended production default (2026): true.
+   */
+  readonly REBALANCE_ON_IMBALANCE: boolean;
   readonly COINS_TO_TRADE: readonly TradeableCoin[];
   readonly FILTER_5MIN_ONLY: boolean;
   readonly MIN_LIQUIDITY_USD: number;
@@ -326,6 +371,19 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       2_000,
       parseIntOrDefault(env.SELL_AFTER_FILL_DELAY_MS, '8000')
     ),
+    MARKET_MAKER_MODE: parseBoolean(env.MARKET_MAKER_MODE, false),
+    DYNAMIC_QUOTING_ENABLED: parseBoolean(env.DYNAMIC_QUOTING_ENABLED, false),
+    POST_ONLY_ONLY: parseBoolean(env.POST_ONLY_ONLY, true),
+    QUOTING_INTERVAL_MS: Math.max(
+      50,
+      parseIntOrDefault(env.QUOTING_INTERVAL_MS, '150')
+    ),
+    MAX_IMBALANCE_PERCENT: parseFloatOrDefault(env.MAX_IMBALANCE_PERCENT, '35'),
+    QUOTING_SPREAD_TICKS: Math.max(
+      1,
+      parseIntOrDefault(env.QUOTING_SPREAD_TICKS, '2')
+    ),
+    REBALANCE_ON_IMBALANCE: parseBoolean(env.REBALANCE_ON_IMBALANCE, true),
     COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
     FILTER_5MIN_ONLY: parseBoolean(
       env.FILTER_5MIN_ONLY ?? env.ONLY_FIVE_MINUTE_MARKETS,
@@ -721,6 +779,18 @@ export function validateConfig(candidate: AppConfig = config): void {
   if (candidate.SELL_AFTER_FILL_DELAY_MS < 2_000) {
     throw new Error('SELL_AFTER_FILL_DELAY_MS must be at least 2000.');
   }
+
+  if (candidate.QUOTING_INTERVAL_MS < 50) {
+    throw new Error('QUOTING_INTERVAL_MS must be at least 50.');
+  }
+
+  if (candidate.MAX_IMBALANCE_PERCENT <= 0 || candidate.MAX_IMBALANCE_PERCENT > 100) {
+    throw new Error('MAX_IMBALANCE_PERCENT must be in the range (0, 100].');
+  }
+
+  if (candidate.QUOTING_SPREAD_TICKS < 1) {
+    throw new Error('QUOTING_SPREAD_TICKS must be at least 1.');
+  }
 }
 
 export function isDryRunMode(candidate: AppConfig = config): boolean {
@@ -729,6 +799,10 @@ export function isDryRunMode(candidate: AppConfig = config): boolean {
   }
 
   return candidate.SIMULATION_MODE || candidate.TEST_MODE || candidate.DRY_RUN;
+}
+
+export function isDynamicQuotingEnabled(candidate: AppConfig = config): boolean {
+  return candidate.MARKET_MAKER_MODE && candidate.DYNAMIC_QUOTING_ENABLED;
 }
 
 function deepFreeze<T>(value: T): T {

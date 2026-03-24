@@ -3,7 +3,12 @@ import { pathToFileURL } from 'node:url';
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import { BinanceEdgeProvider, extractCoinFromTitle } from './binance-edge.js';
 import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
-import { config, isDryRunMode, validateConfig } from './config.js';
+import {
+  config,
+  isDryRunMode,
+  isDynamicQuotingEnabled,
+  validateConfig,
+} from './config.js';
 import { getDayPnlState } from './day-pnl-state.js';
 import { FillTracker, type ConfirmedFill } from './fill-tracker.js';
 import { buildFlattenSignals } from './flatten-signals.js';
@@ -14,9 +19,15 @@ import {
   getSlotKey,
   type MarketCandidate,
 } from './monitor.js';
-import { OrderExecutor } from './order-executor.js';
+import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
 import { PositionManager } from './position-manager.js';
 import { ProductTestModeController } from './product-test-mode.js';
+import {
+  buildQuoteRefreshPlan,
+  QuotingEngine,
+  type ActiveQuoteOrder,
+  type QuoteRefreshPlan,
+} from './quoting-engine.js';
 import { writeLatencyLog } from './reports.js';
 import { RiskManager } from './risk-manager.js';
 import {
@@ -41,7 +52,7 @@ import {
   recordExecution,
   recordTrade,
 } from './slot-reporter.js';
-import type { StrategySignal } from './strategy-types.js';
+import { isQuotingSignalType, type StrategySignal } from './strategy-types.js';
 import { pruneSetEntries, roundTo, sleep } from './utils.js';
 
 const MAX_TRACKED_SLOT_REPORTS = 2_048;
@@ -78,6 +89,7 @@ class MarketMakerRuntime {
   private readonly tradeLogger = new TradeLogger();
   private readonly riskManager = new RiskManager();
   private readonly signalEngine = new SignalScalper();
+  private readonly quotingEngine = new QuotingEngine();
   private readonly redeemer = new AutoRedeemer();
   private readonly fillTracker = new FillTracker(
     {
@@ -209,6 +221,11 @@ class MarketMakerRuntime {
     });
     this.statusMonitor.start();
     this.binanceEdge.start();
+    if (isDynamicQuotingEnabled(config)) {
+      this.quotingEngine.start(async (plan) => {
+        await this.handleQuoteRefresh(plan);
+      });
+    }
     if (!isDryRunMode(config)) {
       this.fillTracker.start();
     }
@@ -286,6 +303,7 @@ class MarketMakerRuntime {
       this.pendingLiveOrders.clear();
       this.settlementCooldowns.clear();
       this.redeemer.stop();
+      this.quotingEngine.stop();
       this.statusMonitor.stop();
       this.binanceEdge.stop();
       this.fetcher.close();
@@ -303,6 +321,11 @@ class MarketMakerRuntime {
     const scannedMarkets = await this.monitor.scanEligibleMarkets();
     const markets = this.productTestMode.selectMarkets(scannedMarkets);
     this.setActiveMarkets(markets);
+    if (isDynamicQuotingEnabled(config)) {
+      for (const order of this.quotingEngine.removeInactiveMarkets(this.activeMarketIds)) {
+        await this.cancelQuoteOrder(order);
+      }
+    }
     this.syncRuntimeStatus({
       running: true,
       isPaused: this.statusMonitor.isPaused(),
@@ -365,14 +388,26 @@ class MarketMakerRuntime {
       market,
       statusPausedSignals
     );
-    const executionCandidates = this.applyBinanceEdge(
-      market,
-      orderbook,
-      latencyPausedSignals
-    );
-    this.rememberMarketAction(market, signals, executionCandidates, positionManager);
+    const quoteSignals = isDynamicQuotingEnabled(config)
+      ? latencyPausedSignals.filter((signal) => isQuotingSignalType(signal.signalType))
+      : [];
+    const directSignals = isDynamicQuotingEnabled(config)
+      ? latencyPausedSignals.filter((signal) => !isQuotingSignalType(signal.signalType))
+      : latencyPausedSignals;
+    if (isDynamicQuotingEnabled(config)) {
+      this.quotingEngine.syncMarketContext({
+        market,
+        orderbook,
+        positionManager,
+        riskAssessment,
+        quoteSignals,
+        binanceFairValueAdjustment,
+      });
+    }
+    const executionCandidates = this.applyBinanceEdge(market, orderbook, directSignals);
+    this.rememberMarketAction(market, signals, executionCandidates, positionManager, quoteSignals);
 
-    if (executionCandidates.length === 0) {
+    if (executionCandidates.length === 0 && quoteSignals.length === 0) {
       this.maybePrintSlotReport(slotKey);
       return;
     }
@@ -411,9 +446,9 @@ class MarketMakerRuntime {
     signal: StrategySignal,
     slotKey: string,
     binanceAssessment?: BinanceEdgeAssessment
-  ): Promise<void> {
+  ): Promise<OrderExecutionReport | null> {
     if (signal.targetPrice === null || signal.shares <= 0) {
-      return;
+      return null;
     }
 
     if (this.statusMonitor.isPaused() && !signal.reduceOnly) {
@@ -424,7 +459,7 @@ class MarketMakerRuntime {
         action: signal.action,
         reason: this.statusMonitor.getState().reason,
       });
-      return;
+      return null;
     }
 
     const pendingOrderKey = this.getPendingOrderKey(market.marketId, signal.outcome);
@@ -440,7 +475,7 @@ class MarketMakerRuntime {
         outcome: signal.outcome,
         action: signal.action,
       });
-      return;
+      return null;
     }
 
     const nowMs = Date.now();
@@ -459,7 +494,7 @@ class MarketMakerRuntime {
         outcome: signal.outcome,
         remainingMs: Math.max(0, (settlementCooldownUntil ?? nowMs) - nowMs),
       });
-      return;
+      return null;
     }
     if (settlementCooldownUntil && nowMs >= settlementCooldownUntil) {
       this.settlementCooldowns.delete(settlementCooldownKey);
@@ -701,6 +736,7 @@ class MarketMakerRuntime {
       latencyPaused: this.latencyPaused,
       latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
     });
+    return execution;
   }
 
   private applyConfirmedFill(fill: ConfirmedFill): void {
@@ -1320,11 +1356,13 @@ class MarketMakerRuntime {
     market: MarketCandidate,
     signals: readonly StrategySignal[],
     executionCandidates: readonly SignalExecutionCandidate[],
-    positionManager: PositionManager
+    positionManager: PositionManager,
+    quoteSignals: readonly StrategySignal[] = []
   ): void {
     const snapshot = positionManager.getSnapshot();
     const entrySignals = signals.filter((signal) => !signal.reduceOnly);
     const nextCandidate = executionCandidates[0]?.signal;
+    const nextQuote = quoteSignals[0];
 
     let action = 'SCAN';
     if (this.statusMonitor.isPaused() && entrySignals.length > 0) {
@@ -1334,6 +1372,11 @@ class MarketMakerRuntime {
         nextCandidate.action === 'BUY'
           ? `ENTER ${nextCandidate.outcome}`
           : `EXIT ${nextCandidate.outcome}`;
+    } else if (nextQuote) {
+      action =
+        nextQuote.signalType === 'INVENTORY_REBALANCE_QUOTE'
+          ? `REB ${nextQuote.outcome}`
+          : `QUOTE ${nextQuote.outcome}`;
     } else if (snapshot.grossExposureShares > 0) {
       action = 'MONITOR';
     }
@@ -1444,6 +1487,90 @@ class MarketMakerRuntime {
       .filter((entry): entry is RuntimePositionSnapshot => entry !== null)
       .sort((left, right) => Math.abs(right.markValueUsd) - Math.abs(left.markValueUsd))
       .slice(0, 8);
+  }
+
+  private async handleQuoteRefresh(plan: QuoteRefreshPlan): Promise<void> {
+    if (!this.running || this.stopping) {
+      return;
+    }
+
+    const market = this.markets.get(plan.marketId);
+    const quoteContext = this.quotingEngine.getContext(plan.marketId);
+    if (!market || !quoteContext) {
+      return;
+    }
+
+    await this.runSerializedMarketTask(plan.marketId, async () => {
+      const orderbook = await this.fetcher.getMarketSnapshot(market);
+      this.latestBooks.set(plan.marketId, orderbook);
+      const positionManager = this.getPositionManager(market);
+      const riskAssessment = this.riskManager.checkRiskLimits({
+        market,
+        orderbook,
+        positionManager,
+        now: new Date(),
+      });
+      const refreshedPlan = buildQuoteRefreshPlan({
+        context: {
+          ...quoteContext,
+          orderbook,
+          positionManager,
+          riskAssessment,
+        },
+        activeQuoteOrders: plan.activeQuoteOrders,
+        runtimeConfig: config,
+        now: new Date(),
+      });
+
+      for (const order of plan.activeQuoteOrders) {
+        await this.cancelQuoteOrder(order);
+      }
+
+      const nextActiveOrders: ActiveQuoteOrder[] = [];
+
+      for (const signal of refreshedPlan.signals) {
+        const execution = await this.executeSignal(
+          market,
+          orderbook,
+          positionManager,
+          signal,
+          refreshedPlan.slotKey
+        );
+
+        if (
+          execution &&
+          execution.orderId &&
+          !execution.simulation &&
+          !execution.fillConfirmed
+        ) {
+          nextActiveOrders.push({
+            orderId: execution.orderId,
+            marketId: market.marketId,
+            outcome: signal.outcome,
+            action: signal.action,
+            signalType: signal.signalType,
+          });
+        }
+      }
+
+      this.quotingEngine.replaceQuoteOrders(refreshedPlan.marketId, nextActiveOrders);
+    });
+  }
+
+  private async cancelQuoteOrder(order: ActiveQuoteOrder): Promise<void> {
+    try {
+      await this.executor.cancelOrder(order.orderId);
+    } catch (error) {
+      logger.debug('Quote cancel failed', {
+        orderId: order.orderId,
+        marketId: order.marketId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.fillTracker.forgetPendingOrder(order.orderId);
+      this.quotingEngine.forgetQuoteOrder(order.orderId);
+      this.clearPendingLiveOrder(this.getPendingOrderKey(order.marketId, order.outcome));
+    }
   }
 }
 

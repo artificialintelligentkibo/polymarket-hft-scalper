@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { config, createConfig, isDryRunMode } from '../src/config.js';
+import {
+  config,
+  createConfig,
+  isDryRunMode,
+  isDynamicQuotingEnabled,
+} from '../src/config.js';
 
 test('createConfig filters invalid and duplicate whitelist condition ids', () => {
   const candidate = createConfig({
@@ -47,6 +52,13 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.FILL_POLL_TIMEOUT_MS, 120000);
   assert.equal(candidate.FILL_CANCEL_BEFORE_END_MS, 20000);
   assert.equal(candidate.SELL_AFTER_FILL_DELAY_MS, 8000);
+  assert.equal(candidate.MARKET_MAKER_MODE, false);
+  assert.equal(candidate.DYNAMIC_QUOTING_ENABLED, false);
+  assert.equal(candidate.POST_ONLY_ONLY, true);
+  assert.equal(candidate.QUOTING_INTERVAL_MS, 150);
+  assert.equal(candidate.MAX_IMBALANCE_PERCENT, 35);
+  assert.equal(candidate.QUOTING_SPREAD_TICKS, 2);
+  assert.equal(candidate.REBALANCE_ON_IMBALANCE, true);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
   assert.equal(candidate.POLYMARKET_API_SECRET, '');
   assert.equal(candidate.POLYMARKET_API_PASSPHRASE, '');
@@ -138,6 +150,22 @@ test('createConfig clamps SELL_AFTER_FILL_DELAY_MS to at least 2 seconds', () =>
   });
 
   assert.equal(candidate.SELL_AFTER_FILL_DELAY_MS, 2000);
+});
+
+test('dynamic quoting requires both MARKET_MAKER_MODE and DYNAMIC_QUOTING_ENABLED', () => {
+  const makerOnly = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'false',
+  });
+  const fullMm = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+  });
+
+  assert.equal(isDynamicQuotingEnabled(makerOnly), false);
+  assert.equal(isDynamicQuotingEnabled(fullMm), true);
 });
 
 test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () => {

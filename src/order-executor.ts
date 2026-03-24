@@ -125,7 +125,7 @@ export class OrderExecutor {
     orderType: OrderMode;
     urgency: StrategySignal['urgency'];
   } {
-    const effectiveUrgency = resolveProductTestUrgency(signal.urgency, this.runtimeConfig);
+    const effectiveUrgency = resolveExecutionUrgency(signal, this.runtimeConfig);
     const fallbackPrice =
       signal.targetPrice ?? signal.midPrice ?? signal.referencePrice ?? signal.tokenPrice;
     if (fallbackPrice === null) {
@@ -213,11 +213,27 @@ export class OrderExecutor {
 }
 
 function resolveOrderType(signal: StrategySignal, runtimeConfig: AppConfig): OrderMode {
-  const urgency = resolveProductTestUrgency(signal.urgency, runtimeConfig);
+  const urgency = resolveExecutionUrgency(signal, runtimeConfig);
   if (urgency === 'cross' && runtimeConfig.trading.orderTypeFallback !== 'NONE') {
     return runtimeConfig.trading.orderTypeFallback;
   }
   return runtimeConfig.trading.orderType;
+}
+
+function resolveExecutionUrgency(
+  signal: StrategySignal,
+  runtimeConfig: AppConfig
+): StrategySignal['urgency'] {
+  const urgency = resolveProductTestUrgency(signal.urgency, runtimeConfig);
+  if (!runtimeConfig.MARKET_MAKER_MODE) {
+    return urgency;
+  }
+
+  if (urgency !== 'cross') {
+    return urgency;
+  }
+
+  return runtimeConfig.POST_ONLY_ONLY ? 'passive' : 'improve';
 }
 
 function inferTickSize(book: TokenBookSnapshot, fallbackPrice: number): number {

@@ -40,6 +40,7 @@ src/
   order-executor.ts
   position-manager.ts
   product-test-mode.ts
+  quoting-engine.ts
   reports.ts
   auto-redeemer.ts
   binance-edge.ts
@@ -107,6 +108,13 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `STATE_FILE=./reports/state.json`
 - `REPORTS_FOLDER=./reports`
 - `REPORTS_FILE_PREFIX=slot-reports`
+- `MARKET_MAKER_MODE=false`
+- `DYNAMIC_QUOTING_ENABLED=false`
+- `POST_ONLY_ONLY=true`
+- `QUOTING_INTERVAL_MS=150`
+- `MAX_IMBALANCE_PERCENT=35`
+- `QUOTING_SPREAD_TICKS=2`
+- `REBALANCE_ON_IMBALANCE=true`
 
 Sizing is now driven by:
 
@@ -131,6 +139,7 @@ The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) 
 11. background gasless auto-redeem for resolved proxy-wallet positions
 12. Polymarket status monitoring with auto-pause / auto-resume
 13. optional Binance latency-edge post-filter for entry signals
+14. optional market-maker quoting loop for passive cancel/repost inventory management
 
 ## Reports
 
@@ -285,6 +294,48 @@ If an active incident mentions CLOB, order flow, confirmation delays, latency, A
 - keeps safety exits (`HARD_STOP`, `TRAILING_TAKE_PROFIT`, `SLOT_FLATTEN`, risk flatten) and redeem enabled
 
 When incidents clear, the bot auto-resumes after `PAUSE_GRACE_PERIOD_MS`.
+
+## Market Maker Mode (2026)
+
+`MARKET_MAKER_MODE` adds an optional automated market-maker overlay to the existing scalper. The old runtime remains the default and is not replaced unless you explicitly enable both market-maker flags.
+
+How to switch:
+
+```bash
+MARKET_MAKER_MODE=true
+DYNAMIC_QUOTING_ENABLED=true
+```
+
+Mode behavior:
+
+- `MARKET_MAKER_MODE=false`
+  The legacy dual-sided scalper runs exactly as before.
+- `MARKET_MAKER_MODE=true` and `DYNAMIC_QUOTING_ENABLED=false`
+  The old execution flow stays active, but urgency remains maker-friendly.
+- `MARKET_MAKER_MODE=true` and `DYNAMIC_QUOTING_ENABLED=true`
+  Entry and rebalance opportunities are routed through `src/quoting-engine.ts`, which refreshes passive quotes on an interval.
+
+Recommended 2026 defaults:
+
+| Parameter | Default | Recommended | Purpose |
+|---|---:|---:|---|
+| `MARKET_MAKER_MODE` | `false` | `false` until validated | Global MM overlay switch |
+| `DYNAMIC_QUOTING_ENABLED` | `false` | `false` until product-tested | Starts the dedicated quote loop |
+| `POST_ONLY_ONLY` | `true` | `true` | Never intentionally cross the spread |
+| `QUOTING_INTERVAL_MS` | `150` | `150` | Quote refresh cadence |
+| `MAX_IMBALANCE_PERCENT` | `35` | `35` | Suppresses fresh quotes on overweight inventory |
+| `QUOTING_SPREAD_TICKS` | `2` | `2` | Quote distance from the current book |
+| `REBALANCE_ON_IMBALANCE` | `true` | `true` | Routes imbalance reduction through quote updates |
+
+What changes when enabled:
+
+- `EXTREME_*`, `FAIR_VALUE_*`, and combined-discount entries can be rewritten into `DYNAMIC_QUOTE_BOTH`
+- inventory rebalance can be rewritten into `INVENTORY_REBALANCE_QUOTE`
+- the quoting engine cancels old quote orders, reposts new passive quotes, and respects `TEST_MIN_TRADE_USDC` in `PRODUCT_TEST_MODE`
+- risk exits (`HARD_STOP`, `TRAILING_TAKE_PROFIT`, `SLOT_FLATTEN`) stay on the normal execution path
+- `POST_ONLY_ONLY=true` keeps the bot in passive/improve mode and prevents `cross` urgency
+
+Turning the two feature flags back off fully restores the pre-market-maker behavior.
 
 ## Binance Latency Edge
 

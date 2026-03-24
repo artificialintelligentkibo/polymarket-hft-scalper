@@ -4,15 +4,28 @@ export type SignalAction = 'BUY' | 'SELL';
 export type SignalUrgency = 'passive' | 'improve' | 'cross';
 export type SignalType =
   | 'COMBINED_DISCOUNT_BUY_BOTH'
+  | 'DYNAMIC_QUOTE_BOTH'
   | 'EXTREME_BUY'
   | 'EXTREME_SELL'
   | 'FAIR_VALUE_BUY'
   | 'FAIR_VALUE_SELL'
   | 'INVENTORY_REBALANCE'
+  | 'INVENTORY_REBALANCE_QUOTE'
   | 'RISK_LIMIT'
   | 'TRAILING_TAKE_PROFIT'
   | 'HARD_STOP'
   | 'SLOT_FLATTEN';
+
+export const QUOTING_SIGNAL_TYPES = [
+  'DYNAMIC_QUOTE_BOTH',
+  'INVENTORY_REBALANCE_QUOTE',
+] as const satisfies readonly SignalType[];
+
+export function isQuotingSignalType(signalType: SignalType): boolean {
+  return QUOTING_SIGNAL_TYPES.includes(
+    signalType as (typeof QUOTING_SIGNAL_TYPES)[number]
+  );
+}
 
 export interface StrategySignal {
   readonly marketId: string;

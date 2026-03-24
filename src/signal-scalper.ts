@@ -1,4 +1,4 @@
-import { config, type AppConfig } from './config.js';
+import { config, isDynamicQuotingEnabled, type AppConfig } from './config.js';
 import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob-fetcher.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
@@ -120,7 +120,8 @@ export class SignalScalper {
     ];
 
     const flattened = mergeSignals(groups.flat());
-    return takeTopSignals(flattened, strategy.maxSignalsPerTick);
+    const topSignals = takeTopSignals(flattened, strategy.maxSignalsPerTick);
+    return transformSignalsForMarketMaker(topSignals, this.runtimeConfig);
   }
 
   private getCombinedDiscountSignals(
@@ -524,7 +525,11 @@ export class SignalScalper {
       buildSignal({
         market,
         orderbook,
-        signalType: 'INVENTORY_REBALANCE',
+        signalType:
+          isDynamicQuotingEnabled(this.runtimeConfig) &&
+          this.runtimeConfig.REBALANCE_ON_IMBALANCE
+            ? 'INVENTORY_REBALANCE_QUOTE'
+            : 'INVENTORY_REBALANCE',
         priority: 100,
         action: 'SELL',
         outcome,
@@ -538,7 +543,10 @@ export class SignalScalper {
         priceMultiplier: size.priceMultiplier,
         fillRatio: size.fillRatio,
         capitalClamp: size.capitalClamp,
-        urgency: resolveProductTestUrgency('improve', this.runtimeConfig),
+        urgency: resolveProductTestUrgency(
+          isDynamicQuotingEnabled(this.runtimeConfig) ? 'passive' : 'improve',
+          this.runtimeConfig
+        ),
         reduceOnly: true,
         reason: `Inventory imbalance ${formatPrice(imbalanceState.imbalance)} exceeded threshold ${strategy.inventoryImbalanceThreshold}`,
       }),
@@ -767,6 +775,40 @@ function mergeSignals(signals: StrategySignal[]): StrategySignal[] {
   }
 
   return Array.from(byOutcomeAction.values());
+}
+
+function transformSignalsForMarketMaker(
+  signals: readonly StrategySignal[],
+  runtimeConfig: AppConfig
+): StrategySignal[] {
+  if (!isDynamicQuotingEnabled(runtimeConfig)) {
+    return [...signals];
+  }
+
+  return signals.map((signal) => {
+    if (signal.signalType === 'INVENTORY_REBALANCE_QUOTE') {
+      return {
+        ...signal,
+        urgency: resolveProductTestUrgency('passive', runtimeConfig),
+      };
+    }
+
+    if (
+      signal.signalType === 'COMBINED_DISCOUNT_BUY_BOTH' ||
+      signal.signalType === 'EXTREME_BUY' ||
+      signal.signalType === 'EXTREME_SELL' ||
+      signal.signalType === 'FAIR_VALUE_BUY' ||
+      signal.signalType === 'FAIR_VALUE_SELL'
+    ) {
+      return {
+        ...signal,
+        signalType: 'DYNAMIC_QUOTE_BOTH',
+        urgency: resolveProductTestUrgency('passive', runtimeConfig),
+      };
+    }
+
+    return signal;
+  });
 }
 
 function takeTopSignals(signals: StrategySignal[], maxSignals: number): StrategySignal[] {
