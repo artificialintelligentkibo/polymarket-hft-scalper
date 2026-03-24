@@ -4,6 +4,8 @@ import {
   evaluateLatencyPauseState,
   filterSignalsForLatencyPause,
   pruneLatencyPauseSamples,
+  pruneExpiredSettlementCooldowns,
+  shouldDeferSignalForSettlement,
 } from '../src/index.js';
 import type { StrategySignal } from '../src/strategy-types.js';
 
@@ -145,4 +147,57 @@ test('exit signals always pass through during latency pause', () => {
     filtered.map((signal) => signal.signalType),
     ['HARD_STOP', 'FAIR_VALUE_SELL']
   );
+});
+
+test('settlement cooldown defers sell signals except hard stops', () => {
+  assert.equal(
+    shouldDeferSignalForSettlement({
+      signal: createSignal({
+        signalType: 'TRAILING_TAKE_PROFIT',
+        action: 'SELL',
+        reduceOnly: true,
+      }),
+      cooldownUntilMs: 10_000,
+      nowMs: 5_000,
+    }),
+    true
+  );
+
+  assert.equal(
+    shouldDeferSignalForSettlement({
+      signal: createSignal({
+        signalType: 'HARD_STOP',
+        action: 'SELL',
+        reduceOnly: true,
+      }),
+      cooldownUntilMs: 10_000,
+      nowMs: 5_000,
+    }),
+    false
+  );
+
+  assert.equal(
+    shouldDeferSignalForSettlement({
+      signal: createSignal({
+        signalType: 'FAIR_VALUE_BUY',
+        action: 'BUY',
+        reduceOnly: false,
+      }),
+      cooldownUntilMs: 10_000,
+      nowMs: 5_000,
+    }),
+    false
+  );
+});
+
+test('pruneExpiredSettlementCooldowns removes expired entries', () => {
+  const pruned = pruneExpiredSettlementCooldowns(
+    new Map([
+      ['market-1:YES', 15_000],
+      ['market-1:NO', 4_000],
+    ]),
+    10_000
+  );
+
+  assert.deepEqual(Array.from(pruned.entries()), [['market-1:YES', 15_000]]);
 });

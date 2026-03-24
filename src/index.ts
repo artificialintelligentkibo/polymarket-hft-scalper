@@ -95,6 +95,7 @@ class MarketMakerRuntime {
   private readonly pendingSlotReports = new Set<string>();
   private readonly printedSlotReports = new Set<string>();
   private readonly pendingLiveOrders = new Map<string, number>();
+  private readonly settlementCooldowns = new Map<string, number>();
   private readonly recentSignals: RuntimeSignalSnapshot[] = [];
   private readonly recentLatencySamples: number[] = [];
   private readonly latencyWindow: LatencySample[] = [];
@@ -283,6 +284,7 @@ class MarketMakerRuntime {
         activeMarkets: [],
       });
       this.pendingLiveOrders.clear();
+      this.settlementCooldowns.clear();
       this.redeemer.stop();
       this.statusMonitor.stop();
       this.binanceEdge.stop();
@@ -294,6 +296,7 @@ class MarketMakerRuntime {
     for (const fill of this.fillTracker.drainConfirmedFills()) {
       this.applyConfirmedFill(fill);
     }
+    this.pruneSettlementCooldowns();
 
     this.consumeControlCommands();
     this.refreshLatencyPauseState();
@@ -440,6 +443,28 @@ class MarketMakerRuntime {
       return;
     }
 
+    const nowMs = Date.now();
+    const settlementCooldownKey = getSettlementCooldownKey(market.marketId, signal.outcome);
+    const settlementCooldownUntil = this.settlementCooldowns.get(settlementCooldownKey);
+    if (
+      shouldDeferSignalForSettlement({
+        signal,
+        cooldownUntilMs: settlementCooldownUntil,
+        nowMs,
+      })
+    ) {
+      logger.debug('SELL deferred: waiting for token settlement after BUY fill', {
+        marketId: market.marketId,
+        signalType: signal.signalType,
+        outcome: signal.outcome,
+        remainingMs: Math.max(0, (settlementCooldownUntil ?? nowMs) - nowMs),
+      });
+      return;
+    }
+    if (settlementCooldownUntil && nowMs >= settlementCooldownUntil) {
+      this.settlementCooldowns.delete(settlementCooldownKey);
+    }
+
     const tokenId = signal.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
     const book = signal.outcome === 'YES' ? orderbook.yes : orderbook.no;
     const beforeSnapshot = positionManager.getSnapshot();
@@ -523,6 +548,9 @@ class MarketMakerRuntime {
       );
     }
     const completedAt = Date.now();
+    if (effectiveShares > 0 && signal.action === 'BUY') {
+      this.setSettlementCooldown(market.marketId, signal.outcome, completedAt);
+    }
     if (effectiveShares > 0 && signal.signalType === 'HARD_STOP' && signal.action === 'SELL') {
       positionManager.setEntryCooldown(
         signal.outcome,
@@ -699,6 +727,9 @@ class MarketMakerRuntime {
       timestamp: new Date(fill.filledAt).toISOString(),
       orderId: fill.orderId,
     });
+    if (fill.side === 'BUY') {
+      this.setSettlementCooldown(fill.marketId, fill.outcome, fill.filledAt);
+    }
     const notionalUsd = roundTo(fill.filledShares * fill.fillPrice, 2);
     const pendingOrderKey = this.getPendingOrderKey(fill.marketId, fill.outcome);
     if (!this.fillTracker.hasPendingOrderFor(fill.marketId, fill.outcome)) {
@@ -939,6 +970,31 @@ class MarketMakerRuntime {
 
   private getPendingOrderKey(marketId: string, outcome: StrategySignal['outcome']): string {
     return `${marketId}:${outcome}`;
+  }
+
+  private setSettlementCooldown(
+    marketId: string,
+    outcome: StrategySignal['outcome'],
+    baseTimeMs: number
+  ): void {
+    const cooldownUntilMs = baseTimeMs + config.SELL_AFTER_FILL_DELAY_MS;
+    this.settlementCooldowns.set(
+      getSettlementCooldownKey(marketId, outcome),
+      cooldownUntilMs
+    );
+    logger.debug('Settlement cooldown set after BUY fill', {
+      marketId,
+      outcome,
+      cooldownUntil: new Date(cooldownUntilMs).toISOString(),
+    });
+  }
+
+  private pruneSettlementCooldowns(nowMs = Date.now()): void {
+    const next = pruneExpiredSettlementCooldowns(this.settlementCooldowns, nowMs);
+    this.settlementCooldowns.clear();
+    for (const [key, value] of next.entries()) {
+      this.settlementCooldowns.set(key, value);
+    }
   }
 
   private async runSerializedMarketTask(
@@ -1508,6 +1564,43 @@ function createTrackedSignal(
     reason: 'Confirmed via fill tracker',
     generatedAt: fill.filledAt,
   };
+}
+
+function getSettlementCooldownKey(
+  marketId: string,
+  outcome: StrategySignal['outcome']
+): string {
+  return `${marketId}:${outcome}`;
+}
+
+export function shouldDeferSignalForSettlement(params: {
+  signal: Pick<StrategySignal, 'action' | 'signalType'>;
+  cooldownUntilMs: number | undefined;
+  nowMs: number;
+}): boolean {
+  if (params.signal.action !== 'SELL') {
+    return false;
+  }
+
+  if (params.signal.signalType === 'HARD_STOP') {
+    return false;
+  }
+
+  return params.cooldownUntilMs !== undefined && params.nowMs < params.cooldownUntilMs;
+}
+
+export function pruneExpiredSettlementCooldowns(
+  cooldowns: ReadonlyMap<string, number>,
+  nowMs: number
+): Map<string, number> {
+  const next = new Map<string, number>();
+  for (const [key, untilMs] of cooldowns.entries()) {
+    if (Number.isFinite(untilMs) && untilMs >= nowMs) {
+      next.set(key, untilMs);
+    }
+  }
+
+  return next;
 }
 
 export function filterSignalsForLatencyPause(

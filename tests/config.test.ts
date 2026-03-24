@@ -46,6 +46,7 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.FILL_POLL_INTERVAL_MS, 2500);
   assert.equal(candidate.FILL_POLL_TIMEOUT_MS, 120000);
   assert.equal(candidate.FILL_CANCEL_BEFORE_END_MS, 20000);
+  assert.equal(candidate.SELL_AFTER_FILL_DELAY_MS, 8000);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
   assert.equal(candidate.POLYMARKET_API_SECRET, '');
   assert.equal(candidate.POLYMARKET_API_PASSPHRASE, '');
@@ -128,6 +129,15 @@ test('createConfig clamps fill cancel guard to at least 10 seconds', () => {
   });
 
   assert.equal(candidate.FILL_CANCEL_BEFORE_END_MS, 10000);
+});
+
+test('createConfig clamps SELL_AFTER_FILL_DELAY_MS to at least 2 seconds', () => {
+  const candidate = createConfig({
+    ...process.env,
+    SELL_AFTER_FILL_DELAY_MS: '1000',
+  });
+
+  assert.equal(candidate.SELL_AFTER_FILL_DELAY_MS, 2000);
 });
 
 test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () => {

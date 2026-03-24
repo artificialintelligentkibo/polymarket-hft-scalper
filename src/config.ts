@@ -29,6 +29,7 @@ export interface AppConfig {
   readonly FILL_POLL_INTERVAL_MS: number;
   readonly FILL_POLL_TIMEOUT_MS: number;
   readonly FILL_CANCEL_BEFORE_END_MS: number;
+  readonly SELL_AFTER_FILL_DELAY_MS: number;
   readonly COINS_TO_TRADE: readonly TradeableCoin[];
   readonly FILTER_5MIN_ONLY: boolean;
   readonly MIN_LIQUIDITY_USD: number;
@@ -320,6 +321,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     FILL_CANCEL_BEFORE_END_MS: Math.max(
       10_000,
       parseIntOrDefault(env.FILL_CANCEL_BEFORE_END_MS, '20000')
+    ),
+    SELL_AFTER_FILL_DELAY_MS: Math.max(
+      2_000,
+      parseIntOrDefault(env.SELL_AFTER_FILL_DELAY_MS, '8000')
     ),
     COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
     FILTER_5MIN_ONLY: parseBoolean(
@@ -711,6 +716,10 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.FILL_CANCEL_BEFORE_END_MS < 10_000) {
     throw new Error('FILL_CANCEL_BEFORE_END_MS must be at least 10000.');
+  }
+
+  if (candidate.SELL_AFTER_FILL_DELAY_MS < 2_000) {
+    throw new Error('SELL_AFTER_FILL_DELAY_MS must be at least 2000.');
   }
 }
 
