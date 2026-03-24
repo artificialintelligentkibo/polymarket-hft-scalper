@@ -17,6 +17,9 @@ export interface LatencyLogEntry {
   readonly latencyRoundTripMs?: number;
   readonly binanceEdge?: boolean;
   readonly binanceMovePct?: number;
+  readonly balanceCacheHits?: number;
+  readonly balanceCacheMisses?: number;
+  readonly balanceCacheHitRatePct?: number | null;
   readonly simulationMode: boolean;
   readonly dryRun: boolean;
   readonly testMode: boolean;
@@ -105,6 +108,9 @@ function formatLatencyLogEntry(entry: LatencyLogEntry): string {
     `roundTripMs=${formatLatencyValue(entry.latencyRoundTripMs)}`,
     `binanceEdge=${entry.binanceEdge === true}`,
     `binanceMovePct=${formatPercentValue(entry.binanceMovePct)}`,
+    `balanceCacheHits=${formatCountValue(entry.balanceCacheHits)}`,
+    `balanceCacheMisses=${formatCountValue(entry.balanceCacheMisses)}`,
+    `balanceCacheHitRatePct=${formatPercentValue(entry.balanceCacheHitRatePct)}`,
     `orderId=${entry.orderId || 'n/a'}`,
     `simulation=${entry.simulationMode}`,
     `dryRun=${entry.dryRun}`,
@@ -153,7 +159,7 @@ function formatLatencyValue(value: number | undefined): string {
   return `${Math.max(0, Math.round(value))}`;
 }
 
-function formatPercentValue(value: number | undefined): string {
+function formatPercentValue(value: number | null | undefined): string {
   if (value === undefined || !Number.isFinite(value)) {
     return 'n/a';
   }
@@ -164,4 +170,12 @@ function formatPercentValue(value: number | undefined): string {
 
 function ensureTrailingNewline(value: string): string {
   return value.endsWith('\n') ? value : `${value}\n`;
+}
+
+function formatCountValue(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value)) {
+    return 'n/a';
+  }
+
+  return String(Math.max(0, Math.round(value)));
 }

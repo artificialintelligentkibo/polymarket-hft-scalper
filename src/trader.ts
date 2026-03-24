@@ -8,15 +8,20 @@ import {
   type OrderMode,
   type SignatureType,
 } from './config.js';
+import {
+  CircuitBreaker,
+  type CircuitBreakerSnapshot,
+  retryWithBackoff,
+} from './api-retry.js';
 import { logger } from './logger.js';
 import { clampProductTestShares } from './product-test-mode.js';
 import type { Outcome } from './clob-fetcher.js';
 import { roundTo } from './utils.js';
 
-interface ApiCredentials {
-  apiKey: string;
-  secret: string;
-  passphrase: string;
+export interface ApiCredentials {
+  readonly apiKey: string;
+  readonly secret: string;
+  readonly passphrase: string;
 }
 
 interface ExecutionContext {
@@ -32,6 +37,16 @@ interface MarketMetadata {
   negRisk: boolean;
   feeRateBps: number;
   updatedAt: number;
+}
+
+interface BigNumberCacheEntry {
+  readonly value: ethers.BigNumber;
+  readonly expiresAtMs: number;
+}
+
+interface CacheMetricsSnapshot {
+  readonly hits: number;
+  readonly misses: number;
 }
 
 type ClobChainId = ConstructorParameters<typeof ClobClient>[1];
@@ -65,6 +80,9 @@ export interface TradeExecutionResult {
   wasMaker: boolean | null;
   postOnly: boolean;
   orderType: OrderMode;
+  balanceCacheHits: number;
+  balanceCacheMisses: number;
+  balanceCacheHitRatePct: number | null;
 }
 
 export class Trader {
@@ -78,6 +96,18 @@ export class Trader {
   private approvalsChecked = false;
   private readonly marketMetadataCache = new Map<string, MarketMetadata>();
   private readonly metadataTtlMs = 60 * 60 * 1000;
+  private readonly tokenDecimals = 6;
+  private readonly clobCircuitBreaker = new CircuitBreaker({
+    name: 'clob',
+    failureThreshold: 5,
+    resetTimeoutMs: 30_000,
+  });
+  private readonly balanceCache = new Map<string, BigNumberCacheEntry>();
+  private readonly allowanceCache = new Map<string, BigNumberCacheEntry>();
+  private readonly outcomeBalanceCache = new Map<string, BigNumberCacheEntry>();
+  private usdcDecimalsPromise: Promise<number> | null = null;
+  private balanceCacheHits = 0;
+  private balanceCacheMisses = 0;
   private readonly erc20Abi = [
     'function balanceOf(address) view returns (uint256)',
     'function allowance(address owner, address spender) view returns (uint256)',
@@ -85,6 +115,7 @@ export class Trader {
     'function decimals() view returns (uint8)',
   ];
   private readonly ctfAbi = [
+    'function balanceOf(address account, uint256 id) view returns (uint256)',
     'function isApprovedForAll(address owner, address operator) view returns (bool)',
     'function setApprovalForAll(address operator, bool approved)',
   ];
@@ -159,6 +190,8 @@ export class Trader {
       );
     }
 
+    const cacheMetricsBefore = this.snapshotCacheMetrics();
+
     if (isDryRunMode(this.runtimeConfig)) {
       logger.info('Dry-run mode: skipping live order placement', {
         marketId: request.marketId,
@@ -191,6 +224,9 @@ export class Trader {
         wasMaker: null,
         postOnly,
         orderType,
+        balanceCacheHits: 0,
+        balanceCacheMisses: 0,
+        balanceCacheHitRatePct: null,
       };
     }
 
@@ -218,33 +254,39 @@ export class Trader {
       productTestMode: this.runtimeConfig.PRODUCT_TEST_MODE,
     });
 
-    const response =
-      orderTypeValue === OrderType.GTC
-        ? await this.clobClient.createAndPostOrder(
-            {
-              tokenID: request.tokenId,
-              price: validatedPrice,
-              size: validatedShares,
-              side,
-              feeRateBps: metadata.feeRateBps,
-            },
-            orderOptions,
-            orderTypeValue,
-            false,
-            postOnly
-          )
-        : await this.clobClient.createAndPostMarketOrder(
-            {
-              tokenID: request.tokenId,
-              amount: request.side === 'BUY' ? notionalUsd : validatedShares,
-              price: validatedPrice,
-              side,
-              feeRateBps: metadata.feeRateBps,
-              orderType: orderTypeValue,
-            },
-            orderOptions,
-            orderTypeValue
-          );
+    const response = await this.executeClobCall(
+      'placeOrder',
+      async () =>
+        orderTypeValue === OrderType.GTC
+          ? this.clobClient.createAndPostOrder(
+              {
+                tokenID: request.tokenId,
+                price: validatedPrice,
+                size: validatedShares,
+                side,
+                feeRateBps: metadata.feeRateBps,
+              },
+              orderOptions,
+              orderTypeValue,
+              false,
+              postOnly
+            )
+          : this.clobClient.createAndPostMarketOrder(
+              {
+                tokenID: request.tokenId,
+                amount: request.side === 'BUY' ? notionalUsd : validatedShares,
+                price: validatedPrice,
+                side,
+                feeRateBps: metadata.feeRateBps,
+                orderType: orderTypeValue,
+              },
+              orderOptions,
+              orderTypeValue
+            ),
+      {
+        maxAttempts: 1,
+      }
+    );
 
     if (!response?.success) {
       const message = response?.errorMsg || response?.error || 'Unknown order error';
@@ -275,6 +317,7 @@ export class Trader {
       wasMaker: fillSummary.wasMaker,
       postOnly,
       orderType,
+      ...this.computeCacheMetricsDelta(cacheMetricsBefore),
     };
   }
 
@@ -289,12 +332,12 @@ export class Trader {
     const client = this.clobClient as any;
 
     if (typeof client.cancelAll === 'function') {
-      await client.cancelAll();
+      await this.executeClobCall('cancelAll', () => client.cancelAll());
       return;
     }
 
     if (typeof client.cancelAllOrders === 'function') {
-      await client.cancelAllOrders();
+      await this.executeClobCall('cancelAllOrders', () => client.cancelAllOrders());
       return;
     }
 
@@ -306,7 +349,7 @@ export class Trader {
 
     const client = this.clobClient as any;
     if (typeof client.getOrder === 'function') {
-      return client.getOrder(orderId);
+      return this.executeClobCall('getOrder', () => client.getOrder(orderId));
     }
 
     throw new Error('Authenticated client does not expose getOrder');
@@ -322,7 +365,9 @@ export class Trader {
 
     const client = this.clobClient as any;
     if (typeof client.cancelOrder === 'function') {
-      await client.cancelOrder({ orderID: orderId });
+      await this.executeClobCall('cancelOrder', () =>
+        client.cancelOrder({ orderID: orderId })
+      );
       return;
     }
 
@@ -331,6 +376,67 @@ export class Trader {
 
   getAuthenticatedClient(): ClobClient {
     return this.clobClient;
+  }
+
+  async getApiCredentials(): Promise<ApiCredentials | null> {
+    await this.initialize();
+    return this.apiCreds ?? null;
+  }
+
+  async getOutcomeTokenBalance(
+    tokenId: string,
+    forceRefresh = false
+  ): Promise<number> {
+    await this.initialize();
+
+    if (isDryRunMode(this.runtimeConfig)) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const ctf = new ethers.Contract(
+      this.runtimeConfig.contracts.ctf,
+      this.ctfAbi,
+      this.provider
+    );
+    const owner = this.executionContext.funderAddress;
+    const key = this.buildOutcomeBalanceCacheKey(owner, tokenId);
+    const balance = await this.readCachedBigNumber({
+      cache: this.outcomeBalanceCache,
+      key,
+      forceRefresh,
+      loader: () =>
+        retryWithBackoff(
+          async () => ctf.balanceOf(owner, tokenId),
+          {
+            maxAttempts: 3,
+            baseDelayMs: 250,
+            maxDelayMs: 2_000,
+          }
+        ),
+    });
+
+    return Number.parseFloat(
+      ethers.utils.formatUnits(balance, this.tokenDecimals)
+    );
+  }
+
+  invalidateBalanceValidationCache(): void {
+    this.balanceCache.clear();
+    this.allowanceCache.clear();
+  }
+
+  invalidateOutcomeBalanceCache(tokenId?: string): void {
+    if (!tokenId) {
+      this.outcomeBalanceCache.clear();
+      return;
+    }
+
+    const owner = this.executionContext.funderAddress;
+    this.outcomeBalanceCache.delete(this.buildOutcomeBalanceCacheKey(owner, tokenId));
+  }
+
+  getClobCircuitBreakerSnapshot(): CircuitBreakerSnapshot {
+    return this.clobCircuitBreaker.getSnapshot();
   }
 
   async close(): Promise<void> {
@@ -413,11 +519,15 @@ export class Trader {
       return cached;
     }
 
-    const [tickSizeData, negRisk, feeRateRaw] = await Promise.all([
-      this.clobClient.getTickSize(tokenId).catch(() => ({ minimum_tick_size: '0.01' })),
-      this.clobClient.getNegRisk(tokenId).catch(() => false),
-      this.clobClient.getFeeRateBps(tokenId).catch(() => 0),
-    ]);
+    const [tickSizeData, negRisk, feeRateRaw] = await this.executeClobCall(
+      'getMarketMetadata',
+      async () =>
+        Promise.all([
+          this.clobClient.getTickSize(tokenId).catch(() => ({ minimum_tick_size: '0.01' })),
+          this.clobClient.getNegRisk(tokenId).catch(() => false),
+          this.clobClient.getFeeRateBps(tokenId).catch(() => 0),
+        ])
+    );
 
     const tickSizeStr =
       String((tickSizeData as any)?.minimum_tick_size || tickSizeData || '0.01').trim() || '0.01';
@@ -453,7 +563,7 @@ export class Trader {
 
     const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.signerWallet);
     const ctf = new ethers.Contract(this.runtimeConfig.contracts.ctf, this.ctfAbi, this.signerWallet);
-    const decimals = await usdc.decimals();
+    const decimals = await this.getUsdcDecimals();
     const boundedApprovalUsd = roundTo(
       Math.max(
         (this.runtimeConfig.strategy.maxNetYes + this.runtimeConfig.strategy.maxNetNo) * 1.1,
@@ -475,7 +585,15 @@ export class Trader {
     ];
 
     for (const spender of usdcSpenders) {
-      const allowance = await usdc.allowance(this.executionContext.funderAddress, spender.address);
+      const allowance = await retryWithBackoff(
+        async () =>
+          usdc.allowance(this.executionContext.funderAddress, spender.address),
+        {
+          maxAttempts: 3,
+          baseDelayMs: 250,
+          maxDelayMs: 2_000,
+        }
+      );
       if (allowance.gte(approvalAmount)) {
         continue;
       }
@@ -483,6 +601,7 @@ export class Trader {
       logger.info('Approving USDC.e spender', spender);
       const tx = await usdc.approve(spender.address, approvalAmount, gasOverrides);
       await tx.wait();
+      this.invalidateBalanceValidationCache();
     }
 
     const operators = [
@@ -490,7 +609,15 @@ export class Trader {
       this.runtimeConfig.contracts.negRiskExchange,
     ];
     for (const operator of operators) {
-      const approved = await ctf.isApprovedForAll(this.executionContext.funderAddress, operator);
+      const approved = await retryWithBackoff(
+        async () =>
+          ctf.isApprovedForAll(this.executionContext.funderAddress, operator),
+        {
+          maxAttempts: 3,
+          baseDelayMs: 250,
+          maxDelayMs: 2_000,
+        }
+      );
       if (approved) {
         continue;
       }
@@ -502,38 +629,227 @@ export class Trader {
   }
 
   private async validateBalance(requiredAmount: number, negRisk: boolean): Promise<void> {
-    const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.provider);
-    const decimals = await usdc.decimals();
+    const decimals = await this.getUsdcDecimals();
     const required = ethers.utils.parseUnits(requiredAmount.toFixed(2), decimals);
     const owner = this.executionContext.funderAddress;
     const spender = negRisk
       ? this.runtimeConfig.contracts.negRiskExchange
       : this.runtimeConfig.contracts.exchange;
 
+    await this.validateBalanceSnapshot({
+      owner,
+      spender,
+      required,
+      requiredAmount,
+      decimals,
+      forceRefresh: false,
+    }).catch(async (error) => {
+      if (!isInsufficientBalanceError(error) || this.runtimeConfig.BALANCE_CACHE_TTL_MS <= 0) {
+        throw error;
+      }
+
+      logger.debug('Retrying balance validation with fresh RPC state', {
+        owner,
+        spender,
+        requiredAmount,
+      });
+
+      await this.validateBalanceSnapshot({
+        owner,
+        spender,
+        required,
+        requiredAmount,
+        decimals,
+        forceRefresh: true,
+      });
+    });
+  }
+
+  private async validateBalanceSnapshot(params: {
+    owner: string;
+    spender: string;
+    required: ethers.BigNumber;
+    requiredAmount: number;
+    decimals: number;
+    forceRefresh: boolean;
+  }): Promise<void> {
     const [balance, allowanceToCtf, allowanceToExchange] = await Promise.all([
-      usdc.balanceOf(owner),
-      usdc.allowance(owner, this.runtimeConfig.contracts.ctf),
-      usdc.allowance(owner, spender),
+      this.getUsdcBalance(params.owner, params.forceRefresh),
+      this.getUsdcAllowance(params.owner, this.runtimeConfig.contracts.ctf, params.forceRefresh),
+      this.getUsdcAllowance(params.owner, params.spender, params.forceRefresh),
     ]);
 
-    if (balance.lt(required)) {
+    if (balance.lt(params.required)) {
       throw new Error(
-        `Insufficient USDC.e balance for ${owner}: ${ethers.utils.formatUnits(balance, decimals)} < ${requiredAmount}`
+        `Insufficient USDC.e balance for ${params.owner}: ${ethers.utils.formatUnits(
+          balance,
+          params.decimals
+        )} < ${params.requiredAmount}`
       );
     }
 
-    if (allowanceToCtf.lt(required)) {
+    if (allowanceToCtf.lt(params.required)) {
       throw new Error('USDC.e allowance to CTF is below the required order amount.');
     }
 
-    if (allowanceToExchange.lt(required)) {
-      throw new Error(`USDC.e allowance to ${spender} is below the required order amount.`);
+    if (allowanceToExchange.lt(params.required)) {
+      throw new Error(
+        `USDC.e allowance to ${params.spender} is below the required order amount.`
+      );
     }
   }
 
+  private async getUsdcBalance(owner: string, forceRefresh: boolean): Promise<ethers.BigNumber> {
+    const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.provider);
+    return this.readCachedBigNumber({
+      cache: this.balanceCache,
+      key: `balance:${owner.toLowerCase()}`,
+      forceRefresh,
+      loader: () =>
+        retryWithBackoff(
+          async () => usdc.balanceOf(owner),
+          {
+            maxAttempts: 3,
+            baseDelayMs: 250,
+            maxDelayMs: 2_000,
+          }
+        ),
+    });
+  }
+
+  private async getUsdcAllowance(
+    owner: string,
+    spender: string,
+    forceRefresh: boolean
+  ): Promise<ethers.BigNumber> {
+    const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.provider);
+    return this.readCachedBigNumber({
+      cache: this.allowanceCache,
+      key: `allowance:${owner.toLowerCase()}:${spender.toLowerCase()}`,
+      forceRefresh,
+      loader: () =>
+        retryWithBackoff(
+          async () => usdc.allowance(owner, spender),
+          {
+            maxAttempts: 3,
+            baseDelayMs: 250,
+            maxDelayMs: 2_000,
+          }
+        ),
+    });
+  }
+
+  private async getUsdcDecimals(): Promise<number> {
+    if (!this.usdcDecimalsPromise) {
+      const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.provider);
+      this.usdcDecimalsPromise = retryWithBackoff(
+        async () => Number(await usdc.decimals()),
+        {
+          maxAttempts: 3,
+          baseDelayMs: 250,
+          maxDelayMs: 2_000,
+        }
+      );
+    }
+
+    return this.usdcDecimalsPromise;
+  }
+
+  private async readCachedBigNumber(params: {
+    cache: Map<string, BigNumberCacheEntry>;
+    key: string;
+    forceRefresh: boolean;
+    loader: () => Promise<ethers.BigNumber>;
+  }): Promise<ethers.BigNumber> {
+    const nowMs = Date.now();
+    const ttlMs = this.runtimeConfig.BALANCE_CACHE_TTL_MS;
+    if (!params.forceRefresh && ttlMs > 0) {
+      const cached = params.cache.get(params.key);
+      if (cached && cached.expiresAtMs > nowMs) {
+        this.balanceCacheHits += 1;
+        return cached.value;
+      }
+    }
+
+    this.balanceCacheMisses += 1;
+    const value = await params.loader();
+    if (ttlMs > 0) {
+      params.cache.set(params.key, {
+        value,
+        expiresAtMs: nowMs + ttlMs,
+      });
+    }
+
+    return value;
+  }
+
+  private snapshotCacheMetrics(): CacheMetricsSnapshot {
+    return {
+      hits: this.balanceCacheHits,
+      misses: this.balanceCacheMisses,
+    };
+  }
+
+  private computeCacheMetricsDelta(
+    before: CacheMetricsSnapshot
+  ): Pick<
+    TradeExecutionResult,
+    'balanceCacheHits' | 'balanceCacheMisses' | 'balanceCacheHitRatePct'
+  > {
+    const hits = Math.max(0, this.balanceCacheHits - before.hits);
+    const misses = Math.max(0, this.balanceCacheMisses - before.misses);
+    const total = hits + misses;
+    return {
+      balanceCacheHits: hits,
+      balanceCacheMisses: misses,
+      balanceCacheHitRatePct: total > 0 ? roundTo((hits / total) * 100, 2) : null,
+    };
+  }
+
+  private buildOutcomeBalanceCacheKey(owner: string, tokenId: string): string {
+    return `ctf-balance:${owner.toLowerCase()}:${tokenId}`;
+  }
+
+  private async executeClobCall<T>(
+    operation: string,
+    fn: () => Promise<T>,
+    options: { respectOpenState?: boolean; maxAttempts?: number } = {}
+  ): Promise<T> {
+    return retryWithBackoff(
+      async () => fn(),
+      {
+        maxAttempts: Math.max(
+          1,
+          options.maxAttempts ?? this.runtimeConfig.trading.retryAttempts
+        ),
+        baseDelayMs: 250,
+        maxDelayMs: 2_000,
+        breaker: this.clobCircuitBreaker,
+        respectOpenState: options.respectOpenState ?? false,
+      }
+    ).catch((error) => {
+      logger.warn('CLOB API call failed', {
+        operation,
+        message: error instanceof Error ? error.message : String(error),
+        circuitBreakerOpen: this.clobCircuitBreaker.getSnapshot().isOpen,
+      });
+      throw error;
+    });
+  }
+
   private async getGasOverrides(): Promise<ethers.providers.TransactionRequest> {
-    const feeData = await this.provider.getFeeData();
-    const latestBlock = await this.provider.getBlock('latest');
+    const [feeData, latestBlock] = await retryWithBackoff(
+      async () =>
+        Promise.all([
+          this.provider.getFeeData(),
+          this.provider.getBlock('latest'),
+        ]),
+      {
+        maxAttempts: 3,
+        baseDelayMs: 250,
+        maxDelayMs: 2_000,
+      }
+    );
     const minPriority = ethers.utils.parseUnits('30', 'gwei');
     let maxPriority = feeData.maxPriorityFeePerGas || feeData.gasPrice || minPriority;
     let maxFee = feeData.maxFeePerGas || feeData.gasPrice || ethers.utils.parseUnits('60', 'gwei');
@@ -578,6 +894,19 @@ function normalizeFeeRateBps(raw: unknown): number {
   }
 
   return 0;
+}
+
+function isInsufficientBalanceError(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message.toLowerCase()
+      : String(error ?? '').toLowerCase();
+
+  return (
+    message.includes('insufficient balance') ||
+    message.includes('not enough balance') ||
+    message.includes('allowance')
+  );
 }
 
 function extractFillSummary(params: {

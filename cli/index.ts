@@ -369,6 +369,13 @@ function printStatus(runtimeConfig: AppConfig): void {
         : color.green('OFF')
     }`
   );
+  console.log(
+    `${label('API gate')} ${
+      runtimeStatus
+        ? formatCircuitBreakerGate(runtimeStatus)
+        : color.dim('n/a')
+    }`
+  );
 
   if (runtimeStatus?.lastSlotReport) {
     console.log('');
@@ -560,6 +567,10 @@ function renderPerformance(
         `ON (${runtimeStatus.latencyPauseAverageMs?.toFixed(0) ?? 'n/a'}ms)`
       )
     : color.green('OFF');
+  const apiGate =
+    runtimeStatus && isAnyCircuitBreakerOpen(runtimeStatus)
+      ? color.yellow(formatCircuitBreakerGate(runtimeStatus, false))
+      : color.green('OFF');
   const lastSlotNet = runtimeStatus?.lastSlotReport
     ? formatSignedCurrency(runtimeStatus.lastSlotReport.netPnl)
     : color.dim('n/a');
@@ -575,10 +586,35 @@ function renderPerformance(
       ['Day PnL', formatSignedCurrency(totalDayPnl), 'Drawdown', formatSignedCurrency(drawdown)],
       ['Active slots', color.bold(String(activeSlots)), 'Open positions', color.bold(String(openPositions))],
       ['Avg latency', color.bold(averageLatency), 'Latency gate', latencyGate],
-      ['Manager', color.bold(inspection.manager ?? 'n/a'), 'Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK')],
+      ['API gate', apiGate, 'Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK')],
+      ['Manager', color.bold(inspection.manager ?? 'n/a'), 'Circuit details', runtimeStatus ? color.dim(formatCircuitBreakerGate(runtimeStatus, false)) : color.dim('n/a')],
       ['Last slot', lastSlotNet, 'Slot label', lastSlotLabel],
     ]
   );
+}
+
+function isAnyCircuitBreakerOpen(runtimeStatus: RuntimeStatusSnapshot): boolean {
+  return (
+    runtimeStatus.apiCircuitBreakers.clob.isOpen ||
+    runtimeStatus.apiCircuitBreakers.gamma.isOpen
+  );
+}
+
+function formatCircuitBreakerGate(
+  runtimeStatus: RuntimeStatusSnapshot,
+  colorize = true
+): string {
+  const clob = runtimeStatus.apiCircuitBreakers.clob;
+  const gamma = runtimeStatus.apiCircuitBreakers.gamma;
+  const raw = isAnyCircuitBreakerOpen(runtimeStatus)
+    ? `ON (CLOB=${clob.isOpen ? 'OPEN' : 'OK'}, GAMMA=${gamma.isOpen ? 'OPEN' : 'OK'})`
+    : 'OFF';
+
+  if (!colorize) {
+    return raw;
+  }
+
+  return isAnyCircuitBreakerOpen(runtimeStatus) ? color.yellow(raw) : color.green(raw);
 }
 
 function renderRecentSignals(signals: RuntimeStatusSnapshot['lastSignals']): string {

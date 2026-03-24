@@ -840,3 +840,83 @@ test('extreme buy skips degenerate entry books with negligible ask depth', () =>
     false
   );
 });
+
+test('fair value buy is rejected when spread exceeds the fair-value-specific guard', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.yes.bestBid = 0.34;
+  orderbook.yes.bestAsk = 0.42;
+  orderbook.yes.midPrice = 0.45;
+  orderbook.yes.spread = 0.08;
+  orderbook.yes.lastTradePrice = 0.41;
+  orderbook.no.bestBid = 0.55;
+  orderbook.no.bestAsk = 0.56;
+  orderbook.no.midPrice = 0.55;
+  orderbook.no.lastTradePrice = 0.55;
+
+  const signalEngine = createBinanceFvSignalEngine({
+    FAIR_VALUE_BUY_THRESHOLD: '0.005',
+    MAX_ENTRY_SPREAD: '0.12',
+    MAX_ENTRY_SPREAD_FAIR_VALUE: '0.06',
+  });
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskAssessment = new RiskManager().checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-24T10:02:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    now: new Date('2026-03-24T10:02:00.000Z'),
+  });
+
+  assert.equal(
+    signals.some(
+      (signal) => signal.signalType === 'FAIR_VALUE_BUY' && signal.outcome === 'YES'
+    ),
+    false
+  );
+});
+
+test('extreme buy still passes when spread fits the extreme-specific guard', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.yes.bestBid = 0.02;
+  orderbook.yes.bestAsk = 0.12;
+  orderbook.yes.midPrice = 0.07;
+  orderbook.yes.spread = 0.1;
+  orderbook.yes.lastTradePrice = 0.11;
+
+  const signalEngine = createBinanceFvSignalEngine({
+    EXTREME_BUY_THRESHOLD: '0.20',
+    MAX_ENTRY_SPREAD: '0.12',
+    MAX_ENTRY_SPREAD_EXTREME: '0.15',
+  });
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskAssessment = new RiskManager().checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-24T10:02:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    now: new Date('2026-03-24T10:02:00.000Z'),
+  });
+
+  assert.equal(
+    signals.some(
+      (signal) => signal.signalType === 'EXTREME_BUY' && signal.outcome === 'YES'
+    ),
+    true
+  );
+});

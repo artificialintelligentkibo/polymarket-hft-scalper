@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { ClobClient } from '@polymarket/clob-client';
 import WebSocket from 'ws';
 import { config, type AppConfig } from './config.js';
@@ -60,6 +61,26 @@ type ClobChainId = ConstructorParameters<typeof ClobClient>[1];
 const WS_CONNECT_TIMEOUT_MS = 10_000;
 const WS_RECONNECT_BASE_MS = 1_000;
 const WS_RECONNECT_MAX_MS = 30_000;
+const CLOB_USER_WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/user';
+
+export interface ClobUserChannelCredentials {
+  readonly apiKey: string;
+  readonly secret: string;
+  readonly passphrase: string;
+}
+
+export interface UserTradeFillEvent {
+  readonly tradeId: string;
+  readonly orderId: string;
+  readonly marketId: string;
+  readonly tokenId: string;
+  readonly outcome: Outcome;
+  readonly side: 'BUY' | 'SELL';
+  readonly matchedShares: number;
+  readonly fillPrice: number;
+  readonly status: string | null;
+  readonly matchedAtMs: number;
+}
 
 export class ClobFetcher {
   private readonly client: ClobClient;
@@ -455,6 +476,311 @@ export class ClobFetcher {
   }
 }
 
+export class ClobUserStream extends EventEmitter {
+  private ws: WebSocket | null = null;
+  private connectPromise: Promise<void> | undefined;
+  private pingInterval: NodeJS.Timeout | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempt = 0;
+  private manualClose = false;
+  private isConnected = false;
+  private credentials: ClobUserChannelCredentials | null = null;
+  private readonly subscribedMarkets = new Set<string>();
+
+  constructor(private readonly runtimeConfig: AppConfig = config) {
+    super();
+  }
+
+  async start(credentials: ClobUserChannelCredentials): Promise<void> {
+    this.credentials = credentials;
+    this.manualClose = false;
+    await this.ensureConnected();
+  }
+
+  async syncMarkets(conditionIds: readonly string[]): Promise<void> {
+    const next = new Set(
+      conditionIds
+        .map((conditionId) => conditionId.trim())
+        .filter(Boolean)
+    );
+    const previous = new Set(this.subscribedMarkets);
+
+    for (const marketId of Array.from(this.subscribedMarkets)) {
+      if (!next.has(marketId)) {
+        this.subscribedMarkets.delete(marketId);
+      }
+    }
+    for (const marketId of next) {
+      this.subscribedMarkets.add(marketId);
+    }
+
+    if (this.isConnected) {
+      const added = Array.from(next).filter((marketId) => !previous.has(marketId));
+      const removed = Array.from(previous).filter((marketId) => !next.has(marketId));
+      if (removed.length > 0) {
+        this.sendUserSubscriptionUpdate('unsubscribe', removed);
+      }
+      if (added.length > 0) {
+        this.sendUserSubscriptionUpdate('subscribe', added);
+      }
+      return;
+    }
+
+    if (this.credentials) {
+      await this.ensureConnected();
+    }
+  }
+
+  stop(): void {
+    this.manualClose = true;
+    this.clearReconnectTimer();
+    this.stopPingInterval();
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws.close();
+      this.ws = null;
+    }
+    this.isConnected = false;
+    this.emit('connection', { connected: false });
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.isConnected) {
+      return;
+    }
+    if (!this.credentials) {
+      throw new Error('User stream credentials are not configured');
+    }
+    if (!this.connectPromise) {
+      this.connectPromise = this.connect().finally(() => {
+        this.connectPromise = undefined;
+      });
+    }
+    await this.connectPromise;
+  }
+
+  private async connect(): Promise<void> {
+    this.clearReconnectTimer();
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const ws = new WebSocket(CLOB_USER_WS_URL);
+      this.ws = ws;
+
+      const timeoutId = setTimeout(() => {
+        try {
+          ws.terminate();
+        } catch {
+          ws.close();
+        }
+        finish(new Error('User WebSocket connection timeout'));
+      }, WS_CONNECT_TIMEOUT_MS);
+      timeoutId.unref?.();
+
+      const finish = (error?: Error): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeoutId);
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      };
+
+      ws.on('open', () => {
+        this.isConnected = true;
+        this.reconnectAttempt = 0;
+        this.startPingInterval();
+        this.sendUserSubscription();
+        this.emit('connection', { connected: true });
+        finish();
+      });
+
+      ws.on('message', (payload: WebSocket.Data) => {
+        this.handleUserMessage(normalizeWsData(payload));
+      });
+
+      ws.on('close', (code, reasonBuffer) => {
+        const reason =
+          typeof reasonBuffer === 'string'
+            ? reasonBuffer
+            : reasonBuffer?.toString?.() || 'Unknown reason';
+        const wasConnected = this.isConnected;
+        this.handleUserDisconnect();
+        if (!settled) {
+          finish(new Error(`User WebSocket closed before ready (${code}: ${reason})`));
+          return;
+        }
+
+        if (!this.manualClose && this.credentials) {
+          logger.warn('CLOB user WebSocket closed, scheduling reconnect', {
+            code,
+            reason,
+            wasConnected,
+          });
+          this.scheduleReconnect();
+        }
+      });
+
+      ws.on('error', (error: Error) => {
+        logger.warn('CLOB user WebSocket error', {
+          message: error.message,
+        });
+        if (!settled) {
+          finish(error);
+        }
+      });
+    });
+  }
+
+  private sendUserSubscription(): void {
+    if (!this.ws || !this.isConnected || !this.credentials) {
+      return;
+    }
+
+    try {
+      this.ws.send(
+        JSON.stringify({
+          auth: {
+            apiKey: this.credentials.apiKey,
+            secret: this.credentials.secret,
+            passphrase: this.credentials.passphrase,
+          },
+          markets: Array.from(this.subscribedMarkets),
+          type: 'user',
+        })
+      );
+    } catch (error: any) {
+      logger.warn('CLOB user WebSocket subscription send failed', {
+        message: error?.message || 'Unknown error',
+      });
+      this.handleUserDisconnect();
+      this.scheduleReconnect();
+    }
+  }
+
+  private sendUserSubscriptionUpdate(
+    operation: 'subscribe' | 'unsubscribe',
+    markets: readonly string[]
+  ): void {
+    if (!this.ws || !this.isConnected || markets.length === 0) {
+      return;
+    }
+
+    try {
+      this.ws.send(
+        JSON.stringify({
+          operation,
+          markets: Array.from(markets),
+        })
+      );
+    } catch (error: any) {
+      logger.warn('CLOB user WebSocket subscription update failed', {
+        operation,
+        marketCount: markets.length,
+        message: error?.message || 'Unknown error',
+      });
+      this.handleUserDisconnect();
+      this.scheduleReconnect();
+    }
+  }
+
+  private handleUserMessage(data: string): void {
+    if (!data || data === 'PING') {
+      this.ws?.send('PONG');
+      return;
+    }
+    if (data === 'PONG') {
+      return;
+    }
+
+    try {
+      const payload = JSON.parse(data) as unknown;
+      const messages = Array.isArray(payload) ? payload : [payload];
+      for (const message of messages) {
+        const fills = normalizeUserTradeFillEvents(asRecord(message));
+        if (fills.length > 0) {
+          this.emit('fills', fills);
+        }
+      }
+    } catch (error) {
+      logger.debug('Ignoring malformed CLOB user WebSocket payload', {
+        message: String(error),
+      });
+    }
+  }
+
+  private handleUserDisconnect(): void {
+    this.isConnected = false;
+    this.stopPingInterval();
+    this.emit('connection', { connected: false });
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws = null;
+    }
+  }
+
+  private startPingInterval(): void {
+    if (this.pingInterval) {
+      return;
+    }
+
+    this.pingInterval = setInterval(() => {
+      if (!this.ws || !this.isConnected) {
+        return;
+      }
+
+      try {
+        this.ws.send('PING');
+      } catch (error) {
+        logger.debug('Failed to send user WebSocket ping', {
+          message: String(error),
+        });
+      }
+    }, 10_000);
+    this.pingInterval.unref?.();
+  }
+
+  private stopPingInterval(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.manualClose || !this.credentials || this.reconnectTimer) {
+      return;
+    }
+
+    const delayMs = Math.min(
+      WS_RECONNECT_BASE_MS * 2 ** this.reconnectAttempt,
+      WS_RECONNECT_MAX_MS
+    );
+    this.reconnectAttempt += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.ensureConnected().catch((error: any) => {
+        logger.warn('CLOB user WebSocket reconnect failed', {
+          message: error?.message || 'Unknown error',
+        });
+        this.scheduleReconnect();
+      });
+    }, delayMs);
+    this.reconnectTimer.unref?.();
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+}
+
 export function computeCombinedBookMetrics(
   yes: Pick<TokenBookSnapshot, 'bestBid' | 'bestAsk' | 'midPrice'>,
   no: Pick<TokenBookSnapshot, 'bestBid' | 'bestAsk' | 'midPrice'>
@@ -542,6 +868,167 @@ function createEmptyState(tokenId: string): TokenBookSnapshot {
     source: 'rest',
     updatedAt: new Date().toISOString(),
   };
+}
+
+function normalizeWsData(payload: WebSocket.Data): string {
+  if (typeof payload === 'string') {
+    return payload;
+  }
+  if (Buffer.isBuffer(payload)) {
+    return payload.toString('utf8');
+  }
+  if (Array.isArray(payload)) {
+    return Buffer.concat(
+      payload.map((entry) => (Buffer.isBuffer(entry) ? entry : Buffer.from(entry)))
+    ).toString('utf8');
+  }
+  if (payload instanceof ArrayBuffer) {
+    return Buffer.from(payload).toString('utf8');
+  }
+  if (ArrayBuffer.isView(payload)) {
+    return Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).toString('utf8');
+  }
+
+  return String(payload);
+}
+
+function normalizeUserTradeFillEvents(message: JsonRecord | null): UserTradeFillEvent[] {
+  if (!message) {
+    return [];
+  }
+
+  const eventType = (asString(message.event) || asString(message.type) || '').toLowerCase();
+  if (eventType !== 'trade') {
+    return [];
+  }
+
+  const tradeId = asString(message.id) || asString(message.trade_id) || asString(message.tradeId);
+  const marketId = asString(message.market);
+  const status = asString(message.status)?.toLowerCase() ?? null;
+  const matchedAtMs = normalizeTradeTimestamp(
+    message.match_time ?? message.matchtime ?? message.last_update ?? message.timestamp
+  );
+  const topLevelTokenId =
+    asString(message.asset_id) || asString(message.assetId) || asString(message.token_id);
+  const topLevelOutcome = normalizeOutcomeLabel(
+    asString(message.outcome) || asString(message.token_outcome)
+  );
+  const topLevelSide = normalizeSide(asString(message.side));
+  const price = toFiniteNumberOrNull(message.price);
+  const size = toFiniteNumberOrNull(message.size);
+  const traderSide = (asString(message.trader_side) || '').toUpperCase();
+
+  const fills: UserTradeFillEvent[] = [];
+  if (
+    tradeId &&
+    marketId &&
+    topLevelTokenId &&
+    topLevelOutcome &&
+    topLevelSide &&
+    price !== null &&
+    size !== null &&
+    traderSide !== 'MAKER'
+  ) {
+    fills.push({
+      tradeId,
+      orderId:
+        asString(message.taker_order_id) ||
+        asString(message.order_id) ||
+        asString(message.orderId) ||
+        '',
+      marketId,
+      tokenId: topLevelTokenId,
+      outcome: topLevelOutcome,
+      side: topLevelSide,
+      matchedShares: roundTo(size, 4),
+      fillPrice: roundTo(price, 6),
+      status,
+      matchedAtMs,
+    });
+  }
+
+  const makerOrders = Array.isArray(message.maker_orders) ? message.maker_orders : [];
+  for (const makerOrder of makerOrders) {
+    const record = asRecord(makerOrder);
+    const orderId = asString(record?.order_id) || asString(record?.orderId);
+    const tokenId = asString(record?.asset_id) || asString(record?.assetId) || topLevelTokenId;
+    const outcome = normalizeOutcomeLabel(asString(record?.outcome) || topLevelOutcome);
+    const side = normalizeSide(asString(record?.side)) ?? invertSide(topLevelSide);
+    const matchedShares = toFiniteNumberOrNull(record?.matched_amount ?? record?.size ?? record?.matchedAmount);
+    const makerPrice = toFiniteNumberOrNull(record?.price) ?? price;
+
+    if (!tradeId || !marketId || !orderId || !tokenId || !outcome || !side || makerPrice === null || matchedShares === null) {
+      continue;
+    }
+
+    fills.push({
+      tradeId,
+      orderId,
+      marketId,
+      tokenId,
+      outcome,
+      side,
+      matchedShares: roundTo(matchedShares, 4),
+      fillPrice: roundTo(makerPrice, 6),
+      status,
+      matchedAtMs,
+    });
+  }
+
+  return fills.filter((fill) => fill.orderId && fill.matchedShares > 0);
+}
+
+function normalizeTradeTimestamp(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 10_000_000_000 ? value : value * 1000;
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsedNumber = Number(value);
+    if (Number.isFinite(parsedNumber)) {
+      return parsedNumber > 10_000_000_000 ? parsedNumber : parsedNumber * 1000;
+    }
+    const parsedDate = Date.parse(value);
+    if (Number.isFinite(parsedDate)) {
+      return parsedDate;
+    }
+  }
+
+  return Date.now();
+}
+
+function normalizeOutcomeLabel(value: string | null): Outcome | null {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  if (normalized === 'YES' || normalized === 'UP' || normalized === 'TRUE') {
+    return 'YES';
+  }
+  if (normalized === 'NO' || normalized === 'DOWN' || normalized === 'FALSE') {
+    return 'NO';
+  }
+  return null;
+}
+
+function normalizeSide(value: string | null): 'BUY' | 'SELL' | null {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  if (normalized === 'BUY' || normalized === 'BID') {
+    return 'BUY';
+  }
+  if (normalized === 'SELL' || normalized === 'ASK') {
+    return 'SELL';
+  }
+  return null;
+}
+
+function invertSide(
+  value: 'BUY' | 'SELL' | null
+): 'BUY' | 'SELL' | null {
+  if (value === 'BUY') {
+    return 'SELL';
+  }
+  if (value === 'SELL') {
+    return 'BUY';
+  }
+  return null;
 }
 
 function extractLevels(candidate: unknown, direction: 'asc' | 'desc'): OrderbookLevel[] {

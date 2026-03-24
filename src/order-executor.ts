@@ -1,11 +1,16 @@
 import type { ClobClient } from '@polymarket/clob-client';
+import type { CircuitBreakerSnapshot } from './api-retry.js';
 import { config, type AppConfig, type OrderMode } from './config.js';
 import type { MarketOrderbookSnapshot, OrderbookLevel, TokenBookSnapshot } from './clob-fetcher.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import { resolveProductTestUrgency } from './product-test-mode.js';
 import type { StrategySignal } from './strategy-types.js';
-import { Trader, type TradeExecutionResult } from './trader.js';
+import {
+  Trader,
+  type ApiCredentials,
+  type TradeExecutionResult,
+} from './trader.js';
 import { roundTo, sleep } from './utils.js';
 
 export interface OrderExecutionReport extends TradeExecutionResult {
@@ -106,6 +111,26 @@ export class OrderExecutor {
 
   async cancelOrder(orderId: string): Promise<void> {
     await this.trader.cancelOrder(orderId);
+  }
+
+  async getApiCredentials(): Promise<ApiCredentials | null> {
+    return this.trader.getApiCredentials();
+  }
+
+  async getOutcomeTokenBalance(tokenId: string, forceRefresh = false): Promise<number> {
+    return this.trader.getOutcomeTokenBalance(tokenId, forceRefresh);
+  }
+
+  invalidateBalanceValidationCache(): void {
+    this.trader.invalidateBalanceValidationCache();
+  }
+
+  invalidateOutcomeBalanceCache(tokenId?: string): void {
+    this.trader.invalidateOutcomeBalanceCache(tokenId);
+  }
+
+  getClobCircuitBreakerSnapshot(): CircuitBreakerSnapshot {
+    return this.trader.getClobCircuitBreakerSnapshot();
   }
 
   getAuthenticatedClient(): ClobClient {

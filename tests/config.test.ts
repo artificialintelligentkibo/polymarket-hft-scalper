@@ -53,6 +53,7 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.FILL_POLL_TIMEOUT_MS, 120000);
   assert.equal(candidate.FILL_CANCEL_BEFORE_END_MS, 20000);
   assert.equal(candidate.SELL_AFTER_FILL_DELAY_MS, 8000);
+  assert.equal(candidate.BALANCE_CACHE_TTL_MS, 10000);
   assert.equal(candidate.MARKET_MAKER_MODE, false);
   assert.equal(candidate.DYNAMIC_QUOTING_ENABLED, false);
   assert.equal(candidate.POST_ONLY_ONLY, true);
@@ -86,7 +87,11 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.strategy.binanceFvDecayWindowMs, 300000);
   assert.equal(candidate.strategy.binanceFvDecayMinMultiplier, 0.25);
   assert.equal(candidate.strategy.minEntryDepthUsd, 2);
-  assert.equal(candidate.strategy.maxEntrySpread, 0.3);
+  assert.equal(candidate.strategy.maxEntrySpread, 0.12);
+  assert.equal(candidate.strategy.maxEntrySpreadCombinedDiscount, 0.08);
+  assert.equal(candidate.strategy.maxEntrySpreadExtreme, 0.15);
+  assert.equal(candidate.strategy.maxEntrySpreadFairValue, 0.06);
+  assert.equal(candidate.strategy.maxEntrySpreadRebalance, 0.2);
   assert.equal(candidate.strategy.entryImbalanceBlockThreshold, 100);
   assert.equal(candidate.strategy.latencyPauseThresholdMs, 800);
   assert.equal(candidate.strategy.latencyResumeThresholdMs, 400);
@@ -159,6 +164,15 @@ test('createConfig clamps SELL_AFTER_FILL_DELAY_MS to at least 2 seconds', () =>
   });
 
   assert.equal(candidate.SELL_AFTER_FILL_DELAY_MS, 2000);
+});
+
+test('createConfig clamps BALANCE_CACHE_TTL_MS to zero or above', () => {
+  const candidate = createConfig({
+    ...process.env,
+    BALANCE_CACHE_TTL_MS: '-1',
+  });
+
+  assert.equal(candidate.BALANCE_CACHE_TTL_MS, 0);
 });
 
 test('dynamic quoting requires both MARKET_MAKER_MODE and DYNAMIC_QUOTING_ENABLED', () => {

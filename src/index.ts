@@ -6,7 +6,11 @@ import {
   BinanceDeepIntegration,
   type DeepBinanceAssessment,
 } from './binance-deep-integration.js';
-import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
+import {
+  ClobFetcher,
+  ClobUserStream,
+  type MarketOrderbookSnapshot,
+} from './clob-fetcher.js';
 import {
   config,
   isDryRunMode,
@@ -88,6 +92,7 @@ export interface LatencySample {
 class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
   private readonly fetcher = new ClobFetcher();
+  private readonly userStream = new ClobUserStream();
   private readonly executor = new OrderExecutor();
   private readonly statusMonitor = new StatusMonitor();
   private readonly binanceEdge = new BinanceEdgeProvider();
@@ -114,6 +119,14 @@ class MarketMakerRuntime {
   private readonly printedSlotReports = new Set<string>();
   private readonly pendingLiveOrders = new Map<string, number>();
   private readonly settlementCooldowns = new Map<string, number>();
+  private readonly settlementStartedAt = new Map<string, number>();
+  private readonly settlementAttempts = new Map<string, number>();
+  private userStreamCredentials: {
+    apiKey: string;
+    secret: string;
+    passphrase: string;
+  } | null = null;
+  private userStreamStarted = false;
   private readonly recentSignals: RuntimeSignalSnapshot[] = [];
   private readonly recentLatencySamples: number[] = [];
   private readonly latencyWindow: LatencySample[] = [];
@@ -234,6 +247,13 @@ class MarketMakerRuntime {
       });
     }
     if (!isDryRunMode(config)) {
+      this.userStream.on('fills', (fills) => {
+        this.fillTracker.recordRealtimeFills(fills);
+      });
+      this.userStream.on('connection', ({ connected }) => {
+        this.fillTracker.setRealtimeFeedConnected(Boolean(connected));
+      });
+      this.userStreamCredentials = await this.executor.getApiCredentials();
       this.fillTracker.start();
     }
     this.redeemer.start();
@@ -278,6 +298,7 @@ class MarketMakerRuntime {
 
     logger.info('Graceful shutdown started', { reason });
     this.fillTracker.stop();
+    this.userStream.stop();
 
     try {
       await withTimeout(
@@ -309,6 +330,10 @@ class MarketMakerRuntime {
       });
       this.pendingLiveOrders.clear();
       this.settlementCooldowns.clear();
+      this.settlementStartedAt.clear();
+      this.settlementAttempts.clear();
+      this.userStreamCredentials = null;
+      this.userStreamStarted = false;
       this.redeemer.stop();
       this.quotingEngine.stop();
       this.statusMonitor.stop();
@@ -322,7 +347,7 @@ class MarketMakerRuntime {
     for (const fill of this.fillTracker.drainConfirmedFills()) {
       this.applyConfirmedFill(fill);
     }
-    this.pruneSettlementCooldowns();
+    this.pruneSettlementConfirmationState();
 
     this.consumeControlCommands();
     this.refreshLatencyPauseState();
@@ -359,6 +384,19 @@ class MarketMakerRuntime {
 
     const tokenIds = markets.flatMap((market) => [market.yesTokenId, market.noTokenId]);
     await this.fetcher.subscribeAssets(tokenIds);
+    if (!isDryRunMode(config)) {
+      try {
+        if (!this.userStreamStarted && this.userStreamCredentials) {
+          await this.userStream.start(this.userStreamCredentials);
+          this.userStreamStarted = true;
+        }
+        await this.userStream.syncMarkets(markets.map((market) => market.conditionId));
+      } catch (error: any) {
+        logger.debug('Failed to sync authenticated user stream markets', {
+          message: error?.message || 'Unknown error',
+        });
+      }
+    }
 
     await runWithConcurrency(markets, config.runtime.maxConcurrentMarkets, async (market) => {
       await this.runSerializedMarketTask(market.marketId, async () => {
@@ -393,9 +431,13 @@ class MarketMakerRuntime {
       binanceFairValueAdjustment,
     });
     const statusPausedSignals = this.applyPauseFilter(market, signals);
-    const latencyPausedSignals = this.applyLatencyPauseFilter(
+    const apiGuardSignals = this.applyApiCircuitBreakerFilter(
       market,
       statusPausedSignals
+    );
+    const latencyPausedSignals = this.applyLatencyPauseFilter(
+      market,
+      apiGuardSignals
     );
     const quoteSignals = isDynamicQuotingEnabled(config)
       ? latencyPausedSignals.filter((signal) => isQuotingSignalType(signal.signalType))
@@ -489,28 +531,37 @@ class MarketMakerRuntime {
     }
 
     const nowMs = Date.now();
+    const tokenId = signal.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
     const settlementCooldownKey = getSettlementCooldownKey(market.marketId, signal.outcome);
     const settlementCooldownUntil = this.settlementCooldowns.get(settlementCooldownKey);
-    if (
-      shouldDeferSignalForSettlement({
+    if (signal.action === 'SELL' && signal.signalType !== 'HARD_STOP') {
+      if (
+        shouldDeferSignalForSettlement({
+          signal,
+          cooldownUntilMs: settlementCooldownUntil,
+          nowMs,
+        })
+      ) {
+        logger.debug('SELL deferred: waiting for token settlement after BUY fill', {
+          marketId: market.marketId,
+          signalType: signal.signalType,
+          outcome: signal.outcome,
+          remainingMs: Math.max(0, (settlementCooldownUntil ?? nowMs) - nowMs),
+        });
+        return null;
+      }
+
+      const settlementReady = await this.confirmSettlementForSell({
+        market,
         signal,
-        cooldownUntilMs: settlementCooldownUntil,
+        tokenId,
         nowMs,
-      })
-    ) {
-      logger.debug('SELL deferred: waiting for token settlement after BUY fill', {
-        marketId: market.marketId,
-        signalType: signal.signalType,
-        outcome: signal.outcome,
-        remainingMs: Math.max(0, (settlementCooldownUntil ?? nowMs) - nowMs),
       });
-      return null;
-    }
-    if (settlementCooldownUntil && nowMs >= settlementCooldownUntil) {
-      this.settlementCooldowns.delete(settlementCooldownKey);
+      if (!settlementReady) {
+        return null;
+      }
     }
 
-    const tokenId = signal.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
     const book = signal.outcome === 'YES' ? orderbook.yes : orderbook.no;
     const beforeSnapshot = positionManager.getSnapshot();
     const startedAt = Date.now();
@@ -594,7 +645,13 @@ class MarketMakerRuntime {
     }
     const completedAt = Date.now();
     if (effectiveShares > 0 && signal.action === 'BUY') {
-      this.setSettlementCooldown(market.marketId, signal.outcome, completedAt);
+      this.armSettlementConfirmation(market.marketId, signal.outcome, completedAt);
+      this.executor.invalidateOutcomeBalanceCache(tokenId);
+      this.executor.invalidateBalanceValidationCache();
+    } else if (effectiveShares > 0 && signal.action === 'SELL') {
+      this.clearSettlementConfirmation(market.marketId, signal.outcome);
+      this.executor.invalidateOutcomeBalanceCache(tokenId);
+      this.executor.invalidateBalanceValidationCache();
     }
     if (effectiveShares > 0 && signal.signalType === 'HARD_STOP' && signal.action === 'SELL') {
       positionManager.setEntryCooldown(
@@ -636,6 +693,9 @@ class MarketMakerRuntime {
       latencyRoundTripMs,
       binanceEdge: binanceAssessment?.available,
       binanceMovePct: binanceAssessment?.available ? binanceAssessment.binanceMovePct : undefined,
+      balanceCacheHits: execution.balanceCacheHits,
+      balanceCacheMisses: execution.balanceCacheMisses,
+      balanceCacheHitRatePct: execution.balanceCacheHitRatePct,
       simulationMode: execution.simulation,
       dryRun: isDryRunMode(config),
       testMode: config.TEST_MODE,
@@ -774,7 +834,13 @@ class MarketMakerRuntime {
       orderId: fill.orderId,
     });
     if (fill.side === 'BUY') {
-      this.setSettlementCooldown(fill.marketId, fill.outcome, fill.filledAt);
+      this.armSettlementConfirmation(fill.marketId, fill.outcome, fill.filledAt);
+      this.executor.invalidateOutcomeBalanceCache(fill.tokenId);
+      this.executor.invalidateBalanceValidationCache();
+    } else {
+      this.clearSettlementConfirmation(fill.marketId, fill.outcome);
+      this.executor.invalidateOutcomeBalanceCache(fill.tokenId);
+      this.executor.invalidateBalanceValidationCache();
     }
     const notionalUsd = roundTo(fill.filledShares * fill.fillPrice, 2);
     const pendingOrderKey = this.getPendingOrderKey(fill.marketId, fill.outcome);
@@ -957,6 +1023,18 @@ class MarketMakerRuntime {
     this.refreshLatencyPauseState();
   }
 
+  private getApiCircuitBreakers() {
+    return {
+      clob: this.executor.getClobCircuitBreakerSnapshot(),
+      gamma: this.monitor.getGammaCircuitBreakerSnapshot(),
+    };
+  }
+
+  private isApiEntryGateOpen(): boolean {
+    const snapshots = this.getApiCircuitBreakers();
+    return snapshots.clob.isOpen || snapshots.gamma.isOpen;
+  }
+
   private syncRuntimeStatus(overrides: Parameters<typeof writeRuntimeStatus>[0]): void {
     const openPositions = this.buildRuntimePositionSnapshots();
     writeRuntimeStatus(
@@ -973,6 +1051,7 @@ class MarketMakerRuntime {
         averageLatencyMs: this.getAverageLatencyMs(),
         latencyPaused: this.latencyPaused,
         latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
+        apiCircuitBreakers: this.getApiCircuitBreakers(),
         activeMarkets: this.buildRuntimeMarketSnapshots(),
         openPositions,
         openPositionsCount: openPositions.length,
@@ -1018,28 +1097,96 @@ class MarketMakerRuntime {
     return `${marketId}:${outcome}`;
   }
 
-  private setSettlementCooldown(
+  private armSettlementConfirmation(
     marketId: string,
     outcome: StrategySignal['outcome'],
     baseTimeMs: number
   ): void {
-    const cooldownUntilMs = baseTimeMs + config.SELL_AFTER_FILL_DELAY_MS;
-    this.settlementCooldowns.set(
-      getSettlementCooldownKey(marketId, outcome),
-      cooldownUntilMs
-    );
-    logger.debug('Settlement cooldown set after BUY fill', {
+    const key = getSettlementCooldownKey(marketId, outcome);
+    this.settlementCooldowns.set(key, baseTimeMs);
+    this.settlementStartedAt.set(key, baseTimeMs);
+    this.settlementAttempts.set(key, 0);
+    logger.debug('Settlement confirmation armed after BUY fill', {
       marketId,
       outcome,
-      cooldownUntil: new Date(cooldownUntilMs).toISOString(),
+      tokenSettlementCheckAt: new Date(baseTimeMs).toISOString(),
     });
   }
 
-  private pruneSettlementCooldowns(nowMs = Date.now()): void {
-    const next = pruneExpiredSettlementCooldowns(this.settlementCooldowns, nowMs);
-    this.settlementCooldowns.clear();
-    for (const [key, value] of next.entries()) {
-      this.settlementCooldowns.set(key, value);
+  private clearSettlementConfirmation(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): void {
+    const key = getSettlementCooldownKey(marketId, outcome);
+    this.settlementCooldowns.delete(key);
+    this.settlementStartedAt.delete(key);
+    this.settlementAttempts.delete(key);
+  }
+
+  private async confirmSettlementForSell(params: {
+    market: MarketCandidate;
+    signal: StrategySignal;
+    tokenId: string;
+    nowMs: number;
+  }): Promise<boolean> {
+    const key = getSettlementCooldownKey(params.market.marketId, params.signal.outcome);
+    if (!this.settlementStartedAt.has(key)) {
+      return true;
+    }
+
+    const requiredShares = getRequiredSettledShares(params.signal.shares);
+    let latestBalance = 0;
+    let attempts = this.settlementAttempts.get(key) ?? 0;
+
+    for (let index = 0; index < 3; index += 1) {
+      const forceRefresh = index > 0;
+      latestBalance = await this.executor.getOutcomeTokenBalance(params.tokenId, forceRefresh);
+      attempts += 1;
+      if (hasSettledOutcomeBalance(latestBalance, params.signal.shares)) {
+        const startedAtMs = this.settlementStartedAt.get(key) ?? params.nowMs;
+        const delayMs = Math.max(0, Date.now() - startedAtMs);
+        this.clearSettlementConfirmation(params.market.marketId, params.signal.outcome);
+        logger.info('Token settlement confirmed after BUY fill', {
+          marketId: params.market.marketId,
+          outcome: params.signal.outcome,
+          requiredShares,
+          availableShares: roundTo(latestBalance, 4),
+          attempts,
+          settlementDelayMs: delayMs,
+        });
+        return true;
+      }
+
+      if (index < 2) {
+        await sleep(1_000);
+      }
+    }
+
+    const nextCheckAtMs = Date.now() + 1_000;
+    this.settlementCooldowns.set(key, nextCheckAtMs);
+    this.settlementAttempts.set(key, attempts);
+    logger.debug('SELL deferred: waiting for settled token balance after BUY fill', {
+      marketId: params.market.marketId,
+      signalType: params.signal.signalType,
+      outcome: params.signal.outcome,
+      requiredShares,
+      availableShares: roundTo(latestBalance, 4),
+      attempts,
+      nextCheckAt: new Date(nextCheckAtMs).toISOString(),
+    });
+    return false;
+  }
+
+  private pruneSettlementConfirmationState(nowMs = Date.now()): void {
+    const maxAgeMs = Math.max(config.FILL_POLL_TIMEOUT_MS, 5 * 60_000);
+    for (const [key, startedAtMs] of Array.from(this.settlementStartedAt.entries())) {
+      if (!Number.isFinite(startedAtMs) || nowMs - startedAtMs <= maxAgeMs) {
+        continue;
+      }
+
+      this.settlementStartedAt.delete(key);
+      this.settlementAttempts.delete(key);
+      this.settlementCooldowns.delete(key);
     }
   }
 
@@ -1247,6 +1394,28 @@ class MarketMakerRuntime {
         remaining: allowed.length,
         blocked: signals.length - allowed.length,
         avgLatencyMs: this.getLatencyPauseAverageMs(),
+      });
+    }
+
+    return allowed;
+  }
+
+  private applyApiCircuitBreakerFilter(
+    market: MarketCandidate,
+    signals: StrategySignal[]
+  ): StrategySignal[] {
+    if (!this.isApiEntryGateOpen()) {
+      return signals;
+    }
+
+    const allowed = filterSignalsForLatencyPause(signals, true);
+    if (allowed.length < signals.length) {
+      logger.warn('API circuit breaker filtered new entry signals', {
+        marketId: market.marketId,
+        original: signals.length,
+        remaining: allowed.length,
+        blocked: signals.length - allowed.length,
+        circuitBreakers: this.getApiCircuitBreakers(),
       });
     }
 
@@ -1753,6 +1922,17 @@ export function shouldDeferSignalForSettlement(params: {
   }
 
   return params.cooldownUntilMs !== undefined && params.nowMs < params.cooldownUntilMs;
+}
+
+export function getRequiredSettledShares(requestedShares: number): number {
+  return Math.max(0.01, roundTo(requestedShares * 0.99, 4));
+}
+
+export function hasSettledOutcomeBalance(
+  availableShares: number,
+  requestedShares: number
+): boolean {
+  return availableShares >= getRequiredSettledShares(requestedShares);
 }
 
 export function pruneExpiredSettlementCooldowns(

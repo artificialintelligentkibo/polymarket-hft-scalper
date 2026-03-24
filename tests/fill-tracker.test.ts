@@ -62,44 +62,84 @@ test('normalizeTrackedOrderStatus parses order fill fields from multiple respons
   });
 });
 
-test('FillTracker emits only fill deltas and keeps partially filled orders pending', async () => {
+test('FillTracker confirms fills immediately from realtime WS events', () => {
+  const tracker = new FillTracker(
+    {
+      getOrderStatus: async () => ({ status: 'open', sizeMatched: '0' }),
+      cancelOrder: async () => undefined,
+    },
+    createFillTrackerConfig(),
+    { now: () => 20_000 }
+  );
+
+  tracker.setRealtimeFeedConnected(true);
+  tracker.registerPendingOrder(createPendingOrder());
+  tracker.recordRealtimeFills([
+    {
+      tradeId: 'trade-1',
+      orderId: 'order-1',
+      marketId: 'market-1',
+      tokenId: 'token-1',
+      outcome: 'YES',
+      side: 'BUY',
+      matchedShares: 2.5,
+      fillPrice: 0.44,
+      status: 'matched',
+      matchedAtMs: 20_100,
+    },
+  ]);
+
+  const fills = tracker.drainConfirmedFills();
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].filledShares, 2.5);
+  assert.equal(fills[0].fillPrice, 0.44);
+  assert.equal(tracker.hasPendingOrderFor('market-1', 'YES'), true);
+});
+
+test('FillTracker falls back to REST polling only when realtime feed is unavailable', async () => {
   let nowMs = 20_000;
   let statusPayload: unknown = {
     status: 'open',
     sizeMatched: '2.5',
     avgPrice: '0.44',
   };
+  let pollCount = 0;
 
   const tracker = new FillTracker(
     {
-      getOrderStatus: async () => statusPayload,
+      getOrderStatus: async () => {
+        pollCount += 1;
+        return statusPayload;
+      },
       cancelOrder: async () => undefined,
     },
     createFillTrackerConfig(),
     { now: () => nowMs }
   );
 
+  tracker.setRealtimeFeedConnected(false);
   tracker.registerPendingOrder(createPendingOrder());
 
   await tracker.pollAllPending();
-  const firstDrain = tracker.drainConfirmedFills();
-  assert.equal(firstDrain.length, 1);
-  assert.equal(firstDrain[0].filledShares, 2.5);
-  assert.equal(firstDrain[0].fillPrice, 0.44);
-  assert.equal(tracker.hasPendingOrderFor('market-1', 'YES'), true);
+  assert.equal(pollCount, 1);
+  assert.equal(tracker.drainConfirmedFills().length, 1);
 
-  nowMs = 25_000;
+  nowMs = 24_000;
+  await tracker.pollAllPending();
+  assert.equal(pollCount, 1);
+
+  nowMs = 31_500;
   statusPayload = {
     status: 'filled',
     sizeMatched: '4.0',
     avgPrice: '0.45',
   };
-
   await tracker.pollAllPending();
+  assert.equal(pollCount, 2);
+
   const secondDrain = tracker.drainConfirmedFills();
   assert.equal(secondDrain.length, 1);
   assert.equal(secondDrain[0].filledShares, 1.5);
-  assert.equal(secondDrain[0].fillPrice, 0.45);
   assert.equal(tracker.hasPendingOrderFor('market-1', 'YES'), false);
 });
 

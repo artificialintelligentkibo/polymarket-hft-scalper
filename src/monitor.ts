@@ -1,4 +1,9 @@
 import { EventEmitter } from 'node:events';
+import {
+  CircuitBreaker,
+  type CircuitBreakerSnapshot,
+  retryWithBackoff,
+} from './api-retry.js';
 import { config, type AppConfig, type TradeableCoin } from './config.js';
 import { logger } from './logger.js';
 import {
@@ -109,6 +114,11 @@ const COIN_PATTERNS: Record<TradeableCoin, RegExp> = {
 export class MarketMonitor extends EventEmitter {
   private readonly seenSlots = new Map<string, MarketCandidate>();
   private readonly reportedSlots = new Set<string>();
+  private readonly gammaCircuitBreaker = new CircuitBreaker({
+    name: 'gamma',
+    failureThreshold: 5,
+    resetTimeoutMs: 30_000,
+  });
 
   constructor(
     private readonly runtimeConfig: AppConfig = config,
@@ -125,6 +135,7 @@ export class MarketMonitor extends EventEmitter {
         gammaUrl: this.runtimeConfig.clob.gammaUrl,
         marketQueryLimit: this.runtimeConfig.runtime.marketQueryLimit,
         fetchImpl: this.fetchImpl,
+        breaker: this.gammaCircuitBreaker,
       });
     } catch (error: any) {
       logger.warn('Could not fetch active Gamma events for market discovery', {
@@ -229,6 +240,10 @@ export class MarketMonitor extends EventEmitter {
     return eligible;
   }
 
+  getGammaCircuitBreakerSnapshot(): CircuitBreakerSnapshot {
+    return this.gammaCircuitBreaker.getSnapshot();
+  }
+
   private emitSlotEndedEvents(candidates: MarketCandidate[]): void {
     const activeKeys = new Set<string>();
 
@@ -279,6 +294,7 @@ export async function fetchPaginatedGammaEventMarkets(params: {
   gammaUrl: string;
   marketQueryLimit: number;
   fetchImpl?: FetchLike;
+  breaker?: CircuitBreaker;
 }): Promise<GammaEventFetchResult> {
   const fetchImpl = params.fetchImpl ?? fetch;
   const targetMarketCount = Math.max(
@@ -301,6 +317,7 @@ export async function fetchPaginatedGammaEventMarkets(params: {
       limit: GAMMA_EVENT_PAGE_LIMIT,
       offset,
       fetchImpl,
+      breaker: params.breaker,
     });
 
     if (page.length === 0) {
@@ -344,6 +361,7 @@ export async function fetchGammaEventsPage(params: {
   offset: number;
   fetchImpl?: FetchLike;
   requestTimeoutMs?: number;
+  breaker?: CircuitBreaker;
 }): Promise<JsonRecord[]> {
   const fetchImpl = params.fetchImpl ?? fetch;
   const requestTimeoutMs = params.requestTimeoutMs ?? GAMMA_REQUEST_TIMEOUT_MS;
@@ -364,48 +382,71 @@ export async function fetchGammaEventsPage(params: {
       url.searchParams.set('ascending', 'true');
     }
 
-    const response = await fetchWithTimeout(
-      fetchImpl,
-      url,
-      {
-        method: 'GET',
-        headers: {
-          accept: 'application/json',
-        },
-      },
-      requestTimeoutMs
-    );
+    try {
+      const payload = await retryWithBackoff(
+        async () => {
+          const response = await fetchWithTimeout(
+            fetchImpl,
+            url,
+            {
+              method: 'GET',
+              headers: {
+                accept: 'application/json',
+              },
+            },
+            requestTimeoutMs
+          );
 
-    if (!response.ok) {
-      const errorText = await safeReadResponseText(response);
+          if (!response.ok) {
+            const errorText = await safeReadResponseText(response);
+            const error = new Error(
+              `Gamma events API returned ${response.status}${errorText ? `: ${errorText}` : ''}`
+            ) as Error & { status?: number };
+            error.status = response.status;
+            throw error;
+          }
+
+          return (await response.json()) as unknown;
+        },
+        {
+          maxAttempts: 3,
+          baseDelayMs: 250,
+          maxDelayMs: 2_000,
+          breaker: params.breaker,
+          respectOpenState: false,
+        }
+      );
+
+      preferredGammaOrderField = orderField;
+      if (Array.isArray(payload)) {
+        return payload.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
+      }
+
+      const record = asRecord(payload);
+      const events = Array.isArray(record?.events) ? record.events : [];
+      return events.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status =
+        error && typeof error === 'object' && 'status' in error
+          ? Number((error as { status?: number }).status)
+          : Number.NaN;
       const isOrderValidationError =
-        response.status === 400 &&
-        /order fields are not valid/i.test(errorText);
+        status === 400 &&
+        /order fields are not valid/i.test(message);
 
       if (isOrderValidationError && orderField) {
         if (preferredGammaOrderField === orderField) {
           preferredGammaOrderField = undefined;
         }
         lastError = new Error(
-          `Gamma events API rejected order field "${orderField}": ${errorText}`
+          `Gamma events API rejected order field "${orderField}": ${message}`
         );
         continue;
       }
 
-      throw new Error(
-        `Gamma events API returned ${response.status}${errorText ? `: ${errorText}` : ''}`
-      );
+      throw error;
     }
-
-    const payload = (await response.json()) as unknown;
-    preferredGammaOrderField = orderField;
-    if (Array.isArray(payload)) {
-      return payload.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
-    }
-
-    const record = asRecord(payload);
-    const events = Array.isArray(record?.events) ? record.events : [];
-    return events.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
   }
 
   if (lastError) {

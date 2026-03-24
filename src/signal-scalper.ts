@@ -35,6 +35,13 @@ interface InventoryRebalanceBlockState {
   expiresAtMs: number;
 }
 
+interface EntryGuardEvaluation {
+  multiplier: number;
+  reason: 'ok' | 'missing_entry_ask' | 'spread_too_wide';
+  spread: number | null;
+  spreadThreshold: number;
+}
+
 export class SignalScalper {
   private readonly fairValueBuyCadence = new Map<string, FairValueBuyCadenceState>();
   private readonly inventoryRebalanceBlocks = new Map<string, InventoryRebalanceBlockState>();
@@ -168,8 +175,13 @@ export class SignalScalper {
       }
       const bestAsk = book.bestAsk;
       const fairValue = estimateFairValue(orderbook, outcome);
-      const entryGuardMultiplier = resolveEntryGuardMultiplier(book, this.runtimeConfig);
-      if (entryGuardMultiplier <= 0) {
+      const entryGuard = resolveEntryGuardMultiplier(
+        book,
+        'COMBINED_DISCOUNT_BUY_BOTH',
+        this.runtimeConfig
+      );
+      if (entryGuard.multiplier <= 0) {
+        logEntryGuardRejection(market, outcome, 'COMBINED_DISCOUNT_BUY_BOTH', entryGuard);
         continue;
       }
 
@@ -183,7 +195,7 @@ export class SignalScalper {
         price: bestAsk,
         referenceEdge: strategy.minCombinedDiscount,
         runtimeConfig: this.runtimeConfig,
-        entryGuardMultiplier,
+        entryGuardMultiplier: entryGuard.multiplier,
       });
 
       if (size.shares < strategy.minShares) {
@@ -237,8 +249,9 @@ export class SignalScalper {
         hasValidEntryAsk(book)
       ) {
         const bestAsk = book.bestAsk;
-        const entryGuardMultiplier = resolveEntryGuardMultiplier(book, this.runtimeConfig);
-        if (entryGuardMultiplier <= 0) {
+        const entryGuard = resolveEntryGuardMultiplier(book, 'EXTREME_BUY', this.runtimeConfig);
+        if (entryGuard.multiplier <= 0) {
+          logEntryGuardRejection(market, outcome, 'EXTREME_BUY', entryGuard);
           continue;
         }
         const edge = strategy.extremeBuyThreshold - bestAsk;
@@ -253,7 +266,7 @@ export class SignalScalper {
             price: bestAsk,
             referenceEdge: strategy.extremeBuyThreshold,
             runtimeConfig: this.runtimeConfig,
-            entryGuardMultiplier,
+            entryGuardMultiplier: entryGuard.multiplier,
           });
 
           if (size.shares >= strategy.minShares) {
@@ -381,8 +394,9 @@ export class SignalScalper {
           strategy.fairValueBuyThreshold,
           bestAsk
         );
-        const entryGuardMultiplier = resolveEntryGuardMultiplier(book, this.runtimeConfig);
-        if (entryGuardMultiplier <= 0) {
+        const entryGuard = resolveEntryGuardMultiplier(book, 'FAIR_VALUE_BUY', this.runtimeConfig);
+        if (entryGuard.multiplier <= 0) {
+          logEntryGuardRejection(market, outcome, 'FAIR_VALUE_BUY', entryGuard);
           continue;
         }
         const buyEdge = fairValue - bestAsk;
@@ -397,7 +411,7 @@ export class SignalScalper {
             price: bestAsk,
             referenceEdge: adaptedBuyThreshold,
             runtimeConfig: this.runtimeConfig,
-            entryGuardMultiplier,
+            entryGuardMultiplier: entryGuard.multiplier,
           });
 
           if (size.shares >= strategy.minShares) {
@@ -500,6 +514,15 @@ export class SignalScalper {
     if (bestBid === null) {
       return [];
     }
+    const entryGuard = resolveEntryGuardMultiplier(
+      book,
+      'INVENTORY_REBALANCE',
+      this.runtimeConfig
+    );
+    if (entryGuard.multiplier <= 0) {
+      logEntryGuardRejection(market, outcome, 'INVENTORY_REBALANCE', entryGuard);
+      return [];
+    }
 
     const size = calculateTradeSize({
       action: 'SELL',
@@ -515,6 +538,7 @@ export class SignalScalper {
       referenceEdge: strategy.inventoryImbalanceThreshold,
       runtimeConfig: this.runtimeConfig,
       allowBelowMin: true,
+      entryGuardMultiplier: entryGuard.multiplier,
     });
 
     if (size.shares <= 0) {
@@ -958,14 +982,23 @@ function hasValidEntryAsk(
 
 function resolveEntryGuardMultiplier(
   book: TokenBookSnapshot,
+  signalType: StrategySignal['signalType'],
   runtimeConfig: AppConfig
-): number {
+): EntryGuardEvaluation {
   if (!hasValidEntryAsk(book)) {
-    return 0;
+    return {
+      multiplier: 0,
+      reason: 'missing_entry_ask',
+      spread: null,
+      spreadThreshold: resolveSpreadThresholdForSignalType(signalType, runtimeConfig),
+    };
   }
 
   const depthThreshold = Math.max(runtimeConfig.strategy.minEntryDepthUsd, 0);
-  const spreadThreshold = Math.max(runtimeConfig.strategy.maxEntrySpread, 0.000001);
+  const spreadThreshold = Math.max(
+    resolveSpreadThresholdForSignalType(signalType, runtimeConfig),
+    0.000001
+  );
   const depth = Math.max(0, book.depthNotionalAsk);
   const spread =
     book.spread ??
@@ -992,10 +1025,56 @@ function resolveEntryGuardMultiplier(
           : spread <= spreadThreshold * 1.5
             ? 0.5
             : spread <= spreadThreshold * 2
-              ? 0.25
-              : 0;
+            ? 0.25
+            : 0;
 
-  return Math.min(depthMultiplier, spreadMultiplier);
+  return {
+    multiplier: Math.min(depthMultiplier, spreadMultiplier),
+    reason: spreadMultiplier <= 0 ? 'spread_too_wide' : 'ok',
+    spread,
+    spreadThreshold,
+  };
+}
+
+function resolveSpreadThresholdForSignalType(
+  signalType: StrategySignal['signalType'],
+  runtimeConfig: AppConfig
+): number {
+  switch (signalType) {
+    case 'COMBINED_DISCOUNT_BUY_BOTH':
+      return runtimeConfig.strategy.maxEntrySpreadCombinedDiscount;
+    case 'EXTREME_BUY':
+    case 'EXTREME_SELL':
+      return runtimeConfig.strategy.maxEntrySpreadExtreme;
+    case 'FAIR_VALUE_BUY':
+    case 'FAIR_VALUE_SELL':
+      return runtimeConfig.strategy.maxEntrySpreadFairValue;
+    case 'INVENTORY_REBALANCE':
+    case 'INVENTORY_REBALANCE_QUOTE':
+      return runtimeConfig.strategy.maxEntrySpreadRebalance;
+    default:
+      return runtimeConfig.strategy.maxEntrySpread;
+  }
+}
+
+function logEntryGuardRejection(
+  market: Pick<MarketCandidate, 'marketId'>,
+  outcome: Outcome,
+  signalType: StrategySignal['signalType'],
+  entryGuard: EntryGuardEvaluation
+): void {
+  if (entryGuard.reason !== 'spread_too_wide') {
+    return;
+  }
+
+  logger.debug('Entry rejected by spread guard', {
+    marketId: market.marketId,
+    outcome,
+    signalType,
+    reason: 'spread_too_wide',
+    spread: entryGuard.spread,
+    spreadThreshold: entryGuard.spreadThreshold,
+  });
 }
 
 function estimateLegacyFairValue(

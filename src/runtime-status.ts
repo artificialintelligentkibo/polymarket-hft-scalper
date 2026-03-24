@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import type { CircuitBreakerSnapshot } from './api-retry.js';
 import { config, isDryRunMode, type AppConfig } from './config.js';
 import { getDayPnlState } from './day-pnl-state.js';
 import { roundTo } from './utils.js';
@@ -72,6 +73,10 @@ export interface RuntimeStatusSnapshot {
   readonly openPositionsCount: number;
   readonly latencyPaused: boolean;
   readonly latencyPauseAverageMs: number | null;
+  readonly apiCircuitBreakers: {
+    readonly clob: CircuitBreakerSnapshot;
+    readonly gamma: CircuitBreakerSnapshot;
+  };
   readonly totalDayPnl: number;
   readonly dayDrawdown: number;
   readonly averageLatencyMs: number | null;
@@ -115,6 +120,10 @@ export function createRuntimeStatusSnapshot(
     openPositionsCount: 0,
     latencyPaused: false,
     latencyPauseAverageMs: null,
+    apiCircuitBreakers: {
+      clob: createDefaultCircuitBreakerSnapshot('clob'),
+      gamma: createDefaultCircuitBreakerSnapshot('gamma'),
+    },
     totalDayPnl: dayState.dayPnl,
     dayDrawdown: dayState.drawdown,
     averageLatencyMs: null,
@@ -212,6 +221,7 @@ function normalizeRuntimeStatus(
     ),
     latencyPaused: Boolean(value.latencyPaused),
     latencyPauseAverageMs: normalizeNullableNumber(value.latencyPauseAverageMs),
+    apiCircuitBreakers: normalizeCircuitBreakers(value.apiCircuitBreakers),
     totalDayPnl: normalizeNumber(value.totalDayPnl, dayState.dayPnl),
     dayDrawdown: normalizeNumber(value.dayDrawdown, dayState.drawdown),
     averageLatencyMs: normalizeNullableNumber(value.averageLatencyMs),
@@ -224,6 +234,47 @@ function normalizeRuntimeStatus(
           .slice(-3)
       : [],
     lastSlotReport: normalizeRuntimeSlot(value.lastSlotReport),
+  };
+}
+
+function normalizeCircuitBreakers(
+  value: unknown
+): RuntimeStatusSnapshot['apiCircuitBreakers'] {
+  const record = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  return {
+    clob: normalizeCircuitBreakerSnapshot(record.clob, 'clob'),
+    gamma: normalizeCircuitBreakerSnapshot(record.gamma, 'gamma'),
+  };
+}
+
+function normalizeCircuitBreakerSnapshot(
+  value: unknown,
+  name: string
+): CircuitBreakerSnapshot {
+  const record = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  return {
+    name:
+      typeof record.name === 'string' && record.name.trim()
+        ? record.name
+        : name,
+    isOpen: Boolean(record.isOpen),
+    consecutiveFailures: normalizeCount(record.consecutiveFailures),
+    failureThreshold: Math.max(1, normalizeCount(record.failureThreshold) || 5),
+    resetTimeoutMs: Math.max(1_000, normalizeCount(record.resetTimeoutMs) || 30_000),
+    openedAtMs: normalizeNullableInteger(record.openedAtMs),
+    nextAttemptAtMs: normalizeNullableInteger(record.nextAttemptAtMs),
+  };
+}
+
+function createDefaultCircuitBreakerSnapshot(name: string): CircuitBreakerSnapshot {
+  return {
+    name,
+    isOpen: false,
+    consecutiveFailures: 0,
+    failureThreshold: 5,
+    resetTimeoutMs: 30_000,
+    openedAtMs: null,
+    nextAttemptAtMs: null,
   };
 }
 
@@ -385,4 +436,17 @@ function normalizeCount(value: unknown): number {
   }
 
   return 0;
+}
+
+function normalizeNullableInteger(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
 }

@@ -30,6 +30,7 @@ export interface AppConfig {
   readonly FILL_POLL_TIMEOUT_MS: number;
   readonly FILL_CANCEL_BEFORE_END_MS: number;
   readonly SELL_AFTER_FILL_DELAY_MS: number;
+  readonly BALANCE_CACHE_TTL_MS: number;
   /**
    * Enables the 2026 market-maker overlay while preserving the legacy scalper.
    * Recommended production default (2026): false until quoting has been
@@ -197,6 +198,10 @@ export interface AppConfig {
     readonly capitalReferenceShares: number;
     readonly minEntryDepthUsd: number;
     readonly maxEntrySpread: number;
+    readonly maxEntrySpreadCombinedDiscount: number;
+    readonly maxEntrySpreadExtreme: number;
+    readonly maxEntrySpreadFairValue: number;
+    readonly maxEntrySpreadRebalance: number;
     readonly entryImbalanceBlockThreshold: number;
     readonly latencyPauseThresholdMs: number;
     readonly latencyResumeThresholdMs: number;
@@ -424,6 +429,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       2_000,
       parseIntOrDefault(env.SELL_AFTER_FILL_DELAY_MS, '8000')
     ),
+    BALANCE_CACHE_TTL_MS: Math.max(
+      0,
+      parseIntOrDefault(env.BALANCE_CACHE_TTL_MS, '10000')
+    ),
     MARKET_MAKER_MODE: parseBoolean(env.MARKET_MAKER_MODE, false),
     DYNAMIC_QUOTING_ENABLED: parseBoolean(env.DYNAMIC_QUOTING_ENABLED, false),
     POST_ONLY_ONLY: parseBoolean(env.POST_ONLY_ONLY, true),
@@ -579,7 +588,14 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       depthReferenceShares: parseFloatOrDefault(env.DEPTH_REFERENCE_SHARES, '180'),
       capitalReferenceShares: parseFloatOrDefault(env.CAPITAL_REFERENCE_SHARES, '120'),
       minEntryDepthUsd: parseFloatOrDefault(env.MIN_ENTRY_DEPTH_USD, '2'),
-      maxEntrySpread: parseFloatOrDefault(env.MAX_ENTRY_SPREAD, '0.3'),
+      maxEntrySpread: parseFloatOrDefault(env.MAX_ENTRY_SPREAD, '0.12'),
+      maxEntrySpreadCombinedDiscount: parseFloatOrDefault(
+        env.MAX_ENTRY_SPREAD_COMBINED_DISCOUNT,
+        '0.08'
+      ),
+      maxEntrySpreadExtreme: parseFloatOrDefault(env.MAX_ENTRY_SPREAD_EXTREME, '0.15'),
+      maxEntrySpreadFairValue: parseFloatOrDefault(env.MAX_ENTRY_SPREAD_FAIR_VALUE, '0.06'),
+      maxEntrySpreadRebalance: parseFloatOrDefault(env.MAX_ENTRY_SPREAD_REBALANCE, '0.20'),
       entryImbalanceBlockThreshold: parseFloatOrDefault(
         env.ENTRY_IMBALANCE_BLOCK_THRESHOLD,
         '100'
@@ -759,6 +775,22 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.strategy.maxEntrySpread <= 0) {
     throw new Error('MAX_ENTRY_SPREAD must be positive.');
+  }
+
+  if (candidate.strategy.maxEntrySpreadCombinedDiscount <= 0) {
+    throw new Error('MAX_ENTRY_SPREAD_COMBINED_DISCOUNT must be positive.');
+  }
+
+  if (candidate.strategy.maxEntrySpreadExtreme <= 0) {
+    throw new Error('MAX_ENTRY_SPREAD_EXTREME must be positive.');
+  }
+
+  if (candidate.strategy.maxEntrySpreadFairValue <= 0) {
+    throw new Error('MAX_ENTRY_SPREAD_FAIR_VALUE must be positive.');
+  }
+
+  if (candidate.strategy.maxEntrySpreadRebalance <= 0) {
+    throw new Error('MAX_ENTRY_SPREAD_REBALANCE must be positive.');
   }
 
   if (candidate.strategy.entryImbalanceBlockThreshold <= 0) {

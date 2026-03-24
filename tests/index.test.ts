@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   evaluateLatencyPauseState,
   filterSignalsForLatencyPause,
+  getRequiredSettledShares,
+  hasSettledOutcomeBalance,
   pruneLatencyPauseSamples,
   pruneExpiredSettlementCooldowns,
   shouldDeferSignalForSettlement,
@@ -200,4 +202,10 @@ test('pruneExpiredSettlementCooldowns removes expired entries', () => {
   );
 
   assert.deepEqual(Array.from(pruned.entries()), [['market-1:YES', 15_000]]);
+});
+
+test('settled outcome balance requires a small confirmation margin before SELL', () => {
+  assert.equal(getRequiredSettledShares(10), 9.9);
+  assert.equal(hasSettledOutcomeBalance(9.89, 10), false);
+  assert.equal(hasSettledOutcomeBalance(9.9, 10), true);
 });
