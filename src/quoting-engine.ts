@@ -1,4 +1,14 @@
-import { config, isDynamicQuotingEnabled, type AppConfig } from './config.js';
+import {
+  config,
+  isDeepBinanceEnabled,
+  isDynamicQuotingEnabled,
+  type AppConfig,
+} from './config.js';
+import {
+  getDynamicSpreadTicks,
+  shouldBlockSignalByBinanceSpread,
+  type DeepBinanceAssessment,
+} from './binance-deep-integration.js';
 import type {
   MarketOrderbookSnapshot,
   Outcome,
@@ -23,6 +33,7 @@ export interface QuoteContext {
   readonly riskAssessment: RiskAssessment;
   readonly quoteSignals: readonly StrategySignal[];
   readonly binanceFairValueAdjustment?: FairValueBinanceAdjustment;
+  readonly deepBinanceAssessment?: DeepBinanceAssessment;
 }
 
 export interface ActiveQuoteOrder {
@@ -75,6 +86,10 @@ export function buildMarketMakerQuoteSignals(params: {
 
   const now = params.now ?? new Date();
   const builtSignals: StrategySignal[] = [];
+  const quoteSpreadTicks = resolveQuoteSpreadTicks(
+    runtimeConfig,
+    params.context.deepBinanceAssessment
+  );
   const snapshot = params.context.positionManager.getSnapshot();
   const imbalancePercent = resolveInventoryImbalancePercent(snapshot);
   const overweightOutcome =
@@ -98,6 +113,8 @@ export function buildMarketMakerQuoteSignals(params: {
         template: signal,
         runtimeConfig,
         binanceFairValueAdjustment: params.context.binanceFairValueAdjustment,
+        deepBinanceAssessment: params.context.deepBinanceAssessment,
+        quoteSpreadTicks,
         now,
       });
       if (rebalanceQuote) {
@@ -113,6 +130,8 @@ export function buildMarketMakerQuoteSignals(params: {
         template: signal,
         runtimeConfig,
         binanceFairValueAdjustment: params.context.binanceFairValueAdjustment,
+        deepBinanceAssessment: params.context.deepBinanceAssessment,
+        quoteSpreadTicks,
         now,
       });
       if (reduceOnlyQuote) {
@@ -134,6 +153,8 @@ export function buildMarketMakerQuoteSignals(params: {
       template: signal,
       runtimeConfig,
       binanceFairValueAdjustment: params.context.binanceFairValueAdjustment,
+      deepBinanceAssessment: params.context.deepBinanceAssessment,
+      quoteSpreadTicks,
       now,
     });
     if (entryQuote) {
@@ -160,6 +181,8 @@ export function buildMarketMakerQuoteSignals(params: {
       },
       runtimeConfig,
       binanceFairValueAdjustment: params.context.binanceFairValueAdjustment,
+      deepBinanceAssessment: params.context.deepBinanceAssessment,
+      quoteSpreadTicks,
       now,
     });
     if (oppositeQuote) {
@@ -303,23 +326,36 @@ function buildEntryQuoteSignal(params: {
   template: StrategySignal;
   runtimeConfig: AppConfig;
   binanceFairValueAdjustment?: FairValueBinanceAdjustment;
+  deepBinanceAssessment?: DeepBinanceAssessment;
+  quoteSpreadTicks: number;
   now: Date;
 }): StrategySignal | null {
   const book = getBookForOutcome(params.orderbook, params.template.outcome);
-  const fairValue = estimateFairValue(
+  if (
+    params.deepBinanceAssessment &&
+    shouldBlockSignalByBinanceSpread({
+      binanceSpreadRatio: params.deepBinanceAssessment.binanceSpreadRatio,
+      runtimeConfig: params.runtimeConfig,
+    })
+  ) {
+    return null;
+  }
+
+  const fairValue = resolveQuoteFairValue(
     params.orderbook,
     params.template.outcome,
+    params.runtimeConfig,
     params.binanceFairValueAdjustment,
-    params.runtimeConfig
+    params.deepBinanceAssessment
   );
-  const targetPrice = resolveBuyQuotePrice(book, fairValue, params.runtimeConfig);
+  const targetPrice = resolveBuyQuotePrice(book, fairValue, params.quoteSpreadTicks);
   if (targetPrice === null) {
     return null;
   }
 
   return {
     ...params.template,
-    signalType: 'DYNAMIC_QUOTE_BOTH',
+    signalType: resolveQuoteSignalType(params.template, params.deepBinanceAssessment),
     action: 'BUY',
     targetPrice,
     referencePrice: fairValue ?? params.template.referencePrice,
@@ -339,16 +375,19 @@ function buildReduceOnlyQuoteSignal(params: {
   template: StrategySignal;
   runtimeConfig: AppConfig;
   binanceFairValueAdjustment?: FairValueBinanceAdjustment;
+  deepBinanceAssessment?: DeepBinanceAssessment;
+  quoteSpreadTicks: number;
   now: Date;
 }): StrategySignal | null {
   const book = getBookForOutcome(params.orderbook, params.template.outcome);
-  const fairValue = estimateFairValue(
+  const fairValue = resolveQuoteFairValue(
     params.orderbook,
     params.template.outcome,
+    params.runtimeConfig,
     params.binanceFairValueAdjustment,
-    params.runtimeConfig
+    params.deepBinanceAssessment
   );
-  const targetPrice = resolveSellQuotePrice(book, fairValue, params.runtimeConfig);
+  const targetPrice = resolveSellQuotePrice(book, fairValue, params.quoteSpreadTicks);
   if (targetPrice === null || params.template.shares <= 0) {
     return null;
   }
@@ -358,7 +397,7 @@ function buildReduceOnlyQuoteSignal(params: {
     signalType:
       params.template.signalType === 'INVENTORY_REBALANCE_QUOTE'
         ? 'INVENTORY_REBALANCE_QUOTE'
-        : 'DYNAMIC_QUOTE_BOTH',
+        : resolveQuoteSignalType(params.template, params.deepBinanceAssessment),
     action: 'SELL',
     targetPrice,
     referencePrice: fairValue ?? params.template.referencePrice,
@@ -420,7 +459,7 @@ function resolveQuoteUrgency(runtimeConfig: AppConfig): StrategySignal['urgency'
 function resolveBuyQuotePrice(
   book: TokenBookSnapshot,
   fairValue: number | null,
-  runtimeConfig: AppConfig
+  quoteSpreadTicks: number
 ): number | null {
   const fallback = fairValue ?? book.midPrice ?? book.bestBid ?? book.bestAsk;
   if (fallback === null || !Number.isFinite(fallback) || fallback <= 0) {
@@ -436,14 +475,14 @@ function resolveBuyQuotePrice(
     book.bestBid !== null && Number.isFinite(book.bestBid)
       ? Math.max(0.01, book.bestBid)
       : 0.01;
-  const desired = Math.min(fallback, upperBound) - tick * Math.max(0, runtimeConfig.QUOTING_SPREAD_TICKS - 1);
+  const desired = Math.min(fallback, upperBound) - tick * Math.max(0, quoteSpreadTicks - 1);
   return normalizeQuotePrice(desired, lowerBound, upperBound);
 }
 
 function resolveSellQuotePrice(
   book: TokenBookSnapshot,
   fairValue: number | null,
-  runtimeConfig: AppConfig
+  quoteSpreadTicks: number
 ): number | null {
   const fallback = fairValue ?? book.midPrice ?? book.bestAsk ?? book.bestBid;
   if (fallback === null || !Number.isFinite(fallback) || fallback <= 0) {
@@ -459,8 +498,64 @@ function resolveSellQuotePrice(
     book.bestAsk !== null && Number.isFinite(book.bestAsk)
       ? Math.min(0.99, book.bestAsk)
       : 0.99;
-  const desired = Math.max(fallback, lowerBound) + tick * Math.max(0, runtimeConfig.QUOTING_SPREAD_TICKS - 1);
+  const desired = Math.max(fallback, lowerBound) + tick * Math.max(0, quoteSpreadTicks - 1);
   return normalizeQuotePrice(desired, lowerBound, upperBound);
+}
+
+function resolveQuoteFairValue(
+  orderbook: MarketOrderbookSnapshot,
+  outcome: Outcome,
+  runtimeConfig: AppConfig,
+  binanceFairValueAdjustment?: FairValueBinanceAdjustment,
+  deepBinanceAssessment?: DeepBinanceAssessment
+): number | null {
+  if (
+    isDeepBinanceEnabled(runtimeConfig) &&
+    deepBinanceAssessment?.available &&
+    deepBinanceAssessment.fairValue !== null
+  ) {
+    return outcome === 'YES'
+      ? deepBinanceAssessment.fairValue
+      : roundTo(clamp(1 - deepBinanceAssessment.fairValue, 0.001, 0.999), 6);
+  }
+
+  return estimateFairValue(
+    orderbook,
+    outcome,
+    binanceFairValueAdjustment,
+    runtimeConfig
+  );
+}
+
+function resolveQuoteSpreadTicks(
+  runtimeConfig: AppConfig,
+  deepBinanceAssessment?: DeepBinanceAssessment
+): number {
+  if (
+    !isDeepBinanceEnabled(runtimeConfig) ||
+    !deepBinanceAssessment?.available
+  ) {
+    return runtimeConfig.QUOTING_SPREAD_TICKS;
+  }
+
+  return getDynamicSpreadTicks({
+    baseTicks: runtimeConfig.QUOTING_SPREAD_TICKS,
+    volatilityRatio: deepBinanceAssessment.volatilityRatio,
+    runtimeConfig,
+  });
+}
+
+function resolveQuoteSignalType(
+  template: StrategySignal,
+  deepBinanceAssessment?: DeepBinanceAssessment
+): SignalType {
+  if (template.signalType === 'INVENTORY_REBALANCE_QUOTE') {
+    return 'INVENTORY_REBALANCE_QUOTE';
+  }
+
+  return deepBinanceAssessment?.available && deepBinanceAssessment.fairValue !== null
+    ? 'DEEP_BINANCE_SIGNAL'
+    : 'DYNAMIC_QUOTE_BOTH';
 }
 
 function normalizeQuotePrice(

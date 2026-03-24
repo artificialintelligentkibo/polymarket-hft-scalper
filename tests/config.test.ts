@@ -4,6 +4,7 @@ import {
   config,
   createConfig,
   isDryRunMode,
+  isDeepBinanceEnabled,
   isDynamicQuotingEnabled,
 } from '../src/config.js';
 
@@ -59,6 +60,14 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.MAX_IMBALANCE_PERCENT, 35);
   assert.equal(candidate.QUOTING_SPREAD_TICKS, 2);
   assert.equal(candidate.REBALANCE_ON_IMBALANCE, true);
+  assert.equal(candidate.DEEP_BINANCE_MODE, false);
+  assert.equal(candidate.BINANCE_WS_ENABLED, true);
+  assert.equal(candidate.BINANCE_DEPTH_LEVELS, 20);
+  assert.equal(candidate.BINANCE_FUNDING_WEIGHT, 0.3);
+  assert.equal(candidate.MIN_BINANCE_SPREAD_THRESHOLD, 0.004);
+  assert.equal(candidate.DYNAMIC_SPREAD_VOL_FACTOR, 1.5);
+  assert.equal(candidate.BINANCE_FAIR_VALUE_WEIGHT, 0.7);
+  assert.equal(candidate.POLYMARKET_FAIR_VALUE_WEIGHT, 0.2);
   assert.equal(candidate.POLYMARKET_API_KEY, '');
   assert.equal(candidate.POLYMARKET_API_SECRET, '');
   assert.equal(candidate.POLYMARKET_API_PASSPHRASE, '');
@@ -166,6 +175,33 @@ test('dynamic quoting requires both MARKET_MAKER_MODE and DYNAMIC_QUOTING_ENABLE
 
   assert.equal(isDynamicQuotingEnabled(makerOnly), false);
   assert.equal(isDynamicQuotingEnabled(fullMm), true);
+});
+
+test('deep binance mode requires MM mode, quoting, and websocket flag', () => {
+  const disabled = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    DEEP_BINANCE_MODE: 'false',
+  });
+  const noWs = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    DEEP_BINANCE_MODE: 'true',
+    BINANCE_WS_ENABLED: 'false',
+  });
+  const enabled = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    DEEP_BINANCE_MODE: 'true',
+    BINANCE_WS_ENABLED: 'true',
+  });
+
+  assert.equal(isDeepBinanceEnabled(disabled), false);
+  assert.equal(isDeepBinanceEnabled(noWs), false);
+  assert.equal(isDeepBinanceEnabled(enabled), true);
 });
 
 test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () => {

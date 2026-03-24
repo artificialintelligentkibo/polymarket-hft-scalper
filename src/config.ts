@@ -75,6 +75,59 @@ export interface AppConfig {
    * Recommended production default (2026): true.
    */
   readonly REBALANCE_ON_IMBALANCE: boolean;
+  /**
+   * Enables the deeper Binance derivatives integration for the market-maker.
+   * false = keep the existing lightweight Binance edge only.
+   * true = blend Binance perpetual depth, funding, and short-horizon
+   * directional state into quoting decisions.
+   * Recommended production default (2026): false until validated on the
+   * target VPS/network path; then true for production MM deployments.
+   */
+  readonly DEEP_BINANCE_MODE: boolean;
+  /**
+   * Controls whether the deep Binance module should maintain its WebSocket
+   * connections. This can stay true even while DEEP_BINANCE_MODE=false so the
+   * operator can pre-warm connectivity before enabling the feature flag.
+   * Recommended production default (2026): true.
+   */
+  readonly BINANCE_WS_ENABLED: boolean;
+  /**
+   * Number of Binance depth levels retained per side for deep fair-value and
+   * spread diagnostics. Higher values give better context but cost more CPU.
+   * Recommended production default (2026): 20.
+   */
+  readonly BINANCE_DEPTH_LEVELS: number;
+  /**
+   * Weight assigned to funding-basis pressure when blending the synthetic
+   * Polymarket fair value in deep Binance mode.
+   * Recommended production default (2026): 0.3.
+   */
+  readonly BINANCE_FUNDING_WEIGHT: number;
+  /**
+   * Maximum allowed Binance spread ratio before new quote entry signals are
+   * withheld. A value of 0.004 means 0.4% wide spread on Binance futures.
+   * Recommended production default (2026): 0.004.
+   */
+  readonly MIN_BINANCE_SPREAD_THRESHOLD: number;
+  /**
+   * Multiplier used when converting observed Binance short-horizon volatility
+   * into wider quoting spreads. Higher values widen quotes faster in volatile
+   * conditions.
+   * Recommended production default (2026): 1.5.
+   */
+  readonly DYNAMIC_SPREAD_VOL_FACTOR: number;
+  /**
+   * Weight assigned to Binance-derived directional fair value when deep
+   * Binance mode is enabled.
+   * Recommended production default (2026): 0.7.
+   */
+  readonly BINANCE_FAIR_VALUE_WEIGHT: number;
+  /**
+   * Weight assigned to the legacy Polymarket-only fair value component when
+   * deep Binance mode is enabled.
+   * Recommended production default (2026): 0.2.
+   */
+  readonly POLYMARKET_FAIR_VALUE_WEIGHT: number;
   readonly COINS_TO_TRADE: readonly TradeableCoin[];
   readonly FILTER_5MIN_ONLY: boolean;
   readonly MIN_LIQUIDITY_USD: number;
@@ -384,6 +437,29 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       parseIntOrDefault(env.QUOTING_SPREAD_TICKS, '2')
     ),
     REBALANCE_ON_IMBALANCE: parseBoolean(env.REBALANCE_ON_IMBALANCE, true),
+    DEEP_BINANCE_MODE: parseBoolean(env.DEEP_BINANCE_MODE, false),
+    BINANCE_WS_ENABLED: parseBoolean(env.BINANCE_WS_ENABLED, true),
+    BINANCE_DEPTH_LEVELS: Math.max(
+      1,
+      parseIntOrDefault(env.BINANCE_DEPTH_LEVELS, '20')
+    ),
+    BINANCE_FUNDING_WEIGHT: parseFloatOrDefault(env.BINANCE_FUNDING_WEIGHT, '0.3'),
+    MIN_BINANCE_SPREAD_THRESHOLD: parseFloatOrDefault(
+      env.MIN_BINANCE_SPREAD_THRESHOLD,
+      '0.004'
+    ),
+    DYNAMIC_SPREAD_VOL_FACTOR: parseFloatOrDefault(
+      env.DYNAMIC_SPREAD_VOL_FACTOR,
+      '1.5'
+    ),
+    BINANCE_FAIR_VALUE_WEIGHT: parseFloatOrDefault(
+      env.BINANCE_FAIR_VALUE_WEIGHT,
+      '0.7'
+    ),
+    POLYMARKET_FAIR_VALUE_WEIGHT: parseFloatOrDefault(
+      env.POLYMARKET_FAIR_VALUE_WEIGHT,
+      '0.2'
+    ),
     COINS_TO_TRADE: parseCoinsToTrade(env.COINS_TO_TRADE),
     FILTER_5MIN_ONLY: parseBoolean(
       env.FILTER_5MIN_ONLY ?? env.ONLY_FIVE_MINUTE_MARKETS,
@@ -791,6 +867,40 @@ export function validateConfig(candidate: AppConfig = config): void {
   if (candidate.QUOTING_SPREAD_TICKS < 1) {
     throw new Error('QUOTING_SPREAD_TICKS must be at least 1.');
   }
+
+  if (candidate.BINANCE_DEPTH_LEVELS < 1) {
+    throw new Error('BINANCE_DEPTH_LEVELS must be at least 1.');
+  }
+
+  if (candidate.BINANCE_FUNDING_WEIGHT < 0) {
+    throw new Error('BINANCE_FUNDING_WEIGHT must be zero or positive.');
+  }
+
+  if (candidate.MIN_BINANCE_SPREAD_THRESHOLD <= 0) {
+    throw new Error('MIN_BINANCE_SPREAD_THRESHOLD must be positive.');
+  }
+
+  if (candidate.DYNAMIC_SPREAD_VOL_FACTOR <= 0) {
+    throw new Error('DYNAMIC_SPREAD_VOL_FACTOR must be positive.');
+  }
+
+  if (candidate.BINANCE_FAIR_VALUE_WEIGHT < 0) {
+    throw new Error('BINANCE_FAIR_VALUE_WEIGHT must be zero or positive.');
+  }
+
+  if (candidate.POLYMARKET_FAIR_VALUE_WEIGHT < 0) {
+    throw new Error('POLYMARKET_FAIR_VALUE_WEIGHT must be zero or positive.');
+  }
+
+  if (
+    candidate.BINANCE_FAIR_VALUE_WEIGHT === 0 &&
+    candidate.POLYMARKET_FAIR_VALUE_WEIGHT === 0 &&
+    candidate.BINANCE_FUNDING_WEIGHT === 0
+  ) {
+    throw new Error(
+      'At least one of BINANCE_FAIR_VALUE_WEIGHT, POLYMARKET_FAIR_VALUE_WEIGHT, or BINANCE_FUNDING_WEIGHT must be positive.'
+    );
+  }
 }
 
 export function isDryRunMode(candidate: AppConfig = config): boolean {
@@ -803,6 +913,14 @@ export function isDryRunMode(candidate: AppConfig = config): boolean {
 
 export function isDynamicQuotingEnabled(candidate: AppConfig = config): boolean {
   return candidate.MARKET_MAKER_MODE && candidate.DYNAMIC_QUOTING_ENABLED;
+}
+
+export function isDeepBinanceEnabled(candidate: AppConfig = config): boolean {
+  return (
+    isDynamicQuotingEnabled(candidate) &&
+    candidate.DEEP_BINANCE_MODE &&
+    candidate.BINANCE_WS_ENABLED
+  );
 }
 
 function deepFreeze<T>(value: T): T {

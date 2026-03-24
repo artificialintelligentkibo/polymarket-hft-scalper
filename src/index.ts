@@ -2,10 +2,15 @@ import { AutoRedeemer } from './auto-redeemer.js';
 import { pathToFileURL } from 'node:url';
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import { BinanceEdgeProvider, extractCoinFromTitle } from './binance-edge.js';
+import {
+  BinanceDeepIntegration,
+  type DeepBinanceAssessment,
+} from './binance-deep-integration.js';
 import { ClobFetcher, type MarketOrderbookSnapshot } from './clob-fetcher.js';
 import {
   config,
   isDryRunMode,
+  isDeepBinanceEnabled,
   isDynamicQuotingEnabled,
   validateConfig,
 } from './config.js';
@@ -86,6 +91,7 @@ class MarketMakerRuntime {
   private readonly executor = new OrderExecutor();
   private readonly statusMonitor = new StatusMonitor();
   private readonly binanceEdge = new BinanceEdgeProvider();
+  private readonly deepBinance = new BinanceDeepIntegration();
   private readonly tradeLogger = new TradeLogger();
   private readonly riskManager = new RiskManager();
   private readonly signalEngine = new SignalScalper();
@@ -221,6 +227,7 @@ class MarketMakerRuntime {
     });
     this.statusMonitor.start();
     this.binanceEdge.start();
+    this.deepBinance.start();
     if (isDynamicQuotingEnabled(config)) {
       this.quotingEngine.start(async (plan) => {
         await this.handleQuoteRefresh(plan);
@@ -306,6 +313,7 @@ class MarketMakerRuntime {
       this.quotingEngine.stop();
       this.statusMonitor.stop();
       this.binanceEdge.stop();
+      this.deepBinance.stop();
       this.fetcher.close();
     }
   }
@@ -376,6 +384,7 @@ class MarketMakerRuntime {
       positionManager,
     });
     const binanceFairValueAdjustment = this.getBinanceFairValueAdjustment(market, orderbook);
+    const deepBinanceAssessment = this.getDeepBinanceAssessment(market, orderbook);
     const signals = this.signalEngine.generateSignals({
       market,
       orderbook,
@@ -402,6 +411,7 @@ class MarketMakerRuntime {
         riskAssessment,
         quoteSignals,
         binanceFairValueAdjustment,
+        deepBinanceAssessment,
       });
     }
     const executionCandidates = this.applyBinanceEdge(market, orderbook, directSignals);
@@ -1352,6 +1362,33 @@ class MarketMakerRuntime {
     };
   }
 
+  private getDeepBinanceAssessment(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot
+  ): DeepBinanceAssessment | undefined {
+    if (!isDeepBinanceEnabled(config)) {
+      return undefined;
+    }
+
+    const coin = extractCoinFromTitle(market.title);
+    if (!coin) {
+      return undefined;
+    }
+
+    this.deepBinance.recordSlotOpen(coin, market.startTime);
+    const polymarketMid =
+      orderbook.yes.midPrice ??
+      orderbook.yes.lastTradePrice ??
+      orderbook.yes.bestBid ??
+      orderbook.yes.bestAsk;
+
+    return this.deepBinance.calculateFairValue({
+      coin,
+      slotStartTime: market.startTime,
+      polymarketMid,
+    });
+  }
+
   private rememberMarketAction(
     market: MarketCandidate,
     signals: readonly StrategySignal[],
@@ -1510,12 +1547,14 @@ class MarketMakerRuntime {
         positionManager,
         now: new Date(),
       });
+      const deepBinanceAssessment = this.getDeepBinanceAssessment(market, orderbook);
       const refreshedPlan = buildQuoteRefreshPlan({
         context: {
           ...quoteContext,
           orderbook,
           positionManager,
           riskAssessment,
+          deepBinanceAssessment,
         },
         activeQuoteOrders: plan.activeQuoteOrders,
         runtimeConfig: config,

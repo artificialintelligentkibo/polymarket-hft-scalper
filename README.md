@@ -43,6 +43,7 @@ src/
   quoting-engine.ts
   reports.ts
   auto-redeemer.ts
+  binance-deep-integration.ts
   binance-edge.ts
   risk-manager.ts
   signal-scalper.ts
@@ -115,6 +116,14 @@ Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper
 - `MAX_IMBALANCE_PERCENT=35`
 - `QUOTING_SPREAD_TICKS=2`
 - `REBALANCE_ON_IMBALANCE=true`
+- `DEEP_BINANCE_MODE=false`
+- `BINANCE_WS_ENABLED=true`
+- `BINANCE_DEPTH_LEVELS=20`
+- `BINANCE_FUNDING_WEIGHT=0.3`
+- `MIN_BINANCE_SPREAD_THRESHOLD=0.004`
+- `DYNAMIC_SPREAD_VOL_FACTOR=1.5`
+- `BINANCE_FAIR_VALUE_WEIGHT=0.7`
+- `POLYMARKET_FAIR_VALUE_WEIGHT=0.2`
 
 Sizing is now driven by:
 
@@ -140,6 +149,7 @@ The main loop in [src/index.ts](/C:/GitHub/polymarket-hft-scalper/src/index.ts) 
 12. Polymarket status monitoring with auto-pause / auto-resume
 13. optional Binance latency-edge post-filter for entry signals
 14. optional market-maker quoting loop for passive cancel/repost inventory management
+15. optional deep Binance perpetual depth/funding overlay for quote fair value and spread selection
 
 ## Reports
 
@@ -295,7 +305,7 @@ If an active incident mentions CLOB, order flow, confirmation delays, latency, A
 
 When incidents clear, the bot auto-resumes after `PAUSE_GRACE_PERIOD_MS`.
 
-## Market Maker Mode (2026)
+## Market Maker Mode + Deep Binance Integration (2026)
 
 `MARKET_MAKER_MODE` adds an optional automated market-maker overlay to the existing scalper. The old runtime remains the default and is not replaced unless you explicitly enable both market-maker flags.
 
@@ -303,6 +313,7 @@ How to switch:
 
 ```bash
 MARKET_MAKER_MODE=true
+DEEP_BINANCE_MODE=true
 DYNAMIC_QUOTING_ENABLED=true
 ```
 
@@ -314,6 +325,8 @@ Mode behavior:
   The old execution flow stays active, but urgency remains maker-friendly.
 - `MARKET_MAKER_MODE=true` and `DYNAMIC_QUOTING_ENABLED=true`
   Entry and rebalance opportunities are routed through `src/quoting-engine.ts`, which refreshes passive quotes on an interval.
+- `MARKET_MAKER_MODE=true`, `DYNAMIC_QUOTING_ENABLED=true`, and `DEEP_BINANCE_MODE=true`
+  The quoting engine also blends Binance perpetual depth, short-horizon move, and funding basis into fair value while widening or blocking quotes when Binance conditions degrade.
 
 Recommended 2026 defaults:
 
@@ -326,6 +339,14 @@ Recommended 2026 defaults:
 | `MAX_IMBALANCE_PERCENT` | `35` | `35` | Suppresses fresh quotes on overweight inventory |
 | `QUOTING_SPREAD_TICKS` | `2` | `2` | Quote distance from the current book |
 | `REBALANCE_ON_IMBALANCE` | `true` | `true` | Routes imbalance reduction through quote updates |
+| `DEEP_BINANCE_MODE` | `false` | `true` after dry-run validation | Enables perpetual depth + funding blend |
+| `BINANCE_WS_ENABLED` | `true` | `true` | Maintains deep Binance WebSocket connectivity |
+| `BINANCE_DEPTH_LEVELS` | `20` | `20` | Number of retained Binance depth levels |
+| `BINANCE_FUNDING_WEIGHT` | `0.3` | `0.3` | Funding-basis contribution to fair value |
+| `MIN_BINANCE_SPREAD_THRESHOLD` | `0.004` | `0.004` | Block new entry quotes when Binance spread is too wide |
+| `DYNAMIC_SPREAD_VOL_FACTOR` | `1.5` | `1.5` | Widen quote ticks as Binance volatility rises |
+| `BINANCE_FAIR_VALUE_WEIGHT` | `0.7` | `0.7` | Deep Binance directional weight in fair value |
+| `POLYMARKET_FAIR_VALUE_WEIGHT` | `0.2` | `0.2` | Legacy Polymarket fair-value weight in the blend |
 
 What changes when enabled:
 
@@ -334,8 +355,50 @@ What changes when enabled:
 - the quoting engine cancels old quote orders, reposts new passive quotes, and respects `TEST_MIN_TRADE_USDC` in `PRODUCT_TEST_MODE`
 - risk exits (`HARD_STOP`, `TRAILING_TAKE_PROFIT`, `SLOT_FLATTEN`) stay on the normal execution path
 - `POST_ONLY_ONLY=true` keeps the bot in passive/improve mode and prevents `cross` urgency
+- when `DEEP_BINANCE_MODE=true`, quote fair value is blended from Polymarket mid + Binance perpetual move + funding basis
+- Binance volatility can widen `QUOTING_SPREAD_TICKS` dynamically, and excessively wide Binance spreads block fresh entry quotes without disabling safety exits
 
 Turning the two feature flags back off fully restores the pre-market-maker behavior.
+
+Example test configuration:
+
+```bash
+MARKET_MAKER_MODE=true
+DYNAMIC_QUOTING_ENABLED=true
+DEEP_BINANCE_MODE=true
+POST_ONLY_ONLY=true
+QUOTING_INTERVAL_MS=150
+QUOTING_SPREAD_TICKS=2
+BINANCE_WS_ENABLED=true
+BINANCE_DEPTH_LEVELS=20
+BINANCE_FUNDING_WEIGHT=0.3
+BINANCE_FAIR_VALUE_WEIGHT=0.7
+POLYMARKET_FAIR_VALUE_WEIGHT=0.2
+MIN_BINANCE_SPREAD_THRESHOLD=0.004
+DYNAMIC_SPREAD_VOL_FACTOR=1.5
+PRODUCT_TEST_MODE=true
+TEST_MIN_TRADE_USDC=1
+```
+
+Example production configuration:
+
+```bash
+MARKET_MAKER_MODE=true
+DYNAMIC_QUOTING_ENABLED=true
+DEEP_BINANCE_MODE=true
+POST_ONLY_ONLY=true
+QUOTING_INTERVAL_MS=150
+MAX_IMBALANCE_PERCENT=35
+QUOTING_SPREAD_TICKS=2
+REBALANCE_ON_IMBALANCE=true
+BINANCE_WS_ENABLED=true
+BINANCE_DEPTH_LEVELS=20
+BINANCE_FUNDING_WEIGHT=0.3
+BINANCE_FAIR_VALUE_WEIGHT=0.7
+POLYMARKET_FAIR_VALUE_WEIGHT=0.2
+MIN_BINANCE_SPREAD_THRESHOLD=0.004
+DYNAMIC_SPREAD_VOL_FACTOR=1.5
+```
 
 ## Binance Latency Edge
 

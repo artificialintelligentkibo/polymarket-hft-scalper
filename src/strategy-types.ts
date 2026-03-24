@@ -4,6 +4,7 @@ export type SignalAction = 'BUY' | 'SELL';
 export type SignalUrgency = 'passive' | 'improve' | 'cross';
 export type SignalType =
   | 'COMBINED_DISCOUNT_BUY_BOTH'
+  | 'DEEP_BINANCE_SIGNAL'
   | 'DYNAMIC_QUOTE_BOTH'
   | 'EXTREME_BUY'
   | 'EXTREME_SELL'
@@ -17,6 +18,7 @@ export type SignalType =
   | 'SLOT_FLATTEN';
 
 export const QUOTING_SIGNAL_TYPES = [
+  'DEEP_BINANCE_SIGNAL',
   'DYNAMIC_QUOTE_BOTH',
   'INVENTORY_REBALANCE_QUOTE',
 ] as const satisfies readonly SignalType[];

@@ -1,6 +1,6 @@
 {
   "name": "polymarket-hft-scalper",
-  "version": "2.1.0-market-maker",
+  "version": "2.1.0-market-maker-deep-binance",
   "private": true,
   "type": "module",
   "bin": {
