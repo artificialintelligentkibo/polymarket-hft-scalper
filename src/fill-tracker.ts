@@ -429,7 +429,7 @@ export class FillTracker {
   private pruneOrphanRealtimeFills(): void {
     const cutoffMs = this.now() - ORPHAN_FILL_TTL_MS;
     for (const [orderId, fills] of this.orphanRealtimeFills.entries()) {
-      const next = fills.filter((fill) => fill.filledAt >= cutoffMs);
+      const next = fills.filter((fill) => fill.matchedAtMs >= cutoffMs);
       if (next.length === 0) {
         this.orphanRealtimeFills.delete(orderId);
         continue;

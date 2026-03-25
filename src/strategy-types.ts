@@ -10,8 +10,12 @@ export type SignalType =
   | 'EXTREME_SELL'
   | 'FAIR_VALUE_BUY'
   | 'FAIR_VALUE_SELL'
+  | 'LATENCY_MOMENTUM_BUY'
   | 'INVENTORY_REBALANCE'
   | 'INVENTORY_REBALANCE_QUOTE'
+  | 'PAIRED_ARB_BUY_YES'
+  | 'PAIRED_ARB_BUY_NO'
+  | 'PAIRED_ARB_REBALANCE'
   | 'RISK_LIMIT'
   | 'TRAILING_TAKE_PROFIT'
   | 'HARD_STOP'
@@ -26,6 +30,15 @@ export const QUOTING_SIGNAL_TYPES = [
 export function isQuotingSignalType(signalType: SignalType): boolean {
   return QUOTING_SIGNAL_TYPES.includes(
     signalType as (typeof QUOTING_SIGNAL_TYPES)[number]
+  );
+}
+
+export function bypassesBinanceEdge(signalType: SignalType): boolean {
+  return (
+    signalType === 'LATENCY_MOMENTUM_BUY' ||
+    signalType === 'PAIRED_ARB_BUY_YES' ||
+    signalType === 'PAIRED_ARB_BUY_NO' ||
+    signalType === 'PAIRED_ARB_REBALANCE'
   );
 }
 

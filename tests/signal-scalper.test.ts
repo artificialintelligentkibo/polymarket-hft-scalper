@@ -115,11 +115,21 @@ function createLowPriceFairValueOrderbook(): MarketOrderbookSnapshot {
 function createBinanceFvSignalEngine(
   overrides: Record<string, string> = {}
 ): SignalScalper {
+  return createLegacySignalEngine({
+    EXTREME_BUY_THRESHOLD: '0.02',
+    BINANCE_FV_SENSITIVITY: '0.10',
+    ...overrides,
+  });
+}
+
+function createLegacySignalEngine(
+  overrides: Record<string, string> = {}
+): SignalScalper {
   return new SignalScalper(
     createConfig({
-      ...process.env,
-      EXTREME_BUY_THRESHOLD: '0.02',
-      BINANCE_FV_SENSITIVITY: '0.10',
+      ENTRY_STRATEGY: 'LEGACY',
+      PAIRED_ARB_ENABLED: 'false',
+      LATENCY_MOMENTUM_ENABLED: 'false',
       ...overrides,
     })
   );
@@ -130,7 +140,7 @@ test('combined discount emits dual-sided BUY signals capped at two', () => {
   const orderbook = createOrderbook();
   const positionManager = new PositionManager(market.marketId, market.endTime);
   const riskManager = new RiskManager();
-  const signalEngine = new SignalScalper();
+  const signalEngine = createLegacySignalEngine();
 
   const riskAssessment = riskManager.checkRiskLimits({
     market,
@@ -171,7 +181,7 @@ test('inventory rebalance emits a reduce-only sell on dominant inventory', () =>
   };
   const positionManager = new PositionManager(market.marketId, market.endTime);
   const riskManager = new RiskManager();
-  const signalEngine = new SignalScalper();
+  const signalEngine = createLegacySignalEngine();
 
   positionManager.applyFill({
     outcome: 'YES',
@@ -259,23 +269,23 @@ test('fair value buy uses paired normalization rather than raw single-book mid',
   const market = createMarket();
   const orderbook = createOrderbook();
   orderbook.combined = {
-    combinedBid: 0.91,
-    combinedAsk: 0.94,
-    combinedMid: 0.925,
-    combinedDiscount: 0.005,
-    combinedPremium: -0.09,
-    pairSpread: 0.03,
+    combinedBid: 0.97,
+    combinedAsk: 1.01,
+    combinedMid: 0.99,
+    combinedDiscount: -0.01,
+    combinedPremium: 0.01,
+    pairSpread: 0.04,
   };
   orderbook.yes.bestBid = 0.42;
   orderbook.yes.bestAsk = 0.44;
   orderbook.yes.midPrice = 0.43;
   orderbook.no.bestBid = 0.49;
-  orderbook.no.bestAsk = 0.5;
+  orderbook.no.bestAsk = 0.57;
   orderbook.no.midPrice = 0.495;
 
   const positionManager = new PositionManager(market.marketId, market.endTime);
   const riskManager = new RiskManager();
-  const signalEngine = new SignalScalper();
+  const signalEngine = createLegacySignalEngine();
 
   const riskAssessment = riskManager.checkRiskLimits({
     market,
@@ -330,7 +340,7 @@ test('fair value sell can reduce YES inventory when YES is rich versus parity', 
   });
 
   const riskManager = new RiskManager();
-  const signalEngine = new SignalScalper();
+  const signalEngine = createLegacySignalEngine();
   const riskAssessment = riskManager.checkRiskLimits({
     market,
     orderbook,
@@ -645,14 +655,18 @@ test('market-maker mode rewrites non-risk entry signals into quoting signal type
   const positionManager = new PositionManager(market.marketId, market.endTime);
   const riskManager = new RiskManager(
     createConfig({
-      ...process.env,
+      ENTRY_STRATEGY: 'LEGACY',
+      PAIRED_ARB_ENABLED: 'false',
+      LATENCY_MOMENTUM_ENABLED: 'false',
       MARKET_MAKER_MODE: 'true',
       DYNAMIC_QUOTING_ENABLED: 'true',
     })
   );
   const signalEngine = new SignalScalper(
     createConfig({
-      ...process.env,
+      ENTRY_STRATEGY: 'LEGACY',
+      PAIRED_ARB_ENABLED: 'false',
+      LATENCY_MOMENTUM_ENABLED: 'false',
       MARKET_MAKER_MODE: 'true',
       DYNAMIC_QUOTING_ENABLED: 'true',
     })
@@ -817,7 +831,7 @@ test('extreme buy skips degenerate entry books with negligible ask depth', () =>
 
   const positionManager = new PositionManager(market.marketId, market.endTime);
   const riskManager = new RiskManager();
-  const signalEngine = new SignalScalper();
+  const signalEngine = createLegacySignalEngine();
   const riskAssessment = riskManager.checkRiskLimits({
     market,
     orderbook,
@@ -885,7 +899,18 @@ test('fair value buy is rejected when spread exceeds the fair-value-specific gua
 
 test('extreme buy still passes when spread fits the extreme-specific guard', () => {
   const market = createMarket();
+  market.startTime = '2026-03-24T10:00:00.000Z';
+  market.endTime = '2026-03-24T10:05:00.000Z';
   const orderbook = createOrderbook();
+  orderbook.combined = {
+    combinedBid: 0.94,
+    combinedAsk: 1.02,
+    combinedMid: 0.98,
+    combinedDiscount: -0.02,
+    combinedPremium: 0.02,
+    pairSpread: 0.08,
+  };
+  orderbook.no.bestAsk = 0.9;
   orderbook.yes.bestBid = 0.02;
   orderbook.yes.bestAsk = 0.12;
   orderbook.yes.midPrice = 0.07;

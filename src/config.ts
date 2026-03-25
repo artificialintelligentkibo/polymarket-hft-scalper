@@ -1,7 +1,11 @@
 import dotenv from 'dotenv';
+import type { LatencyMomentumConfig } from './latency-momentum.js';
+import type { PairedArbConfig } from './paired-arbitrage.js';
+import type { PaperTraderConfig } from './paper-trader.js';
 import { parseBooleanLoose, sanitizeConditionIds } from './utils.js';
 
 export type AuthMode = 'EOA' | 'PROXY';
+export type EntryStrategy = 'LEGACY' | 'PAIRED_ARBITRAGE' | 'LATENCY_MOMENTUM' | 'ALL';
 export type SignatureType = 0 | 1 | 2;
 export type OrderMode = 'GTC' | 'FOK' | 'FAK';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -21,6 +25,10 @@ export interface AppConfig {
   readonly TEST_MIN_TRADE_USDC: number;
   readonly TEST_MAX_SLOTS: number;
   readonly ENABLE_SIGNAL: boolean;
+  readonly ENTRY_STRATEGY: EntryStrategy;
+  readonly PAIRED_ARB_ENABLED: boolean;
+  readonly LATENCY_MOMENTUM_ENABLED: boolean;
+  readonly PAPER_TRADING_ENABLED: boolean;
   readonly STATUS_CHECK_INTERVAL_MS: number;
   readonly AUTO_PAUSE_ON_INCIDENT: boolean;
   readonly PAUSE_GRACE_PERIOD_MS: number;
@@ -211,6 +219,9 @@ export interface AppConfig {
     readonly priceMultiplierLevels: readonly PriceMultiplierLevel[];
     readonly exitBeforeEndMs: number;
   };
+  readonly pairedArbitrage: PairedArbConfig;
+  readonly latencyMomentum: LatencyMomentumConfig;
+  readonly paperTrading: PaperTraderConfig;
   readonly trading: {
     readonly slippageTolerance: number;
     readonly orderType: OrderMode;
@@ -347,6 +358,23 @@ function parseLogLevel(value?: string): LogLevel {
   return 'info';
 }
 
+function parseEntryStrategy(value?: string): EntryStrategy {
+  const normalized = value?.trim().toUpperCase();
+  if (!normalized || normalized === 'LEGACY') {
+    return 'LEGACY';
+  }
+  if (
+    normalized === 'PAIRED_ARBITRAGE' ||
+    normalized === 'LATENCY_MOMENTUM' ||
+    normalized === 'ALL'
+  ) {
+    return normalized;
+  }
+  throw new Error(
+    `Invalid ENTRY_STRATEGY: ${value}. Expected LEGACY, PAIRED_ARBITRAGE, LATENCY_MOMENTUM, or ALL.`
+  );
+}
+
 function parsePriceMultiplierLevels(value?: string): PriceMultiplierLevel[] {
   const raw =
     value?.trim() ||
@@ -402,6 +430,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     TEST_MIN_TRADE_USDC: Math.max(0.1, parseFloatOrDefault(env.TEST_MIN_TRADE_USDC, '1')),
     TEST_MAX_SLOTS: Math.max(1, parseIntOrDefault(env.TEST_MAX_SLOTS, '1')),
     ENABLE_SIGNAL: parseBoolean(env.ENABLE_SIGNAL, true),
+    ENTRY_STRATEGY: parseEntryStrategy(env.ENTRY_STRATEGY),
+    PAIRED_ARB_ENABLED: parseBoolean(env.PAIRED_ARB_ENABLED, false),
+    LATENCY_MOMENTUM_ENABLED: parseBoolean(env.LATENCY_MOMENTUM_ENABLED, false),
+    PAPER_TRADING_ENABLED: parseBoolean(env.PAPER_TRADING_ENABLED, false),
     STATUS_CHECK_INTERVAL_MS: Math.max(
       60_000,
       parseIntOrDefault(env.STATUS_CHECK_INTERVAL_MS, '300000')
@@ -620,6 +652,71 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       priceMultiplierLevels: parsePriceMultiplierLevels(env.PRICE_MULTIPLIER_LEVELS),
       exitBeforeEndMs: Math.max(0, parseIntOrDefault(env.EXIT_BEFORE_END_MS, '20000')),
     },
+    pairedArbitrage: {
+      enabled: parseBoolean(env.PAIRED_ARB_ENABLED, false),
+      minNetEdge: parseFloatOrDefault(env.PAIRED_ARB_MIN_NET_EDGE, '0.03'),
+      maxPairCost: parseFloatOrDefault(env.PAIRED_ARB_MAX_PAIR_COST, '0.97'),
+      targetBalanceRatio: parseFloatOrDefault(env.PAIRED_ARB_TARGET_BALANCE_RATIO, '1.0'),
+      balanceTolerance: parseFloatOrDefault(env.PAIRED_ARB_BALANCE_TOLERANCE, '0.15'),
+      maxPositionPerSide: parseFloatOrDefault(env.PAIRED_ARB_MAX_PER_SIDE, '200'),
+      minSharesPerLeg: parseFloatOrDefault(env.PAIRED_ARB_MIN_SHARES, '20'),
+      maxSharesPerLeg: parseFloatOrDefault(env.PAIRED_ARB_MAX_SHARES, '80'),
+      cooldownMs: Math.max(0, parseIntOrDefault(env.PAIRED_ARB_COOLDOWN_MS, '5000')),
+      requireBothSidesLiquidity: parseBoolean(env.PAIRED_ARB_REQUIRE_BOTH_LIQUIDITY, true),
+      minDepthPerSide: parseFloatOrDefault(env.PAIRED_ARB_MIN_DEPTH_USD, '3'),
+    },
+    latencyMomentum: {
+      enabled: parseBoolean(env.LATENCY_MOMENTUM_ENABLED, false),
+      minMovePct: parseFloatOrDefault(env.LATENCY_MOMENTUM_MIN_MOVE_PCT, '0.30'),
+      strongMovePct: parseFloatOrDefault(env.LATENCY_MOMENTUM_STRONG_MOVE_PCT, '0.50'),
+      maxEntryWindowMs: Math.max(
+        1_000,
+        parseIntOrDefault(env.LATENCY_MOMENTUM_MAX_ENTRY_WINDOW_MS, '120000')
+      ),
+      maxPmLagPct: parseFloatOrDefault(env.LATENCY_MOMENTUM_MAX_PM_LAG_PCT, '0.10'),
+      maxEntryPrice: parseFloatOrDefault(env.LATENCY_MOMENTUM_MAX_ENTRY_PRICE, '0.15'),
+      minEntryPrice: parseFloatOrDefault(env.LATENCY_MOMENTUM_MIN_ENTRY_PRICE, '0.01'),
+      baseShares: parseFloatOrDefault(env.LATENCY_MOMENTUM_BASE_SHARES, '30'),
+      strongShares: parseFloatOrDefault(env.LATENCY_MOMENTUM_STRONG_SHARES, '60'),
+      maxPositionShares: parseFloatOrDefault(env.LATENCY_MOMENTUM_MAX_POSITION_SHARES, '100'),
+      cooldownMs: Math.max(
+        0,
+        parseIntOrDefault(env.LATENCY_MOMENTUM_COOLDOWN_MS, '10000')
+      ),
+      invertSignal: parseBoolean(env.LATENCY_MOMENTUM_INVERT_SIGNAL, false),
+    },
+    paperTrading: {
+      enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
+      simulatedLatencyMinMs: Math.max(
+        0,
+        parseIntOrDefault(env.PAPER_TRADING_LATENCY_MIN_MS, '400')
+      ),
+      simulatedLatencyMaxMs: Math.max(
+        0,
+        parseIntOrDefault(env.PAPER_TRADING_LATENCY_MAX_MS, '1500')
+      ),
+      fillProbability: {
+        passive: parseFloatOrDefault(env.PAPER_TRADING_FILL_PROB_PASSIVE, '0.40'),
+        improve: parseFloatOrDefault(env.PAPER_TRADING_FILL_PROB_IMPROVE, '0.65'),
+        cross: parseFloatOrDefault(env.PAPER_TRADING_FILL_PROB_CROSS, '0.95'),
+      },
+      slippageModel: {
+        maxSlippageTicks: Math.max(
+          0,
+          parseIntOrDefault(env.PAPER_TRADING_MAX_SLIPPAGE_TICKS, '2')
+        ),
+        sizeImpactFactor: parseFloatOrDefault(
+          env.PAPER_TRADING_SIZE_IMPACT_FACTOR,
+          '0.5'
+        ),
+      },
+      partialFillEnabled: parseBoolean(env.PAPER_TRADING_PARTIAL_FILLS, true),
+      minFillRatio: parseFloatOrDefault(env.PAPER_TRADING_MIN_FILL_RATIO, '0.30'),
+      initialBalanceUsd: parseFloatOrDefault(env.PAPER_TRADING_INITIAL_BALANCE, '100'),
+      tradeLogFile: (
+        env.PAPER_TRADING_TRADE_LOG || `${reportsDir}/paper-trades.jsonl`
+      ).trim() || `${reportsDir}/paper-trades.jsonl`,
+    },
     trading: {
       slippageTolerance: parseFloatOrDefault(env.SLIPPAGE_TOLERANCE, '0.02'),
       orderType: parseOrderMode(env.ORDER_TYPE),
@@ -709,13 +806,13 @@ export const config: AppConfig = new Proxy({} as AppConfig, {
 });
 
 export function validateConfig(candidate: AppConfig = config): void {
-  if (!isDryRunMode(candidate) && !candidate.signerPrivateKey) {
+  if (!isDryRunMode(candidate) && !isPaperTradingEnabled(candidate) && !candidate.signerPrivateKey) {
     throw new Error(
       'Missing signer private key. Set SIGNER_PRIVATE_KEY or PRIVATE_KEY for live trading.'
     );
   }
 
-  if (candidate.auth.mode === 'PROXY' && !isDryRunMode(candidate)) {
+  if (candidate.auth.mode === 'PROXY' && !isDryRunMode(candidate) && !isPaperTradingEnabled(candidate)) {
     if (!candidate.auth.funderAddress) {
       throw new Error('FUNDER_ADDRESS is required in PROXY mode.');
     }
@@ -726,7 +823,7 @@ export function validateConfig(candidate: AppConfig = config): void {
     }
   }
 
-  if (!isDryRunMode(candidate) && candidate.auth.mode === 'PROXY') {
+  if (!isDryRunMode(candidate) && !isPaperTradingEnabled(candidate) && candidate.auth.mode === 'PROXY') {
     if (!candidate.POLYMARKET_API_KEY) {
       console.warn(
         'WARNING: POLYMARKET_API_KEY not set. Bot will attempt runtime derive (may fail with { privateKey } signer).'
@@ -864,6 +961,66 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error('MAX_SIGNALS_PER_TICK must be between 1 and 10.');
   }
 
+  if (
+    candidate.pairedArbitrage.maxPairCost <= 0 ||
+    candidate.pairedArbitrage.maxPairCost >= 1
+  ) {
+    throw new Error('PAIRED_ARB_MAX_PAIR_COST must be in the range (0, 1).');
+  }
+
+  if (candidate.pairedArbitrage.minNetEdge < 0) {
+    throw new Error('PAIRED_ARB_MIN_NET_EDGE must be zero or positive.');
+  }
+
+  if (
+    candidate.pairedArbitrage.maxSharesPerLeg <
+    candidate.pairedArbitrage.minSharesPerLeg
+  ) {
+    throw new Error(
+      'PAIRED_ARB_MAX_SHARES must be greater than or equal to PAIRED_ARB_MIN_SHARES.'
+    );
+  }
+
+  if (
+    candidate.latencyMomentum.strongShares <
+    candidate.latencyMomentum.baseShares
+  ) {
+    throw new Error(
+      'LATENCY_MOMENTUM_STRONG_SHARES must be greater than or equal to LATENCY_MOMENTUM_BASE_SHARES.'
+    );
+  }
+
+  if (
+    candidate.paperTrading.simulatedLatencyMaxMs <
+    candidate.paperTrading.simulatedLatencyMinMs
+  ) {
+    throw new Error(
+      'PAPER_TRADING_LATENCY_MAX_MS must be greater than or equal to PAPER_TRADING_LATENCY_MIN_MS.'
+    );
+  }
+
+  if (
+    candidate.paperTrading.fillProbability.passive < 0 ||
+    candidate.paperTrading.fillProbability.passive > 1 ||
+    candidate.paperTrading.fillProbability.improve < 0 ||
+    candidate.paperTrading.fillProbability.improve > 1 ||
+    candidate.paperTrading.fillProbability.cross < 0 ||
+    candidate.paperTrading.fillProbability.cross > 1
+  ) {
+    throw new Error('Paper trading fill probabilities must be between 0 and 1.');
+  }
+
+  if (
+    candidate.paperTrading.minFillRatio <= 0 ||
+    candidate.paperTrading.minFillRatio > 1
+  ) {
+    throw new Error('PAPER_TRADING_MIN_FILL_RATIO must be in the range (0, 1].');
+  }
+
+  if (candidate.paperTrading.initialBalanceUsd <= 0) {
+    throw new Error('PAPER_TRADING_INITIAL_BALANCE must be positive.');
+  }
+
   if (candidate.TEST_MIN_TRADE_USDC <= 0) {
     throw new Error('TEST_MIN_TRADE_USDC must be positive.');
   }
@@ -941,6 +1098,10 @@ export function isDryRunMode(candidate: AppConfig = config): boolean {
   }
 
   return candidate.SIMULATION_MODE || candidate.TEST_MODE || candidate.DRY_RUN;
+}
+
+export function isPaperTradingEnabled(candidate: AppConfig = config): boolean {
+  return candidate.PAPER_TRADING_ENABLED && candidate.paperTrading.enabled;
 }
 
 export function isDynamicQuotingEnabled(candidate: AppConfig = config): boolean {

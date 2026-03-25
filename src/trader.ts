@@ -1,4 +1,10 @@
-import { ClobClient, OrderType, Side } from '@polymarket/clob-client';
+import {
+  ClobClient,
+  OrderType,
+  Side,
+  type CreateOrderOptions,
+  type TickSize,
+} from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 import {
   config,
@@ -236,8 +242,8 @@ export class Trader {
 
     const orderTypeValue = toOrderType(orderType);
     const side = request.side === 'BUY' ? Side.BUY : Side.SELL;
-    const orderOptions = {
-      tickSize: metadata.tickSizeStr,
+    const orderOptions: Partial<CreateOrderOptions> = {
+      tickSize: metadata.tickSizeStr as TickSize,
       negRisk: metadata.negRisk,
     };
 
@@ -278,10 +284,10 @@ export class Trader {
                 price: validatedPrice,
                 side,
                 feeRateBps: metadata.feeRateBps,
-                orderType: orderTypeValue,
+                orderType: orderTypeValue === OrderType.FAK ? OrderType.FAK : OrderType.FOK,
               },
               orderOptions,
-              orderTypeValue
+              orderTypeValue === OrderType.FAK ? OrderType.FAK : OrderType.FOK
             ),
       {
         maxAttempts: 1,
@@ -1043,7 +1049,7 @@ function createExecutionContext(candidate: AppConfig, signerAddress: string): Ex
   };
 }
 
-function toOrderType(orderType: OrderMode): OrderType {
+function toOrderType(orderType: OrderMode): OrderType.GTC | OrderType.FOK | OrderType.FAK {
   if (orderType === 'FOK') {
     return OrderType.FOK;
   }

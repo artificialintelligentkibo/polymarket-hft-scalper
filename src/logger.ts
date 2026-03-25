@@ -267,24 +267,24 @@ export class TradeLogger {
       totalPnl: roundTo(input.totalPnl, 4),
       slotEntryCount: safePositiveCount(input.slotEntryCount),
       slotFillCount: safePositiveCount(input.slotFillCount),
-      upExposureUsd: safeNumberOrNull(input.upExposureUsd ?? null),
-      downExposureUsd: safeNumberOrNull(input.downExposureUsd ?? null),
-      dayPnl: safeNumberOrNull(input.dayPnl ?? null),
-      peakDayPnl: safeNumberOrNull(input.peakDayPnl ?? null),
-      dayDrawdown: safeNumberOrNull(input.dayDrawdown ?? null),
+      upExposureUsd: safeOptionalNumber(input.upExposureUsd),
+      downExposureUsd: safeOptionalNumber(input.downExposureUsd),
+      dayPnl: safeOptionalNumber(input.dayPnl),
+      peakDayPnl: safeOptionalNumber(input.peakDayPnl),
+      dayDrawdown: safeOptionalNumber(input.dayDrawdown),
       latencySignalToOrderMs: safeLatency(input.latencySignalToOrderMs),
       latencyRoundTripMs: safeLatency(input.latencyRoundTripMs),
       binanceEdgeAvailable:
         input.binanceEdgeAvailable === undefined ? undefined : Boolean(input.binanceEdgeAvailable),
-      binanceMovePct: safeNumberOrNull(input.binanceMovePct ?? null),
+      binanceMovePct: safeOptionalNumber(input.binanceMovePct),
       binanceDirection: input.binanceDirection || undefined,
-      binanceSizeMultiplier: safeNumberOrNull(input.binanceSizeMultiplier ?? null),
+      binanceSizeMultiplier: safeOptionalNumber(input.binanceSizeMultiplier),
       binanceContraSignal:
         input.binanceContraSignal === undefined ? undefined : Boolean(input.binanceContraSignal),
       crypto_prices_at_time: await getCryptoPrices(input.timestampMs),
     };
 
-    await appendToJsonl('trades', record, input.timestampMs);
+    await appendToJsonl('trades', record as unknown as Record<string, unknown>, input.timestampMs);
     return record;
   }
 
@@ -410,7 +410,7 @@ function scheduleCryptoPriceFetch(minuteBucket: number): void {
         )
       );
 
-      const snapshot = Object.fromEntries(entries) as CryptoPricesAtTime;
+      const snapshot = Object.fromEntries(entries) as unknown as CryptoPricesAtTime;
       cryptoPriceCache.set(minuteBucket, snapshot);
       lastKnownCryptoPrices = snapshot;
       pruneOldPriceCache(minuteBucket);
@@ -449,6 +449,10 @@ function emptyCryptoPrices(): CryptoPricesAtTime {
 
 function safeNumberOrNull(value: number | null): number | null {
   return value === null || !Number.isFinite(value) ? null : value;
+}
+
+function safeOptionalNumber(value: number | null | undefined): number | undefined {
+  return value === null || value === undefined || !Number.isFinite(value) ? undefined : value;
 }
 
 function safeLatency(value: number | undefined): number | undefined {

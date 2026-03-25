@@ -18,7 +18,15 @@ export interface DayPnlEvaluation {
   readonly justHalted: boolean;
 }
 
-interface PersistedDayPnlState extends DayPnlStateSnapshot {}
+interface PersistedDayPnlState {
+  dayKey: string;
+  dayPnl: number;
+  peakPnl: number;
+  drawdown: number;
+  tradingHalted: boolean;
+  haltReason: string | null;
+  updatedAt: string;
+}
 
 let stateCache: PersistedDayPnlState | null = null;
 

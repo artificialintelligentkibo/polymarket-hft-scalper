@@ -232,8 +232,9 @@ export class BinanceDeepIntegration {
     }
 
     const spreadRatio =
-      state?.bestBid !== null &&
-      state?.bestAsk !== null &&
+      state !== undefined &&
+      state.bestBid !== null &&
+      state.bestAsk !== null &&
       binanceMid > 0
         ? roundTo((state.bestAsk - state.bestBid) / binanceMid, 6)
         : null;

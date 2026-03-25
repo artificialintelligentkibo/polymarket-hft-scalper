@@ -138,8 +138,8 @@ export async function findLatestMatchingFile(
     if (stats.isFile()) {
       candidates.push({
         filePath: resolvedRoot,
-        sortMs: extractLogDateMs(path.basename(resolvedRoot)) ?? stats.mtimeMs,
-        mtimeMs: stats.mtimeMs,
+        sortMs: extractLogDateMs(path.basename(resolvedRoot)) ?? Number(stats.mtimeMs),
+        mtimeMs: Number(stats.mtimeMs),
       });
       continue;
     }
@@ -162,8 +162,8 @@ export async function findLatestMatchingFile(
       const fileStats = await stat(filePath);
       candidates.push({
         filePath,
-        sortMs: extractLogDateMs(entry.name) ?? fileStats.mtimeMs,
-        mtimeMs: fileStats.mtimeMs,
+        sortMs: extractLogDateMs(entry.name) ?? Number(fileStats.mtimeMs),
+        mtimeMs: Number(fileStats.mtimeMs),
       });
     }
   }

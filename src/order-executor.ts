@@ -1,9 +1,16 @@
 import type { ClobClient } from '@polymarket/clob-client';
 import type { CircuitBreakerSnapshot } from './api-retry.js';
-import { config, type AppConfig, type OrderMode } from './config.js';
+import {
+  config,
+  isPaperTradingEnabled,
+  type AppConfig,
+  type OrderMode,
+} from './config.js';
 import type { MarketOrderbookSnapshot, OrderbookLevel, TokenBookSnapshot } from './clob-fetcher.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
+import { OrderbookHistory } from './orderbook-history.js';
+import { PaperTrader } from './paper-trader.js';
 import { resolveProductTestUrgency } from './product-test-mode.js';
 import type { StrategySignal } from './strategy-types.js';
 import {
@@ -22,14 +29,35 @@ export interface OrderExecutionReport extends TradeExecutionResult {
 
 export class OrderExecutor {
   private lastDispatchAt = 0;
+  private readonly trader: Trader | null;
+  private readonly runtimeConfig: AppConfig;
+  private readonly orderbookHistory: OrderbookHistory;
+  private readonly paperTrader: PaperTrader;
 
-  constructor(
-    private readonly trader: Trader = new Trader(),
-    private readonly runtimeConfig: AppConfig = config
-  ) {}
+  constructor(trader?: Trader, runtimeConfig: AppConfig = config) {
+    this.runtimeConfig = runtimeConfig;
+    this.trader = isPaperTradingEnabled(this.runtimeConfig)
+      ? trader ?? null
+      : trader ?? new Trader(this.runtimeConfig);
+    this.orderbookHistory = new OrderbookHistory();
+    this.paperTrader = new PaperTrader(this.runtimeConfig.paperTrading, this.orderbookHistory);
+  }
 
   async initialize(): Promise<void> {
-    await this.trader.initialize();
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      await this.paperTrader.ensureReady();
+      return;
+    }
+
+    await this.trader?.initialize();
+  }
+
+  recordOrderbookSnapshot(orderbook: MarketOrderbookSnapshot): void {
+    this.orderbookHistory.record(
+      orderbook.marketId,
+      orderbook,
+      Date.parse(orderbook.timestamp) || Date.now()
+    );
   }
 
   async executeSignal(params: {
@@ -48,13 +76,50 @@ export class OrderExecutor {
       );
     }
 
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      await this.waitForRateLimit();
+      const orderDispatchStartedAt = Date.now();
+      const execution = await this.paperTrader.simulateOrder({
+        marketId: market.marketId,
+        marketTitle: market.title,
+        signalType: signal.signalType,
+        tokenId,
+        outcome: signal.outcome,
+        side: signal.action,
+        shares: signal.shares,
+        price: executionPlan.price,
+        orderType: executionPlan.orderType,
+        postOnly: executionPlan.postOnly,
+        urgency: executionPlan.urgency,
+        currentOrderbook: orderbook,
+        signalGeneratedAt: signal.generatedAt,
+      });
+      const orderCompletedAt = Date.now();
+      const latencySignalToOrderMs =
+        signal.generatedAt !== undefined
+          ? Math.max(0, orderDispatchStartedAt - signal.generatedAt)
+          : undefined;
+      const latencyRoundTripMs =
+        signal.generatedAt !== undefined
+          ? Math.max(0, orderCompletedAt - signal.generatedAt)
+          : undefined;
+
+      return {
+        ...execution,
+        attemptCount: 1,
+        urgency: executionPlan.urgency,
+        latencySignalToOrderMs,
+        latencyRoundTripMs,
+      };
+    }
+
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= this.runtimeConfig.trading.retryAttempts; attempt += 1) {
       await this.waitForRateLimit();
 
       try {
         const orderDispatchStartedAt = Date.now();
-        const execution = await this.trader.placeOrder({
+        const execution = await this.trader!.placeOrder({
           marketId: market.marketId,
           marketTitle: market.title,
           tokenId,
@@ -102,43 +167,96 @@ export class OrderExecutor {
   }
 
   async cancelAll(): Promise<void> {
-    await this.trader.cancelAllOrders();
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      return;
+    }
+    await this.trader?.cancelAllOrders();
   }
 
   async getOrderStatus(orderId: string): Promise<unknown> {
-    return this.trader.getOrderStatus(orderId);
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      return {
+        orderId,
+        status: 'paper',
+      };
+    }
+    return this.trader?.getOrderStatus(orderId);
   }
 
   async cancelOrder(orderId: string): Promise<void> {
-    await this.trader.cancelOrder(orderId);
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      return;
+    }
+    await this.trader?.cancelOrder(orderId);
   }
 
   async getApiCredentials(): Promise<ApiCredentials | null> {
-    return this.trader.getApiCredentials();
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      return null;
+    }
+    return this.trader?.getApiCredentials() ?? null;
   }
 
   async getOutcomeTokenBalance(tokenId: string, forceRefresh = false): Promise<number> {
-    return this.trader.getOutcomeTokenBalance(tokenId, forceRefresh);
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      return 0;
+    }
+    return this.trader?.getOutcomeTokenBalance(tokenId, forceRefresh) ?? 0;
   }
 
   invalidateBalanceValidationCache(): void {
-    this.trader.invalidateBalanceValidationCache();
+    this.trader?.invalidateBalanceValidationCache();
   }
 
   invalidateOutcomeBalanceCache(tokenId?: string): void {
-    this.trader.invalidateOutcomeBalanceCache(tokenId);
+    this.trader?.invalidateOutcomeBalanceCache(tokenId);
   }
 
   getClobCircuitBreakerSnapshot(): CircuitBreakerSnapshot {
-    return this.trader.getClobCircuitBreakerSnapshot();
+    return (
+      this.trader?.getClobCircuitBreakerSnapshot() ?? {
+        name: 'clob',
+        isOpen: true,
+        consecutiveFailures: 0,
+        failureThreshold: 0,
+        resetTimeoutMs: 0,
+        openedAtMs: null,
+        nextAttemptAtMs: null,
+      }
+    );
   }
 
   getAuthenticatedClient(): ClobClient {
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      throw new Error('Authenticated CLOB client is unavailable in paper trading mode.');
+    }
+    if (!this.trader) {
+      throw new Error('Authenticated CLOB client is unavailable.');
+    }
     return this.trader.getAuthenticatedClient();
   }
 
+  hasOpenPaperPosition(marketId: string): boolean {
+    return this.paperTrader.hasOpenPosition(marketId);
+  }
+
+  resolvePaperSlot(params: {
+    marketId: string;
+    winningOutcome: 'YES' | 'NO';
+  }): { pnl: number; yesValue: number; noValue: number } | null {
+    if (!isPaperTradingEnabled(this.runtimeConfig) || !this.paperTrader.hasOpenPosition(params.marketId)) {
+      return null;
+    }
+
+    return this.paperTrader.resolveSlot(params);
+  }
+
   async close(): Promise<void> {
-    await this.trader.close();
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      this.paperTrader.printSummary();
+      return;
+    }
+    await this.trader?.close();
   }
 
   private buildExecutionPlan(

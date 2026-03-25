@@ -160,7 +160,7 @@ function formatLatencyValue(value: number | undefined): string {
 }
 
 function formatPercentValue(value: number | null | undefined): string {
-  if (value === undefined || !Number.isFinite(value)) {
+  if (value === undefined || value === null || !Number.isFinite(value)) {
     return 'n/a';
   }
 

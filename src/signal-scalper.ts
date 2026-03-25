@@ -1,7 +1,10 @@
+import type { BinanceEdgeAssessment } from './binance-edge.js';
 import { config, isDynamicQuotingEnabled, type AppConfig } from './config.js';
+import { LatencyMomentumEngine } from './latency-momentum.js';
 import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob-fetcher.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
+import { PairedArbitrageEngine } from './paired-arbitrage.js';
 import type { PositionManager } from './position-manager.js';
 import {
   clampProductTestShares,
@@ -45,6 +48,8 @@ interface EntryGuardEvaluation {
 export class SignalScalper {
   private readonly fairValueBuyCadence = new Map<string, FairValueBuyCadenceState>();
   private readonly inventoryRebalanceBlocks = new Map<string, InventoryRebalanceBlockState>();
+  private readonly pairedArbEngine = new PairedArbitrageEngine();
+  private readonly latencyMomentumEngine = new LatencyMomentumEngine();
 
   constructor(private readonly runtimeConfig: AppConfig = config) {}
 
@@ -57,6 +62,33 @@ export class SignalScalper {
     this.pruneFairValueControlState(executedAtMs);
     const key = buildFairValueControlKey(params.market, params.signal.outcome);
     const expiresAtMs = resolveFairValueControlExpiryMs(params.market, executedAtMs);
+
+    if (
+      params.signal.action === 'BUY' &&
+      (params.signal.signalType === 'PAIRED_ARB_BUY_YES' ||
+        params.signal.signalType === 'PAIRED_ARB_BUY_NO' ||
+        params.signal.signalType === 'PAIRED_ARB_REBALANCE')
+    ) {
+      this.pairedArbEngine.applyFill({
+        marketId: params.market.marketId,
+        outcome: params.signal.outcome,
+        shares: params.signal.shares,
+        price:
+          params.signal.targetPrice ??
+          params.signal.referencePrice ??
+          params.signal.tokenPrice ??
+          0.5,
+      });
+    }
+
+    if (
+      params.signal.action === 'BUY' &&
+      params.signal.signalType === 'LATENCY_MOMENTUM_BUY'
+    ) {
+      this.latencyMomentumEngine.recordExecution({
+        marketId: params.market.marketId,
+      });
+    }
 
     if (params.signal.signalType === 'FAIR_VALUE_BUY' && params.signal.action === 'BUY') {
       const current = this.fairValueBuyCadence.get(key);
@@ -87,6 +119,7 @@ export class SignalScalper {
     positionManager: PositionManager;
     riskAssessment: RiskAssessment;
     binanceFairValueAdjustment?: FairValueBinanceAdjustment;
+    binanceAssessment?: BinanceEdgeAssessment;
     now?: Date;
   }): StrategySignal[] {
     const now = params.now ?? new Date();
@@ -96,12 +129,24 @@ export class SignalScalper {
       positionManager,
       riskAssessment,
       binanceFairValueAdjustment,
+      binanceAssessment,
     } = params;
     this.pruneFairValueControlState(now.getTime());
     const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
+    const pairedProtectionEnabled =
+      this.runtimeConfig.PAIRED_ARB_ENABLED &&
+      (this.runtimeConfig.ENTRY_STRATEGY === 'PAIRED_ARBITRAGE' ||
+        this.runtimeConfig.ENTRY_STRATEGY === 'ALL');
 
     if (riskAssessment.forcedSignals.length > 0) {
-      return takeTopSignals(riskAssessment.forcedSignals, strategy.maxSignalsPerTick);
+      const protectedForcedSignals = pairedProtectionEnabled
+        ? this.pairedArbEngine.protectSignals({
+            marketId: market.marketId,
+            positionManager,
+            signals: riskAssessment.forcedSignals,
+          })
+        : [...riskAssessment.forcedSignals];
+      return takeTopSignals(protectedForcedSignals, strategy.maxSignalsPerTick);
     }
 
     if (!this.runtimeConfig.ENABLE_SIGNAL) {
@@ -112,10 +157,12 @@ export class SignalScalper {
       return [];
     }
 
-    const groups: StrategySignal[][] = [
-      this.getCombinedDiscountSignals(market, orderbook, positionManager, riskAssessment),
-      this.getExtremeSignals(market, orderbook, positionManager, riskAssessment),
-      this.getFairValueSignals(
+    const entryStrategy = this.runtimeConfig.ENTRY_STRATEGY;
+    const groups: StrategySignal[][] = [];
+    const legacySignals = [
+      ...this.getCombinedDiscountSignals(market, orderbook, positionManager, riskAssessment),
+      ...this.getExtremeSignals(market, orderbook, positionManager, riskAssessment),
+      ...this.getFairValueSignals(
         market,
         orderbook,
         positionManager,
@@ -123,10 +170,57 @@ export class SignalScalper {
         now,
         binanceFairValueAdjustment
       ),
-      this.getInventoryRebalanceSignals(market, orderbook, positionManager, riskAssessment),
     ];
 
-    const flattened = mergeSignals(groups.flat());
+    if (entryStrategy === 'LEGACY' || entryStrategy === 'ALL') {
+      groups.push(legacySignals);
+    } else {
+      groups.push(legacySignals.filter((signal) => signal.reduceOnly));
+    }
+
+    groups.push(
+      this.getInventoryRebalanceSignals(market, orderbook, positionManager, riskAssessment)
+    );
+
+    if (
+      (entryStrategy === 'PAIRED_ARBITRAGE' || entryStrategy === 'ALL') &&
+      this.runtimeConfig.PAIRED_ARB_ENABLED
+    ) {
+      groups.push(
+        this.pairedArbEngine.generateSignals({
+          market,
+          orderbook,
+          positionManager,
+          config: this.runtimeConfig.pairedArbitrage,
+          blockedOutcomes: riskAssessment.blockedOutcomes,
+        })
+      );
+    }
+
+    if (
+      (entryStrategy === 'LATENCY_MOMENTUM' || entryStrategy === 'ALL') &&
+      this.runtimeConfig.LATENCY_MOMENTUM_ENABLED
+    ) {
+      groups.push(
+        this.latencyMomentumEngine.generateSignals({
+          market,
+          orderbook,
+          positionManager,
+          binanceAssessment,
+          config: this.runtimeConfig.latencyMomentum,
+          blockedOutcomes: riskAssessment.blockedOutcomes,
+        })
+      );
+    }
+
+    const protectedSignals = pairedProtectionEnabled
+      ? this.pairedArbEngine.protectSignals({
+          marketId: market.marketId,
+          positionManager,
+          signals: groups.flat(),
+        })
+      : groups.flat();
+    const flattened = mergeSignals(protectedSignals);
     const topSignals = takeTopSignals(flattened, strategy.maxSignalsPerTick);
     return transformSignalsForMarketMaker(topSignals, this.runtimeConfig);
   }

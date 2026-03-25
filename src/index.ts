@@ -16,6 +16,7 @@ import {
   isDryRunMode,
   isDeepBinanceEnabled,
   isDynamicQuotingEnabled,
+  isPaperTradingEnabled,
   validateConfig,
 } from './config.js';
 import { getDayPnlState } from './day-pnl-state.js';
@@ -61,7 +62,11 @@ import {
   recordExecution,
   recordTrade,
 } from './slot-reporter.js';
-import { isQuotingSignalType, type StrategySignal } from './strategy-types.js';
+import {
+  bypassesBinanceEdge,
+  isQuotingSignalType,
+  type StrategySignal,
+} from './strategy-types.js';
 import { pruneSetEntries, roundTo, sleep } from './utils.js';
 
 const MAX_TRACKED_SLOT_REPORTS = 2_048;
@@ -121,6 +126,7 @@ class MarketMakerRuntime {
   private readonly settlementCooldowns = new Map<string, number>();
   private readonly settlementStartedAt = new Map<string, number>();
   private readonly settlementAttempts = new Map<string, number>();
+  private readonly paperResolutionTimers = new Map<string, NodeJS.Timeout>();
   private userStreamCredentials: {
     apiKey: string;
     secret: string;
@@ -146,6 +152,7 @@ class MarketMakerRuntime {
         market.endTime
       );
       this.pendingSlotReports.add(slotKey);
+      this.schedulePaperResolution(market);
       this.pruneSlotReportState();
     });
 
@@ -247,16 +254,20 @@ class MarketMakerRuntime {
       });
     }
     if (!isDryRunMode(config)) {
-      this.userStream.on('fills', (fills) => {
-        this.fillTracker.recordRealtimeFills(fills);
-      });
-      this.userStream.on('connection', ({ connected }) => {
-        this.fillTracker.setRealtimeFeedConnected(Boolean(connected));
-      });
-      this.userStreamCredentials = await this.executor.getApiCredentials();
-      this.fillTracker.start();
+      if (!isPaperTradingEnabled(config)) {
+        this.userStream.on('fills', (fills) => {
+          this.fillTracker.recordRealtimeFills(fills);
+        });
+        this.userStream.on('connection', ({ connected }) => {
+          this.fillTracker.setRealtimeFeedConnected(Boolean(connected));
+        });
+        this.userStreamCredentials = await this.executor.getApiCredentials();
+        this.fillTracker.start();
+      }
     }
-    this.redeemer.start();
+    if (!isPaperTradingEnabled(config)) {
+      this.redeemer.start();
+    }
   }
 
   async run(): Promise<void> {
@@ -332,6 +343,10 @@ class MarketMakerRuntime {
       this.settlementCooldowns.clear();
       this.settlementStartedAt.clear();
       this.settlementAttempts.clear();
+      for (const timer of this.paperResolutionTimers.values()) {
+        clearTimeout(timer);
+      }
+      this.paperResolutionTimers.clear();
       this.userStreamCredentials = null;
       this.userStreamStarted = false;
       this.redeemer.stop();
@@ -384,7 +399,7 @@ class MarketMakerRuntime {
 
     const tokenIds = markets.flatMap((market) => [market.yesTokenId, market.noTokenId]);
     await this.fetcher.subscribeAssets(tokenIds);
-    if (!isDryRunMode(config)) {
+    if (!isDryRunMode(config) && !isPaperTradingEnabled(config)) {
       try {
         if (!this.userStreamStarted && this.userStreamCredentials) {
           await this.userStream.start(this.userStreamCredentials);
@@ -414,6 +429,7 @@ class MarketMakerRuntime {
     const slotKey = getSlotKey(market);
     const orderbook = await this.fetcher.getMarketSnapshot(market);
     this.latestBooks.set(market.marketId, orderbook);
+    this.executor.recordOrderbookSnapshot(orderbook);
 
     const positionManager = this.getPositionManager(market);
     const riskAssessment = this.riskManager.checkRiskLimits({
@@ -422,6 +438,7 @@ class MarketMakerRuntime {
       positionManager,
     });
     const binanceFairValueAdjustment = this.getBinanceFairValueAdjustment(market, orderbook);
+    const binanceAssessment = this.getPrimaryBinanceAssessment(market, orderbook);
     const deepBinanceAssessment = this.getDeepBinanceAssessment(market, orderbook);
     const signals = this.signalEngine.generateSignals({
       market,
@@ -429,6 +446,7 @@ class MarketMakerRuntime {
       positionManager,
       riskAssessment,
       binanceFairValueAdjustment,
+      binanceAssessment,
     });
     const statusPausedSignals = this.applyPauseFilter(market, signals);
     const apiGuardSignals = this.applyApiCircuitBreakerFilter(
@@ -514,27 +532,30 @@ class MarketMakerRuntime {
       return null;
     }
 
+    const paperTradingEnabled = isPaperTradingEnabled(config);
     const pendingOrderKey = this.getPendingOrderKey(market.marketId, signal.outcome);
-    const trackerPending = this.fillTracker.hasPendingOrderFor(market.marketId, signal.outcome);
-    if (!trackerPending) {
-      this.clearPendingLiveOrder(pendingOrderKey);
-    }
+    if (!paperTradingEnabled) {
+      const trackerPending = this.fillTracker.hasPendingOrderFor(market.marketId, signal.outcome);
+      if (!trackerPending) {
+        this.clearPendingLiveOrder(pendingOrderKey);
+      }
 
-    if (this.hasPendingLiveOrder(pendingOrderKey) || trackerPending) {
-      logger.debug('Skipping signal because live resting order is still pending', {
-        marketId: market.marketId,
-        signalType: signal.signalType,
-        outcome: signal.outcome,
-        action: signal.action,
-      });
-      return null;
+      if (this.hasPendingLiveOrder(pendingOrderKey) || trackerPending) {
+        logger.debug('Skipping signal because live resting order is still pending', {
+          marketId: market.marketId,
+          signalType: signal.signalType,
+          outcome: signal.outcome,
+          action: signal.action,
+        });
+        return null;
+      }
     }
 
     const nowMs = Date.now();
     const tokenId = signal.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
     const settlementCooldownKey = getSettlementCooldownKey(market.marketId, signal.outcome);
     const settlementCooldownUntil = this.settlementCooldowns.get(settlementCooldownKey);
-    if (signal.action === 'SELL' && signal.signalType !== 'HARD_STOP') {
+    if (!paperTradingEnabled && signal.action === 'SELL' && signal.signalType !== 'HARD_STOP') {
       if (
         shouldDeferSignalForSettlement({
           signal,
@@ -612,7 +633,9 @@ class MarketMakerRuntime {
         submittedPrice: execution.price,
         signalType: signal.signalType,
         placedAt: startedAt,
-        slotEndTime: market.endTime,
+        slotEndTime:
+          market.endTime ??
+          new Date(startedAt + config.FILL_POLL_TIMEOUT_MS).toISOString(),
         lastCheckedAt: 0,
         filledSharesSoFar: 0,
       });
@@ -644,11 +667,11 @@ class MarketMakerRuntime {
       );
     }
     const completedAt = Date.now();
-    if (effectiveShares > 0 && signal.action === 'BUY') {
+    if (!paperTradingEnabled && effectiveShares > 0 && signal.action === 'BUY') {
       this.armSettlementConfirmation(market.marketId, signal.outcome, completedAt);
       this.executor.invalidateOutcomeBalanceCache(tokenId);
       this.executor.invalidateBalanceValidationCache();
-    } else if (effectiveShares > 0 && signal.action === 'SELL') {
+    } else if (!paperTradingEnabled && effectiveShares > 0 && signal.action === 'SELL') {
       this.clearSettlementConfirmation(market.marketId, signal.outcome);
       this.executor.invalidateOutcomeBalanceCache(tokenId);
       this.executor.invalidateBalanceValidationCache();
@@ -1444,6 +1467,24 @@ class MarketMakerRuntime {
           return { signal };
         }
 
+        if (bypassesBinanceEdge(signal.signalType)) {
+          if (signal.signalType === 'LATENCY_MOMENTUM_BUY') {
+            const assessment = this.binanceEdge.assess({
+              coin,
+              slotStartTime: market.startTime,
+              pmUpMid: orderbook.yes.midPrice,
+              signalAction: signal.action,
+              signalOutcome: signal.outcome,
+            });
+            return {
+              signal,
+              binanceAssessment: assessment.available ? assessment : undefined,
+            };
+          }
+
+          return { signal };
+        }
+
         const assessment = this.binanceEdge.assess({
           coin,
           slotStartTime: market.startTime,
@@ -1499,6 +1540,91 @@ class MarketMakerRuntime {
       .filter((candidate): candidate is SignalExecutionCandidate => candidate !== null);
   }
 
+  private getPrimaryBinanceAssessment(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot
+  ): BinanceEdgeAssessment | undefined {
+    const coin = extractCoinFromTitle(market.title);
+    if (!coin || !this.binanceEdge.hasMarketData()) {
+      return undefined;
+    }
+
+    this.binanceEdge.recordSlotOpen(coin, market.startTime);
+    return this.binanceEdge.assess({
+      coin,
+      slotStartTime: market.startTime,
+      pmUpMid: orderbook.yes.midPrice,
+      signalAction: 'BUY',
+      signalOutcome: 'YES',
+    });
+  }
+
+  private schedulePaperResolution(market: MarketCandidate): void {
+    if (!isPaperTradingEnabled(config) || this.paperResolutionTimers.has(market.marketId)) {
+      return;
+    }
+
+    const endMs = market.endTime ? Date.parse(market.endTime) : Number.NaN;
+    if (!Number.isFinite(endMs)) {
+      return;
+    }
+
+    const delayMs = Math.max(0, endMs - Date.now()) + 1_000;
+    const timer = setTimeout(() => {
+      this.paperResolutionTimers.delete(market.marketId);
+      void this.resolvePaperSlot(market);
+    }, delayMs);
+    timer.unref?.();
+    this.paperResolutionTimers.set(market.marketId, timer);
+  }
+
+  private async resolvePaperSlot(market: MarketCandidate): Promise<void> {
+    if (!isPaperTradingEnabled(config) || !this.executor.hasOpenPaperPosition(market.marketId)) {
+      return;
+    }
+
+    const coin = extractCoinFromTitle(market.title);
+    if (!coin) {
+      return;
+    }
+
+    const slotOpenPrice = this.binanceEdge.getSlotOpenPrice(coin, market.startTime);
+    const latestPrice = this.binanceEdge.getLatestPrice(coin);
+    if (
+      slotOpenPrice === null ||
+      latestPrice === null ||
+      !Number.isFinite(slotOpenPrice) ||
+      !Number.isFinite(latestPrice)
+    ) {
+      logger.debug('Paper slot resolution skipped due to missing Binance reference', {
+        marketId: market.marketId,
+        coin,
+      });
+      return;
+    }
+
+    const winningOutcome: 'YES' | 'NO' = latestPrice >= slotOpenPrice ? 'YES' : 'NO';
+    const resolution = this.executor.resolvePaperSlot({
+      marketId: market.marketId,
+      winningOutcome,
+    });
+    if (!resolution) {
+      return;
+    }
+
+    logger.info('Paper slot resolved', {
+      marketId: market.marketId,
+      winningOutcome,
+      slotOpenPrice,
+      latestPrice,
+      pnl: resolution.pnl,
+    });
+
+    this.positions.delete(market.marketId);
+    this.latestBooks.delete(market.marketId);
+    this.marketActions.delete(market.marketId);
+  }
+
   private getBinanceFairValueAdjustment(
     market: MarketCandidate,
     orderbook: MarketOrderbookSnapshot
@@ -1540,7 +1666,7 @@ class MarketMakerRuntime {
     }
 
     const coin = extractCoinFromTitle(market.title);
-    if (!coin) {
+    if (!coin || !market.startTime) {
       return undefined;
     }
 
@@ -1606,7 +1732,7 @@ class MarketMakerRuntime {
         const coin = extractCoinFromTitle(market.title);
         const pmUpMid = normalizeRuntimeNumber(orderbook?.yes.midPrice);
         const pmDownMid = normalizeRuntimeNumber(orderbook?.no.midPrice);
-        const combinedDiscount = normalizeRuntimeNumber(orderbook?.combinedDiscount);
+        const combinedDiscount = normalizeRuntimeNumber(orderbook?.combined.combinedDiscount);
         const assessment =
           coin && orderbook
             ? this.binanceEdge.assess({

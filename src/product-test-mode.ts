@@ -39,6 +39,14 @@ export interface ProductTestExecutionRecord {
   readonly latencyRoundTripMs?: number;
 }
 
+function isProductTestFeature(
+  signalType: SignalType
+): signalType is Exclude<ProductTestFeature, 'AUTO_REDEEM'> {
+  return PRODUCT_TEST_REQUIRED_FEATURES.includes(
+    signalType as Exclude<ProductTestFeature, 'AUTO_REDEEM'>
+  );
+}
+
 export interface ProductTestRedeemRecord {
   readonly timestampMs: number;
   readonly conditionId: string;
@@ -187,7 +195,9 @@ export class ProductTestModeController {
       return;
     }
 
-    this.observedFeatures.add(params.signal.signalType);
+    if (isProductTestFeature(params.signal.signalType)) {
+      this.observedFeatures.add(params.signal.signalType);
+    }
     this.executionRecords.push({
       timestampMs: Date.now(),
       signalType: params.signal.signalType,

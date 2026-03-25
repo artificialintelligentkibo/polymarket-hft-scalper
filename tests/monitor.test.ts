@@ -278,7 +278,7 @@ test('fetchPaginatedGammaEventMarkets paginates ordered crypto /events and flatt
 });
 
 test('fetchGammaEventsPage aborts hung Gamma requests with a timeout', async () => {
-  const hangingFetch = ((_: URL | RequestInfo, init?: RequestInit) =>
+  const hangingFetch = ((_: Parameters<typeof fetch>[0], init?: RequestInit) =>
     new Promise<Response>((_resolve, reject) => {
       const signal = init?.signal;
       signal?.addEventListener(

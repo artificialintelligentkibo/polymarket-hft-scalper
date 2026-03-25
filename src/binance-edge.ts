@@ -50,7 +50,7 @@ export class BinanceEdgeProvider {
   constructor(private readonly runtimeConfig: AppConfig = config) {}
 
   start(): void {
-    if (!this.runtimeConfig.binance.edgeEnabled || this.ws || this.reconnectTimer) {
+    if (!this.shouldRunFeed() || this.ws || this.reconnectTimer) {
       return;
     }
 
@@ -77,6 +77,19 @@ export class BinanceEdgeProvider {
 
   isReady(): boolean {
     return this.runtimeConfig.binance.edgeEnabled && this.lastPrices.size > 0;
+  }
+
+  hasMarketData(): boolean {
+    return this.lastPrices.size > 0;
+  }
+
+  getLatestPrice(coin: string): number | null {
+    const symbol = COIN_TO_BINANCE[coin.toUpperCase()];
+    if (!symbol) {
+      return null;
+    }
+
+    return this.lastPrices.get(symbol) ?? null;
   }
 
   assess(params: {
@@ -267,7 +280,7 @@ export class BinanceEdgeProvider {
   }
 
   private scheduleReconnect(): void {
-    if (!this.runtimeConfig.binance.edgeEnabled) {
+    if (!this.shouldRunFeed()) {
       return;
     }
     if (this.reconnectTimer) {
@@ -318,6 +331,14 @@ export class BinanceEdgeProvider {
       });
     }, 60_000);
     this.heartbeatTimer.unref?.();
+  }
+
+  private shouldRunFeed(): boolean {
+    return (
+      this.runtimeConfig.binance.edgeEnabled ||
+      this.runtimeConfig.LATENCY_MOMENTUM_ENABLED ||
+      this.runtimeConfig.PAPER_TRADING_ENABLED
+    );
   }
 }
 

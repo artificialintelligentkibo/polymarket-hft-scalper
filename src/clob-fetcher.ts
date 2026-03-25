@@ -886,7 +886,8 @@ function normalizeWsData(payload: WebSocket.Data): string {
     return Buffer.from(payload).toString('utf8');
   }
   if (ArrayBuffer.isView(payload)) {
-    return Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).toString('utf8');
+    const view = payload as ArrayBufferView;
+    return Buffer.from(view.buffer, view.byteOffset, view.byteLength).toString('utf8');
   }
 
   return String(payload);
