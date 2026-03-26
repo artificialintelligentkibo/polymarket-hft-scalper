@@ -1589,12 +1589,18 @@ class MarketMakerRuntime {
     }
 
     const slotOpenPrice = this.binanceEdge.getSlotOpenPrice(coin, market.startTime);
+    const slotEndMs = market.endTime ? Date.parse(market.endTime) : Number.NaN;
+    const slotClosePrice =
+      Number.isFinite(slotEndMs)
+        ? this.binanceEdge.getPriceAt(coin, slotEndMs)
+        : null;
     const latestPrice = this.binanceEdge.getLatestPrice(coin);
+    const settlementPrice = slotClosePrice ?? latestPrice;
     if (
       slotOpenPrice === null ||
-      latestPrice === null ||
+      settlementPrice === null ||
       !Number.isFinite(slotOpenPrice) ||
-      !Number.isFinite(latestPrice)
+      !Number.isFinite(settlementPrice)
     ) {
       logger.debug('Paper slot resolution skipped due to missing Binance reference', {
         marketId: market.marketId,
@@ -1603,7 +1609,7 @@ class MarketMakerRuntime {
       return;
     }
 
-    const winningOutcome: 'YES' | 'NO' = latestPrice >= slotOpenPrice ? 'YES' : 'NO';
+    const winningOutcome: 'YES' | 'NO' = settlementPrice >= slotOpenPrice ? 'YES' : 'NO';
     const resolution = this.executor.resolvePaperSlot({
       marketId: market.marketId,
       winningOutcome,
@@ -1616,7 +1622,9 @@ class MarketMakerRuntime {
       marketId: market.marketId,
       winningOutcome,
       slotOpenPrice,
+      slotClosePrice,
       latestPrice,
+      settlementPrice,
       pnl: resolution.pnl,
     });
 

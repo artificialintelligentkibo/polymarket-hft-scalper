@@ -6,6 +6,8 @@ import type { StrategySignal } from './strategy-types.js';
 import { clamp, roundTo } from './utils.js';
 
 const ESTIMATED_SETTLEMENT_FEE = 0.02;
+export const MIN_CLOB_ORDER_NOTIONAL_USD = 1;
+export const MIN_CLOB_ORDER_SHARES = 5;
 
 export interface PairedArbConfig {
   enabled: boolean;
@@ -122,6 +124,12 @@ export class PairedArbitrageEngine {
     }
 
     const signals: StrategySignal[] = [];
+    const aggressiveOutcome =
+      yesShares > 0 && noShares > 0
+        ? bestAskYes <= bestAskNo
+          ? 'YES'
+          : 'NO'
+        : null;
     if (yesShares > 0) {
       const signalType =
         noShares > 0 ? 'PAIRED_ARB_BUY_YES' : 'PAIRED_ARB_REBALANCE';
@@ -134,6 +142,8 @@ export class PairedArbitrageEngine {
           shares: yesShares,
           targetPrice: bestAskYes,
           edgeAmount: netEdge,
+          priority: aggressiveOutcome === 'YES' ? 501 : 500,
+          urgency: aggressiveOutcome === 'YES' ? 'cross' : 'improve',
           reason:
             noShares > 0
               ? `YES + NO ask ${combinedAsk.toFixed(4)} leaves ${netEdge.toFixed(4)} net paired edge`
@@ -154,6 +164,8 @@ export class PairedArbitrageEngine {
           shares: noShares,
           targetPrice: bestAskNo,
           edgeAmount: netEdge,
+          priority: aggressiveOutcome === 'NO' ? 501 : 500,
+          urgency: aggressiveOutcome === 'NO' ? 'cross' : 'improve',
           reason:
             yesShares > 0
               ? `YES + NO ask ${combinedAsk.toFixed(4)} leaves ${netEdge.toFixed(4)} net paired edge`
@@ -190,6 +202,8 @@ export class PairedArbitrageEngine {
     const { position, bestAskYes, bestAskNo, depthYes, depthNo, config } = params;
     const currentYes = position?.yesShares ?? 0;
     const currentNo = position?.noShares ?? 0;
+    const minYesShares = resolveMinimumTradableShares(bestAskYes, config.minSharesPerLeg);
+    const minNoShares = resolveMinimumTradableShares(bestAskNo, config.minSharesPerLeg);
     const targetNo = currentYes * config.targetBalanceRatio;
     const targetYes = currentNo * config.targetBalanceRatio;
     const imbalanceRatio =
@@ -209,23 +223,30 @@ export class PairedArbitrageEngine {
     if (imbalanceRatio > config.balanceTolerance) {
       if (currentYes < targetYes) {
         const neededShares = roundTo(targetYes - currentYes, 4);
-        const shares = clamp(neededShares, 0, capYes);
-        if (shares >= config.minSharesPerLeg && this.canImprovePairCost(position, 'YES', shares, bestAskYes, config)) {
+        const shares = clamp(Math.max(neededShares, minYesShares), 0, capYes);
+        if (
+          shares >= minYesShares &&
+          this.canImprovePairCost(position, 'YES', shares, bestAskYes, config)
+        ) {
           return { yesShares: roundTo(shares, 4), noShares: 0 };
         }
       }
 
       if (currentNo < targetNo) {
         const neededShares = roundTo(targetNo - currentNo, 4);
-        const shares = clamp(neededShares, 0, capNo);
-        if (shares >= config.minSharesPerLeg && this.canImprovePairCost(position, 'NO', shares, bestAskNo, config)) {
+        const shares = clamp(Math.max(neededShares, minNoShares), 0, capNo);
+        if (
+          shares >= minNoShares &&
+          this.canImprovePairCost(position, 'NO', shares, bestAskNo, config)
+        ) {
           return { yesShares: 0, noShares: roundTo(shares, 4) };
         }
       }
     }
 
     const pairShares = roundTo(Math.min(capYes, capNo), 4);
-    if (pairShares < config.minSharesPerLeg) {
+    const minPairShares = roundTo(Math.max(minYesShares, minNoShares), 4);
+    if (pairShares < minPairShares) {
       return { yesShares: 0, noShares: 0 };
     }
 
@@ -379,7 +400,7 @@ export class PairedArbitrageEngine {
     price: number,
     config: PairedArbConfig
   ): boolean {
-    if (shares <= 0) {
+    if (shares <= 0 || !meetsClobMinimums(shares, price)) {
       return false;
     }
 
@@ -417,10 +438,12 @@ function buildPairedSignal(params: {
   market: MarketCandidate;
   orderbook: MarketOrderbookSnapshot;
   signalType: StrategySignal['signalType'];
+  priority: number;
   outcome: Outcome;
   shares: number;
   targetPrice: number;
   edgeAmount: number;
+  urgency: StrategySignal['urgency'];
   reason: string;
 }): StrategySignal {
   const book = params.outcome === 'YES' ? params.orderbook.yes : params.orderbook.no;
@@ -429,7 +452,7 @@ function buildPairedSignal(params: {
     marketId: params.market.marketId,
     marketTitle: params.market.title,
     signalType: params.signalType,
-    priority: 500,
+    priority: params.priority,
     generatedAt: Date.now(),
     action: 'BUY',
     outcome: params.outcome,
@@ -449,10 +472,39 @@ function buildPairedSignal(params: {
     fillRatio: 1,
     capitalClamp: 1,
     priceMultiplier: 1,
-    urgency: 'cross',
+    urgency: params.urgency,
     reduceOnly: false,
     reason: params.reason,
   };
+}
+
+export function resolveMinimumTradableShares(
+  price: number,
+  configuredMinShares: number
+): number {
+  if (!Number.isFinite(price) || price <= 0) {
+    return roundTo(Math.max(configuredMinShares, MIN_CLOB_ORDER_SHARES), 4);
+  }
+
+  const notionalFloorShares = roundTo(
+    Math.ceil((MIN_CLOB_ORDER_NOTIONAL_USD / price) * 10_000) / 10_000,
+    4
+  );
+  return roundTo(
+    Math.max(configuredMinShares, MIN_CLOB_ORDER_SHARES, notionalFloorShares),
+    4
+  );
+}
+
+export function meetsClobMinimums(shares: number, price: number): boolean {
+  if (!Number.isFinite(shares) || !Number.isFinite(price) || shares <= 0 || price <= 0) {
+    return false;
+  }
+
+  return (
+    shares >= MIN_CLOB_ORDER_SHARES &&
+    roundTo(shares * price, 6) >= MIN_CLOB_ORDER_NOTIONAL_USD
+  );
 }
 
 function computeWeightedAverage(

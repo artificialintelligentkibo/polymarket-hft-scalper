@@ -211,61 +211,6 @@ export class PaperTrader {
     };
   }
 
-  /**
-   * Walks orderbook levels to simulate a taker fill.
-   */
-  private simulateOrderbookWalk(
-    levels: OrderbookLevel[],
-    shares: number,
-    side: 'BUY' | 'SELL'
-  ): { filledShares: number; avgPrice: number; slippage: number } {
-    const orderedLevels =
-      side === 'BUY'
-        ? [...levels].sort((left, right) => left.price - right.price)
-        : [...levels].sort((left, right) => right.price - left.price);
-
-    let remainingShares = shares;
-    let filledShares = 0;
-    let totalNotional = 0;
-
-    for (const level of orderedLevels) {
-      if (remainingShares <= 0) {
-        break;
-      }
-
-      const availableShares = Math.max(0, level.size);
-      if (availableShares <= 0) {
-        continue;
-      }
-
-      const consumedShares = Math.min(remainingShares, availableShares);
-      filledShares += consumedShares;
-      totalNotional += consumedShares * level.price;
-      remainingShares -= consumedShares;
-    }
-
-    if (filledShares <= 0) {
-      return {
-        filledShares: 0,
-        avgPrice: 0,
-        slippage: 0,
-      };
-    }
-
-    const avgPrice = totalNotional / filledShares;
-    const topPrice = orderedLevels[0]?.price ?? avgPrice;
-    const slippage =
-      side === 'BUY'
-        ? Math.max(0, avgPrice - topPrice)
-        : Math.max(0, topPrice - avgPrice);
-
-    return {
-      filledShares: roundTo(filledShares, 4),
-      avgPrice: roundTo(avgPrice, 6),
-      slippage: roundTo(slippage, 6),
-    };
-  }
-
   resolveSlot(params: {
     marketId: string;
     winningOutcome: 'YES' | 'NO';
@@ -429,7 +374,7 @@ export class PaperTrader {
     slippage: number;
   } {
     const levels = params.side === 'BUY' ? params.book.asks : params.book.bids;
-    const walked = this.simulateOrderbookWalk(levels, params.shares, params.side);
+    const walked = simulateOrderbookWalk(levels, params.shares, params.side);
     if (walked.filledShares <= 0) {
       return this.buildUnfilledFill(params.side, params.requestedPrice);
     }
@@ -622,6 +567,58 @@ export class PaperTrader {
 
 function resolveBookForOutcome(snapshot: MarketOrderbookSnapshot, outcome: Outcome): TokenBookSnapshot {
   return outcome === 'YES' ? snapshot.yes : snapshot.no;
+}
+
+export function simulateOrderbookWalk(
+  levels: OrderbookLevel[],
+  shares: number,
+  side: 'BUY' | 'SELL'
+): { filledShares: number; avgPrice: number; slippage: number } {
+  const orderedLevels =
+    side === 'BUY'
+      ? [...levels].sort((left, right) => left.price - right.price)
+      : [...levels].sort((left, right) => right.price - left.price);
+
+  let remainingShares = shares;
+  let filledShares = 0;
+  let totalNotional = 0;
+
+  for (const level of orderedLevels) {
+    if (remainingShares <= 0) {
+      break;
+    }
+
+    const availableShares = Math.max(0, level.size);
+    if (availableShares <= 0) {
+      continue;
+    }
+
+    const consumedShares = Math.min(remainingShares, availableShares);
+    filledShares += consumedShares;
+    totalNotional += consumedShares * level.price;
+    remainingShares -= consumedShares;
+  }
+
+  if (filledShares <= 0) {
+    return {
+      filledShares: 0,
+      avgPrice: 0,
+      slippage: 0,
+    };
+  }
+
+  const avgPrice = totalNotional / filledShares;
+  const topPrice = orderedLevels[0]?.price ?? avgPrice;
+  const slippage =
+    side === 'BUY'
+      ? Math.max(0, avgPrice - topPrice)
+      : Math.max(0, topPrice - avgPrice);
+
+  return {
+    filledShares: roundTo(filledShares, 4),
+    avgPrice: roundTo(avgPrice, 6),
+    slippage: roundTo(slippage, 6),
+  };
 }
 
 function inferTickSize(book: TokenBookSnapshot, fallbackPrice: number): number {

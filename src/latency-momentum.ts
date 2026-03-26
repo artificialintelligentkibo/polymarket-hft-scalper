@@ -12,6 +12,7 @@ export interface LatencyMomentumConfig {
   strongMovePct: number;
   maxEntryWindowMs: number;
   maxPmLagPct: number;
+  pmMoveSensitivity: number;
   maxEntryPrice: number;
   minEntryPrice: number;
   baseShares: number;
@@ -79,9 +80,12 @@ export class LatencyMomentumEngine {
     }
 
     const pmDirectionalMovePct =
-      binanceAssessment.pmUpMid === null
-        ? 0
-        : Math.abs((binanceAssessment.pmUpMid - 0.5) * 100);
+      calculatePmEquivalentMovePct({
+        pmUpMid: binanceAssessment.pmUpMid,
+        pmDirection: binanceAssessment.pmImpliedDirection,
+        binanceDirection: binanceAssessment.direction,
+        pmMoveSensitivity: config.pmMoveSensitivity,
+      });
     const lagGap = roundTo(movePct - pmDirectionalMovePct, 4);
     if (lagGap < config.maxPmLagPct) {
       return [];
@@ -118,7 +122,8 @@ export class LatencyMomentumEngine {
         outcomeIndex: desiredOutcome === 'YES' ? 0 : 1,
         shares,
         targetPrice: roundTo(bestAsk, 6),
-        referencePrice: binanceAssessment.binancePrice,
+        referencePrice:
+          binanceAssessment.binancePrice ?? binanceAssessment.slotOpenPrice,
         tokenPrice: book.lastTradePrice ?? bestAsk,
         midPrice: book.midPrice,
         fairValue: null,
@@ -131,9 +136,9 @@ export class LatencyMomentumEngine {
         fillRatio: 1,
         capitalClamp: clamp(availableCapacity / Math.max(config.maxPositionShares, 1), 0.25, 1),
         priceMultiplier: movePct >= config.strongMovePct ? 1.5 : 1,
-        urgency: 'cross',
+          urgency: 'cross',
         reduceOnly: false,
-        reason: `Binance moved ${binanceAssessment.binanceMovePct.toFixed(4)}% ${binanceAssessment.direction} while ${desiredOutcome} still offers ${bestAsk.toFixed(4)} ask`,
+        reason: `Binance moved ${binanceAssessment.binanceMovePct.toFixed(4)}% ${binanceAssessment.direction} while Polymarket repriced only ${pmDirectionalMovePct.toFixed(4)}% equivalent and ${desiredOutcome} still offers ${bestAsk.toFixed(4)} ask`,
       },
     ];
   }
@@ -145,7 +150,7 @@ export class LatencyMomentumEngine {
   }
 }
 
-function resolveLatencyOutcome(
+export function resolveLatencyOutcome(
   direction: 'UP' | 'DOWN' | 'FLAT',
   invertSignal: boolean
 ): Outcome {
@@ -155,4 +160,25 @@ function resolveLatencyOutcome(
   }
 
   return cheapOutcome === 'YES' ? 'NO' : 'YES';
+}
+
+export function calculatePmEquivalentMovePct(params: {
+  pmUpMid: number | null;
+  pmDirection: 'UP' | 'DOWN' | 'FLAT';
+  binanceDirection: 'UP' | 'DOWN' | 'FLAT';
+  pmMoveSensitivity: number;
+}): number {
+  const { pmUpMid, pmDirection, binanceDirection, pmMoveSensitivity } = params;
+  if (
+    pmUpMid === null ||
+    !Number.isFinite(pmUpMid) ||
+    binanceDirection === 'FLAT' ||
+    pmDirection !== binanceDirection ||
+    !Number.isFinite(pmMoveSensitivity) ||
+    pmMoveSensitivity <= 0
+  ) {
+    return 0;
+  }
+
+  return roundTo(Math.abs(pmUpMid - 0.5) / pmMoveSensitivity, 4);
 }

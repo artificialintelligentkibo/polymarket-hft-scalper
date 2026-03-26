@@ -173,3 +173,14 @@ test('assess reports explicit reason when slot open is missing', () => {
   assert.equal(assessment.available, false);
   assert.equal(assessment.unavailableReason, 'no_slot_open_price');
 });
+
+test('getPriceAt returns the nearest cached Binance sample around slot close', () => {
+  const provider = createEdgeProvider();
+  const baseMs = Date.now();
+  provider.ingestPriceTick('btcusdt', 100, baseMs + 1_000);
+  provider.ingestPriceTick('btcusdt', 101, baseMs + 5_000);
+  provider.ingestPriceTick('btcusdt', 102, baseMs + 9_000);
+
+  assert.equal(provider.getPriceAt('BTC', baseMs + 4_600), 101);
+  assert.equal(provider.getPriceAt('BTC', baseMs + 8_800), 102);
+});

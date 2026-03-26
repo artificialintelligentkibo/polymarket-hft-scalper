@@ -25,8 +25,15 @@ interface SlotOpenReference {
   readonly createdAt: number;
 }
 
+interface BinancePriceSample {
+  readonly price: number;
+  readonly recordedAtMs: number;
+}
+
 const BINANCE_STREAM_BASE = 'wss://stream.binance.com:9443/stream?streams=';
 const SLOT_OPEN_TTL_MS = 10 * 60_000;
+const PRICE_HISTORY_TTL_MS = 20 * 60_000;
+const MAX_PRICE_SAMPLES_PER_SYMBOL = 4_096;
 
 export const COIN_TO_BINANCE: Record<string, string> = {
   BTC: 'btcusdt',
@@ -46,6 +53,7 @@ export class BinanceEdgeProvider {
   private connected = false;
   private readonly lastPrices = new Map<string, number>();
   private readonly slotOpenPrices = new Map<string, SlotOpenReference>();
+  private readonly priceHistory = new Map<string, BinancePriceSample[]>();
 
   constructor(private readonly runtimeConfig: AppConfig = config) {}
 
@@ -90,6 +98,40 @@ export class BinanceEdgeProvider {
     }
 
     return this.lastPrices.get(symbol) ?? null;
+  }
+
+  getPriceAt(coin: string, timestampMs: number): number | null {
+    const symbol = COIN_TO_BINANCE[coin.toUpperCase()];
+    if (!symbol || !Number.isFinite(timestampMs)) {
+      return null;
+    }
+
+    this.prunePriceHistory();
+    const history = this.priceHistory.get(symbol);
+    if (!history || history.length === 0) {
+      return null;
+    }
+
+    let bestSample: BinancePriceSample | null = null;
+    for (const sample of history) {
+      if (bestSample === null) {
+        bestSample = sample;
+        continue;
+      }
+
+      const sampleDistance = Math.abs(sample.recordedAtMs - timestampMs);
+      const bestDistance = Math.abs(bestSample.recordedAtMs - timestampMs);
+      if (
+        sampleDistance < bestDistance ||
+        (sampleDistance === bestDistance &&
+          sample.recordedAtMs <= timestampMs &&
+          bestSample.recordedAtMs > timestampMs)
+      ) {
+        bestSample = sample;
+      }
+    }
+
+    return bestSample?.price ?? null;
   }
 
   assess(params: {
@@ -206,13 +248,24 @@ export class BinanceEdgeProvider {
     return this.slotOpenPrices.get(buildSlotKey(coin.toUpperCase(), slotStartTime))?.openPrice ?? null;
   }
 
-  ingestPriceTick(symbol: string, price: number): void {
+  ingestPriceTick(symbol: string, price: number, recordedAtMs = Date.now()): void {
     if (!Number.isFinite(price) || price <= 0) {
       return;
     }
 
+    const normalizedSymbol = symbol.toLowerCase();
     this.connected = true;
-    this.lastPrices.set(symbol.toLowerCase(), price);
+    this.lastPrices.set(normalizedSymbol, price);
+    const history = this.priceHistory.get(normalizedSymbol) ?? [];
+    history.push({
+      price,
+      recordedAtMs,
+    });
+    if (history.length > MAX_PRICE_SAMPLES_PER_SYMBOL) {
+      history.splice(0, history.length - MAX_PRICE_SAMPLES_PER_SYMBOL);
+    }
+    this.priceHistory.set(normalizedSymbol, history);
+    this.prunePriceHistory();
   }
 
   private connect(): void {
@@ -317,6 +370,18 @@ export class BinanceEdgeProvider {
     }
   }
 
+  private prunePriceHistory(): void {
+    const cutoff = Date.now() - PRICE_HISTORY_TTL_MS;
+    for (const [symbol, samples] of this.priceHistory.entries()) {
+      const next = samples.filter((sample) => sample.recordedAtMs >= cutoff);
+      if (next.length === 0) {
+        this.priceHistory.delete(symbol);
+        continue;
+      }
+      this.priceHistory.set(symbol, next);
+    }
+  }
+
   private startHeartbeat(): void {
     if (this.heartbeatTimer) {
       return;
@@ -327,6 +392,7 @@ export class BinanceEdgeProvider {
         connected: this.connected,
         symbols: this.lastPrices.size,
         slotOpenPrices: this.slotOpenPrices.size,
+        priceHistorySymbols: this.priceHistory.size,
         reconnectAttempts: this.reconnectAttempts,
       });
     }, 60_000);

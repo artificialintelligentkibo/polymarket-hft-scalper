@@ -654,7 +654,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     pairedArbitrage: {
       enabled: parseBoolean(env.PAIRED_ARB_ENABLED, false),
-      minNetEdge: parseFloatOrDefault(env.PAIRED_ARB_MIN_NET_EDGE, '0.03'),
+      minNetEdge: parseFloatOrDefault(env.PAIRED_ARB_MIN_NET_EDGE, '0.02'),
       maxPairCost: parseFloatOrDefault(env.PAIRED_ARB_MAX_PAIR_COST, '0.97'),
       targetBalanceRatio: parseFloatOrDefault(env.PAIRED_ARB_TARGET_BALANCE_RATIO, '1.0'),
       balanceTolerance: parseFloatOrDefault(env.PAIRED_ARB_BALANCE_TOLERANCE, '0.15'),
@@ -674,6 +674,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseIntOrDefault(env.LATENCY_MOMENTUM_MAX_ENTRY_WINDOW_MS, '120000')
       ),
       maxPmLagPct: parseFloatOrDefault(env.LATENCY_MOMENTUM_MAX_PM_LAG_PCT, '0.10'),
+      pmMoveSensitivity: parseFloatOrDefault(
+        env.LATENCY_MOMENTUM_PM_MOVE_SENSITIVITY,
+        '0.10'
+      ),
       maxEntryPrice: parseFloatOrDefault(env.LATENCY_MOMENTUM_MAX_ENTRY_PRICE, '0.15'),
       minEntryPrice: parseFloatOrDefault(env.LATENCY_MOMENTUM_MIN_ENTRY_PRICE, '0.01'),
       baseShares: parseFloatOrDefault(env.LATENCY_MOMENTUM_BASE_SHARES, '30'),
@@ -988,6 +992,10 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error(
       'LATENCY_MOMENTUM_STRONG_SHARES must be greater than or equal to LATENCY_MOMENTUM_BASE_SHARES.'
     );
+  }
+
+  if (candidate.latencyMomentum.pmMoveSensitivity <= 0) {
+    throw new Error('LATENCY_MOMENTUM_PM_MOVE_SENSITIVITY must be positive.');
   }
 
   if (
