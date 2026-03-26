@@ -16,6 +16,7 @@ export interface SlotMetrics {
   readonly total: number;
   readonly entryCount: number;
   readonly fillCount: number;
+  readonly skippedCount: number;
   readonly upExposureUsd: number;
   readonly downExposureUsd: number;
   readonly updatedAt: string;
@@ -33,6 +34,7 @@ interface SlotResult {
   total: number;
   entryCount: number;
   fillCount: number;
+  skippedCount: number;
   upExposureUsd: number;
   downExposureUsd: number;
   updatedAt: string;
@@ -76,6 +78,7 @@ export function ensureSlotResult(
     total: 0,
     entryCount: 0,
     fillCount: 0,
+    skippedCount: 0,
     upExposureUsd: 0,
     downExposureUsd: 0,
     updatedAt: now.toISOString(),
@@ -140,6 +143,24 @@ export function recordTrade(
   recordDayPnlDelta(pnl, new Date(data.updatedAt));
 }
 
+export function recordSkippedSignal(params: {
+  slotKey: string;
+  marketId: string;
+  marketTitle: string;
+  slotStart?: string | null;
+  slotEnd?: string | null;
+}): void {
+  const data = ensureSlotResult(
+    params.slotKey,
+    params.marketId,
+    params.marketTitle,
+    params.slotStart,
+    params.slotEnd
+  );
+  data.skippedCount += 1;
+  data.updatedAt = new Date().toISOString();
+}
+
 export function getSlotMetrics(slotKey: string): SlotMetrics | null {
   const entry = slotResults.get(slotKey);
   return entry ? { ...entry } : null;
@@ -179,6 +200,7 @@ export function printSlotReport(slotKey?: string): void {
     Market: `${entry.marketId.slice(0, 12)}...`,
     Entries: entry.entryCount,
     Fills: entry.fillCount,
+    Skipped: entry.skippedCount,
     'Up PNL': entry.upPnl.toFixed(2),
     'Down PNL': entry.downPnl.toFixed(2),
     'NET PNL': entry.total.toFixed(2),
@@ -201,6 +223,7 @@ function formatSlotReport(rows: readonly SlotResult[], dayKey: string): string {
     padRight(truncateMarketId(entry.marketId), 23),
     padLeft(String(entry.entryCount), 7),
     padLeft(String(entry.fillCount), 5),
+    padLeft(String(entry.skippedCount), 7),
     padLeft(formatSigned(entry.upPnl), 9),
     padLeft(formatSigned(entry.downPnl), 9),
     padLeft(formatSigned(entry.total), 9),
@@ -216,7 +239,7 @@ function formatSlotReport(rows: readonly SlotResult[], dayKey: string): string {
     `${padRight('Slot', 30)} | ${padRight('Market', 23)} | ${padLeft('Entries', 7)} | ${padLeft(
       'Fills',
       5
-    )} | ${padLeft('Up PNL', 9)} | ${padLeft('Down PNL', 9)} | ${padLeft('NET PNL', 9)}`,
+    )} | ${padLeft('Skipped', 7)} | ${padLeft('Up PNL', 9)} | ${padLeft('Down PNL', 9)} | ${padLeft('NET PNL', 9)}`,
     ...reportRows.map((parts) => parts.join(' | ')),
     ...details,
     `TOTAL DAY PNL: ${formatSigned(totalDayPnl)} | PEAK PNL: ${formatSigned(dayState.peakPnl)} | DRAWDOWN: ${formatSigned(dayState.drawdown)}`,

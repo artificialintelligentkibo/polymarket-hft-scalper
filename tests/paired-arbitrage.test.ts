@@ -21,6 +21,10 @@ function createPairedConfig(overrides: Partial<PairedArbConfig> = {}): PairedArb
     cooldownMs: 0,
     requireBothSidesLiquidity: true,
     minDepthPerSide: 3,
+    asyncEnabled: true,
+    asyncMaxEntryPrice: 0.45,
+    asyncMinEdge: 0.01,
+    asyncMaxWaitMs: 180_000,
     ...overrides,
   };
 }

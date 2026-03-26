@@ -8,6 +8,7 @@ import { clamp, roundTo } from './utils.js';
 const ESTIMATED_SETTLEMENT_FEE = 0.02;
 export const MIN_CLOB_ORDER_NOTIONAL_USD = 1;
 export const MIN_CLOB_ORDER_SHARES = 5;
+const PENDING_HARD_STOP_PROTECTION_MS = 10_000;
 
 export interface PairedArbConfig {
   enabled: boolean;
@@ -21,6 +22,10 @@ export interface PairedArbConfig {
   cooldownMs: number;
   requireBothSidesLiquidity: boolean;
   minDepthPerSide: number;
+  asyncEnabled: boolean;
+  asyncMaxEntryPrice: number;
+  asyncMinEdge: number;
+  asyncMaxWaitMs: number;
 }
 
 export interface PairPosition {
@@ -46,6 +51,7 @@ interface PairPositionMeta {
 export class PairedArbitrageEngine {
   private readonly positions = new Map<string, PairPosition>();
   private readonly metadata = new Map<string, PairPositionMeta>();
+  private readonly pendingProtectionUntilMs = new Map<string, number>();
 
   /**
    * Generates paired entry or rebalance signals when YES + NO is cheaply mispriced.
@@ -80,98 +86,92 @@ export class PairedArbitrageEngine {
     }
 
     const combinedAsk = roundTo(bestAskYes + bestAskNo, 6);
-    if (combinedAsk >= config.maxPairCost) {
-      return [];
-    }
-
-    if (
-      config.requireBothSidesLiquidity &&
-      (orderbook.yes.depthNotionalAsk < config.minDepthPerSide ||
-        orderbook.no.depthNotionalAsk < config.minDepthPerSide)
-    ) {
-      return [];
-    }
-
     const netEdge = roundTo(1 - combinedAsk - ESTIMATED_SETTLEMENT_FEE, 6);
-    if (netEdge < config.minNetEdge) {
-      return [];
-    }
-
-    const legSizes = this.calculateLegSizes({
-      position,
-      bestAskYes,
-      bestAskNo,
-      depthYes: orderbook.yes.depthSharesAsk,
-      depthNo: orderbook.no.depthSharesAsk,
-      config,
-    });
-
-    let yesShares = legSizes.yesShares;
-    let noShares = legSizes.noShares;
-
-    if (blockedOutcomes?.has('YES')) {
-      yesShares = 0;
-    }
-    if (blockedOutcomes?.has('NO')) {
-      noShares = 0;
-    }
-
-    if (yesShares > 0 && noShares === 0 && (position?.noShares ?? 0) <= 0) {
-      return [];
-    }
-    if (noShares > 0 && yesShares === 0 && (position?.yesShares ?? 0) <= 0) {
-      return [];
-    }
 
     const signals: StrategySignal[] = [];
-    const aggressiveOutcome =
-      yesShares > 0 && noShares > 0
-        ? bestAskYes <= bestAskNo
-          ? 'YES'
-          : 'NO'
-        : null;
-    if (yesShares > 0) {
-      const signalType =
-        noShares > 0 ? 'PAIRED_ARB_BUY_YES' : 'PAIRED_ARB_REBALANCE';
-      signals.push(
-        buildPairedSignal({
-          market,
-          orderbook,
-          signalType,
-          outcome: 'YES',
-          shares: yesShares,
-          targetPrice: bestAskYes,
-          edgeAmount: netEdge,
-          priority: aggressiveOutcome === 'YES' ? 501 : 500,
-          urgency: aggressiveOutcome === 'YES' ? 'cross' : 'improve',
-          reason:
-            noShares > 0
-              ? `YES + NO ask ${combinedAsk.toFixed(4)} leaves ${netEdge.toFixed(4)} net paired edge`
-              : `Rebalancing YES inventory to restore paired arb ratio at ${bestAskYes.toFixed(4)}`,
-        })
-      );
-    }
+    const syncEligible =
+      combinedAsk < config.maxPairCost &&
+      (!config.requireBothSidesLiquidity ||
+        (orderbook.yes.depthNotionalAsk >= config.minDepthPerSide &&
+          orderbook.no.depthNotionalAsk >= config.minDepthPerSide)) &&
+      netEdge >= config.minNetEdge;
 
-    if (noShares > 0) {
-      const signalType =
-        yesShares > 0 ? 'PAIRED_ARB_BUY_NO' : 'PAIRED_ARB_REBALANCE';
-      signals.push(
-        buildPairedSignal({
-          market,
-          orderbook,
-          signalType,
-          outcome: 'NO',
-          shares: noShares,
-          targetPrice: bestAskNo,
-          edgeAmount: netEdge,
-          priority: aggressiveOutcome === 'NO' ? 501 : 500,
-          urgency: aggressiveOutcome === 'NO' ? 'cross' : 'improve',
-          reason:
-            yesShares > 0
-              ? `YES + NO ask ${combinedAsk.toFixed(4)} leaves ${netEdge.toFixed(4)} net paired edge`
-              : `Rebalancing NO inventory to restore paired arb ratio at ${bestAskNo.toFixed(4)}`,
-        })
-      );
+    if (syncEligible) {
+      const legSizes = this.calculateLegSizes({
+        position,
+        bestAskYes,
+        bestAskNo,
+        depthYes: orderbook.yes.depthSharesAsk,
+        depthNo: orderbook.no.depthSharesAsk,
+        config,
+      });
+
+      let yesShares = legSizes.yesShares;
+      let noShares = legSizes.noShares;
+
+      if (blockedOutcomes?.has('YES')) {
+        yesShares = 0;
+      }
+      if (blockedOutcomes?.has('NO')) {
+        noShares = 0;
+      }
+
+      if (yesShares > 0 && noShares === 0 && (position?.noShares ?? 0) <= 0) {
+        return [];
+      }
+      if (noShares > 0 && yesShares === 0 && (position?.yesShares ?? 0) <= 0) {
+        return [];
+      }
+
+      const aggressiveOutcome =
+        yesShares > 0 && noShares > 0
+          ? bestAskYes <= bestAskNo
+            ? 'YES'
+            : 'NO'
+          : null;
+      if (yesShares > 0) {
+        const signalType =
+          noShares > 0 ? 'PAIRED_ARB_BUY_YES' : 'PAIRED_ARB_REBALANCE';
+        signals.push(
+          buildPairedSignal({
+            market,
+            orderbook,
+            signalType,
+            outcome: 'YES',
+            shares: yesShares,
+            targetPrice: bestAskYes,
+            edgeAmount: netEdge,
+            priority: aggressiveOutcome === 'YES' ? 501 : 500,
+            urgency: aggressiveOutcome === 'YES' ? 'cross' : 'improve',
+            reason:
+              noShares > 0
+                ? `YES + NO ask ${combinedAsk.toFixed(4)} leaves ${netEdge.toFixed(4)} net paired edge`
+                : `Rebalancing YES inventory to restore paired arb ratio at ${bestAskYes.toFixed(4)}`,
+          })
+        );
+      }
+
+      if (noShares > 0) {
+        const signalType =
+          yesShares > 0 ? 'PAIRED_ARB_BUY_NO' : 'PAIRED_ARB_REBALANCE';
+        signals.push(
+          buildPairedSignal({
+            market,
+            orderbook,
+            signalType,
+            outcome: 'NO',
+            shares: noShares,
+            targetPrice: bestAskNo,
+            edgeAmount: netEdge,
+            priority: aggressiveOutcome === 'NO' ? 501 : 500,
+            urgency: aggressiveOutcome === 'NO' ? 'cross' : 'improve',
+            reason:
+              yesShares > 0
+                ? `YES + NO ask ${combinedAsk.toFixed(4)} leaves ${netEdge.toFixed(4)} net paired edge`
+                : `Rebalancing NO inventory to restore paired arb ratio at ${bestAskNo.toFixed(4)}`,
+          })
+        );
+      }
     }
 
     if (signals.length > 0) {
@@ -179,9 +179,141 @@ export class PairedArbitrageEngine {
         marketId: market.marketId,
         combinedAsk,
         netEdge,
-        yesShares,
-        noShares,
+        yesShares:
+          signals.find((signal) => signal.outcome === 'YES')?.shares ?? 0,
+        noShares:
+          signals.find((signal) => signal.outcome === 'NO')?.shares ?? 0,
         pairedShares: position?.pairedShares ?? 0,
+      });
+    }
+
+    if (signals.length > 0) {
+      return signals;
+    }
+
+    return this.generateAsyncPairingSignals(params);
+  }
+
+  /**
+   * Generates gabagool-style async pairing entries when a single side becomes cheap.
+   */
+  generateAsyncPairingSignals(params: {
+    market: MarketCandidate;
+    orderbook: MarketOrderbookSnapshot;
+    positionManager: PositionManager;
+    config: PairedArbConfig;
+    blockedOutcomes?: ReadonlySet<Outcome>;
+  }): StrategySignal[] {
+    const { market, orderbook, positionManager, config, blockedOutcomes } = params;
+    if (!config.enabled || !config.asyncEnabled) {
+      return [];
+    }
+
+    const position = this.resolvePosition(market.marketId, positionManager);
+    const nowMs = Date.now();
+    if (
+      position &&
+      position.unpairedShares > 0 &&
+      nowMs - position.lastEntryAt > config.asyncMaxWaitMs
+    ) {
+      this.pendingProtectionUntilMs.delete(market.marketId);
+      return [];
+    }
+
+    const signals: StrategySignal[] = [];
+    for (const outcome of ['YES', 'NO'] as const) {
+      if (blockedOutcomes?.has(outcome)) {
+        continue;
+      }
+
+      const book = outcome === 'YES' ? orderbook.yes : orderbook.no;
+      const bestAsk = book.bestAsk;
+      if (
+        bestAsk === null ||
+        bestAsk <= 0 ||
+        bestAsk > config.asyncMaxEntryPrice ||
+        book.depthNotionalAsk < config.minDepthPerSide
+      ) {
+        continue;
+      }
+
+      const fairValue = estimateAsyncFairValue(orderbook, outcome);
+      const edge = fairValue === null ? null : roundTo(fairValue - bestAsk, 6);
+      if (edge === null || edge < config.asyncMinEdge) {
+        continue;
+      }
+
+      const currentShares = outcome === 'YES' ? position?.yesShares ?? 0 : position?.noShares ?? 0;
+      const oppositeShares = outcome === 'YES' ? position?.noShares ?? 0 : position?.yesShares ?? 0;
+      const currentCostBasis =
+        outcome === 'YES' ? position?.yesCostBasis ?? 0 : position?.noCostBasis ?? 0;
+      const oppositeCostBasis =
+        outcome === 'YES' ? position?.noCostBasis ?? 0 : position?.yesCostBasis ?? 0;
+      const projectedLegCost = computeWeightedAverage(
+        currentCostBasis,
+        currentShares,
+        bestAsk,
+        Math.max(0, desiredAsyncSizingHint(oppositeShares, currentShares, config, bestAsk))
+      );
+      const projectedOppositePrice =
+        oppositeShares > 0
+          ? oppositeCostBasis
+          : outcome === 'YES'
+            ? orderbook.no.midPrice ?? orderbook.no.bestAsk
+            : orderbook.yes.midPrice ?? orderbook.yes.bestAsk;
+      if (
+        projectedOppositePrice !== null &&
+        Number.isFinite(projectedOppositePrice) &&
+        roundTo(projectedLegCost + projectedOppositePrice, 6) > config.maxPairCost
+      ) {
+        continue;
+      }
+      const capShares = roundTo(
+        Math.max(
+          0,
+          Math.min(
+            config.maxSharesPerLeg,
+            config.maxPositionPerSide - currentShares,
+            book.depthSharesAsk
+          )
+        ),
+        4
+      );
+      const minimumShares = resolveMinimumTradableShares(bestAsk, config.minSharesPerLeg);
+      const desiredShares = desiredAsyncSizingHint(oppositeShares, currentShares, config, bestAsk);
+      const shares = roundTo(clamp(desiredShares, 0, capShares), 4);
+      if (shares < minimumShares || !meetsClobMinimums(shares, bestAsk)) {
+        continue;
+      }
+
+      if (!this.canImprovePairCost(position, outcome, shares, bestAsk, config)) {
+        continue;
+      }
+
+      signals.push(
+        buildPairedSignal({
+          market,
+          orderbook,
+          signalType: outcome === 'YES' ? 'PAIRED_ARB_BUY_YES' : 'PAIRED_ARB_BUY_NO',
+          outcome,
+          shares,
+          targetPrice: bestAsk,
+          edgeAmount: edge,
+          priority: oppositeShares > currentShares ? 495 : 490,
+          urgency: oppositeShares > currentShares ? 'cross' : 'improve',
+          reason:
+            oppositeShares > currentShares
+              ? `Async pairing completion for ${outcome} at ${bestAsk.toFixed(4)} with projected pair cost below ${config.maxPairCost.toFixed(4)}`
+              : `Async pairing starter for ${outcome} at ${bestAsk.toFixed(4)} (${edge.toFixed(4)} below async fair value)`,
+        })
+      );
+    }
+
+    if (signals.length > 0) {
+      logger.info('Async paired arbitrage opportunity detected', {
+        marketId: market.marketId,
+        signalCount: signals.length,
+        outcomes: signals.map((signal) => signal.outcome),
       });
     }
 
@@ -293,6 +425,14 @@ export class PairedArbitrageEngine {
       createdAt: normalized.createdAt,
       lastEntryAt: normalized.lastEntryAt,
     });
+    if (normalized.unpairedShares > 0) {
+      this.pendingProtectionUntilMs.set(
+        params.marketId,
+        Date.now() + PENDING_HARD_STOP_PROTECTION_MS
+      );
+    } else {
+      this.pendingProtectionUntilMs.delete(params.marketId);
+    }
   }
 
   /**
@@ -335,12 +475,25 @@ export class PairedArbitrageEngine {
     signals: readonly StrategySignal[];
   }): StrategySignal[] {
     const position = this.resolvePosition(params.marketId, params.positionManager);
-    if (!position || position.pairedShares <= 0) {
-      return [...params.signals];
-    }
-
     return params.signals
       .map((signal) => {
+        if (
+          signal.marketId === params.marketId &&
+          signal.signalType === 'HARD_STOP' &&
+          this.isPairedArbPending(params.marketId)
+        ) {
+          logger.info('HARD_STOP deferred for pending paired arb position', {
+            marketId: params.marketId,
+            outcome: signal.outcome,
+            shares: signal.shares,
+          });
+          return null;
+        }
+
+        if (!position || position.pairedShares <= 0) {
+          return signal;
+        }
+
         if (signal.marketId !== params.marketId || signal.action !== 'SELL') {
           return signal;
         }
@@ -363,6 +516,20 @@ export class PairedArbitrageEngine {
       .filter((signal): signal is StrategySignal => signal !== null);
   }
 
+  isPairedArbPending(marketId: string, nowMs = Date.now()): boolean {
+    const pendingUntilMs = this.pendingProtectionUntilMs.get(marketId);
+    if (!pendingUntilMs) {
+      return false;
+    }
+
+    if (pendingUntilMs <= nowMs) {
+      this.pendingProtectionUntilMs.delete(marketId);
+      return false;
+    }
+
+    return true;
+  }
+
   private resolvePosition(marketId: string, positionManager: PositionManager): PairPosition | undefined {
     const yesShares = positionManager.getShares('YES');
     const noShares = positionManager.getShares('NO');
@@ -371,6 +538,7 @@ export class PairedArbitrageEngine {
       if (existing) {
         this.positions.delete(marketId);
       }
+      this.pendingProtectionUntilMs.delete(marketId);
       return undefined;
     }
 
@@ -390,6 +558,9 @@ export class PairedArbitrageEngine {
       lastEntryAt: metadata?.lastEntryAt ?? 0,
     });
     this.positions.set(marketId, next);
+    if (next.unpairedShares <= 0) {
+      this.pendingProtectionUntilMs.delete(marketId);
+    }
     return next;
   }
 
@@ -555,4 +726,43 @@ function finalizePairPosition(position: PairPosition): PairPosition {
     guaranteedPayout,
     guaranteedProfit,
   };
+}
+
+function estimateAsyncFairValue(
+  orderbook: MarketOrderbookSnapshot,
+  outcome: Outcome
+): number | null {
+  const own = outcome === 'YES' ? orderbook.yes : orderbook.no;
+  const opposite = outcome === 'YES' ? orderbook.no : orderbook.yes;
+  if (own.midPrice !== null && opposite.midPrice !== null) {
+    const total = own.midPrice + opposite.midPrice;
+    if (Number.isFinite(total) && total > 0) {
+      return roundTo(own.midPrice / total, 6);
+    }
+  }
+
+  if (opposite.midPrice !== null) {
+    return roundTo(1 - opposite.midPrice, 6);
+  }
+
+  if (opposite.bestAsk !== null) {
+    return roundTo(1 - opposite.bestAsk, 6);
+  }
+
+  return own.midPrice ?? own.bestAsk ?? own.lastTradePrice;
+}
+
+function desiredAsyncSizingHint(
+  oppositeShares: number,
+  currentShares: number,
+  config: PairedArbConfig,
+  bestAsk: number
+): number {
+  const minimumShares = resolveMinimumTradableShares(bestAsk, config.minSharesPerLeg);
+  return roundTo(
+    oppositeShares > currentShares
+      ? Math.max(minimumShares, oppositeShares - currentShares)
+      : minimumShares,
+    4
+  );
 }

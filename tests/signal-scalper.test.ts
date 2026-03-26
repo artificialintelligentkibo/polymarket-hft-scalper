@@ -135,6 +135,19 @@ function createLegacySignalEngine(
   );
 }
 
+function createPairedSignalEngine(
+  overrides: Record<string, string> = {}
+): SignalScalper {
+  return new SignalScalper(
+    createConfig({
+      ENTRY_STRATEGY: 'PAIRED_ARBITRAGE',
+      PAIRED_ARB_ENABLED: 'true',
+      LATENCY_MOMENTUM_ENABLED: 'false',
+      ...overrides,
+    })
+  );
+}
+
 test('combined discount emits dual-sided BUY signals capped at two', () => {
   const market = createMarket();
   const orderbook = createOrderbook();
@@ -166,6 +179,189 @@ test('combined discount emits dual-sided BUY signals capped at two', () => {
     signals.map((signal) => signal.outcome).sort(),
     ['NO', 'YES']
   );
+});
+
+test('paired arb ignores MAX_SIGNALS_PER_TICK so both legs survive together', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager(
+    createConfig({
+      ENTRY_STRATEGY: 'PAIRED_ARBITRAGE',
+      PAIRED_ARB_ENABLED: 'true',
+      LATENCY_MOMENTUM_ENABLED: 'false',
+      MAX_SIGNALS_PER_TICK: '1',
+      PAIRED_ARB_MIN_NET_EDGE: '0.03',
+    })
+  );
+  const signalEngine = createPairedSignalEngine({
+    MAX_SIGNALS_PER_TICK: '1',
+    PAIRED_ARB_MIN_NET_EDGE: '0.03',
+  });
+
+  const riskAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  assert.deepEqual(
+    signals
+      .filter((signal) => signal.signalType === 'PAIRED_ARB_BUY_YES' || signal.signalType === 'PAIRED_ARB_BUY_NO')
+      .map((signal) => signal.outcome)
+      .sort(),
+    ['NO', 'YES']
+  );
+});
+
+test('hard stop is deferred while a paired arb leg is still pending completion', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 12,
+    price: 0.45,
+  });
+
+  const signalEngine = createPairedSignalEngine();
+  signalEngine.recordExecution({
+    market,
+    signal: {
+      marketId: market.marketId,
+      marketTitle: market.title,
+      signalType: 'PAIRED_ARB_BUY_YES',
+      priority: 500,
+      generatedAt: Date.parse('2026-03-18T10:02:00.000Z'),
+      action: 'BUY',
+      outcome: 'YES',
+      outcomeIndex: 0,
+      shares: 12,
+      targetPrice: 0.45,
+      referencePrice: 0.93,
+      tokenPrice: 0.45,
+      midPrice: 0.445,
+      fairValue: null,
+      edgeAmount: 0.03,
+      combinedBid: orderbook.combined.combinedBid,
+      combinedAsk: orderbook.combined.combinedAsk,
+      combinedMid: orderbook.combined.combinedMid,
+      combinedDiscount: orderbook.combined.combinedDiscount,
+      combinedPremium: orderbook.combined.combinedPremium,
+      fillRatio: 1,
+      capitalClamp: 1,
+      priceMultiplier: 1,
+      urgency: 'cross',
+      reduceOnly: false,
+      reason: 'paired starter',
+    },
+    filledShares: 12,
+    fillPrice: 0.45,
+    executedAtMs: Date.parse('2026-03-18T10:02:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment: {
+      snapshot: positionManager.getSnapshot(),
+      blockedOutcomes: new Set(),
+      forcedSignals: [
+        {
+          marketId: market.marketId,
+          marketTitle: market.title,
+          signalType: 'HARD_STOP',
+          priority: 950,
+          generatedAt: Date.parse('2026-03-18T10:02:01.000Z'),
+          action: 'SELL',
+          outcome: 'YES',
+          outcomeIndex: 0,
+          shares: 12,
+          targetPrice: 0.2,
+          referencePrice: 0.2,
+          tokenPrice: 0.2,
+          midPrice: 0.2,
+          fairValue: 0.2,
+          edgeAmount: 12,
+          combinedBid: orderbook.combined.combinedBid,
+          combinedAsk: orderbook.combined.combinedAsk,
+          combinedMid: orderbook.combined.combinedMid,
+          combinedDiscount: orderbook.combined.combinedDiscount,
+          combinedPremium: orderbook.combined.combinedPremium,
+          fillRatio: 1,
+          capitalClamp: 1,
+          priceMultiplier: 1,
+          urgency: 'cross',
+          reduceOnly: true,
+          reason: 'forced hard stop',
+        },
+      ],
+    },
+    now: new Date('2026-03-18T10:02:01.000Z'),
+  });
+
+  assert.equal(signals.some((signal) => signal.signalType === 'HARD_STOP'), false);
+});
+
+test('async paired arb can start with a single cheap leg when combined ask is not simultaneously discounted', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.yes.bestBid = 0.39;
+  orderbook.yes.bestAsk = 0.4;
+  orderbook.yes.midPrice = 0.4;
+  orderbook.yes.lastTradePrice = 0.4;
+  orderbook.no.bestBid = 0.54;
+  orderbook.no.bestAsk = 0.6;
+  orderbook.no.midPrice = 0.55;
+  orderbook.no.lastTradePrice = 0.55;
+  orderbook.combined = {
+    combinedBid: 0.93,
+    combinedAsk: 1.0,
+    combinedMid: 0.975,
+    combinedDiscount: 0,
+    combinedPremium: 0,
+    pairSpread: 0.07,
+  };
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const runtimeConfig = createConfig({
+    ENTRY_STRATEGY: 'PAIRED_ARBITRAGE',
+    PAIRED_ARB_ENABLED: 'true',
+    LATENCY_MOMENTUM_ENABLED: 'false',
+    PAIRED_ARB_MAX_PAIR_COST: '0.98',
+    PAIRED_ARB_ASYNC_ENABLED: 'true',
+    PAIRED_ARB_ASYNC_MAX_ENTRY_PRICE: '0.45',
+    PAIRED_ARB_ASYNC_MIN_EDGE: '0.01',
+  });
+  const riskManager = new RiskManager(runtimeConfig);
+  const signalEngine = new SignalScalper(runtimeConfig);
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment: riskManager.checkRiskLimits({
+      market,
+      orderbook,
+      positionManager,
+      now: new Date('2026-03-18T10:02:00.000Z'),
+    }),
+    now: new Date('2026-03-18T10:02:00.000Z'),
+  });
+
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0]?.signalType, 'PAIRED_ARB_BUY_YES');
+  assert.equal(signals[0]?.outcome, 'YES');
 });
 
 test('inventory rebalance emits a reduce-only sell on dominant inventory', () => {

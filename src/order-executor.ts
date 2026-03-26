@@ -2,6 +2,7 @@ import type { ClobClient } from '@polymarket/clob-client';
 import type { CircuitBreakerSnapshot } from './api-retry.js';
 import {
   config,
+  isDryRunMode,
   isPaperTradingEnabled,
   type AppConfig,
   type OrderMode,
@@ -19,6 +20,8 @@ import {
   type TradeExecutionResult,
 } from './trader.js';
 import { roundTo, sleep } from './utils.js';
+
+const MAKER_FALLBACK_DELAY_MS = 2_000;
 
 export interface OrderExecutionReport extends TradeExecutionResult {
   attemptCount: number;
@@ -68,8 +71,80 @@ export class OrderExecutor {
     const { market, orderbook, signal } = params;
     const tokenId = signal.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
     const book = signal.outcome === 'YES' ? orderbook.yes : orderbook.no;
-    const executionPlan = this.buildExecutionPlan(signal, book);
+    const attemptUrgencies = resolveExecutionAttemptUrgencies(signal, this.runtimeConfig);
 
+    let lastExecution: OrderExecutionReport | null = null;
+    for (let attemptIndex = 0; attemptIndex < attemptUrgencies.length; attemptIndex += 1) {
+      const attemptSignal =
+        attemptUrgencies[attemptIndex] === signal.urgency
+          ? signal
+          : {
+              ...signal,
+              urgency: attemptUrgencies[attemptIndex],
+            };
+      const executionPlan = this.buildExecutionPlan(attemptSignal, book);
+
+      if (executionPlan.price === null) {
+        throw new Error(
+          `Could not derive execution price for ${signal.signalType} ${signal.outcome} ${signal.action}`
+        );
+      }
+
+      const execution = await this.executePlannedOrder({
+        market,
+        orderbook,
+        signal: attemptSignal,
+        tokenId,
+        executionPlan,
+      });
+      lastExecution = {
+        ...execution,
+        attemptCount: execution.attemptCount + attemptIndex,
+      };
+
+      if (
+        attemptIndex === attemptUrgencies.length - 1 ||
+        execution.fillConfirmed ||
+        execution.filledShares > 0
+      ) {
+        return lastExecution;
+      }
+
+      logger.info('Maker preference improve attempt did not fill, retrying as taker', {
+        marketId: market.marketId,
+        signalType: signal.signalType,
+        outcome: signal.outcome,
+        makerOrderId: execution.orderId,
+      });
+      if (execution.orderId) {
+        try {
+          await this.cancelOrder(execution.orderId);
+        } catch (error) {
+          logger.debug('Maker preference cancel failed before taker retry', {
+            orderId: execution.orderId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      await sleep(MAKER_FALLBACK_DELAY_MS);
+    }
+
+    throw lastExecution ?? new Error('Order execution did not return a report.');
+  }
+
+  private async executePlannedOrder(params: {
+    market: MarketCandidate;
+    orderbook: MarketOrderbookSnapshot;
+    signal: StrategySignal;
+    tokenId: string;
+    executionPlan: {
+      price: number | null;
+      postOnly: boolean;
+      orderType: OrderMode;
+      urgency: StrategySignal['urgency'];
+    };
+  }): Promise<OrderExecutionReport> {
+    const { market, orderbook, signal, tokenId, executionPlan } = params;
     if (executionPlan.price === null) {
       throw new Error(
         `Could not derive execution price for ${signal.signalType} ${signal.outcome} ${signal.action}`
@@ -377,6 +452,22 @@ function resolveExecutionUrgency(
   }
 
   return runtimeConfig.POST_ONLY_ONLY ? 'passive' : 'improve';
+}
+
+export function resolveExecutionAttemptUrgencies(
+  signal: StrategySignal,
+  runtimeConfig: AppConfig
+): StrategySignal['urgency'][] {
+  if (
+    runtimeConfig.evKelly.preferMakerOrders &&
+    signal.urgency === 'cross' &&
+    !signal.reduceOnly &&
+    (isPaperTradingEnabled(runtimeConfig) || isDryRunMode(runtimeConfig))
+  ) {
+    return ['improve', 'cross'];
+  }
+
+  return [signal.urgency];
 }
 
 function inferTickSize(book: TokenBookSnapshot, fallbackPrice: number): number {

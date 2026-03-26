@@ -45,6 +45,7 @@ import {
   type RuntimeMarketSnapshot,
   type RuntimePositionSnapshot,
   type RuntimeSignalSnapshot,
+  type SkippedSignalRecord,
 } from './runtime-status.js';
 import {
   SignalScalper,
@@ -60,6 +61,7 @@ import {
   getSlotMetrics,
   printSlotReport,
   recordExecution,
+  recordSkippedSignal as recordSlotReporterSkip,
   recordTrade,
 } from './slot-reporter.js';
 import {
@@ -94,7 +96,7 @@ export interface LatencySample {
   readonly recordedAtMs: number;
 }
 
-class MarketMakerRuntime {
+export class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
   private readonly fetcher = new ClobFetcher();
   private readonly userStream = new ClobUserStream();
@@ -134,6 +136,7 @@ class MarketMakerRuntime {
   } | null = null;
   private userStreamStarted = false;
   private readonly recentSignals: RuntimeSignalSnapshot[] = [];
+  private readonly recentSkippedSignals: SkippedSignalRecord[] = [];
   private readonly recentLatencySamples: number[] = [];
   private readonly latencyWindow: LatencySample[] = [];
   private latencyPaused = false;
@@ -243,6 +246,7 @@ class MarketMakerRuntime {
       activeMarkets: [],
       openPositions: [],
       lastSignals: [],
+      recentSkippedSignals: [],
       averageLatencyMs: null,
     });
     this.statusMonitor.start();
@@ -448,6 +452,7 @@ class MarketMakerRuntime {
       binanceFairValueAdjustment,
       binanceAssessment,
     });
+    this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
     const statusPausedSignals = this.applyPauseFilter(market, signals);
     const apiGuardSignals = this.applyApiCircuitBreakerFilter(
       market,
@@ -478,11 +483,48 @@ class MarketMakerRuntime {
     this.rememberMarketAction(market, signals, executionCandidates, positionManager, quoteSignals);
 
     if (executionCandidates.length === 0 && quoteSignals.length === 0) {
+      this.syncRuntimeStatus({
+        recentSkippedSignals: this.recentSkippedSignals,
+      });
       this.maybePrintSlotReport(slotKey);
       return;
     }
 
-    for (const candidate of executionCandidates) {
+    const pairedCandidates = executionCandidates.filter((candidate) =>
+      isAtomicPairedArbExecutionCandidate(candidate.signal)
+    );
+    const otherCandidates =
+      pairedCandidates.length === 2 &&
+      new Set(pairedCandidates.map((candidate) => candidate.signal.outcome)).size === 2
+        ? executionCandidates.filter(
+            (candidate) => !isAtomicPairedArbExecutionCandidate(candidate.signal)
+          )
+        : executionCandidates;
+
+    if (
+      pairedCandidates.length === 2 &&
+      new Set(pairedCandidates.map((candidate) => candidate.signal.outcome)).size === 2
+    ) {
+      try {
+        await this.executePairedArbAtomic(
+          market,
+          orderbook,
+          positionManager,
+          pairedCandidates,
+          slotKey
+        );
+      } catch (error: any) {
+        this.productTestMode.recordExecutionError(
+          `Atomic paired execution failed for ${market.marketId}: ${error?.message || 'Unknown error'}`
+        );
+        logger.warn('Atomic paired execution failed for market tick', {
+          marketId: market.marketId,
+          message: error?.message || 'Unknown error',
+        });
+      }
+    }
+
+    for (const candidate of otherCandidates) {
       try {
         await this.executeSignal(
           market,
@@ -506,6 +548,9 @@ class MarketMakerRuntime {
       }
     }
 
+    this.syncRuntimeStatus({
+      recentSkippedSignals: this.recentSkippedSignals,
+    });
     this.maybePrintSlotReport(slotKey);
   }
 
@@ -687,6 +732,8 @@ class MarketMakerRuntime {
       this.signalEngine.recordExecution({
         market,
         signal,
+        filledShares: effectiveShares,
+        fillPrice: effectivePrice,
         executedAtMs: completedAt,
       });
     }
@@ -825,11 +872,123 @@ class MarketMakerRuntime {
       totalDayPnl: dayState.dayPnl,
       dayDrawdown: dayState.drawdown,
       lastSignals: this.recentSignals,
+      recentSkippedSignals: this.recentSkippedSignals,
       averageLatencyMs: this.getAverageLatencyMs(),
       latencyPaused: this.latencyPaused,
       latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
     });
     return execution;
+  }
+
+  private async executePairedArbAtomic(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot,
+    positionManager: PositionManager,
+    candidates: readonly SignalExecutionCandidate[],
+    slotKey: string
+  ): Promise<[OrderExecutionReport | null, OrderExecutionReport | null]> {
+    const orderedCandidates = [...candidates].sort((left, right) => {
+      if (left.signal.priority !== right.signal.priority) {
+        return right.signal.priority - left.signal.priority;
+      }
+      return left.signal.outcome.localeCompare(right.signal.outcome);
+    });
+    const [firstCandidate, secondCandidate] = orderedCandidates;
+    if (!firstCandidate || !secondCandidate) {
+      return [null, null];
+    }
+
+    const leg1 = await this.executeSignal(
+      market,
+      orderbook,
+      positionManager,
+      firstCandidate.signal,
+      slotKey,
+      firstCandidate.binanceAssessment
+    );
+    if (!leg1 || !leg1.fillConfirmed || leg1.filledShares <= 0) {
+      return [leg1, null];
+    }
+
+    const leg2 = await this.executeSignal(
+      market,
+      orderbook,
+      positionManager,
+      secondCandidate.signal,
+      slotKey,
+      secondCandidate.binanceAssessment
+    );
+    if (!leg2 || !leg2.fillConfirmed || leg2.filledShares <= 0) {
+      if (leg2?.orderId && !leg2.simulation && !leg2.fillConfirmed) {
+        try {
+          await this.executor.cancelOrder(leg2.orderId);
+        } catch (error) {
+          logger.debug('Paired arb leg2 cancel failed during atomic unwind', {
+            marketId: market.marketId,
+            orderId: leg2.orderId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          this.fillTracker.forgetPendingOrder(leg2.orderId);
+          this.clearPendingLiveOrder(this.getPendingOrderKey(market.marketId, secondCandidate.signal.outcome));
+        }
+      }
+
+      logger.warn('Paired arb leg2 failed, unwinding leg1', {
+        marketId: market.marketId,
+        leg1Outcome: firstCandidate.signal.outcome,
+        leg1Shares: leg1.filledShares,
+      });
+      await this.unwindPairedLeg(
+        market,
+        orderbook,
+        positionManager,
+        firstCandidate.signal,
+        leg1,
+        slotKey
+      );
+      return [leg1, null];
+    }
+
+    return [leg1, leg2];
+  }
+
+  private async unwindPairedLeg(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot,
+    positionManager: PositionManager,
+    signal: StrategySignal,
+    execution: OrderExecutionReport,
+    slotKey: string
+  ): Promise<OrderExecutionReport | null> {
+    const book = signal.outcome === 'YES' ? orderbook.yes : orderbook.no;
+    const targetPrice = book.bestBid ?? book.midPrice ?? execution.fillPrice ?? execution.price;
+    if (targetPrice === null || !Number.isFinite(targetPrice) || targetPrice <= 0) {
+      logger.warn('Paired arb unwind skipped because no executable bid was available', {
+        marketId: market.marketId,
+        outcome: signal.outcome,
+      });
+      return null;
+    }
+
+    const unwindSignal: StrategySignal = {
+      ...signal,
+      signalType: 'HARD_STOP',
+      priority: 999,
+      action: 'SELL',
+      shares: roundTo(execution.filledShares, 4),
+      targetPrice,
+      referencePrice: execution.fillPrice ?? execution.price,
+      tokenPrice: book.lastTradePrice ?? targetPrice,
+      midPrice: book.midPrice,
+      fairValue: book.midPrice,
+      edgeAmount: roundTo(execution.filledShares, 4),
+      urgency: 'cross',
+      reduceOnly: true,
+      reason: 'Atomic paired-arb unwind after second leg failed',
+    };
+
+    return this.executeSignal(market, orderbook, positionManager, unwindSignal, slotKey);
   }
 
   private applyConfirmedFill(fill: ConfirmedFill): void {
@@ -906,6 +1065,8 @@ class MarketMakerRuntime {
     this.signalEngine.recordExecution({
       market,
       signal: createTrackedSignal(market, fill),
+      filledShares: fill.filledShares,
+      fillPrice: fill.fillPrice,
       executedAtMs: fill.filledAt,
     });
 
@@ -925,6 +1086,7 @@ class MarketMakerRuntime {
     this.syncRuntimeStatus({
       totalDayPnl: dayState.dayPnl,
       dayDrawdown: dayState.drawdown,
+      recentSkippedSignals: this.recentSkippedSignals,
       averageLatencyMs: this.getAverageLatencyMs(),
       latencyPaused: this.latencyPaused,
       latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
@@ -943,6 +1105,55 @@ class MarketMakerRuntime {
         this.recentLatencySamples.shift();
       }
     }
+  }
+
+  private rememberSkippedSignals(records: readonly SkippedSignalRecord[]): void {
+    for (const record of records) {
+      this.recentSkippedSignals.push(record);
+    }
+    while (this.recentSkippedSignals.length > 24) {
+      this.recentSkippedSignals.shift();
+    }
+  }
+
+  private recordSkippedSignal(params: {
+    signal: StrategySignal;
+    filterReason: string;
+    details: string;
+    ev?: number;
+    context?: Record<string, unknown>;
+  }): void {
+    const record: SkippedSignalRecord = {
+      timestamp: new Date().toISOString(),
+      marketId: params.signal.marketId,
+      signalType: params.signal.signalType,
+      outcome: params.signal.outcome,
+      filterReason: params.filterReason,
+      ev:
+        typeof params.ev === 'number' && Number.isFinite(params.ev)
+          ? roundTo(params.ev, 6)
+          : undefined,
+      details: params.details,
+    };
+    this.rememberSkippedSignals([record]);
+    const market = this.markets.get(params.signal.marketId);
+    if (market) {
+      recordSlotReporterSkip({
+        slotKey: getSlotKey(market),
+        marketId: market.marketId,
+        marketTitle: market.title,
+        slotStart: market.startTime,
+        slotEnd: market.endTime,
+      });
+    }
+    logger.event('signal_filtered', 'Signal filtered', {
+      signalType: params.signal.signalType,
+      outcome: params.signal.outcome,
+      filterReason: params.filterReason,
+      ev: record.ev,
+      details: params.details,
+      ...(params.context ?? {}),
+    });
   }
 
   private getAverageLatencyMs(): number | null {
@@ -1071,6 +1282,7 @@ class MarketMakerRuntime {
         totalDayPnl: getDayPnlState().dayPnl,
         dayDrawdown: getDayPnlState().drawdown,
         lastSignals: this.recentSignals,
+        recentSkippedSignals: this.recentSkippedSignals,
         averageLatencyMs: this.getAverageLatencyMs(),
         latencyPaused: this.latencyPaused,
         latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
@@ -1393,6 +1605,13 @@ class MarketMakerRuntime {
     }
 
     const allowed = signals.filter((signal) => signal.reduceOnly);
+    for (const blockedSignal of signals.filter((signal) => !signal.reduceOnly)) {
+      this.recordSkippedSignal({
+        signal: blockedSignal,
+        filterReason: 'PAUSED',
+        details: this.statusMonitor.getState().reason ?? 'manual/runtime pause',
+      });
+    }
     const blockedCount = signals.length - allowed.length;
     if (blockedCount > 0) {
       logger.warn('Skipping new entry signals because bot is paused', {
@@ -1410,6 +1629,16 @@ class MarketMakerRuntime {
     signals: StrategySignal[]
   ): StrategySignal[] {
     const allowed = filterSignalsForLatencyPause(signals, this.latencyPaused);
+    const allowedSet = new Set(allowed);
+    for (const blockedSignal of signals) {
+      if (!allowedSet.has(blockedSignal)) {
+        this.recordSkippedSignal({
+          signal: blockedSignal,
+          filterReason: 'LATENCY_PAUSE',
+          details: `avgLatencyMs=${this.getLatencyPauseAverageMs() ?? 'n/a'}`,
+        });
+      }
+    }
     if (allowed.length < signals.length) {
       logger.debug('Latency pause filtered entry signals', {
         marketId: market.marketId,
@@ -1451,6 +1680,16 @@ class MarketMakerRuntime {
     }
 
     if (filterResult.allowedSignals.length < signals.length) {
+      const allowedSet = new Set(filterResult.allowedSignals);
+      for (const blockedSignal of signals) {
+        if (!allowedSet.has(blockedSignal)) {
+          this.recordSkippedSignal({
+            signal: blockedSignal,
+            filterReason: 'API_CIRCUIT_BREAKER',
+            details: 'live API entry gate open',
+          });
+        }
+      }
       logger.warn('API circuit breaker filtered new entry signals', {
         marketId: market.marketId,
         original: signals.length,
@@ -1530,6 +1769,11 @@ class MarketMakerRuntime {
         }
 
         if (assessment.sizeMultiplier === 0) {
+          this.recordSkippedSignal({
+            signal,
+            filterReason: 'BINANCE_CONTRA',
+            details: `Binance ${assessment.direction} contradicted ${signal.action} ${signal.outcome}`,
+          });
           logger.info('Binance edge BLOCKED signal', {
             signalType: signal.signalType,
             outcome: signal.outcome,
@@ -1540,6 +1784,11 @@ class MarketMakerRuntime {
 
         const adjustedShares = roundTo(signal.shares * assessment.sizeMultiplier, 4);
         if (adjustedShares <= 0) {
+          this.recordSkippedSignal({
+            signal,
+            filterReason: 'BINANCE_SIZE_ZERO',
+            details: `Binance multiplier reduced shares to ${adjustedShares.toFixed(4)}`,
+          });
           return null;
         }
 
@@ -1990,6 +2239,10 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
 
 function normalizeRuntimeNumber(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? roundTo(value, 4) : null;
+}
+
+function isAtomicPairedArbExecutionCandidate(signal: Pick<StrategySignal, 'signalType'>): boolean {
+  return signal.signalType === 'PAIRED_ARB_BUY_YES' || signal.signalType === 'PAIRED_ARB_BUY_NO';
 }
 
 function resolveSlotOutcome(

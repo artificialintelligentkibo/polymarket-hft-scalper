@@ -5,12 +5,69 @@ Dual-sided Polymarket CLOB market-maker for 5-minute markets. The runtime now co
 - combined discount detection across both outcomes
 - extreme buy / extreme sell zones
 - fair-value mean reversion
+- paired arbitrage with atomic paired-leg execution
+- async paired-arb leg accumulation
+- latency momentum driven directly by Binance spot movement
+- EV filtering + fractional Kelly resizing for non-paired entries
 - inventory rebalance on imbalance
 - risk-enforced flatten, hard stop, and trailing take-profit
 - post-only execution with urgency tiers and retry logic
-- JSONL trade logs with signal metadata and slot-level PnL reporting
+- realistic paper trading with latency-aware simulated fills
+- JSONL trade logs with signal metadata, skipped-signal reasons, and slot-level PnL reporting
+
+## Quick Start
+
+Use the full config reference in [docs/CONFIGURATION.md](/C:/GitHub/polymarket-hft-scalper/docs/CONFIGURATION.md) and the strategy walkthrough in [docs/STRATEGY_GUIDE.md](/C:/GitHub/polymarket-hft-scalper/docs/STRATEGY_GUIDE.md).
+
+Recommended first paper test:
+
+```env
+ENTRY_STRATEGY=PAIRED_ARBITRAGE
+PAIRED_ARB_ENABLED=true
+PAIRED_ARB_ASYNC_ENABLED=true
+PAIRED_ARB_MIN_NET_EDGE=0.005
+PAIRED_ARB_MAX_PAIR_COST=0.995
+PAIRED_ARB_ASYNC_MAX_ENTRY_PRICE=0.45
+PAIRED_ARB_MIN_SHARES=5
+PAIRED_ARB_MAX_SHARES=12
+MAX_SIGNALS_PER_TICK=4
+EV_KELLY_ENABLED=true
+PREFER_MAKER_ORDERS=true
+PAPER_TRADING_ENABLED=true
+SIMULATION_MODE=false
+BINANCE_EDGE_ENABLED=true
+COINS_TO_TRADE=BTC,ETH,SOL
+HARD_STOP_LOSS=0.25
+FAIR_VALUE_BUY_THRESHOLD=9.99
+EXTREME_BUY_THRESHOLD=0.001
+```
+
+Recommended strategy presets:
+
+- `ENTRY_STRATEGY=PAIRED_ARBITRAGE`
+  Safest initial paper mode. Lowest directional exposure.
+- `ENTRY_STRATEGY=LATENCY_MOMENTUM`
+  Directional and fee-sensitive. Use EV/Kelly.
+- `ENTRY_STRATEGY=ALL`
+  Highest activity. Disable weak legacy long entries first.
 
 ## Strategy Model
+
+Entry engines now include:
+
+1. `PAIRED_ARB_BUY_YES` / `PAIRED_ARB_BUY_NO`
+2. `LATENCY_MOMENTUM_BUY`
+3. `COMBINED_DISCOUNT_BUY_BOTH`
+4. `EXTREME_BUY` / `EXTREME_SELL`
+5. `FAIR_VALUE_BUY` / `FAIR_VALUE_SELL`
+6. `INVENTORY_REBALANCE`
+
+Paired-arb notes:
+
+- paired buy legs are atomic when both are present in the same tick
+- paired buy legs are exempt from `MAX_SIGNALS_PER_TICK`
+- if leg 2 fails, leg 1 is unwound immediately
+- `HARD_STOP` is deferred briefly while a pending paired leg is still trying to complete
 
 Priority order per tick:
 
@@ -27,6 +84,7 @@ Risk exits override all of the above:
 - `RISK_LIMIT`
 
 The engine evaluates both `YES` and `NO` every cycle and executes at most `MAX_SIGNALS_PER_TICK=2`.
+Paired arb BUY legs are now the exception: both legs travel together even if the cap is lower.
 
 ## Repository Layout
 
@@ -166,6 +224,7 @@ What goes into `reports/`:
 - `TOTAL DAY PNL`
 - persisted `state.json` with day PnL / peak PnL / drawdown for restart-safe risk limits
 - `runtime-status.json` for the CLI (`scalper status`) with current mode, PID, active slots, recent signals, and last slot report
+- recent skipped signals with structured `filterReason`, EV, and detail strings
 - per-signal latency lines with `signalToOrderMs` and `roundTripMs`
 - gasless redeem activity in `redeem_log_YYYY-MM-DD.log`
 - product-test coverage summaries in `product-test-summary_YYYY-MM-DD.log`
@@ -412,6 +471,8 @@ What it does:
 - boosts, reduces, or blocks entry signals after they are generated
 - never blocks reduce-only safety exits
 
+For `ENTRY_STRATEGY=LATENCY_MOMENTUM`, Binance is no longer just a post-filter. It becomes the primary trigger, and EV/Kelly decides whether the move is still worth trading after fees.
+
 Relevant env vars:
 
 ```bash
@@ -447,6 +508,19 @@ TEST_MODE=true
 SIMULATION_MODE=true
 DRY_RUN=true
 WHITELIST_CONDITION_IDS=0x3f5dc93e734dc9f2c441882160bdf6716d8bb7953ce67962094c6b17f73210c0,0x3756c929609555f5b6cd8a8231d083400ea92397873fcd5ca24182186766e2e7
+npm start
+```
+
+Paper-trading paired arb test:
+
+```bash
+ENTRY_STRATEGY=PAIRED_ARBITRAGE
+PAIRED_ARB_ENABLED=true
+PAIRED_ARB_ASYNC_ENABLED=true
+PAPER_TRADING_ENABLED=true
+SIMULATION_MODE=false
+EV_KELLY_ENABLED=true
+PREFER_MAKER_ORDERS=true
 npm start
 ```
 
@@ -618,9 +692,27 @@ Current test coverage focuses on:
 - target-vs-scalper trade normalization and tolerant comparison matching
 - whitelist-vs-dynamic selection behavior
 - combined discount dual-entry behavior
+- atomic paired-arb execution selection
+- async paired-arb signal generation
+- pending paired hard-stop deferral
+- EV/Kelly filtering and dynamic fee handling
+- maker-preference execution sequencing
 - inventory rebalance generation
 - position risk caps
 - slot-end flattening
+
+## Troubleshooting
+
+- `dotenv` confusion
+  Shell-exported env vars can override `.env`. Verify with `node -e "require('dotenv').config(); console.log(process.env.ENTRY_STRATEGY)"`.
+- paired arb only buys one side
+  That used to happen when `MAX_SIGNALS_PER_TICK=1`. The runtime now exempts paired BUY legs from the cap and executes them atomically.
+- paper mode sees opportunities but no modeled fills
+  Check `PAPER_TRADING_ENABLED=true` and `SIMULATION_MODE=false` or `DRY_RUN=true`, then watch `recentSkippedSignals` in `runtime-status.json`.
+- too many legacy directional entries in `ALL`
+  Set `FAIR_VALUE_BUY_THRESHOLD=9.99` and `EXTREME_BUY_THRESHOLD=0.001`.
+- geo/auth issues
+  Missing or stale CLOB credentials still affect live trading. Paper trading avoids live order submission but not bad `.env` hygiene.
 
 ## Logging
 

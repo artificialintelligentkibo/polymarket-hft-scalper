@@ -16,6 +16,16 @@ export interface RuntimeSignalSnapshot {
   readonly latencyMs: number | null;
 }
 
+export interface SkippedSignalRecord {
+  readonly timestamp: string;
+  readonly marketId: string;
+  readonly signalType: string;
+  readonly outcome: 'YES' | 'NO';
+  readonly filterReason: string;
+  readonly ev?: number;
+  readonly details: string;
+}
+
 export interface RuntimeSlotSnapshot {
   readonly slotLabel: string;
   readonly marketId: string;
@@ -83,6 +93,7 @@ export interface RuntimeStatusSnapshot {
   readonly activeMarkets: readonly RuntimeMarketSnapshot[];
   readonly openPositions: readonly RuntimePositionSnapshot[];
   readonly lastSignals: readonly RuntimeSignalSnapshot[];
+  readonly recentSkippedSignals: readonly SkippedSignalRecord[];
   readonly lastSlotReport: RuntimeSlotSnapshot | null;
 }
 
@@ -130,6 +141,7 @@ export function createRuntimeStatusSnapshot(
     activeMarkets: [],
     openPositions: [],
     lastSignals: [],
+    recentSkippedSignals: [],
     lastSlotReport: null,
     ...overrides,
   };
@@ -233,6 +245,12 @@ function normalizeRuntimeStatus(
           .filter((entry): entry is RuntimeSignalSnapshot => entry !== null)
           .slice(-3)
       : [],
+    recentSkippedSignals: Array.isArray(value.recentSkippedSignals)
+      ? value.recentSkippedSignals
+          .map(normalizeSkippedSignal)
+          .filter((entry): entry is SkippedSignalRecord => entry !== null)
+          .slice(-8)
+      : [],
     lastSlotReport: normalizeRuntimeSlot(value.lastSlotReport),
   };
 }
@@ -327,6 +345,37 @@ function normalizeRuntimeSlot(value: unknown): RuntimeSlotSnapshot | null {
     entries: normalizeCount(record.entries),
     fills: normalizeCount(record.fills),
     reportedAt: record.reportedAt,
+  };
+}
+
+function normalizeSkippedSignal(value: unknown): SkippedSignalRecord | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Partial<SkippedSignalRecord>;
+  const timestamp = typeof record.timestamp === 'string' ? record.timestamp : '';
+  const marketId = typeof record.marketId === 'string' ? record.marketId : '';
+  const signalType = typeof record.signalType === 'string' ? record.signalType : '';
+  const outcome = record.outcome === 'YES' || record.outcome === 'NO' ? record.outcome : null;
+  const filterReason =
+    typeof record.filterReason === 'string' && record.filterReason.trim()
+      ? record.filterReason
+      : '';
+  const details = typeof record.details === 'string' ? record.details : '';
+
+  if (!timestamp || !marketId || !signalType || !outcome || !filterReason) {
+    return null;
+  }
+
+  return {
+    timestamp,
+    marketId,
+    signalType,
+    outcome,
+    filterReason,
+    ev: normalizeNullableNumber(record.ev) ?? undefined,
+    details,
   };
 }
 

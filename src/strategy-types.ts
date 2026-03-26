@@ -66,6 +66,9 @@ export interface StrategySignal {
   readonly fillRatio: number;
   readonly capitalClamp: number;
   readonly priceMultiplier: number;
+  readonly filterReason?: string | null;
+  readonly evScore?: number;
+  readonly kellyAdjustedShares?: number;
   readonly urgency: SignalUrgency;
   readonly reduceOnly: boolean;
   readonly reason: string;

@@ -1,11 +1,13 @@
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import { config, isDynamicQuotingEnabled, type AppConfig } from './config.js';
+import { applyEVKellyFilter } from './ev-kelly.js';
 import { LatencyMomentumEngine } from './latency-momentum.js';
 import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob-fetcher.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import { PairedArbitrageEngine } from './paired-arbitrage.js';
 import type { PositionManager } from './position-manager.js';
+import type { SkippedSignalRecord } from './runtime-status.js';
 import {
   clampProductTestShares,
   getEffectiveStrategyConfig,
@@ -50,12 +52,15 @@ export class SignalScalper {
   private readonly inventoryRebalanceBlocks = new Map<string, InventoryRebalanceBlockState>();
   private readonly pairedArbEngine = new PairedArbitrageEngine();
   private readonly latencyMomentumEngine = new LatencyMomentumEngine();
+  private readonly recentSkippedSignals: SkippedSignalRecord[] = [];
 
   constructor(private readonly runtimeConfig: AppConfig = config) {}
 
   recordExecution(params: {
     market: MarketCandidate;
     signal: StrategySignal;
+    filledShares?: number;
+    fillPrice?: number;
     executedAtMs?: number;
   }): void {
     const executedAtMs = params.executedAtMs ?? Date.now();
@@ -69,16 +74,21 @@ export class SignalScalper {
         params.signal.signalType === 'PAIRED_ARB_BUY_NO' ||
         params.signal.signalType === 'PAIRED_ARB_REBALANCE')
     ) {
-      this.pairedArbEngine.applyFill({
-        marketId: params.market.marketId,
-        outcome: params.signal.outcome,
-        shares: params.signal.shares,
-        price:
-          params.signal.targetPrice ??
-          params.signal.referencePrice ??
-          params.signal.tokenPrice ??
-          0.5,
-      });
+      const filledShares = params.filledShares ?? params.signal.shares;
+      const fillPrice =
+        params.fillPrice ??
+        params.signal.targetPrice ??
+        params.signal.referencePrice ??
+        params.signal.tokenPrice ??
+        0.5;
+      if (filledShares > 0) {
+        this.pairedArbEngine.applyFill({
+          marketId: params.market.marketId,
+          outcome: params.signal.outcome,
+          shares: filledShares,
+          price: fillPrice,
+        });
+      }
     }
 
     if (
@@ -122,6 +132,7 @@ export class SignalScalper {
     binanceAssessment?: BinanceEdgeAssessment;
     now?: Date;
   }): StrategySignal[] {
+    this.recentSkippedSignals.splice(0, this.recentSkippedSignals.length);
     const now = params.now ?? new Date();
     const {
       market,
@@ -146,7 +157,11 @@ export class SignalScalper {
             signals: riskAssessment.forcedSignals,
           })
         : [...riskAssessment.forcedSignals];
-      return takeTopSignals(protectedForcedSignals, strategy.maxSignalsPerTick);
+      const forcedSelection = takeTopSignals(protectedForcedSignals, strategy.maxSignalsPerTick);
+      for (const skippedSignal of forcedSelection.skipped) {
+        this.recordSkippedSignal(skippedSignal, 'MAX_SIGNALS', 'takeTopSignals limit');
+      }
+      return forcedSelection.selected;
     }
 
     if (!this.runtimeConfig.ENABLE_SIGNAL) {
@@ -221,8 +236,18 @@ export class SignalScalper {
         })
       : groups.flat();
     const flattened = mergeSignals(protectedSignals);
-    const topSignals = takeTopSignals(flattened, strategy.maxSignalsPerTick);
-    return transformSignalsForMarketMaker(topSignals, this.runtimeConfig);
+    const evFilteredSignals = this.applyEVKellySignals(flattened);
+    const topSelection = takeTopSignals(evFilteredSignals, strategy.maxSignalsPerTick);
+    for (const skippedSignal of topSelection.skipped) {
+      this.recordSkippedSignal(skippedSignal, 'MAX_SIGNALS', 'takeTopSignals limit');
+    }
+    return transformSignalsForMarketMaker(topSelection.selected, this.runtimeConfig);
+  }
+
+  drainSkippedSignals(): SkippedSignalRecord[] {
+    const drained = [...this.recentSkippedSignals];
+    this.recentSkippedSignals.splice(0, this.recentSkippedSignals.length);
+    return drained;
   }
 
   private getCombinedDiscountSignals(
@@ -725,6 +750,87 @@ export class SignalScalper {
     pruneControlStateMap(this.fairValueBuyCadence, nowMs);
     pruneControlStateMap(this.inventoryRebalanceBlocks, nowMs);
   }
+
+  private applyEVKellySignals(signals: StrategySignal[]): StrategySignal[] {
+    if (!this.runtimeConfig.EV_KELLY_ENABLED || !this.runtimeConfig.evKelly.enabled) {
+      return signals;
+    }
+
+    const bankroll = resolveKellyBankroll(this.runtimeConfig);
+    const nextSignals: StrategySignal[] = signals
+      .map((signal) => {
+        const result = applyEVKellyFilter({
+          signal,
+          bankroll,
+          marketTitle: signal.marketTitle,
+          config: this.runtimeConfig.evKelly,
+        });
+        if (!result.approved) {
+          const marketProb = resolveSignalMarketProbability(signal);
+          const executionPrice = resolveSignalExecutionPrice(signal);
+          const minEV =
+            result.takerFee > this.runtimeConfig.evKelly.defaultTakerFee
+              ? this.runtimeConfig.evKelly.minEVThresholdHighFee
+              : this.runtimeConfig.evKelly.minEVThreshold;
+          this.recordSkippedSignal(
+            signal,
+            result.filterReason ?? 'EV_FILTERED',
+            `trueProb=${resolveSignalTrueProbability(signal).toFixed(3)} price=${executionPrice.toFixed(3)} min=${minEV.toFixed(3)}`,
+            result.ev,
+            {
+              trueProb: resolveSignalTrueProbability(signal),
+              marketProb,
+              price: executionPrice,
+              takerFee: result.takerFee,
+              minEV,
+            }
+          );
+          return null;
+        }
+
+        const nextSignal: StrategySignal = {
+          ...signal,
+          shares: roundTo(result.adjustedShares, 4),
+          evScore: Number.isFinite(result.ev) ? result.ev : undefined,
+          kellyAdjustedShares: roundTo(result.adjustedShares, 4),
+          filterReason: null,
+        };
+        return nextSignal;
+      })
+      .filter((signal): signal is StrategySignal => signal !== null);
+    return nextSignals;
+  }
+
+  private recordSkippedSignal(
+    signal: StrategySignal,
+    filterReason: string,
+    details: string,
+    ev?: number,
+    context: Record<string, unknown> = {}
+  ): void {
+    const record: SkippedSignalRecord = {
+      timestamp: new Date().toISOString(),
+      marketId: signal.marketId,
+      signalType: signal.signalType,
+      outcome: signal.outcome,
+      filterReason,
+      ev: typeof ev === 'number' && Number.isFinite(ev) ? roundTo(ev, 6) : undefined,
+      details,
+    };
+    this.recentSkippedSignals.push(record);
+    while (this.recentSkippedSignals.length > 24) {
+      this.recentSkippedSignals.shift();
+    }
+
+    logger.event('signal_filtered', 'Signal filtered', {
+      signalType: signal.signalType,
+      outcome: signal.outcome,
+      filterReason,
+      ev: record.ev,
+      ...context,
+      details,
+    });
+  }
 }
 
 export function calculateTradeSize(params: {
@@ -929,18 +1035,19 @@ function transformSignalsForMarketMaker(
   });
 }
 
-function takeTopSignals(signals: StrategySignal[], maxSignals: number): StrategySignal[] {
-  return [...signals]
-    .sort((left, right) => {
-      if (left.priority !== right.priority) {
-        return right.priority - left.priority;
-      }
-      if (left.reduceOnly !== right.reduceOnly) {
-        return left.reduceOnly ? -1 : 1;
-      }
-      return right.edgeAmount - left.edgeAmount;
-    })
-    .slice(0, Math.max(1, maxSignals));
+function takeTopSignals(
+  signals: StrategySignal[],
+  maxSignals: number
+): { selected: StrategySignal[]; skipped: StrategySignal[] } {
+  const pairedArbSignals = signals.filter(isAtomicPairedArbSignal);
+  const otherSignals = signals.filter((signal) => !isAtomicPairedArbSignal(signal));
+  const sortedOtherSignals = sortSignals(otherSignals);
+  const limit = Math.max(1, maxSignals);
+
+  return {
+    selected: sortSignals([...pairedArbSignals, ...sortedOtherSignals.slice(0, limit)]),
+    skipped: sortedOtherSignals.slice(limit),
+  };
 }
 
 function buildFairValueControlKey(market: MarketCandidate, outcome: Outcome): string {
@@ -1222,4 +1329,43 @@ function normalizePairedFairValues(
 
 function isFinitePositivePrice(value: number | null): value is number {
   return value !== null && Number.isFinite(value) && value > 0;
+}
+
+function sortSignals(signals: readonly StrategySignal[]): StrategySignal[] {
+  return [...signals].sort((left, right) => {
+    if (left.priority !== right.priority) {
+      return right.priority - left.priority;
+    }
+    if (left.reduceOnly !== right.reduceOnly) {
+      return left.reduceOnly ? -1 : 1;
+    }
+    return right.edgeAmount - left.edgeAmount;
+  });
+}
+
+function isAtomicPairedArbSignal(signal: StrategySignal): boolean {
+  return (
+    signal.signalType === 'PAIRED_ARB_BUY_YES' || signal.signalType === 'PAIRED_ARB_BUY_NO'
+  );
+}
+
+function resolveKellyBankroll(runtimeConfig: AppConfig): number {
+  return Math.max(
+    runtimeConfig.paperTrading.initialBalanceUsd,
+    runtimeConfig.strategy.capitalReferenceShares,
+    runtimeConfig.strategy.maxNetYes,
+    runtimeConfig.strategy.maxNetNo
+  );
+}
+
+function resolveSignalMarketProbability(signal: StrategySignal): number {
+  return clamp(signal.midPrice ?? signal.tokenPrice ?? signal.targetPrice ?? 0.5, 0.0001, 0.9999);
+}
+
+function resolveSignalExecutionPrice(signal: StrategySignal): number {
+  return clamp(signal.targetPrice ?? signal.tokenPrice ?? signal.midPrice ?? 0.5, 0.0001, 0.9999);
+}
+
+function resolveSignalTrueProbability(signal: StrategySignal): number {
+  return clamp(signal.fairValue ?? signal.referencePrice ?? resolveSignalMarketProbability(signal), 0.0001, 0.9999);
 }

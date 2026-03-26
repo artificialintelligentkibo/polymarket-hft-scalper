@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import type { EVKellyConfig } from './ev-kelly.js';
 import type { LatencyMomentumConfig } from './latency-momentum.js';
 import type { PairedArbConfig } from './paired-arbitrage.js';
 import type { PaperTraderConfig } from './paper-trader.js';
@@ -29,6 +30,7 @@ export interface AppConfig {
   readonly PAIRED_ARB_ENABLED: boolean;
   readonly LATENCY_MOMENTUM_ENABLED: boolean;
   readonly PAPER_TRADING_ENABLED: boolean;
+  readonly EV_KELLY_ENABLED: boolean;
   readonly STATUS_CHECK_INTERVAL_MS: number;
   readonly AUTO_PAUSE_ON_INCIDENT: boolean;
   readonly PAUSE_GRACE_PERIOD_MS: number;
@@ -222,6 +224,7 @@ export interface AppConfig {
   readonly pairedArbitrage: PairedArbConfig;
   readonly latencyMomentum: LatencyMomentumConfig;
   readonly paperTrading: PaperTraderConfig;
+  readonly evKelly: EVKellyConfig;
   readonly trading: {
     readonly slippageTolerance: number;
     readonly orderType: OrderMode;
@@ -434,6 +437,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     PAIRED_ARB_ENABLED: parseBoolean(env.PAIRED_ARB_ENABLED, false),
     LATENCY_MOMENTUM_ENABLED: parseBoolean(env.LATENCY_MOMENTUM_ENABLED, false),
     PAPER_TRADING_ENABLED: parseBoolean(env.PAPER_TRADING_ENABLED, false),
+    EV_KELLY_ENABLED: parseBoolean(env.EV_KELLY_ENABLED, false),
     STATUS_CHECK_INTERVAL_MS: Math.max(
       60_000,
       parseIntOrDefault(env.STATUS_CHECK_INTERVAL_MS, '300000')
@@ -664,6 +668,13 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       cooldownMs: Math.max(0, parseIntOrDefault(env.PAIRED_ARB_COOLDOWN_MS, '5000')),
       requireBothSidesLiquidity: parseBoolean(env.PAIRED_ARB_REQUIRE_BOTH_LIQUIDITY, true),
       minDepthPerSide: parseFloatOrDefault(env.PAIRED_ARB_MIN_DEPTH_USD, '3'),
+      asyncEnabled: parseBoolean(env.PAIRED_ARB_ASYNC_ENABLED, true),
+      asyncMaxEntryPrice: parseFloatOrDefault(env.PAIRED_ARB_ASYNC_MAX_ENTRY_PRICE, '0.45'),
+      asyncMinEdge: parseFloatOrDefault(env.PAIRED_ARB_ASYNC_MIN_EDGE, '0.01'),
+      asyncMaxWaitMs: Math.max(
+        1_000,
+        parseIntOrDefault(env.PAIRED_ARB_ASYNC_MAX_WAIT_MS, '180000')
+      ),
     },
     latencyMomentum: {
       enabled: parseBoolean(env.LATENCY_MOMENTUM_ENABLED, false),
@@ -720,6 +731,16 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       tradeLogFile: (
         env.PAPER_TRADING_TRADE_LOG || `${reportsDir}/paper-trades.jsonl`
       ).trim() || `${reportsDir}/paper-trades.jsonl`,
+    },
+    evKelly: {
+      enabled: parseBoolean(env.EV_KELLY_ENABLED, false),
+      minEVThreshold: parseFloatOrDefault(env.EV_MIN_THRESHOLD, '0.005'),
+      minEVThresholdHighFee: parseFloatOrDefault(env.EV_MIN_THRESHOLD_HIGH_FEE, '0.008'),
+      kellyFraction: parseFloatOrDefault(env.KELLY_FRACTION, '0.85'),
+      maxBankrollPerTrade: parseFloatOrDefault(env.MAX_BANKROLL_PER_TRADE, '0.20'),
+      preferMakerOrders: parseBoolean(env.PREFER_MAKER_ORDERS, true),
+      defaultTakerFee: parseFloatOrDefault(env.DEFAULT_TAKER_FEE, '0.02'),
+      highFeeTakerFee: parseFloatOrDefault(env.HIGH_FEE_TAKER_FEE, '0.0315'),
     },
     trading: {
       slippageTolerance: parseFloatOrDefault(env.SLIPPAGE_TOLERANCE, '0.02'),
@@ -985,6 +1006,18 @@ export function validateConfig(candidate: AppConfig = config): void {
     );
   }
 
+  if (candidate.pairedArbitrage.asyncMaxEntryPrice <= 0 || candidate.pairedArbitrage.asyncMaxEntryPrice >= 1) {
+    throw new Error('PAIRED_ARB_ASYNC_MAX_ENTRY_PRICE must be in the range (0, 1).');
+  }
+
+  if (candidate.pairedArbitrage.asyncMinEdge < 0) {
+    throw new Error('PAIRED_ARB_ASYNC_MIN_EDGE must be zero or positive.');
+  }
+
+  if (candidate.pairedArbitrage.asyncMaxWaitMs < 1_000) {
+    throw new Error('PAIRED_ARB_ASYNC_MAX_WAIT_MS must be at least 1000.');
+  }
+
   if (
     candidate.latencyMomentum.strongShares <
     candidate.latencyMomentum.baseShares
@@ -1027,6 +1060,31 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.paperTrading.initialBalanceUsd <= 0) {
     throw new Error('PAPER_TRADING_INITIAL_BALANCE must be positive.');
+  }
+
+  if (candidate.evKelly.minEVThreshold < 0 || candidate.evKelly.minEVThresholdHighFee < 0) {
+    throw new Error('EV thresholds must be zero or positive.');
+  }
+
+  if (candidate.evKelly.kellyFraction < 0 || candidate.evKelly.kellyFraction > 1) {
+    throw new Error('KELLY_FRACTION must be in the range [0, 1].');
+  }
+
+  if (
+    candidate.evKelly.maxBankrollPerTrade <= 0 ||
+    candidate.evKelly.maxBankrollPerTrade > 1
+  ) {
+    throw new Error('MAX_BANKROLL_PER_TRADE must be in the range (0, 1].');
+  }
+
+  if (
+    candidate.evKelly.defaultTakerFee < 0 ||
+    candidate.evKelly.highFeeTakerFee < 0 ||
+    candidate.evKelly.highFeeTakerFee < candidate.evKelly.defaultTakerFee
+  ) {
+    throw new Error(
+      'Taker fee configuration must be non-negative and HIGH_FEE_TAKER_FEE must be >= DEFAULT_TAKER_FEE.'
+    );
   }
 
   if (candidate.TEST_MIN_TRADE_USDC <= 0) {
