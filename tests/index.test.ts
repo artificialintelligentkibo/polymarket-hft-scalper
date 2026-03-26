@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   evaluateLatencyPauseState,
+  filterSignalsForApiEntryGate,
   filterSignalsForLatencyPause,
   getRequiredSettledShares,
   hasSettledOutcomeBalance,
@@ -148,6 +149,53 @@ test('exit signals always pass through during latency pause', () => {
   assert.deepEqual(
     filtered.map((signal) => signal.signalType),
     ['HARD_STOP', 'FAIR_VALUE_SELL']
+  );
+});
+
+test('API entry gate is bypassed in simulation/paper mode so entry signals survive', () => {
+  const entrySignal = createSignal({
+    signalType: 'PAIRED_ARB_BUY_YES',
+    action: 'BUY',
+    reduceOnly: false,
+  });
+
+  const filtered = filterSignalsForApiEntryGate({
+    signals: [entrySignal],
+    apiEntryGateOpen: true,
+    dryRunMode: true,
+    paperTradingEnabled: true,
+  });
+
+  assert.equal(filtered.bypassed, true);
+  assert.equal(filtered.allowedSignals.length, 1);
+  assert.equal(filtered.allowedSignals[0]?.signalType, 'PAIRED_ARB_BUY_YES');
+});
+
+test('API entry gate still blocks live entry signals when the gate is open', () => {
+  const entrySignal = createSignal({
+    signalType: 'PAIRED_ARB_BUY_YES',
+    action: 'BUY',
+    reduceOnly: false,
+  });
+  const reduceOnlySignal = createSignal({
+    signalType: 'HARD_STOP',
+    action: 'SELL',
+    reduceOnly: true,
+    outcome: 'NO',
+    outcomeIndex: 1,
+  });
+
+  const filtered = filterSignalsForApiEntryGate({
+    signals: [entrySignal, reduceOnlySignal],
+    apiEntryGateOpen: true,
+    dryRunMode: false,
+    paperTradingEnabled: false,
+  });
+
+  assert.equal(filtered.bypassed, false);
+  assert.deepEqual(
+    filtered.allowedSignals.map((signal) => signal.signalType),
+    ['HARD_STOP']
   );
 });
 

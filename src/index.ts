@@ -1427,22 +1427,40 @@ class MarketMakerRuntime {
     market: MarketCandidate,
     signals: StrategySignal[]
   ): StrategySignal[] {
-    if (!this.isApiEntryGateOpen()) {
-      return signals;
+    const filterResult = filterSignalsForApiEntryGate({
+      signals,
+      apiEntryGateOpen: this.isApiEntryGateOpen(),
+      dryRunMode: isDryRunMode(config),
+      paperTradingEnabled: isPaperTradingEnabled(config),
+    });
+
+    if (!filterResult.apiEntryGateOpen) {
+      return filterResult.allowedSignals;
     }
 
-    const allowed = filterSignalsForLatencyPause(signals, true);
-    if (allowed.length < signals.length) {
+    if (filterResult.bypassed) {
+      logger.info('API circuit breaker bypassed for simulation/paper mode', {
+        marketId: market.marketId,
+        original: signals.length,
+        remaining: filterResult.allowedSignals.length,
+        circuitBreakers: this.getApiCircuitBreakers(),
+        dryRunMode: isDryRunMode(config),
+        paperTradingEnabled: isPaperTradingEnabled(config),
+      });
+      return filterResult.allowedSignals;
+    }
+
+    if (filterResult.allowedSignals.length < signals.length) {
       logger.warn('API circuit breaker filtered new entry signals', {
         marketId: market.marketId,
         original: signals.length,
-        remaining: allowed.length,
-        blocked: signals.length - allowed.length,
+        remaining: filterResult.allowedSignals.length,
+        blocked: signals.length - filterResult.allowedSignals.length,
         circuitBreakers: this.getApiCircuitBreakers(),
       });
     }
 
-    return allowed;
+    return filterResult.allowedSignals;
   }
 
   private applyBinanceEdge(
@@ -2092,6 +2110,39 @@ export function filterSignalsForLatencyPause(
   }
 
   return signals.filter((signal) => signal.reduceOnly || signal.action === 'SELL');
+}
+
+export function filterSignalsForApiEntryGate(params: {
+  signals: readonly StrategySignal[];
+  apiEntryGateOpen: boolean;
+  dryRunMode: boolean;
+  paperTradingEnabled: boolean;
+}): {
+  allowedSignals: StrategySignal[];
+  apiEntryGateOpen: boolean;
+  bypassed: boolean;
+} {
+  if (!params.apiEntryGateOpen) {
+    return {
+      allowedSignals: [...params.signals],
+      apiEntryGateOpen: false,
+      bypassed: false,
+    };
+  }
+
+  if (params.dryRunMode || params.paperTradingEnabled) {
+    return {
+      allowedSignals: [...params.signals],
+      apiEntryGateOpen: true,
+      bypassed: true,
+    };
+  }
+
+  return {
+    allowedSignals: filterSignalsForLatencyPause(params.signals, true),
+    apiEntryGateOpen: true,
+    bypassed: false,
+  };
 }
 
 export function pruneLatencyPauseSamples(
