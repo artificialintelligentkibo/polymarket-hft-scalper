@@ -898,6 +898,8 @@ export class MarketMakerRuntime {
       return [null, null];
     }
 
+    this.signalEngine.setPairedArbPending(market.marketId);
+
     const leg1 = await this.executeSignal(
       market,
       orderbook,
@@ -910,11 +912,17 @@ export class MarketMakerRuntime {
       return [leg1, null];
     }
 
+    const adjustedLeg2Signal: StrategySignal = {
+      ...secondCandidate.signal,
+      shares: roundTo(Math.min(secondCandidate.signal.shares, leg1.filledShares), 4),
+      reason: `${secondCandidate.signal.reason} | adjusted to match leg1 fill of ${leg1.filledShares}`,
+    };
+
     const leg2 = await this.executeSignal(
       market,
       orderbook,
       positionManager,
-      secondCandidate.signal,
+      adjustedLeg2Signal,
       slotKey,
       secondCandidate.binanceAssessment
     );

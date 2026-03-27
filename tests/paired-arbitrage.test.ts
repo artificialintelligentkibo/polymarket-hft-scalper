@@ -83,7 +83,7 @@ test('canImprovePairCost rejects legs that miss CLOB minimums even when pair cos
   assert.equal(canImprove, false);
 });
 
-test('generateSignals uses one cross leg and one improve leg for fresh paired entries', () => {
+test('generateSignals uses cross urgency on both legs for synchronous paired entries', () => {
   const engine = new PairedArbitrageEngine();
   const signals = engine.generateSignals({
     market: {
@@ -162,7 +162,88 @@ test('generateSignals uses one cross leg and one improve leg for fresh paired en
   });
 
   assert.equal(signals.length, 2);
-  assert.equal(signals.filter((signal) => signal.urgency === 'cross').length, 1);
-  assert.equal(signals.filter((signal) => signal.urgency === 'improve').length, 1);
-  assert.equal(signals.find((signal) => signal.urgency === 'cross')?.outcome, 'YES');
+  assert.equal(signals.filter((signal) => signal.urgency === 'cross').length, 2);
+  assert.equal(signals.filter((signal) => signal.urgency === 'improve').length, 0);
+});
+
+test('generateSignals marks synchronous paired entries as pending before fills confirm', () => {
+  const engine = new PairedArbitrageEngine();
+  const signals = engine.generateSignals({
+    market: {
+      marketId: 'market-1',
+      conditionId: 'market-1',
+      title: 'BTC 5m paired arb',
+      liquidityUsd: 1000,
+      volumeUsd: 2000,
+      startTime: '2026-03-26T10:00:00.000Z',
+      endTime: '2026-03-26T10:05:00.000Z',
+      durationMinutes: 5,
+      yesTokenId: 'yes-token',
+      noTokenId: 'no-token',
+      yesLabel: 'Up',
+      noLabel: 'Down',
+      yesOutcomeIndex: 0,
+      noOutcomeIndex: 1,
+      acceptingOrders: true,
+    },
+    orderbook: {
+      marketId: 'market-1',
+      title: 'BTC 5m paired arb',
+      timestamp: new Date().toISOString(),
+      yes: {
+        tokenId: 'yes-token',
+        bids: [{ price: 0.44, size: 80 }],
+        asks: [{ price: 0.45, size: 80 }],
+        bestBid: 0.44,
+        bestAsk: 0.45,
+        midPrice: 0.445,
+        spread: 0.01,
+        spreadBps: 0,
+        depthSharesBid: 80,
+        depthSharesAsk: 80,
+        depthNotionalBid: 35.2,
+        depthNotionalAsk: 36,
+        lastTradePrice: 0.445,
+        lastTradeSize: 10,
+        source: 'rest',
+        updatedAt: new Date().toISOString(),
+      },
+      no: {
+        tokenId: 'no-token',
+        bids: [{ price: 0.46, size: 80 }],
+        asks: [{ price: 0.48, size: 80 }],
+        bestBid: 0.46,
+        bestAsk: 0.48,
+        midPrice: 0.47,
+        spread: 0.02,
+        spreadBps: 0,
+        depthSharesBid: 80,
+        depthSharesAsk: 80,
+        depthNotionalBid: 36.8,
+        depthNotionalAsk: 38.4,
+        lastTradePrice: 0.47,
+        lastTradeSize: 10,
+        source: 'rest',
+        updatedAt: new Date().toISOString(),
+      },
+      combined: {
+        combinedBid: 0.9,
+        combinedAsk: 0.93,
+        combinedMid: 0.915,
+        combinedDiscount: 0.07,
+        combinedPremium: -0.07,
+        pairSpread: 0.03,
+      },
+    },
+    positionManager: {
+      getShares: () => 0,
+      getAvgEntryPrice: () => 0,
+    } as any,
+    config: createPairedConfig({
+      minNetEdge: 0.03,
+    }),
+  });
+
+  assert.equal(signals.length, 2);
+  assert.equal(engine.isPairedArbPending('market-1'), true);
 });

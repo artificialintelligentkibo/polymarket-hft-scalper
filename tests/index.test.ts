@@ -363,6 +363,10 @@ test('settled outcome balance requires a small confirmation margin before SELL',
 test('executePairedArbAtomic unwinds leg1 when leg2 does not fill', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const calls: StrategySignal[] = [];
+  let pendingMarketId: string | null = null;
+  runtime.signalEngine.setPairedArbPending = (marketId: string) => {
+    pendingMarketId = marketId;
+  };
   runtime.executeSignal = async (
     _market: MarketCandidate,
     _orderbook: MarketOrderbookSnapshot,
@@ -402,15 +406,20 @@ test('executePairedArbAtomic unwinds leg1 when leg2 does not fill', async () => 
     'slot-1'
   );
 
+  assert.equal(pendingMarketId, 'market-1');
   assert.equal(calls.length, 3);
   assert.equal(calls[2]?.signalType, 'HARD_STOP');
   assert.equal(calls[2]?.action, 'SELL');
   assert.equal(calls[2]?.outcome, 'YES');
 });
 
-test('executePairedArbAtomic keeps both legs when both fills succeed', async () => {
+test('executePairedArbAtomic sizes leg2 to the actual leg1 fill', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const calls: StrategySignal[] = [];
+  let pendingMarketId: string | null = null;
+  runtime.signalEngine.setPairedArbPending = (marketId: string) => {
+    pendingMarketId = marketId;
+  };
   runtime.executeSignal = async (
     _market: MarketCandidate,
     _orderbook: MarketOrderbookSnapshot,
@@ -424,6 +433,7 @@ test('executePairedArbAtomic keeps both legs when both fills succeed', async () 
       outcome: signal.outcome,
       price: signal.targetPrice ?? 0.45,
       fillPrice: signal.targetPrice ?? 0.45,
+      filledShares: calls.length === 1 ? 11.38 : signal.shares,
     });
   };
 
@@ -433,12 +443,16 @@ test('executePairedArbAtomic keeps both legs when both fills succeed', async () 
     new PositionManager('market-1'),
     [
       { signal: createSignal({ signalType: 'PAIRED_ARB_BUY_YES', priority: 501, outcome: 'YES', urgency: 'cross' }) },
-      { signal: createSignal({ signalType: 'PAIRED_ARB_BUY_NO', priority: 500, outcome: 'NO', outcomeIndex: 1, urgency: 'improve', targetPrice: 0.54, tokenPrice: 0.54, midPrice: 0.535 }) },
+      { signal: createSignal({ signalType: 'PAIRED_ARB_BUY_NO', priority: 500, outcome: 'NO', outcomeIndex: 1, urgency: 'cross', targetPrice: 0.54, tokenPrice: 0.54, midPrice: 0.535 }) },
     ],
     'slot-1'
   );
 
+  assert.equal(pendingMarketId, 'market-1');
   assert.equal(calls.length, 2);
+  assert.equal(calls[1]?.shares, 11.38);
+  assert.match(calls[1]?.reason ?? '', /adjusted to match leg1 fill of 11\.38/);
   assert.ok(leg1);
   assert.ok(leg2);
+  assert.equal(leg2?.filledShares, 11.38);
 });

@@ -250,6 +250,10 @@ export class SignalScalper {
     return drained;
   }
 
+  setPairedArbPending(marketId: string): void {
+    this.pairedArbEngine.setPending(marketId);
+  }
+
   private getCombinedDiscountSignals(
     market: MarketCandidate,
     orderbook: MarketOrderbookSnapshot,

@@ -142,7 +142,7 @@ export class PairedArbitrageEngine {
             targetPrice: bestAskYes,
             edgeAmount: netEdge,
             priority: aggressiveOutcome === 'YES' ? 501 : 500,
-            urgency: aggressiveOutcome === 'YES' ? 'cross' : 'improve',
+            urgency: yesShares > 0 && noShares > 0 ? 'cross' : 'improve',
             reason:
               noShares > 0
                 ? `YES + NO ask ${combinedAsk.toFixed(4)} leaves ${netEdge.toFixed(4)} net paired edge`
@@ -164,13 +164,17 @@ export class PairedArbitrageEngine {
             targetPrice: bestAskNo,
             edgeAmount: netEdge,
             priority: aggressiveOutcome === 'NO' ? 501 : 500,
-            urgency: aggressiveOutcome === 'NO' ? 'cross' : 'improve',
+            urgency: yesShares > 0 && noShares > 0 ? 'cross' : 'improve',
             reason:
               yesShares > 0
                 ? `YES + NO ask ${combinedAsk.toFixed(4)} leaves ${netEdge.toFixed(4)} net paired edge`
                 : `Rebalancing NO inventory to restore paired arb ratio at ${bestAskNo.toFixed(4)}`,
           })
         );
+      }
+
+      if (signals.length === 2) {
+        this.setPending(market.marketId);
       }
     }
 
@@ -528,6 +532,13 @@ export class PairedArbitrageEngine {
     }
 
     return true;
+  }
+
+  setPending(marketId: string): void {
+    this.pendingProtectionUntilMs.set(
+      marketId,
+      Date.now() + PENDING_HARD_STOP_PROTECTION_MS
+    );
   }
 
   private resolvePosition(marketId: string, positionManager: PositionManager): PairPosition | undefined {
