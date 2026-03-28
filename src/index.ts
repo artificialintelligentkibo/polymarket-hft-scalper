@@ -842,6 +842,8 @@ export class MarketMakerRuntime {
       signalType: signal.signalType,
       outcome: signal.outcome,
       action: signal.action,
+      reason: signal.reason,
+      fairValue: signal.fairValue,
       shares: effectiveShares,
       submittedShares: execution.shares,
       price: effectivePrice,

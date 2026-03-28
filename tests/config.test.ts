@@ -6,6 +6,7 @@ import {
   isDryRunMode,
   isDeepBinanceEnabled,
   isDynamicQuotingEnabled,
+  validateConfig,
 } from '../src/config.js';
 
 test('createConfig filters invalid and duplicate whitelist condition ids', () => {
@@ -44,6 +45,8 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.PRODUCT_TEST_MODE, false);
   assert.equal(candidate.TEST_MIN_TRADE_USDC, 1);
   assert.equal(candidate.TEST_MAX_SLOTS, 1);
+  assert.equal(candidate.BAYESIAN_FV_ENABLED, false);
+  assert.equal(candidate.BAYESIAN_FV_ALPHA, 0.35);
   assert.equal(candidate.STATUS_CHECK_INTERVAL_MS, 300000);
   assert.equal(candidate.AUTO_PAUSE_ON_INCIDENT, true);
   assert.equal(candidate.PAUSE_GRACE_PERIOD_MS, 60000);
@@ -234,6 +237,18 @@ test('PRODUCT_TEST_MODE overrides simulation and dry-run execution checks', () =
 
   assert.equal(candidate.PRODUCT_TEST_MODE, true);
   assert.equal(isDryRunMode(candidate), false);
+});
+
+test('validateConfig rejects BAYESIAN_FV_ALPHA outside [0, 1]', () => {
+  const candidate = createConfig({
+    ...process.env,
+    BAYESIAN_FV_ALPHA: '1.25',
+  });
+
+  assert.throws(
+    () => validateConfig(candidate),
+    /BAYESIAN_FV_ALPHA must be in the range \[0, 1\]/
+  );
 });
 
 test('config proxy supports key enumeration and spreading', () => {

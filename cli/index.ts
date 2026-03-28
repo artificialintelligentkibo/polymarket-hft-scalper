@@ -376,6 +376,13 @@ function printStatus(runtimeConfig: AppConfig): void {
         : color.dim('n/a')
     }`
   );
+  console.log(
+    `${label('FV smoothing')} ${
+      runtimeStatus?.bayesianFvEnabled
+        ? color.green(`ON (alpha=${runtimeStatus.bayesianFvAlpha.toFixed(2)})`)
+        : color.dim('OFF')
+    }`
+  );
 
   if (runtimeStatus?.lastSlotReport) {
     console.log('');
@@ -571,6 +578,10 @@ function renderPerformance(
     runtimeStatus && isAnyCircuitBreakerOpen(runtimeStatus)
       ? color.yellow(formatCircuitBreakerGate(runtimeStatus, false))
       : color.green('OFF');
+  const bayesianFv =
+    runtimeStatus?.bayesianFvEnabled
+      ? color.green(`ON (alpha=${runtimeStatus.bayesianFvAlpha.toFixed(2)})`)
+      : color.dim('OFF');
   const lastSlotNet = runtimeStatus?.lastSlotReport
     ? formatSignedCurrency(runtimeStatus.lastSlotReport.netPnl)
     : color.dim('n/a');
@@ -586,9 +597,10 @@ function renderPerformance(
       ['Day PnL', formatSignedCurrency(totalDayPnl), 'Drawdown', formatSignedCurrency(drawdown)],
       ['Active slots', color.bold(String(activeSlots)), 'Open positions', color.bold(String(openPositions))],
       ['Avg latency', color.bold(averageLatency), 'Latency gate', latencyGate],
-      ['API gate', apiGate, 'Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK')],
-      ['Manager', color.bold(inspection.manager ?? 'n/a'), 'Circuit details', runtimeStatus ? color.dim(formatCircuitBreakerGate(runtimeStatus, false)) : color.dim('n/a')],
-      ['Last slot', lastSlotNet, 'Slot label', lastSlotLabel],
+      ['API gate', apiGate, 'FV smoothing', bayesianFv],
+      ['Manager', color.bold(inspection.manager ?? 'n/a'), 'Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK')],
+      ['Circuit details', runtimeStatus ? color.dim(formatCircuitBreakerGate(runtimeStatus, false)) : color.dim('n/a'), 'Slot label', lastSlotLabel],
+      ['Last slot', lastSlotNet, 'Updated', runtimeStatus?.updatedAt ? truncateDashboardLabel(runtimeStatus.updatedAt, 28) : color.dim('n/a')],
     ]
   );
 }

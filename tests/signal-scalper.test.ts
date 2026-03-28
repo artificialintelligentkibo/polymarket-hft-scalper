@@ -313,6 +313,23 @@ test('hard stop is deferred while a paired arb leg is still pending completion',
   assert.equal(signals.some((signal) => signal.signalType === 'HARD_STOP'), false);
 });
 
+test('smoothFairValue applies EMA once per tick and preserves the expected sequence', () => {
+  const signalEngine = createLegacySignalEngine({
+    BAYESIAN_FV_ENABLED: 'true',
+    BAYESIAN_FV_ALPHA: '0.35',
+  }) as any;
+
+  const tick1 = signalEngine.smoothFairValue('market-1', 'YES', 0.55, 'scalper-base', 1);
+  signalEngine.currentTickFairValueCache.clear();
+  const tick2 = signalEngine.smoothFairValue('market-1', 'YES', 0.6, 'scalper-base', 2);
+  signalEngine.currentTickFairValueCache.clear();
+  const tick3 = signalEngine.smoothFairValue('market-1', 'YES', 0.5, 'scalper-base', 3);
+
+  assert.equal(tick1, 0.55);
+  assert.equal(tick2, 0.5675);
+  assert.equal(tick3, 0.543875);
+});
+
 test('async paired arb can start with a single cheap leg when combined ask is not simultaneously discounted', () => {
   const market = createMarket();
   const orderbook = createOrderbook();

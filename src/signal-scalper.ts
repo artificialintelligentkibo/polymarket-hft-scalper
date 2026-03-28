@@ -47,12 +47,17 @@ interface EntryGuardEvaluation {
   spreadThreshold: number;
 }
 
+const SMOOTHED_FAIR_VALUE_TTL_MS = 15 * 60_000;
+
 export class SignalScalper {
   private readonly fairValueBuyCadence = new Map<string, FairValueBuyCadenceState>();
   private readonly inventoryRebalanceBlocks = new Map<string, InventoryRebalanceBlockState>();
   private readonly pairedArbEngine = new PairedArbitrageEngine();
   private readonly latencyMomentumEngine = new LatencyMomentumEngine();
   private readonly recentSkippedSignals: SkippedSignalRecord[] = [];
+  private readonly smoothedScalperFV = new Map<string, number>();
+  private readonly smoothedScalperFvSeenAtMs = new Map<string, number>();
+  private readonly currentTickFairValueCache = new Map<string, number | null>();
 
   constructor(private readonly runtimeConfig: AppConfig = config) {}
 
@@ -133,6 +138,7 @@ export class SignalScalper {
     now?: Date;
   }): StrategySignal[] {
     this.recentSkippedSignals.splice(0, this.recentSkippedSignals.length);
+    this.currentTickFairValueCache.clear();
     const now = params.now ?? new Date();
     const {
       market,
@@ -143,6 +149,7 @@ export class SignalScalper {
       binanceAssessment,
     } = params;
     this.pruneFairValueControlState(now.getTime());
+    this.pruneSmoothedFairValues(now.getTime());
     const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
     const pairedProtectionEnabled =
       this.runtimeConfig.PAIRED_ARB_ENABLED &&
@@ -254,6 +261,51 @@ export class SignalScalper {
     this.pairedArbEngine.setPending(marketId);
   }
 
+  /**
+   * Applies EMA smoothing per market/outcome FV stream.
+   * The smoothing state is keyed by market/outcome/variant so each strategy path
+   * carries its own prior, while the per-tick cache prevents multiple updates
+   * from the same orderbook snapshot inside one generateSignals pass.
+   */
+  private smoothFairValue(
+    marketId: string,
+    outcome: Outcome,
+    rawFairValue: number | null,
+    variant: string = 'base',
+    nowMs: number = Date.now()
+  ): number | null {
+    if (rawFairValue === null || !this.runtimeConfig.BAYESIAN_FV_ENABLED) {
+      return rawFairValue;
+    }
+
+    const key = `${marketId}:${outcome}:${variant}`;
+    const cached = this.currentTickFairValueCache.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const prev = this.smoothedScalperFV.get(key);
+    const alpha = this.runtimeConfig.BAYESIAN_FV_ALPHA;
+    const smoothed =
+      prev === undefined || !Number.isFinite(prev)
+        ? rawFairValue
+        : roundTo(alpha * rawFairValue + (1 - alpha) * prev, 6);
+    const clamped = clamp(smoothed, 0.001, 0.999);
+
+    this.smoothedScalperFV.set(key, clamped);
+    this.smoothedScalperFvSeenAtMs.set(key, nowMs);
+    this.currentTickFairValueCache.set(key, clamped);
+    logger.debug('Bayesian FV smoothing applied', {
+      key,
+      rawFairValue,
+      prevSmoothedFV: prev ?? null,
+      newSmoothedFV: clamped,
+      alpha,
+    });
+
+    return clamped;
+  }
+
   private getCombinedDiscountSignals(
     market: MarketCandidate,
     orderbook: MarketOrderbookSnapshot,
@@ -297,7 +349,8 @@ export class SignalScalper {
         continue;
       }
       const bestAsk = book.bestAsk;
-      const fairValue = estimateFairValue(orderbook, outcome);
+      const rawFairValue = estimateFairValue(orderbook, outcome);
+      const fairValue = this.smoothFairValue(market.marketId, outcome, rawFairValue, 'scalper-base');
       const entryGuard = resolveEntryGuardMultiplier(
         book,
         'COMBINED_DISCOUNT_BUY_BOTH',
@@ -365,7 +418,8 @@ export class SignalScalper {
     for (const outcome of OUTCOMES as readonly Outcome[]) {
       const book = getBookForOutcome(orderbook, outcome);
       const openShares = positionManager.getShares(outcome);
-      const fairValue = estimateFairValue(orderbook, outcome);
+      const rawFairValue = estimateFairValue(orderbook, outcome);
+      const fairValue = this.smoothFairValue(market.marketId, outcome, rawFairValue, 'scalper-base');
 
       if (
         !riskAssessment.blockedOutcomes.has(outcome) &&
@@ -486,14 +540,27 @@ export class SignalScalper {
       this.runtimeConfig
     );
     const nowMs = now.getTime();
+    const fairValueVariant =
+      effectiveBinanceAdjustment &&
+      effectiveBinanceAdjustment.direction !== 'FLAT' &&
+      Number.isFinite(effectiveBinanceAdjustment.movePct)
+        ? 'scalper-binance'
+        : 'scalper-base';
 
     for (const outcome of OUTCOMES as readonly Outcome[]) {
       const book = getBookForOutcome(orderbook, outcome);
-      const fairValue = estimateFairValue(
+      const rawFairValue = estimateFairValue(
         orderbook,
         outcome,
         effectiveBinanceAdjustment,
         this.runtimeConfig
+      );
+      const fairValue = this.smoothFairValue(
+        market.marketId,
+        outcome,
+        rawFairValue,
+        fairValueVariant,
+        nowMs
       );
       const openShares = positionManager.getShares(outcome);
 
@@ -558,7 +625,7 @@ export class SignalScalper {
                 capitalClamp: size.capitalClamp,
                 urgency: resolveProductTestUrgency('passive', this.runtimeConfig),
                 reduceOnly: false,
-                reason: `${outcome} ask ${formatPrice(bestAsk)} is below fair value ${formatPrice(fairValue)}`,
+                reason: `${outcome} ask ${formatPrice(bestAsk)} is below fair value ${formatFairValueObservation(fairValue, rawFairValue, this.runtimeConfig)}`,
               })
             );
           }
@@ -607,7 +674,7 @@ export class SignalScalper {
                 capitalClamp: size.capitalClamp,
                 urgency: resolveProductTestUrgency('improve', this.runtimeConfig),
                 reduceOnly: true,
-                reason: `${outcome} bid ${formatPrice(executableBid)} is above fair value ${formatPrice(fairValue)}`,
+                reason: `${outcome} bid ${formatPrice(executableBid)} is above fair value ${formatFairValueObservation(fairValue, rawFairValue, this.runtimeConfig)}`,
               })
             );
           }
@@ -633,7 +700,8 @@ export class SignalScalper {
     const outcome = imbalanceState.dominantOutcome;
     const book = getBookForOutcome(orderbook, outcome);
     const bestBid = book.bestBid ?? book.midPrice;
-    const fairValue = estimateFairValue(orderbook, outcome);
+    const rawFairValue = estimateFairValue(orderbook, outcome);
+    const fairValue = this.smoothFairValue(market.marketId, outcome, rawFairValue, 'scalper-base');
     if (bestBid === null) {
       return [];
     }
@@ -753,6 +821,15 @@ export class SignalScalper {
   private pruneFairValueControlState(nowMs: number): void {
     pruneControlStateMap(this.fairValueBuyCadence, nowMs);
     pruneControlStateMap(this.inventoryRebalanceBlocks, nowMs);
+  }
+
+  private pruneSmoothedFairValues(nowMs: number): void {
+    for (const [key, seenAtMs] of this.smoothedScalperFvSeenAtMs.entries()) {
+      if (!Number.isFinite(seenAtMs) || nowMs - seenAtMs > SMOOTHED_FAIR_VALUE_TTL_MS) {
+        this.smoothedScalperFvSeenAtMs.delete(key);
+        this.smoothedScalperFV.delete(key);
+      }
+    }
   }
 
   private applyEVKellySignals(signals: StrategySignal[]): StrategySignal[] {
@@ -1173,6 +1250,26 @@ function formatPrice(value: number): string {
 
 function formatMaybePrice(value: number | null): string {
   return value === null || !Number.isFinite(value) ? 'n/a' : value.toFixed(4);
+}
+
+function formatFairValueObservation(
+  smoothedFairValue: number | null,
+  rawFairValue: number | null,
+  runtimeConfig: AppConfig
+): string {
+  if (smoothedFairValue === null || !Number.isFinite(smoothedFairValue)) {
+    return 'n/a';
+  }
+
+  if (
+    !runtimeConfig.BAYESIAN_FV_ENABLED ||
+    rawFairValue === null ||
+    !Number.isFinite(rawFairValue)
+  ) {
+    return formatPrice(smoothedFairValue);
+  }
+
+  return `${formatPrice(smoothedFairValue)} (raw: ${formatPrice(rawFairValue)}, alpha=${runtimeConfig.BAYESIAN_FV_ALPHA.toFixed(2)})`;
 }
 
 function hasExecutableBid(book: TokenBookSnapshot): book is TokenBookSnapshot & { bestBid: number } {

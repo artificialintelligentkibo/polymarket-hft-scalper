@@ -136,6 +136,7 @@ export class BinanceDeepIntegration {
   private started = false;
   private readonly books = new Map<string, DeepBinanceBookState>();
   private readonly slotOpenMids = new Map<string, SlotOpenSnapshot>();
+  private readonly smoothedFairValues = new Map<string, number>();
 
   constructor(
     private readonly runtimeConfig: AppConfig = config,
@@ -164,6 +165,7 @@ export class BinanceDeepIntegration {
     }
     this.books.clear();
     this.slotOpenMids.clear();
+    this.smoothedFairValues.clear();
   }
 
   isReady(coin?: string): boolean {
@@ -255,6 +257,10 @@ export class BinanceDeepIntegration {
             runtimeConfig: this.runtimeConfig,
           })
         : null;
+    const smoothedFairValue =
+      fairValue !== null
+        ? this.applyFairValueSmoothing(params.coin, params.slotStartTime, fairValue)
+        : null;
 
     return {
       available: true,
@@ -271,7 +277,7 @@ export class BinanceDeepIntegration {
       fundingRate,
       fundingBasis,
       polymarketMid: params.polymarketMid,
-      fairValue,
+      fairValue: smoothedFairValue,
       direction,
     };
   }
@@ -292,6 +298,41 @@ export class BinanceDeepIntegration {
       volatilityRatio: assessment.volatilityRatio,
       runtimeConfig: this.runtimeConfig,
     });
+  }
+
+  /**
+   * Applies EMA smoothing to the deep fair value stream for a single slot.
+   * A new slot key seeds from the raw observation, so smoothing resets
+   * automatically when slotStartTime changes.
+   */
+  private applyFairValueSmoothing(
+    coin: string,
+    slotStartTime: string,
+    rawFairValue: number
+  ): number {
+    if (!this.runtimeConfig.BAYESIAN_FV_ENABLED) {
+      return rawFairValue;
+    }
+
+    const key = buildSlotKey(coin, slotStartTime);
+    const prev = this.smoothedFairValues.get(key);
+    const alpha = this.runtimeConfig.BAYESIAN_FV_ALPHA;
+    const smoothed =
+      prev === undefined || !Number.isFinite(prev)
+        ? rawFairValue
+        : roundTo(alpha * rawFairValue + (1 - alpha) * prev, 6);
+    const clamped = clamp(smoothed, 0.001, 0.999);
+
+    this.smoothedFairValues.set(key, clamped);
+    logger.debug('Bayesian FV smoothing applied', {
+      key,
+      rawFairValue,
+      prevSmoothedFV: prev ?? null,
+      newSmoothedFV: clamped,
+      alpha,
+    });
+
+    return clamped;
   }
 
   private connect(): void {
@@ -414,6 +455,12 @@ export class BinanceDeepIntegration {
     for (const [key, snapshot] of this.slotOpenMids.entries()) {
       if (snapshot.recordedAtMs < cutoff) {
         this.slotOpenMids.delete(key);
+      }
+    }
+
+    for (const key of this.smoothedFairValues.keys()) {
+      if (!this.slotOpenMids.has(key)) {
+        this.smoothedFairValues.delete(key);
       }
     }
   }

@@ -31,6 +31,8 @@ export interface AppConfig {
   readonly LATENCY_MOMENTUM_ENABLED: boolean;
   readonly PAPER_TRADING_ENABLED: boolean;
   readonly EV_KELLY_ENABLED: boolean;
+  readonly BAYESIAN_FV_ENABLED: boolean;
+  readonly BAYESIAN_FV_ALPHA: number;
   readonly STATUS_CHECK_INTERVAL_MS: number;
   readonly AUTO_PAUSE_ON_INCIDENT: boolean;
   readonly PAUSE_GRACE_PERIOD_MS: number;
@@ -438,6 +440,8 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     LATENCY_MOMENTUM_ENABLED: parseBoolean(env.LATENCY_MOMENTUM_ENABLED, false),
     PAPER_TRADING_ENABLED: parseBoolean(env.PAPER_TRADING_ENABLED, false),
     EV_KELLY_ENABLED: parseBoolean(env.EV_KELLY_ENABLED, false),
+    BAYESIAN_FV_ENABLED: parseBoolean(env.BAYESIAN_FV_ENABLED, false),
+    BAYESIAN_FV_ALPHA: parseFloatOrDefault(env.BAYESIAN_FV_ALPHA, '0.35'),
     STATUS_CHECK_INTERVAL_MS: Math.max(
       60_000,
       parseIntOrDefault(env.STATUS_CHECK_INTERVAL_MS, '300000')
@@ -869,6 +873,10 @@ export function validateConfig(candidate: AppConfig = config): void {
     if (!candidate.AUTO_REDEEM) {
       throw new Error('PRODUCT_TEST_MODE requires AUTO_REDEEM=true.');
     }
+  }
+
+  if (candidate.BAYESIAN_FV_ALPHA < 0 || candidate.BAYESIAN_FV_ALPHA > 1) {
+    throw new Error('BAYESIAN_FV_ALPHA must be in the range [0, 1].');
   }
 
   if (candidate.strategy.minShares <= 0 || candidate.strategy.maxShares <= 0) {

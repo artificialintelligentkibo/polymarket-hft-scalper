@@ -90,6 +90,8 @@ export interface RuntimeStatusSnapshot {
   readonly totalDayPnl: number;
   readonly dayDrawdown: number;
   readonly averageLatencyMs: number | null;
+  readonly bayesianFvEnabled: boolean;
+  readonly bayesianFvAlpha: number;
   readonly activeMarkets: readonly RuntimeMarketSnapshot[];
   readonly openPositions: readonly RuntimePositionSnapshot[];
   readonly lastSignals: readonly RuntimeSignalSnapshot[];
@@ -138,6 +140,8 @@ export function createRuntimeStatusSnapshot(
     totalDayPnl: dayState.dayPnl,
     dayDrawdown: dayState.drawdown,
     averageLatencyMs: null,
+    bayesianFvEnabled: runtimeConfig.BAYESIAN_FV_ENABLED,
+    bayesianFvAlpha: runtimeConfig.BAYESIAN_FV_ALPHA,
     activeMarkets: [],
     openPositions: [],
     lastSignals: [],
@@ -237,6 +241,11 @@ function normalizeRuntimeStatus(
     totalDayPnl: normalizeNumber(value.totalDayPnl, dayState.dayPnl),
     dayDrawdown: normalizeNumber(value.dayDrawdown, dayState.drawdown),
     averageLatencyMs: normalizeNullableNumber(value.averageLatencyMs),
+    bayesianFvEnabled:
+      typeof value.bayesianFvEnabled === 'boolean'
+        ? value.bayesianFvEnabled
+        : runtimeConfig.BAYESIAN_FV_ENABLED,
+    bayesianFvAlpha: normalizeNumber(value.bayesianFvAlpha, runtimeConfig.BAYESIAN_FV_ALPHA),
     activeMarkets,
     openPositions,
     lastSignals: Array.isArray(value.lastSignals)
