@@ -12,6 +12,7 @@ import {
   estimateFairValue,
   resolvePriceMultiplier,
 } from '../src/signal-scalper.js';
+import { bypassesBinanceEdge } from '../src/strategy-types.js';
 
 function createMarket(): MarketCandidate {
   return {
@@ -179,6 +180,11 @@ test('combined discount emits dual-sided BUY signals capped at two', () => {
     signals.map((signal) => signal.outcome).sort(),
     ['NO', 'YES']
   );
+});
+
+test('MM quote signal types bypass the Binance edge directional gate', () => {
+  assert.equal(bypassesBinanceEdge('MM_QUOTE_BID'), true);
+  assert.equal(bypassesBinanceEdge('MM_QUOTE_ASK'), true);
 });
 
 test('paired arb ignores MAX_SIGNALS_PER_TICK so both legs survive together', () => {

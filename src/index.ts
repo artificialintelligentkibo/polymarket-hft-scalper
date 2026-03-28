@@ -34,6 +34,7 @@ import { PositionManager } from './position-manager.js';
 import { ProductTestModeController } from './product-test-mode.js';
 import {
   buildQuoteRefreshPlan,
+  countActiveMMMarkets,
   QuotingEngine,
   type ActiveQuoteOrder,
   type QuoteRefreshPlan,
@@ -41,6 +42,7 @@ import {
 import { writeLatencyLog } from './reports.js';
 import { RiskManager } from './risk-manager.js';
 import {
+  type RuntimeMmQuoteSnapshot,
   writeRuntimeStatus,
   type RuntimeMarketSnapshot,
   type RuntimePositionSnapshot,
@@ -469,12 +471,17 @@ export class MarketMakerRuntime {
       ? latencyPausedSignals.filter((signal) => !isQuotingSignalType(signal.signalType))
       : latencyPausedSignals;
     if (isDynamicQuotingEnabled(config)) {
+      const allowEntryQuotes = this.shouldAllowMarketMakingEntries(
+        market.marketId,
+        positionManager
+      );
       this.quotingEngine.syncMarketContext({
         market,
         orderbook,
         positionManager,
         riskAssessment,
         quoteSignals,
+        allowEntryQuotes,
         binanceFairValueAdjustment,
         deepBinanceAssessment,
       });
@@ -1300,6 +1307,16 @@ export class MarketMakerRuntime {
         activeMarkets: this.buildRuntimeMarketSnapshots(),
         openPositions,
         openPositionsCount: openPositions.length,
+        mmEnabled: isDynamicQuotingEnabled(config),
+        mmAutonomousQuotes: config.MM_AUTONOMOUS_QUOTES,
+        mmQuoteShares: config.MM_QUOTE_SHARES,
+        mmMaxGrossExposure: config.MM_MAX_GROSS_EXPOSURE_USD,
+        mmCurrentExposure: this.quotingEngine.getCurrentMMExposureUsd(),
+        mmActiveMarkets: countActiveMMMarkets(this.quotingEngine),
+        mmMaxConcurrentMarkets: config.MM_MAX_CONCURRENT_MARKETS,
+        mmInventorySkew: config.MM_INVENTORY_SKEW_FACTOR,
+        mmMaxNetDirectional: config.MM_MAX_NET_DIRECTIONAL,
+        mmQuotes: this.buildRuntimeMmQuoteSnapshots(),
         ...overrides,
       },
       config
@@ -1336,6 +1353,33 @@ export class MarketMakerRuntime {
     const created = new PositionManager(market.marketId, market.endTime);
     this.positions.set(market.marketId, created);
     return created;
+  }
+
+  private shouldAllowMarketMakingEntries(
+    marketId: string,
+    positionManager: PositionManager
+  ): boolean {
+    const activeCount = countActiveMMMarkets(this.quotingEngine);
+    if (activeCount < config.MM_MAX_CONCURRENT_MARKETS) {
+      return true;
+    }
+
+    if (
+      this.quotingEngine.hasActiveMMMarket(marketId) ||
+      positionManager.getSnapshot().grossExposureShares > 0
+    ) {
+      return true;
+    }
+
+    logger.debug('MM quote skipped', {
+      marketId,
+      reason: 'concurrent_limit',
+      details: {
+        activeMMMarkets: activeCount,
+        maxConcurrentMarkets: config.MM_MAX_CONCURRENT_MARKETS,
+      },
+    });
+    return false;
   }
 
   private getPendingOrderKey(marketId: string, outcome: StrategySignal['outcome']): string {
@@ -2061,6 +2105,48 @@ export class MarketMakerRuntime {
       .slice(0, 8);
   }
 
+  private buildRuntimeMmQuoteSnapshots(): RuntimeMmQuoteSnapshot[] {
+    return this.quotingEngine
+      .getActiveMMMarketIds()
+      .map((marketId) => {
+        const market = this.markets.get(marketId) ?? this.quotingEngine.getContext(marketId)?.market;
+        const context = this.quotingEngine.getContext(marketId);
+        if (!market || !context) {
+          return null;
+        }
+
+        const orders = this.quotingEngine.getQuoteOrders(marketId);
+        const bidPrice = resolveQuoteOrderPrice(orders, 'BUY');
+        const askPrice = resolveQuoteOrderPrice(orders, 'SELL');
+        const spread =
+          bidPrice !== null && askPrice !== null
+            ? roundTo(askPrice - bidPrice, 4)
+            : null;
+        const snapshot = context.positionManager.getSnapshot();
+        const orderbook = this.latestBooks.get(marketId) ?? context.orderbook;
+
+        return {
+          marketId,
+          title: market.title,
+          coin: extractCoinFromTitle(market.title),
+          bidPrice,
+          askPrice,
+          spread,
+          yesShares: roundTo(snapshot.yesShares, 4),
+          noShares: roundTo(snapshot.noShares, 4),
+          grossExposureUsd: roundTo(
+            snapshot.yesShares * (orderbook.yes.midPrice ?? 0.5) +
+              snapshot.noShares * (orderbook.no.midPrice ?? 0.5),
+            4
+          ),
+          netDirectionalShares: roundTo(snapshot.yesShares - snapshot.noShares, 4),
+        } satisfies RuntimeMmQuoteSnapshot;
+      })
+      .filter((entry): entry is RuntimeMmQuoteSnapshot => entry !== null)
+      .sort((left, right) => right.grossExposureUsd - left.grossExposureUsd)
+      .slice(0, Math.max(4, config.MM_MAX_CONCURRENT_MARKETS));
+  }
+
   private buildRuntimePositionSnapshots(): RuntimePositionSnapshot[] {
     return Array.from(this.positions.entries())
       .map(([marketId, positionManager]) => {
@@ -2137,6 +2223,7 @@ export class MarketMakerRuntime {
           deepBinanceAssessment,
         },
         activeQuoteOrders: plan.activeQuoteOrders,
+        currentMMExposureUsd: this.quotingEngine.getCurrentMMExposureUsd(),
         runtimeConfig: config,
         now: new Date(),
       });
@@ -2168,6 +2255,8 @@ export class MarketMakerRuntime {
             outcome: signal.outcome,
             action: signal.action,
             signalType: signal.signalType,
+            targetPrice: signal.targetPrice,
+            shares: signal.shares,
           });
         }
       }
@@ -2249,6 +2338,22 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
 
 function normalizeRuntimeNumber(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? roundTo(value, 4) : null;
+}
+
+function resolveQuoteOrderPrice(
+  orders: readonly ActiveQuoteOrder[],
+  action: StrategySignal['action']
+): number | null {
+  const prices = orders
+    .filter((order) => order.action === action)
+    .map((order) => order.targetPrice)
+    .filter((price): price is number => price !== null && Number.isFinite(price));
+
+  if (prices.length === 0) {
+    return null;
+  }
+
+  return roundTo(action === 'BUY' ? Math.max(...prices) : Math.min(...prices), 4);
 }
 
 function isAtomicPairedArbExecutionCandidate(signal: Pick<StrategySignal, 'signalType'>): boolean {

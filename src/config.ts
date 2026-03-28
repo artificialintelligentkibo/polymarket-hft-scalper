@@ -3,7 +3,7 @@ import type { EVKellyConfig } from './ev-kelly.js';
 import type { LatencyMomentumConfig } from './latency-momentum.js';
 import type { PairedArbConfig } from './paired-arbitrage.js';
 import type { PaperTraderConfig } from './paper-trader.js';
-import { parseBooleanLoose, sanitizeConditionIds } from './utils.js';
+import { clamp, parseBooleanLoose, sanitizeConditionIds } from './utils.js';
 
 export type AuthMode = 'EOA' | 'PROXY';
 export type EntryStrategy = 'LEGACY' | 'PAIRED_ARBITRAGE' | 'LATENCY_MOMENTUM' | 'ALL';
@@ -88,6 +88,28 @@ export interface AppConfig {
    * Recommended production default (2026): true.
    */
   readonly REBALANCE_ON_IMBALANCE: boolean;
+  /** Generate dual-sided quotes without waiting for scalper quote templates. */
+  readonly MM_AUTONOMOUS_QUOTES: boolean;
+  /** Keep autonomous quoting on even when scalper-driven quote signals are present. */
+  readonly MM_ALWAYS_QUOTE: boolean;
+  /** Fixed share size used by autonomous market-making quotes. */
+  readonly MM_QUOTE_SHARES: number;
+  /** Maximum total MM notional exposure across tracked markets in USDC. */
+  readonly MM_MAX_GROSS_EXPOSURE_USD: number;
+  /** Maximum allowed YES-minus-NO directional inventory in shares. */
+  readonly MM_MAX_NET_DIRECTIONAL: number;
+  /** Minimum quote width in ticks for autonomous MM quotes. */
+  readonly MM_MIN_SPREAD_TICKS: number;
+  /** Require a resolved fair value before autonomous MM quotes are posted. */
+  readonly MM_REQUIRE_FAIR_VALUE: boolean;
+  /** Minimum visible depth on both sides of the book before quoting. */
+  readonly MM_MIN_BOOK_DEPTH_USD: number;
+  /** Maximum number of markets allowed to carry active MM inventory/quotes. */
+  readonly MM_MAX_CONCURRENT_MARKETS: number;
+  /** Amount of inventory-based fair-value skew applied to autonomous quotes. */
+  readonly MM_INVENTORY_SKEW_FACTOR: number;
+  /** Minimum extra spread edge above fees for autonomous MM quotes. */
+  readonly MM_MIN_EDGE_AFTER_FEE: number;
   /**
    * Enables the deeper Binance derivatives integration for the market-maker.
    * false = keep the existing lightweight Binance edge only.
@@ -486,6 +508,27 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       parseIntOrDefault(env.QUOTING_SPREAD_TICKS, '2')
     ),
     REBALANCE_ON_IMBALANCE: parseBoolean(env.REBALANCE_ON_IMBALANCE, true),
+    MM_AUTONOMOUS_QUOTES: parseBoolean(env.MM_AUTONOMOUS_QUOTES, true),
+    MM_ALWAYS_QUOTE: parseBoolean(env.MM_ALWAYS_QUOTE, false),
+    MM_QUOTE_SHARES: Math.max(1, parseIntOrDefault(env.MM_QUOTE_SHARES, '8')),
+    MM_MAX_GROSS_EXPOSURE_USD: parseFloatOrDefault(env.MM_MAX_GROSS_EXPOSURE_USD, '30'),
+    MM_MAX_NET_DIRECTIONAL: parseFloatOrDefault(env.MM_MAX_NET_DIRECTIONAL, '25'),
+    MM_MIN_SPREAD_TICKS: Math.max(
+      1,
+      parseIntOrDefault(env.MM_MIN_SPREAD_TICKS, '2')
+    ),
+    MM_REQUIRE_FAIR_VALUE: parseBoolean(env.MM_REQUIRE_FAIR_VALUE, true),
+    MM_MIN_BOOK_DEPTH_USD: parseFloatOrDefault(env.MM_MIN_BOOK_DEPTH_USD, '3'),
+    MM_MAX_CONCURRENT_MARKETS: Math.max(
+      1,
+      parseIntOrDefault(env.MM_MAX_CONCURRENT_MARKETS, '4')
+    ),
+    MM_INVENTORY_SKEW_FACTOR: clamp(
+      parseFloatOrDefault(env.MM_INVENTORY_SKEW_FACTOR, '0.3'),
+      0,
+      1
+    ),
+    MM_MIN_EDGE_AFTER_FEE: parseFloatOrDefault(env.MM_MIN_EDGE_AFTER_FEE, '0.005'),
     DEEP_BINANCE_MODE: parseBoolean(env.DEEP_BINANCE_MODE, false),
     BINANCE_WS_ENABLED: parseBoolean(env.BINANCE_WS_ENABLED, true),
     BINANCE_DEPTH_LEVELS: Math.max(
@@ -1129,6 +1172,26 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.QUOTING_SPREAD_TICKS < 1) {
     throw new Error('QUOTING_SPREAD_TICKS must be at least 1.');
+  }
+
+  if (candidate.MM_MAX_GROSS_EXPOSURE_USD <= 0) {
+    throw new Error('MM_MAX_GROSS_EXPOSURE_USD must be positive.');
+  }
+
+  if (candidate.MM_MAX_NET_DIRECTIONAL <= 0) {
+    throw new Error('MM_MAX_NET_DIRECTIONAL must be positive.');
+  }
+
+  if (candidate.MM_INVENTORY_SKEW_FACTOR < 0 || candidate.MM_INVENTORY_SKEW_FACTOR > 1) {
+    throw new Error('MM_INVENTORY_SKEW_FACTOR must be in range [0, 1].');
+  }
+
+  if (candidate.MM_MIN_EDGE_AFTER_FEE < 0) {
+    throw new Error('MM_MIN_EDGE_AFTER_FEE must be zero or positive.');
+  }
+
+  if (candidate.MM_MIN_BOOK_DEPTH_USD < 0) {
+    throw new Error('MM_MIN_BOOK_DEPTH_USD must be zero or positive.');
   }
 
   if (candidate.BINANCE_DEPTH_LEVELS < 1) {

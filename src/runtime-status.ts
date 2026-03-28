@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { CircuitBreakerSnapshot } from './api-retry.js';
-import { config, isDryRunMode, type AppConfig } from './config.js';
+import { config, isDryRunMode, isDynamicQuotingEnabled, type AppConfig } from './config.js';
 import { getDayPnlState } from './day-pnl-state.js';
 import { roundTo } from './utils.js';
 
@@ -70,6 +70,19 @@ export interface RuntimePositionSnapshot {
   readonly updatedAt: string | null;
 }
 
+export interface RuntimeMmQuoteSnapshot {
+  readonly marketId: string;
+  readonly title: string;
+  readonly coin: string | null;
+  readonly bidPrice: number | null;
+  readonly askPrice: number | null;
+  readonly spread: number | null;
+  readonly yesShares: number;
+  readonly noShares: number;
+  readonly grossExposureUsd: number;
+  readonly netDirectionalShares: number;
+}
+
 export interface RuntimeStatusSnapshot {
   readonly updatedAt: string;
   readonly pid: number | null;
@@ -94,6 +107,16 @@ export interface RuntimeStatusSnapshot {
   readonly bayesianFvAlpha: number;
   readonly activeMarkets: readonly RuntimeMarketSnapshot[];
   readonly openPositions: readonly RuntimePositionSnapshot[];
+  readonly mmEnabled: boolean;
+  readonly mmAutonomousQuotes: boolean;
+  readonly mmQuoteShares: number;
+  readonly mmMaxGrossExposure: number;
+  readonly mmCurrentExposure: number;
+  readonly mmActiveMarkets: number;
+  readonly mmMaxConcurrentMarkets: number;
+  readonly mmInventorySkew: number;
+  readonly mmMaxNetDirectional: number;
+  readonly mmQuotes: readonly RuntimeMmQuoteSnapshot[];
   readonly lastSignals: readonly RuntimeSignalSnapshot[];
   readonly recentSkippedSignals: readonly SkippedSignalRecord[];
   readonly lastSlotReport: RuntimeSlotSnapshot | null;
@@ -144,6 +167,16 @@ export function createRuntimeStatusSnapshot(
     bayesianFvAlpha: runtimeConfig.BAYESIAN_FV_ALPHA,
     activeMarkets: [],
     openPositions: [],
+    mmEnabled: isDynamicQuotingEnabled(runtimeConfig),
+    mmAutonomousQuotes: runtimeConfig.MM_AUTONOMOUS_QUOTES,
+    mmQuoteShares: runtimeConfig.MM_QUOTE_SHARES,
+    mmMaxGrossExposure: runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD,
+    mmCurrentExposure: 0,
+    mmActiveMarkets: 0,
+    mmMaxConcurrentMarkets: runtimeConfig.MM_MAX_CONCURRENT_MARKETS,
+    mmInventorySkew: runtimeConfig.MM_INVENTORY_SKEW_FACTOR,
+    mmMaxNetDirectional: runtimeConfig.MM_MAX_NET_DIRECTIONAL,
+    mmQuotes: [],
     lastSignals: [],
     recentSkippedSignals: [],
     lastSlotReport: null,
@@ -212,6 +245,12 @@ function normalizeRuntimeStatus(
         .filter((entry): entry is RuntimePositionSnapshot => entry !== null)
         .slice(0, 8)
     : [];
+  const mmQuotes = Array.isArray(value.mmQuotes)
+    ? value.mmQuotes
+        .map(normalizeRuntimeMmQuote)
+        .filter((entry): entry is RuntimeMmQuoteSnapshot => entry !== null)
+        .slice(0, 8)
+    : [];
   return {
     updatedAt:
       typeof value.updatedAt === 'string' && value.updatedAt.trim()
@@ -248,6 +287,34 @@ function normalizeRuntimeStatus(
     bayesianFvAlpha: normalizeNumber(value.bayesianFvAlpha, runtimeConfig.BAYESIAN_FV_ALPHA),
     activeMarkets,
     openPositions,
+    mmEnabled:
+      typeof value.mmEnabled === 'boolean'
+        ? value.mmEnabled
+        : isDynamicQuotingEnabled(runtimeConfig),
+    mmAutonomousQuotes:
+      typeof value.mmAutonomousQuotes === 'boolean'
+        ? value.mmAutonomousQuotes
+        : runtimeConfig.MM_AUTONOMOUS_QUOTES,
+    mmQuoteShares: normalizeNumber(value.mmQuoteShares, runtimeConfig.MM_QUOTE_SHARES),
+    mmMaxGrossExposure: normalizeNumber(
+      value.mmMaxGrossExposure,
+      runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
+    ),
+    mmCurrentExposure: normalizeNumber(value.mmCurrentExposure, 0),
+    mmActiveMarkets: normalizeCount(value.mmActiveMarkets),
+    mmMaxConcurrentMarkets: Math.max(
+      1,
+      normalizeCount(value.mmMaxConcurrentMarkets) || runtimeConfig.MM_MAX_CONCURRENT_MARKETS
+    ),
+    mmInventorySkew: normalizeNumber(
+      value.mmInventorySkew,
+      runtimeConfig.MM_INVENTORY_SKEW_FACTOR
+    ),
+    mmMaxNetDirectional: normalizeNumber(
+      value.mmMaxNetDirectional,
+      runtimeConfig.MM_MAX_NET_DIRECTIONAL
+    ),
+    mmQuotes,
     lastSignals: Array.isArray(value.lastSignals)
       ? value.lastSignals
           .map(normalizeRuntimeSignal)
@@ -455,6 +522,30 @@ function normalizeRuntimePosition(value: unknown): RuntimePositionSnapshot | nul
   };
 }
 
+function normalizeRuntimeMmQuote(value: unknown): RuntimeMmQuoteSnapshot | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Partial<RuntimeMmQuoteSnapshot>;
+  if (typeof record.marketId !== 'string' || typeof record.title !== 'string') {
+    return null;
+  }
+
+  return {
+    marketId: record.marketId,
+    title: record.title,
+    coin: typeof record.coin === 'string' && record.coin.trim() ? record.coin.trim() : null,
+    bidPrice: normalizeNullablePrice(record.bidPrice),
+    askPrice: normalizeNullablePrice(record.askPrice),
+    spread: normalizeNullablePrice(record.spread),
+    yesShares: normalizeNumber(record.yesShares, 0),
+    noShares: normalizeNumber(record.noShares, 0),
+    grossExposureUsd: normalizeNumber(record.grossExposureUsd, 0),
+    netDirectionalShares: normalizeNumber(record.netDirectionalShares, 0),
+  };
+}
+
 function normalizeNumber(value: unknown, fallback: number): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return roundTo(value, 4);
@@ -478,6 +569,19 @@ function normalizeNullableNumber(value: unknown): number | null {
   if (typeof value === 'string' && value.trim()) {
     const parsed = Number.parseFloat(value);
     return Number.isFinite(parsed) ? roundTo(parsed, 2) : null;
+  }
+
+  return null;
+}
+
+function normalizeNullablePrice(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return roundTo(value, 4);
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? roundTo(parsed, 4) : null;
   }
 
   return null;

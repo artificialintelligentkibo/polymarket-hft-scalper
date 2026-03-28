@@ -14,6 +14,7 @@ import type {
   Outcome,
   TokenBookSnapshot,
 } from './clob-fetcher.js';
+import { getTakerFee } from './ev-kelly.js';
 import { logger } from './logger.js';
 import { getSlotKey, type MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
@@ -32,6 +33,7 @@ export interface QuoteContext {
   readonly positionManager: PositionManager;
   readonly riskAssessment: RiskAssessment;
   readonly quoteSignals: readonly StrategySignal[];
+  readonly allowEntryQuotes?: boolean;
   readonly binanceFairValueAdjustment?: FairValueBinanceAdjustment;
   readonly deepBinanceAssessment?: DeepBinanceAssessment;
 }
@@ -42,6 +44,8 @@ export interface ActiveQuoteOrder {
   readonly outcome: Outcome;
   readonly action: StrategySignal['action'];
   readonly signalType: SignalType;
+  readonly targetPrice: number | null;
+  readonly shares: number;
 }
 
 export interface QuoteRefreshPlan {
@@ -55,6 +59,7 @@ export function buildQuoteRefreshPlan(params: {
   context: QuoteContext;
   activeQuoteOrders?: readonly ActiveQuoteOrder[];
   runtimeConfig?: AppConfig;
+  currentMMExposureUsd?: number;
   now?: Date;
 }): QuoteRefreshPlan {
   const runtimeConfig = params.runtimeConfig ?? config;
@@ -63,6 +68,7 @@ export function buildQuoteRefreshPlan(params: {
     ? buildMarketMakerQuoteSignals({
         ...params,
         runtimeConfig,
+        currentMMExposureUsd: params.currentMMExposureUsd,
       })
     : [];
 
@@ -77,6 +83,7 @@ export function buildQuoteRefreshPlan(params: {
 export function buildMarketMakerQuoteSignals(params: {
   context: QuoteContext;
   runtimeConfig?: AppConfig;
+  currentMMExposureUsd?: number;
   now?: Date;
 }): StrategySignal[] {
   const runtimeConfig = params.runtimeConfig ?? config;
@@ -96,10 +103,25 @@ export function buildMarketMakerQuoteSignals(params: {
     imbalancePercent > runtimeConfig.MAX_IMBALANCE_PERCENT
       ? snapshot.inventoryImbalance > 0
         ? 'YES'
-        : snapshot.inventoryImbalance < 0
+      : snapshot.inventoryImbalance < 0
           ? 'NO'
           : null
       : null;
+
+  if (
+    runtimeConfig.MM_AUTONOMOUS_QUOTES &&
+    (params.context.quoteSignals.length === 0 || runtimeConfig.MM_ALWAYS_QUOTE)
+  ) {
+    builtSignals.push(
+      ...generateAutonomousQuoteSignals({
+        context: params.context,
+        runtimeConfig,
+        quoteSpreadTicks,
+        currentMMExposureUsd: params.currentMMExposureUsd ?? 0,
+        now,
+      })
+    );
+  }
 
   for (const signal of params.context.quoteSignals) {
     if (!isQuotingSignalType(signal.signalType)) {
@@ -137,6 +159,18 @@ export function buildMarketMakerQuoteSignals(params: {
       if (reduceOnlyQuote) {
         builtSignals.push(reduceOnlyQuote);
       }
+      continue;
+    }
+
+    if (params.context.allowEntryQuotes === false) {
+      logger.debug('MM quote skipped', {
+        marketId: params.context.market.marketId,
+        reason: 'concurrent_limit',
+        details: {
+          signalType: signal.signalType,
+          outcome: signal.outcome,
+        },
+      });
       continue;
     }
 
@@ -193,6 +227,306 @@ export function buildMarketMakerQuoteSignals(params: {
   return mergeQuoteSignals(builtSignals);
 }
 
+/**
+ * Generates autonomous dual-sided quote signals for market making.
+ * Bids can be suppressed by inventory, gross exposure, or concurrent-market
+ * limits, while asks remain available to reduce existing inventory.
+ */
+function generateAutonomousQuoteSignals(params: {
+  context: QuoteContext;
+  runtimeConfig: AppConfig;
+  quoteSpreadTicks: number;
+  currentMMExposureUsd: number;
+  now: Date;
+}): StrategySignal[] {
+  const { context, runtimeConfig, now } = params;
+  const snapshot = context.positionManager.getSnapshot();
+  const imbalancePercent = resolveInventoryImbalancePercent(snapshot);
+  const overweightOutcome =
+    imbalancePercent > runtimeConfig.MAX_IMBALANCE_PERCENT
+      ? snapshot.inventoryImbalance > 0
+        ? 'YES'
+        : snapshot.inventoryImbalance < 0
+          ? 'NO'
+          : null
+      : null;
+  const netInventory = snapshot.yesShares - snapshot.noShares;
+  const skewFactor = runtimeConfig.MM_INVENTORY_SKEW_FACTOR;
+  const skewAdjustment =
+    -clamp(
+      netInventory / Math.max(1, runtimeConfig.MM_MAX_NET_DIRECTIONAL),
+      -1,
+      1
+    ) * skewFactor;
+  const quoteSpreadTicks = Math.max(
+    params.quoteSpreadTicks,
+    runtimeConfig.MM_MIN_SPREAD_TICKS
+  );
+  const builtSignals: StrategySignal[] = [];
+  let projectedExposureUsd = Math.max(0, params.currentMMExposureUsd);
+
+  for (const outcome of ['YES', 'NO'] as const satisfies readonly Outcome[]) {
+    const book = getBookForOutcome(context.orderbook, outcome);
+    if (
+      book.depthNotionalBid < runtimeConfig.MM_MIN_BOOK_DEPTH_USD ||
+      book.depthNotionalAsk < runtimeConfig.MM_MIN_BOOK_DEPTH_USD
+    ) {
+      logger.debug('MM quote skipped', {
+        marketId: context.market.marketId,
+        reason: 'low_depth',
+        details: {
+          outcome,
+          bidDepthUsd: roundTo(book.depthNotionalBid, 4),
+          askDepthUsd: roundTo(book.depthNotionalAsk, 4),
+          minDepthUsd: runtimeConfig.MM_MIN_BOOK_DEPTH_USD,
+        },
+      });
+      continue;
+    }
+
+    const fairValue = resolveQuoteFairValue(
+      context.orderbook,
+      outcome,
+      runtimeConfig,
+      context.binanceFairValueAdjustment,
+      context.deepBinanceAssessment
+    );
+    if (runtimeConfig.MM_REQUIRE_FAIR_VALUE && fairValue === null) {
+      logger.debug('MM quote skipped', {
+        marketId: context.market.marketId,
+        reason: 'no_fair_value',
+        details: { outcome },
+      });
+      continue;
+    }
+
+    const pricingAnchor =
+      fairValue ??
+      book.midPrice ??
+      book.lastTradePrice ??
+      book.bestBid ??
+      book.bestAsk;
+    if (pricingAnchor === null || !Number.isFinite(pricingAnchor)) {
+      logger.debug('MM quote skipped', {
+        marketId: context.market.marketId,
+        reason: 'no_fair_value',
+        details: {
+          outcome,
+          fairValue,
+        },
+      });
+      continue;
+    }
+
+    const tick = inferQuoteTick(book, pricingAnchor);
+    const skewedFairValue = roundTo(
+      clamp(
+        pricingAnchor + skewAdjustment * tick * quoteSpreadTicks,
+        0.01,
+        0.99
+      ),
+      6
+    );
+    const bidPrice = resolveBuyQuotePrice(book, skewedFairValue, quoteSpreadTicks);
+    const askPrice = resolveSellQuotePrice(book, skewedFairValue, quoteSpreadTicks);
+    if (bidPrice === null || askPrice === null) {
+      logger.debug('MM quote skipped', {
+        marketId: context.market.marketId,
+        reason: 'spread_too_thin',
+        details: {
+          outcome,
+          bidPrice,
+          askPrice,
+        },
+      });
+      continue;
+    }
+
+    const takerFee = getTakerFee(context.market.title, runtimeConfig.evKelly);
+    const minProfitableSpread = Math.max(
+      takerFee + runtimeConfig.MM_MIN_EDGE_AFTER_FEE,
+      tick * runtimeConfig.MM_MIN_SPREAD_TICKS
+    );
+    const actualSpread = roundTo(askPrice - bidPrice, 6);
+    if (actualSpread < minProfitableSpread) {
+      logger.debug('MM quote skipped', {
+        marketId: context.market.marketId,
+        reason: 'spread_too_thin',
+        details: {
+          outcome,
+          actualSpread,
+          minProfitableSpread,
+        },
+      });
+      continue;
+    }
+
+    const bidShares = roundTo(runtimeConfig.MM_QUOTE_SHARES, 4);
+    const bidNotionalUsd = roundTo(bidShares * bidPrice, 4);
+    const entryCapacity = context.positionManager.getAvailableEntryCapacity(outcome, {
+      maxNetYes: runtimeConfig.strategy.maxNetYes,
+      maxNetNo: runtimeConfig.strategy.maxNetNo,
+      inventoryImbalanceThreshold: runtimeConfig.strategy.inventoryImbalanceThreshold,
+      inventoryRebalanceFraction: runtimeConfig.strategy.inventoryRebalanceFraction,
+      trailingTakeProfit: runtimeConfig.strategy.trailingTakeProfit,
+      hardStopLoss: runtimeConfig.strategy.hardStopLoss,
+      exitBeforeEndMs: runtimeConfig.strategy.exitBeforeEndMs,
+    });
+    const projectedDirectionalInventory =
+      netInventory + (outcome === 'YES' ? bidShares : -bidShares);
+    const increasesDirectionalRisk =
+      Math.abs(projectedDirectionalInventory) > runtimeConfig.MM_MAX_NET_DIRECTIONAL &&
+      Math.abs(projectedDirectionalInventory) >= Math.abs(netInventory);
+
+    if (
+      context.allowEntryQuotes === false ||
+      context.riskAssessment.blockedOutcomes.has(outcome) ||
+      overweightOutcome === outcome ||
+      entryCapacity < bidShares ||
+      increasesDirectionalRisk ||
+      projectedExposureUsd + bidNotionalUsd > runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
+    ) {
+      logger.debug('MM quote skipped', {
+        marketId: context.market.marketId,
+        reason:
+          context.allowEntryQuotes === false
+            ? 'concurrent_limit'
+            : projectedExposureUsd + bidNotionalUsd > runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
+              ? 'exposure_limit'
+              : 'inventory_limit',
+        details: {
+          outcome,
+          entryCapacity,
+          overweightOutcome,
+          projectedExposureUsd: roundTo(projectedExposureUsd + bidNotionalUsd, 4),
+          maxExposureUsd: runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD,
+          netInventory: roundTo(netInventory, 4),
+          projectedDirectionalInventory: roundTo(projectedDirectionalInventory, 4),
+          maxDirectionalInventory: runtimeConfig.MM_MAX_NET_DIRECTIONAL,
+        },
+      });
+    } else {
+      builtSignals.push(
+        buildAutonomousSignal({
+          market: context.market,
+          orderbook: context.orderbook,
+          runtimeConfig,
+          action: 'BUY',
+          outcome,
+          signalType: 'MM_QUOTE_BID',
+          shares: bidShares,
+          targetPrice: bidPrice,
+          referencePrice: fairValue ?? pricingAnchor,
+          fairValue: skewedFairValue,
+          actualSpread,
+          reason: 'Autonomous MM bid',
+          now,
+        })
+      );
+      projectedExposureUsd += bidNotionalUsd;
+      logger.debug('MM autonomous quote generated', {
+        marketId: context.market.marketId,
+        outcome,
+        action: 'BID',
+        price: bidPrice,
+        fairValue,
+        skewedFairValue,
+        spread: actualSpread,
+        inventorySkew: roundTo(skewAdjustment, 6),
+        grossExposure: roundTo(projectedExposureUsd, 4),
+      });
+    }
+
+    const openShares = context.positionManager.getShares(outcome);
+    const askShares = Math.min(roundTo(runtimeConfig.MM_QUOTE_SHARES, 4), openShares);
+    if (askShares <= 0) {
+      continue;
+    }
+
+    builtSignals.push(
+      buildAutonomousSignal({
+        market: context.market,
+        orderbook: context.orderbook,
+        runtimeConfig,
+        action: 'SELL',
+        outcome,
+        signalType: 'MM_QUOTE_ASK',
+        shares: askShares,
+        targetPrice: askPrice,
+        referencePrice: fairValue ?? pricingAnchor,
+        fairValue: skewedFairValue,
+        actualSpread,
+        reason: 'Autonomous MM ask',
+        now,
+      })
+    );
+    logger.debug('MM autonomous quote generated', {
+      marketId: context.market.marketId,
+      outcome,
+      action: 'ASK',
+      price: askPrice,
+      fairValue,
+      skewedFairValue,
+      spread: actualSpread,
+      inventorySkew: roundTo(skewAdjustment, 6),
+      grossExposure: roundTo(projectedExposureUsd, 4),
+    });
+  }
+
+  return builtSignals;
+}
+
+function buildAutonomousSignal(params: {
+  market: MarketCandidate;
+  orderbook: MarketOrderbookSnapshot;
+  runtimeConfig: AppConfig;
+  action: 'BUY' | 'SELL';
+  outcome: Outcome;
+  signalType: Extract<SignalType, 'MM_QUOTE_BID' | 'MM_QUOTE_ASK'>;
+  shares: number;
+  targetPrice: number;
+  referencePrice: number;
+  fairValue: number;
+  actualSpread: number;
+  reason: string;
+  now: Date;
+}): StrategySignal {
+  const book = getBookForOutcome(params.orderbook, params.outcome);
+  const edgeAmount =
+    params.action === 'BUY'
+      ? roundTo(Math.max(0, params.referencePrice - params.targetPrice), 6)
+      : roundTo(Math.max(0, params.targetPrice - params.referencePrice), 6);
+
+  return {
+    marketId: params.market.marketId,
+    marketTitle: params.market.title,
+    signalType: params.signalType,
+    priority: params.action === 'BUY' ? 150 : 140,
+    generatedAt: params.now.getTime(),
+    action: params.action,
+    outcome: params.outcome,
+    outcomeIndex: params.outcome === 'YES' ? 0 : 1,
+    shares: roundTo(params.shares, 4),
+    targetPrice: params.targetPrice,
+    referencePrice: roundTo(params.referencePrice, 6),
+    tokenPrice: book.lastTradePrice ?? params.targetPrice,
+    midPrice: book.midPrice,
+    fairValue: roundTo(params.fairValue, 6),
+    edgeAmount,
+    combinedBid: params.orderbook.combined.combinedBid,
+    combinedAsk: params.orderbook.combined.combinedAsk,
+    combinedMid: params.orderbook.combined.combinedMid,
+    combinedDiscount: params.orderbook.combined.combinedDiscount,
+    combinedPremium: params.orderbook.combined.combinedPremium,
+    fillRatio: 1,
+    capitalClamp: 1,
+    priceMultiplier: 1,
+    urgency: resolveQuoteUrgency(params.runtimeConfig),
+    reduceOnly: params.action === 'SELL',
+    reason: `${params.reason} | spread=${params.actualSpread.toFixed(4)}`,
+  };
+}
+
 export class QuotingEngine {
   private readonly contexts = new Map<string, QuoteContext>();
   private readonly activeQuoteOrders = new Map<string, ActiveQuoteOrder[]>();
@@ -245,6 +579,53 @@ export class QuotingEngine {
 
   getContext(marketId: string): QuoteContext | undefined {
     return this.contexts.get(marketId);
+  }
+
+  /**
+   * Returns the currently tracked quote orders for a market.
+   */
+  getQuoteOrders(marketId: string): readonly ActiveQuoteOrder[] {
+    return [...(this.activeQuoteOrders.get(marketId) ?? [])];
+  }
+
+  /**
+   * Returns true when a market already carries MM inventory or resting quotes.
+   */
+  hasActiveMMMarket(marketId: string): boolean {
+    const quoteOrders = this.activeQuoteOrders.get(marketId);
+    if (quoteOrders && quoteOrders.length > 0) {
+      return true;
+    }
+
+    const context = this.contexts.get(marketId);
+    return Boolean(context && context.positionManager.getSnapshot().grossExposureShares > 0);
+  }
+
+  /**
+   * Returns market IDs that currently have active MM inventory or resting quotes.
+   */
+  getActiveMMMarketIds(): string[] {
+    const marketIds = new Set<string>([
+      ...this.contexts.keys(),
+      ...this.activeQuoteOrders.keys(),
+    ]);
+
+    return Array.from(marketIds).filter((marketId) => this.hasActiveMMMarket(marketId));
+  }
+
+  /**
+   * Returns total notional MM exposure across all tracked markets.
+   */
+  getCurrentMMExposureUsd(): number {
+    let total = 0;
+    for (const context of this.contexts.values()) {
+      const snapshot = context.positionManager.getSnapshot();
+      const yesMid = context.orderbook.yes.midPrice ?? 0.5;
+      const noMid = context.orderbook.no.midPrice ?? 0.5;
+      total += snapshot.yesShares * yesMid + snapshot.noShares * noMid;
+    }
+
+    return roundTo(total, 4);
   }
 
   replaceQuoteOrders(marketId: string, orders: readonly ActiveQuoteOrder[]): void {
@@ -300,6 +681,7 @@ export class QuotingEngine {
         const plan = buildQuoteRefreshPlan({
           context,
           activeQuoteOrders: this.activeQuoteOrders.get(marketId) ?? [],
+          currentMMExposureUsd: this.getCurrentMMExposureUsd(),
           runtimeConfig: this.runtimeConfig,
           now: this.now(),
         });
@@ -318,6 +700,13 @@ export class QuotingEngine {
       this.refreshInFlight = false;
     }
   }
+}
+
+/**
+ * Counts the markets that currently have MM inventory or live quote orders.
+ */
+export function countActiveMMMarkets(quotingEngine: QuotingEngine): number {
+  return quotingEngine.getActiveMMMarketIds().length;
 }
 
 function buildEntryQuoteSignal(params: {
@@ -551,6 +940,10 @@ function resolveQuoteSignalType(
 ): SignalType {
   if (template.signalType === 'INVENTORY_REBALANCE_QUOTE') {
     return 'INVENTORY_REBALANCE_QUOTE';
+  }
+
+  if (template.signalType === 'MM_QUOTE_BID' || template.signalType === 'MM_QUOTE_ASK') {
+    return template.signalType;
   }
 
   return deepBinanceAssessment?.available && deepBinanceAssessment.fairValue !== null

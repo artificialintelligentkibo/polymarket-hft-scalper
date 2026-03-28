@@ -23,6 +23,7 @@ import {
   resolveRuntimeMode,
   writeRuntimeStatus,
   type RuntimeMarketSnapshot,
+  type RuntimeMmQuoteSnapshot,
   type RuntimeMode,
   type RuntimePositionSnapshot,
   type RuntimeStatusSnapshot,
@@ -477,6 +478,13 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   lines.push('');
   lines.push(
     renderSection(
+      'MM QUOTES  -  ACTIVE QUOTING AND INVENTORY',
+      renderMmQuotes(runtimeStatus)
+    )
+  );
+  lines.push('');
+  lines.push(
+    renderSection(
       'BOT PERFORMANCE STATS',
       renderPerformance(inspection, runtimeStatus, runtimeConfig)
     )
@@ -555,6 +563,42 @@ function renderOpenPositions(positions: readonly RuntimePositionSnapshot[]): str
   );
 }
 
+function renderMmQuotes(runtimeStatus: RuntimeStatusSnapshot | null): string {
+  if (!runtimeStatus?.mmEnabled) {
+    return color.dim('Market-making quotes are disabled in the current runtime.');
+  }
+
+  const summary = [
+    `Exposure ${runtimeStatus.mmCurrentExposure.toFixed(2)}/${runtimeStatus.mmMaxGrossExposure.toFixed(2)} USDC`,
+    `Markets ${runtimeStatus.mmActiveMarkets}/${runtimeStatus.mmMaxConcurrentMarkets}`,
+    `Skew ${runtimeStatus.mmInventorySkew.toFixed(2)}`,
+    `Net limit ${runtimeStatus.mmMaxNetDirectional.toFixed(0)} sh`,
+    `Auto ${runtimeStatus.mmAutonomousQuotes ? 'ON' : 'OFF'}`,
+  ].join('   ');
+
+  if (runtimeStatus.mmQuotes.length === 0) {
+    return `${color.dim(summary)}\n${color.dim('No active MM quotes or inventory are tracked right now.')}`;
+  }
+
+  return [
+    color.dim(summary),
+    renderTable(
+      ['MARKET', 'BID', 'ASK', 'SPR', 'YES', 'NO', 'NET', 'GROSS'],
+      [24, 8, 8, 8, 8, 8, 8, 10],
+      runtimeStatus.mmQuotes.map((quote) => [
+        truncateDashboardLabel(buildMmQuoteLabel(quote), 24),
+        formatMidPrice(quote.bidPrice),
+        formatMidPrice(quote.askPrice),
+        formatMidPrice(quote.spread),
+        formatShares(quote.yesShares),
+        formatShares(quote.noShares),
+        formatSignedShares(quote.netDirectionalShares),
+        formatPlainCurrency(quote.grossExposureUsd),
+      ])
+    ),
+  ].join('\n');
+}
+
 function renderPerformance(
   inspection: BotInspection,
   runtimeStatus: RuntimeStatusSnapshot | null,
@@ -588,6 +632,12 @@ function renderPerformance(
   const lastSlotLabel = runtimeStatus?.lastSlotReport?.slotLabel
     ? truncateDashboardLabel(runtimeStatus.lastSlotReport.slotLabel, 32)
     : 'n/a';
+  const mmExposure = runtimeStatus
+    ? `${runtimeStatus.mmCurrentExposure.toFixed(2)}/${runtimeStatus.mmMaxGrossExposure.toFixed(2)}`
+    : 'n/a';
+  const mmMarkets = runtimeStatus
+    ? `${runtimeStatus.mmActiveMarkets}/${runtimeStatus.mmMaxConcurrentMarkets}`
+    : 'n/a';
 
   return renderTable(
     ['METRIC', 'VALUE', 'METRIC', 'VALUE'],
@@ -596,6 +646,7 @@ function renderPerformance(
       ['Running', inspection.running ? color.green('YES') : color.red('NO'), 'Mode', formatModeLabel(inspection.mode)],
       ['Day PnL', formatSignedCurrency(totalDayPnl), 'Drawdown', formatSignedCurrency(drawdown)],
       ['Active slots', color.bold(String(activeSlots)), 'Open positions', color.bold(String(openPositions))],
+      ['MM exposure', color.bold(mmExposure), 'MM markets', color.bold(mmMarkets)],
       ['Avg latency', color.bold(averageLatency), 'Latency gate', latencyGate],
       ['API gate', apiGate, 'FV smoothing', bayesianFv],
       ['Manager', color.bold(inspection.manager ?? 'n/a'), 'Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK')],
@@ -682,6 +733,10 @@ function buildPositionLabel(position: RuntimePositionSnapshot): string {
   return slot ? `${truncateDashboardLabel(position.title, 18)} ${slot}` : position.title;
 }
 
+function buildMmQuoteLabel(quote: RuntimeMmQuoteSnapshot): string {
+  return quote.coin ? `${quote.coin} ${quote.marketId}` : quote.marketId;
+}
+
 function formatSlotWindow(start: string | null, end: string | null): string {
   const startDate = parseFiniteDate(start);
   const endDate = parseFiniteDate(end);
@@ -753,6 +808,17 @@ function colorizeAction(action: string, signalCount: number): string {
 
 function formatShares(value: number): string {
   return value > 0 ? color.bold(roundTo(value, 2).toFixed(2)) : color.dim('0.00');
+}
+
+function formatSignedShares(value: number): string {
+  const rendered = `${value >= 0 ? '+' : ''}${roundTo(value, 2).toFixed(2)}`;
+  if (value > 0) {
+    return color.green(rendered);
+  }
+  if (value < 0) {
+    return color.red(rendered);
+  }
+  return color.dim(rendered);
 }
 
 function formatPlainCurrency(value: number): string {

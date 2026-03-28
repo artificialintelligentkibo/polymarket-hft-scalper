@@ -11,6 +11,8 @@ export type SignalType =
   | 'FAIR_VALUE_BUY'
   | 'FAIR_VALUE_SELL'
   | 'LATENCY_MOMENTUM_BUY'
+  | 'MM_QUOTE_ASK'
+  | 'MM_QUOTE_BID'
   | 'INVENTORY_REBALANCE'
   | 'INVENTORY_REBALANCE_QUOTE'
   | 'PAIRED_ARB_BUY_YES'
@@ -25,6 +27,8 @@ export const QUOTING_SIGNAL_TYPES = [
   'DEEP_BINANCE_SIGNAL',
   'DYNAMIC_QUOTE_BOTH',
   'INVENTORY_REBALANCE_QUOTE',
+  'MM_QUOTE_BID',
+  'MM_QUOTE_ASK',
 ] as const satisfies readonly SignalType[];
 
 export function isQuotingSignalType(signalType: SignalType): boolean {
@@ -36,6 +40,8 @@ export function isQuotingSignalType(signalType: SignalType): boolean {
 export function bypassesBinanceEdge(signalType: SignalType): boolean {
   return (
     signalType === 'LATENCY_MOMENTUM_BUY' ||
+    signalType === 'MM_QUOTE_BID' ||
+    signalType === 'MM_QUOTE_ASK' ||
     signalType === 'PAIRED_ARB_BUY_YES' ||
     signalType === 'PAIRED_ARB_BUY_NO' ||
     signalType === 'PAIRED_ARB_REBALANCE'
