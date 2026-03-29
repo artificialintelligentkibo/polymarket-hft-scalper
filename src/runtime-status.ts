@@ -60,6 +60,7 @@ export interface RuntimePositionSnapshot {
   readonly title: string;
   readonly slotStart: string | null;
   readonly slotEnd: string | null;
+  readonly dustAbandoned: boolean;
   readonly yesShares: number;
   readonly noShares: number;
   readonly grossExposureShares: number;
@@ -105,6 +106,8 @@ export interface RuntimeStatusSnapshot {
   readonly costBasisTracked: number;
   readonly redeemPnlToday: number;
   readonly dustPositionsCount: number;
+  readonly dustAbandonedCount: number;
+  readonly dustAbandonedKeys: readonly string[];
   readonly blockedExitRemainderShares: number;
   readonly averageLatencyMs: number | null;
   readonly bayesianFvEnabled: boolean;
@@ -169,6 +172,8 @@ export function createRuntimeStatusSnapshot(
     costBasisTracked: 0,
     redeemPnlToday: 0,
     dustPositionsCount: 0,
+    dustAbandonedCount: 0,
+    dustAbandonedKeys: [],
     blockedExitRemainderShares: 0,
     averageLatencyMs: null,
     bayesianFvEnabled: runtimeConfig.BAYESIAN_FV_ENABLED,
@@ -287,6 +292,13 @@ function normalizeRuntimeStatus(
     costBasisTracked: normalizeCount(value.costBasisTracked),
     redeemPnlToday: normalizeNumber(value.redeemPnlToday, 0),
     dustPositionsCount: normalizeCount(value.dustPositionsCount),
+    dustAbandonedCount: normalizeCount(value.dustAbandonedCount),
+    dustAbandonedKeys: Array.isArray(value.dustAbandonedKeys)
+      ? value.dustAbandonedKeys
+          .map((entry) => String(entry ?? '').trim())
+          .filter((entry) => entry.length > 0)
+          .slice(0, 10)
+      : [],
     blockedExitRemainderShares: normalizeNumber(value.blockedExitRemainderShares, 0),
     averageLatencyMs: normalizeNullableNumber(value.averageLatencyMs),
     bayesianFvEnabled:
@@ -519,6 +531,7 @@ function normalizeRuntimePosition(value: unknown): RuntimePositionSnapshot | nul
     title: record.title,
     slotStart: typeof record.slotStart === 'string' && record.slotStart.trim() ? record.slotStart : null,
     slotEnd: typeof record.slotEnd === 'string' && record.slotEnd.trim() ? record.slotEnd : null,
+    dustAbandoned: Boolean(record.dustAbandoned),
     yesShares: normalizeNumber(record.yesShares, 0),
     noShares: normalizeNumber(record.noShares, 0),
     grossExposureShares: normalizeNumber(record.grossExposureShares, 0),

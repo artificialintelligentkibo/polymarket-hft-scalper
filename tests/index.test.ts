@@ -465,6 +465,137 @@ test('sub-minimum reduce-only exits are not submitted to the executor', async ()
 
   assert.equal(result, null);
   assert.equal(executorCalls, 0);
+  assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), true);
+});
+
+test('dust-abandoned reduce-only exits are suppressed on subsequent ticks', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 2.86,
+    price: 0.03,
+  });
+
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  let executorCalls = 0;
+  runtime.executor = {
+    executeSignal: async () => {
+      executorCalls += 1;
+      return createExecutionReport({
+        side: 'SELL',
+        shares: 2.86,
+        filledShares: 2.86,
+      });
+    },
+  };
+  runtime.recordSkippedSignal = () => {};
+
+  const signal = createSignal({
+    signalType: 'SLOT_FLATTEN',
+    action: 'SELL',
+    reduceOnly: true,
+    shares: 2.86,
+    targetPrice: 0.03,
+    referencePrice: 0.03,
+    tokenPrice: 0.03,
+    midPrice: 0.03,
+    fairValue: 0.03,
+    urgency: 'cross',
+  });
+
+  await runtime.executeSignal(market, orderbook, positionManager, signal, 'slot-1');
+  await runtime.executeSignal(market, orderbook, positionManager, signal, 'slot-1');
+
+  const filtered = runtime.filterDustAbandonedSignals(market, [
+    signal,
+  ]);
+
+  assert.equal(executorCalls, 0);
+  assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), true);
+  assert.equal(filtered.length, 0);
+});
+
+test('dust-abandoned positions are cleared by redeem cleanup', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.dustAbandonedPositions.add('market-1:YES');
+
+  runtime.clearDustAbandonmentForCondition('market-1');
+
+  assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), false);
+});
+
+test('dust-abandoned positions are pruned when inventory disappears', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.dustAbandonedPositions.add('market-1:YES');
+
+  runtime.pruneDustAbandonedPositions();
+
+  assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), false);
+});
+
+test('valid SLOT_FLATTEN orders still execute normally above the minimum size', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.5,
+  });
+
+  let executorCalls = 0;
+  runtime.syncRuntimeStatus = () => {};
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.executor = {
+    executeSignal: async (params: { signal: StrategySignal }) => {
+      executorCalls += 1;
+      assert.equal(params.signal.signalType, 'SLOT_FLATTEN');
+      return createExecutionReport({
+        side: 'SELL',
+        shares: 6,
+        filledShares: 6,
+        price: 0.5,
+        fillPrice: 0.5,
+      });
+    },
+    invalidateOutcomeBalanceCache: () => {},
+    invalidateBalanceValidationCache: () => {},
+  };
+
+  const result = await runtime.executeSignal(
+    market,
+    orderbook,
+    positionManager,
+    createSignal({
+      signalType: 'SLOT_FLATTEN',
+      action: 'SELL',
+      reduceOnly: true,
+      shares: 6,
+      targetPrice: 0.5,
+      referencePrice: 0.5,
+      tokenPrice: 0.5,
+      midPrice: 0.5,
+      fairValue: 0.5,
+      urgency: 'cross',
+    }),
+    'slot-1'
+  );
+
+  assert.equal(executorCalls, 1);
+  assert.equal(result?.fillConfirmed, true);
+  assert.equal(runtime.dustAbandonedPositions.size, 0);
 });
 
 test('executePairedArbAtomic unwinds leg1 when leg2 does not fill', async () => {

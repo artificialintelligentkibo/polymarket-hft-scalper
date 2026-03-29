@@ -356,6 +356,7 @@ function printStatus(runtimeConfig: AppConfig): void {
   console.log(`${label('Day PnL')} ${formatSignedCurrency(totalDayPnl)}`);
   console.log(`${label('Drawdown')} ${formatSignedCurrency(drawdown)}`);
   console.log(`${label('Dust exits')} ${String(runtimeStatus?.dustPositionsCount ?? 0)}`);
+  console.log(`${label('Dust wait')} ${String(runtimeStatus?.dustAbandonedCount ?? 0)}`);
   console.log(
     `${label('Blocked rem')} ${(runtimeStatus?.blockedExitRemainderShares ?? 0).toFixed(4)} sh`
   );
@@ -562,9 +563,17 @@ function renderOpenPositions(positions: readonly RuntimePositionSnapshot[]): str
       formatShares(position.yesShares),
       formatShares(position.noShares),
       formatPlainCurrency(position.markValueUsd),
-      formatSignedCurrency(position.unrealizedPnl),
-      formatSignedCurrency(position.totalPnl),
-      position.roiPct !== null ? colorizeSignedPercent(position.roiPct) : color.dim('n/a'),
+      position.dustAbandoned
+        ? color.dim(formatSignedCurrency(position.unrealizedPnl))
+        : formatSignedCurrency(position.unrealizedPnl),
+      position.dustAbandoned
+        ? color.dim(formatSignedCurrency(position.totalPnl))
+        : formatSignedCurrency(position.totalPnl),
+      position.roiPct !== null
+        ? position.dustAbandoned
+          ? color.dim(colorizeSignedPercent(position.roiPct))
+          : colorizeSignedPercent(position.roiPct)
+        : color.dim('n/a'),
     ])
   );
 }
@@ -656,12 +665,13 @@ function renderPerformance(
       ['Day PnL', formatSignedCurrency(totalDayPnl), 'Drawdown', formatSignedCurrency(drawdown)],
       ['Active slots', color.bold(String(activeSlots)), 'Open positions', color.bold(String(openPositions))],
       ['MM exposure', color.bold(mmExposure), 'MM markets', color.bold(mmMarkets)],
-      ['Dust exits', color.bold(String(dustPositions)), 'Blocked remainder', color.bold(`${blockedExitRemainder.toFixed(4)} sh`)],
-      ['Avg latency', color.bold(averageLatency), 'Latency gate', latencyGate],
-      ['API gate', apiGate, 'FV smoothing', bayesianFv],
-      ['Manager', color.bold(inspection.manager ?? 'n/a'), 'Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK')],
-      ['Circuit details', runtimeStatus ? color.dim(formatCircuitBreakerGate(runtimeStatus, false)) : color.dim('n/a'), 'Slot label', lastSlotLabel],
-      ['Last slot', lastSlotNet, 'Updated', runtimeStatus?.updatedAt ? truncateDashboardLabel(runtimeStatus.updatedAt, 28) : color.dim('n/a')],
+      ['Dust exits', color.bold(String(dustPositions)), 'Dust wait', color.bold(String(runtimeStatus?.dustAbandonedCount ?? 0))],
+      ['Blocked remainder', color.bold(`${blockedExitRemainder.toFixed(4)} sh`), 'Avg latency', color.bold(averageLatency)],
+      ['Latency gate', latencyGate, 'API gate', apiGate],
+      ['FV smoothing', bayesianFv, 'Manager', color.bold(inspection.manager ?? 'n/a')],
+      ['Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK'), 'Circuit details', runtimeStatus ? color.dim(formatCircuitBreakerGate(runtimeStatus, false)) : color.dim('n/a')],
+      ['Slot label', lastSlotLabel, 'Last slot', lastSlotNet],
+      ['Updated', runtimeStatus?.updatedAt ? truncateDashboardLabel(runtimeStatus.updatedAt, 28) : color.dim('n/a'), '', ''],
     ]
   );
 }
@@ -740,7 +750,8 @@ function buildMarketLabel(market: RuntimeMarketSnapshot): string {
 
 function buildPositionLabel(position: RuntimePositionSnapshot): string {
   const slot = formatSlotWindow(position.slotStart, position.slotEnd);
-  return slot ? `${truncateDashboardLabel(position.title, 18)} ${slot}` : position.title;
+  const base = slot ? `${truncateDashboardLabel(position.title, 18)} ${slot}` : position.title;
+  return position.dustAbandoned ? `${base} [DUST WAIT]` : base;
 }
 
 function buildMmQuoteLabel(quote: RuntimeMmQuoteSnapshot): string {

@@ -139,6 +139,7 @@ export class MarketMakerRuntime {
       updatedAt: string;
     }
   >();
+  private readonly dustAbandonedPositions = new Set<string>();
   private readonly pendingLiveOrders = new Map<string, number>();
   private readonly settlementCooldowns = new Map<string, number>();
   private readonly settlementStartedAt = new Map<string, number>();
@@ -216,6 +217,7 @@ export class MarketMakerRuntime {
         }
 
         this.costBasisLedger.consume(conditionId);
+        this.clearDustAbandonmentForCondition(conditionId);
       }
       if (this.productTestMode.isCompleted()) {
         logger.info('PRODUCT_TEST_MODE completed after redeem success');
@@ -512,7 +514,8 @@ export class MarketMakerRuntime {
       binanceAssessment,
     });
     this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
-    const statusPausedSignals = this.applyPauseFilter(market, signals);
+    const dustFilteredSignals = this.filterDustAbandonedSignals(market, signals);
+    const statusPausedSignals = this.applyPauseFilter(market, dustFilteredSignals);
     const apiGuardSignals = this.applyApiCircuitBreakerFilter(
       market,
       statusPausedSignals
@@ -544,7 +547,13 @@ export class MarketMakerRuntime {
       });
     }
     const executionCandidates = this.applyBinanceEdge(market, orderbook, directSignals);
-    this.rememberMarketAction(market, signals, executionCandidates, positionManager, quoteSignals);
+    this.rememberMarketAction(
+      market,
+      dustFilteredSignals,
+      executionCandidates,
+      positionManager,
+      quoteSignals
+    );
 
     if (executionCandidates.length === 0 && quoteSignals.length === 0) {
       this.syncRuntimeStatus({
@@ -650,6 +659,14 @@ export class MarketMakerRuntime {
       return null;
     }
 
+    if (
+      signal.reduceOnly &&
+      signal.action === 'SELL' &&
+      this.isDustAbandoned(market.marketId, signal.outcome)
+    ) {
+      return null;
+    }
+
     const book = signal.outcome === 'YES' ? orderbook.yes : orderbook.no;
     const exitGuardPrice = resolveReduceOnlySellReferencePrice({
       signal,
@@ -674,15 +691,12 @@ export class MarketMakerRuntime {
           filterReason: 'MIN_ORDER_SIZE',
           details: `shares=${guardedSell.requestedShares.toFixed(4)} minimum=${guardedSell.minimumShares.toFixed(4)}`,
         });
-        logger.warn('Reduce-only exit skipped below minimum order size', {
-          marketId: market.marketId,
-          signalType: signal.signalType,
-          outcome: signal.outcome,
+        this.abandonPositionForRedeem({
+          market,
+          signal,
           requestedShares: guardedSell.requestedShares,
           minimumShares: guardedSell.minimumShares,
-          blockedExitRemainderShares: guardedSell.blockedRemainderShares,
           referencePrice: exitGuardPrice,
-          reason: guardedSell.reason,
         });
         return null;
       }
@@ -1445,6 +1459,7 @@ export class MarketMakerRuntime {
     const dayState = getDayPnlState();
     this.resetRedeemPnlDayIfNeeded();
     this.pruneBlockedExitRemainders();
+    this.pruneDustAbandonedPositions();
     const exitRemainderSummary = this.getBlockedExitRemainderSummary();
     writeRuntimeStatus(
       {
@@ -1460,6 +1475,8 @@ export class MarketMakerRuntime {
         costBasisTracked: this.costBasisLedger.size,
         redeemPnlToday: this.redeemPnlToday,
         dustPositionsCount: exitRemainderSummary.dustPositionsCount,
+        dustAbandonedCount: this.dustAbandonedPositions.size,
+        dustAbandonedKeys: Array.from(this.dustAbandonedPositions).slice(0, 10),
         blockedExitRemainderShares: exitRemainderSummary.blockedExitRemainderShares,
         lastSignals: this.recentSignals,
         recentSkippedSignals: this.recentSkippedSignals,
@@ -1573,11 +1590,101 @@ export class MarketMakerRuntime {
     this.setBlockedExitRemainder(marketId, outcome, 0);
   }
 
+  private filterDustAbandonedSignals(
+    market: MarketCandidate,
+    signals: readonly StrategySignal[]
+  ): StrategySignal[] {
+    return signals.filter((signal) => {
+      if (!signal.reduceOnly || signal.action !== 'SELL') {
+        return true;
+      }
+
+      return !this.isDustAbandoned(market.marketId, signal.outcome);
+    });
+  }
+
+  private abandonPositionForRedeem(params: {
+    market: MarketCandidate;
+    signal: StrategySignal;
+    requestedShares: number;
+    minimumShares: number;
+    referencePrice: number | null;
+  }): void {
+    const key = this.getMarketOutcomeKey(params.market.marketId, params.signal.outcome);
+    if (this.dustAbandonedPositions.has(key)) {
+      return;
+    }
+
+    this.dustAbandonedPositions.add(key);
+    logger.info('Position abandoned for redeem - below CLOB minimum sell size', {
+      marketId: params.market.marketId,
+      signalType: params.signal.signalType,
+      outcome: params.signal.outcome,
+      requestedShares: params.requestedShares,
+      minimumShares: params.minimumShares,
+      referencePrice: params.referencePrice,
+      estimatedValue: roundTo(params.requestedShares * (params.referencePrice ?? 0), 4),
+      reason:
+        'Shares too few to sell at current price. Auto-redeem or settlement cleanup will handle the remainder.',
+    });
+  }
+
+  private getMarketOutcomeKey(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): string {
+    return getSettlementCooldownKey(marketId, outcome);
+  }
+
+  private isDustAbandoned(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): boolean {
+    return this.dustAbandonedPositions.has(this.getMarketOutcomeKey(marketId, outcome));
+  }
+
+  private hasDustAbandonedMarket(marketId: string): boolean {
+    return this.isDustAbandoned(marketId, 'YES') || this.isDustAbandoned(marketId, 'NO');
+  }
+
+  private clearDustAbandonmentForMarket(marketId: string): void {
+    this.dustAbandonedPositions.delete(this.getMarketOutcomeKey(marketId, 'YES'));
+    this.dustAbandonedPositions.delete(this.getMarketOutcomeKey(marketId, 'NO'));
+    this.setBlockedExitRemainder(marketId, 'YES', 0);
+    this.setBlockedExitRemainder(marketId, 'NO', 0);
+  }
+
+  private clearDustAbandonmentForCondition(conditionId: string): void {
+    let cleared = false;
+    for (const market of this.markets.values()) {
+      if (market.conditionId !== conditionId) {
+        continue;
+      }
+
+      this.clearDustAbandonmentForMarket(market.marketId);
+      cleared = true;
+    }
+
+    if (!cleared) {
+      this.clearDustAbandonmentForMarket(conditionId);
+    }
+  }
+
   private pruneBlockedExitRemainders(): void {
     for (const [key, remainder] of this.blockedExitRemainders.entries()) {
       const positionManager = this.positions.get(remainder.marketId);
       if (!positionManager || positionManager.getShares(remainder.outcome) <= 0) {
         this.blockedExitRemainders.delete(key);
+      }
+    }
+  }
+
+  private pruneDustAbandonedPositions(): void {
+    for (const key of Array.from(this.dustAbandonedPositions)) {
+      const [marketId, outcome] = key.split(':') as [string, StrategySignal['outcome']];
+      const positionManager = this.positions.get(marketId);
+      if (!positionManager || positionManager.getShares(outcome) <= 0) {
+        this.dustAbandonedPositions.delete(key);
       }
     }
   }
@@ -2225,6 +2332,7 @@ export class MarketMakerRuntime {
     });
 
     this.positions.delete(market.marketId);
+    this.clearDustAbandonmentForMarket(market.marketId);
     this.latestBooks.delete(market.marketId);
     this.marketActions.delete(market.marketId);
   }
@@ -2313,6 +2421,8 @@ export class MarketMakerRuntime {
         nextQuote.signalType === 'INVENTORY_REBALANCE_QUOTE'
           ? `REB ${nextQuote.outcome}`
           : `QUOTE ${nextQuote.outcome}`;
+    } else if (this.hasDustAbandonedMarket(market.marketId)) {
+      action = 'DUST WAIT';
     } else if (snapshot.grossExposureShares > 0) {
       action = 'MONITOR';
     }
@@ -2452,6 +2562,7 @@ export class MarketMakerRuntime {
           title: market?.title ?? marketId,
           slotStart: market?.startTime ?? null,
           slotEnd: market?.endTime ?? null,
+          dustAbandoned: this.hasDustAbandonedMarket(marketId),
           yesShares: snapshot.yesShares,
           noShares: snapshot.noShares,
           grossExposureShares: snapshot.grossExposureShares,

@@ -120,3 +120,50 @@ test('runtime status mode switches when config changes between simulation and pr
   rmSync(reportsDir, { recursive: true, force: true });
   resetDayPnlStateCache();
 });
+
+test('runtime status preserves dust abandonment fields for dashboard visibility', () => {
+  const reportsDir = path.resolve(process.cwd(), 'reports', 'runtime-status-dust');
+  rmSync(reportsDir, { recursive: true, force: true });
+  mkdirSync(reportsDir, { recursive: true });
+  resetDayPnlStateCache();
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    REPORTS_DIR: './reports/runtime-status-dust',
+    STATE_FILE: './reports/runtime-status-dust/state.json',
+  });
+
+  const status = writeRuntimeStatus(
+    {
+      dustPositionsCount: 1,
+      dustAbandonedCount: 1,
+      dustAbandonedKeys: ['market-1:YES'],
+      blockedExitRemainderShares: 2.86,
+      openPositions: [
+        {
+          marketId: 'market-1',
+          title: 'BTC Up or Down',
+          slotStart: null,
+          slotEnd: null,
+          dustAbandoned: true,
+          yesShares: 2.86,
+          noShares: 0,
+          grossExposureShares: 2.86,
+          markValueUsd: 0.09,
+          unrealizedPnl: -2.77,
+          totalPnl: -2.77,
+          roiPct: -96.86,
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    },
+    runtimeConfig
+  );
+
+  assert.equal(status.dustAbandonedCount, 1);
+  assert.deepEqual(status.dustAbandonedKeys, ['market-1:YES']);
+  assert.equal(status.openPositions[0]?.dustAbandoned, true);
+
+  rmSync(reportsDir, { recursive: true, force: true });
+  resetDayPnlStateCache();
+});
