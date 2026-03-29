@@ -598,6 +598,80 @@ test('valid SLOT_FLATTEN orders still execute normally above the minimum size', 
   assert.equal(runtime.dustAbandonedPositions.size, 0);
 });
 
+test('redeem-success clears local runtime positions for settled conditions', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.5,
+  });
+
+  runtime.markets.set(market.marketId, market);
+  runtime.positions.set(market.marketId, positionManager);
+  runtime.syncRuntimeStatus = () => {};
+
+  runtime.redeemer.emit('redeem-success', {
+    timestampMs: Date.now(),
+    conditionId: market.conditionId,
+    title: market.title,
+    redeemedAmount: 6,
+    yesShares: 6,
+    noShares: 0,
+  });
+
+  assert.equal(runtime.positions.has(market.marketId), false);
+});
+
+test('live wallet reconciliation clears zero-balance ghost positions', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.5,
+  });
+
+  runtime.markets.set(market.marketId, market);
+  runtime.positions.set(market.marketId, positionManager);
+  runtime.executor = {
+    getOutcomeTokenBalance: async () => 0,
+    invalidateOutcomeBalanceCache: () => {},
+  };
+
+  await runtime.reconcileLivePositionsWithWallet(true);
+
+  assert.equal(runtime.positions.has(market.marketId), false);
+});
+
+test('live wallet reconciliation preserves positions with non-zero balances', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.5,
+  });
+
+  runtime.markets.set(market.marketId, market);
+  runtime.positions.set(market.marketId, positionManager);
+  runtime.executor = {
+    getOutcomeTokenBalance: async (tokenId: string) =>
+      tokenId === market.yesTokenId ? 6 : 0,
+    invalidateOutcomeBalanceCache: () => {},
+  };
+
+  await runtime.reconcileLivePositionsWithWallet(true);
+
+  assert.equal(runtime.positions.has(market.marketId), true);
+});
+
 test('executePairedArbAtomic unwinds leg1 when leg2 does not fill', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const calls: StrategySignal[] = [];

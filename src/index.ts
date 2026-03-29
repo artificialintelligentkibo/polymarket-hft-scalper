@@ -78,6 +78,7 @@ import { formatDayKey, pruneSetEntries, roundTo, sleep } from './utils.js';
 
 const MAX_TRACKED_SLOT_REPORTS = 2_048;
 const UNCONFIRMED_ORDER_COOLDOWN_MS = 15_000;
+const LIVE_POSITION_RECONCILIATION_EPSILON = 0.0001;
 
 interface SignalExecutionCandidate {
   readonly signal: StrategySignal;
@@ -190,6 +191,12 @@ export class MarketMakerRuntime {
 
       this.resetRedeemPnlDayIfNeeded(redeemedAt);
       if (conditionId && redeemedShares > 0) {
+        let dayStateOverride:
+          | {
+              totalDayPnl: number;
+              dayDrawdown: number;
+            }
+          | null = null;
         const entry = this.costBasisLedger.get(conditionId);
         const result = this.costBasisLedger.calculateRedeemPnl(
           conditionId,
@@ -217,10 +224,10 @@ export class MarketMakerRuntime {
             redeemPnl: result.pnl,
             newDayPnl: dayState.dayPnl,
           });
-          this.syncRuntimeStatus({
+          dayStateOverride = {
             totalDayPnl: dayState.dayPnl,
             dayDrawdown: dayState.drawdown,
-          });
+          };
         } else {
           logger.warn('Redeem PnL skipped - no cost basis', {
             conditionId,
@@ -234,6 +241,14 @@ export class MarketMakerRuntime {
 
         this.costBasisLedger.consume(conditionId);
         this.clearDustAbandonmentForCondition(conditionId);
+        const clearedMarketIds = this.clearPositionStateForCondition(conditionId);
+        if (clearedMarketIds.length > 0) {
+          logger.info('Cleared local runtime positions after redeem settlement', {
+            conditionId,
+            marketIds: clearedMarketIds,
+          });
+        }
+        this.syncRuntimeStatus(dayStateOverride ?? {});
       }
       if (this.productTestMode.isCompleted()) {
         logger.info('PRODUCT_TEST_MODE completed after redeem success');
@@ -455,6 +470,10 @@ export class MarketMakerRuntime {
         await this.cancelQuoteOrder(order);
       }
     }
+    for (const market of markets) {
+      this.markets.set(market.marketId, market);
+    }
+    await this.reconcileLivePositionsWithWallet();
     this.syncRuntimeStatus({
       running: true,
       isPaused: this.statusMonitor.isPaused(),
@@ -472,10 +491,6 @@ export class MarketMakerRuntime {
       }
       this.printPendingReports();
       return;
-    }
-
-    for (const market of markets) {
-      this.markets.set(market.marketId, market);
     }
 
     const tokenIds = markets.flatMap((market) => [market.yesTokenId, market.noTokenId]);
@@ -1604,6 +1619,101 @@ export class MarketMakerRuntime {
     }
 
     this.setBlockedExitRemainder(marketId, outcome, 0);
+  }
+
+  /**
+   * Clears local runtime inventory state for a market after redeem settlement
+   * or wallet reconciliation confirms the position no longer exists on-chain.
+   */
+  private clearPositionStateForMarket(marketId: string): void {
+    const market = this.markets.get(marketId);
+    this.positions.delete(marketId);
+    this.latestBooks.delete(marketId);
+    this.marketActions.delete(marketId);
+    this.clearDustAbandonmentForMarket(marketId);
+    this.clearSettlementConfirmation(marketId, 'YES');
+    this.clearSettlementConfirmation(marketId, 'NO');
+    if (market) {
+      this.executor.invalidateOutcomeBalanceCache(market.yesTokenId);
+      this.executor.invalidateOutcomeBalanceCache(market.noTokenId);
+    }
+  }
+
+  /**
+   * Clears all locally tracked market state associated with a settled condition.
+   */
+  private clearPositionStateForCondition(conditionId: string): string[] {
+    const clearedMarketIds = new Set<string>();
+    for (const market of this.markets.values()) {
+      if (market.conditionId !== conditionId) {
+        continue;
+      }
+
+      this.clearPositionStateForMarket(market.marketId);
+      clearedMarketIds.add(market.marketId);
+    }
+
+    if (clearedMarketIds.size === 0 && this.positions.has(conditionId)) {
+      this.clearPositionStateForMarket(conditionId);
+      clearedMarketIds.add(conditionId);
+    }
+
+    return Array.from(clearedMarketIds.values());
+  }
+
+  /**
+   * Reconciles locally tracked live positions with actual conditional-token
+   * balances and removes stale zero-balance ghosts from the dashboard/runtime.
+   */
+  private async reconcileLivePositionsWithWallet(force = false): Promise<void> {
+    if (
+      (!force && (isDryRunMode(config) || isPaperTradingEnabled(config))) ||
+      this.positions.size === 0
+    ) {
+      return;
+    }
+
+    for (const [marketId, positionManager] of Array.from(this.positions.entries())) {
+      const snapshot = positionManager.getSnapshot();
+      if (snapshot.grossExposureShares <= 0) {
+        this.clearPositionStateForMarket(marketId);
+        continue;
+      }
+
+      const market = this.markets.get(marketId);
+      if (!market) {
+        continue;
+      }
+
+      try {
+        const [yesBalance, noBalance] = await Promise.all([
+          this.executor.getOutcomeTokenBalance(market.yesTokenId),
+          this.executor.getOutcomeTokenBalance(market.noTokenId),
+        ]);
+        const normalizedYesBalance = roundTo(Math.max(0, yesBalance), 4);
+        const normalizedNoBalance = roundTo(Math.max(0, noBalance), 4);
+        if (
+          normalizedYesBalance <= LIVE_POSITION_RECONCILIATION_EPSILON &&
+          normalizedNoBalance <= LIVE_POSITION_RECONCILIATION_EPSILON
+        ) {
+          logger.info('Cleared stale live position after wallet balance reconciliation', {
+            marketId,
+            conditionId: market.conditionId,
+            localYesShares: snapshot.yesShares,
+            localNoShares: snapshot.noShares,
+            walletYesShares: normalizedYesBalance,
+            walletNoShares: normalizedNoBalance,
+          });
+          this.clearPositionStateForMarket(marketId);
+        }
+      } catch (error: any) {
+        logger.debug('Live position reconciliation skipped due to balance check failure', {
+          marketId,
+          conditionId: market.conditionId,
+          message: error?.message || 'Unknown error',
+        });
+      }
+    }
   }
 
   private filterDustAbandonedSignals(
