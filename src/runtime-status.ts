@@ -102,6 +102,8 @@ export interface RuntimeStatusSnapshot {
   };
   readonly totalDayPnl: number;
   readonly dayDrawdown: number;
+  readonly costBasisTracked: number;
+  readonly redeemPnlToday: number;
   readonly averageLatencyMs: number | null;
   readonly bayesianFvEnabled: boolean;
   readonly bayesianFvAlpha: number;
@@ -162,6 +164,8 @@ export function createRuntimeStatusSnapshot(
     },
     totalDayPnl: dayState.dayPnl,
     dayDrawdown: dayState.drawdown,
+    costBasisTracked: 0,
+    redeemPnlToday: 0,
     averageLatencyMs: null,
     bayesianFvEnabled: runtimeConfig.BAYESIAN_FV_ENABLED,
     bayesianFvAlpha: runtimeConfig.BAYESIAN_FV_ALPHA,
@@ -279,6 +283,8 @@ function normalizeRuntimeStatus(
     apiCircuitBreakers: normalizeCircuitBreakers(value.apiCircuitBreakers),
     totalDayPnl: normalizeNumber(value.totalDayPnl, dayState.dayPnl),
     dayDrawdown: normalizeNumber(value.dayDrawdown, dayState.drawdown),
+    costBasisTracked: normalizeCount(value.costBasisTracked),
+    redeemPnlToday: normalizeNumber(value.redeemPnlToday, 0),
     averageLatencyMs: normalizeNullableNumber(value.averageLatencyMs),
     bayesianFvEnabled:
       typeof value.bayesianFvEnabled === 'boolean'

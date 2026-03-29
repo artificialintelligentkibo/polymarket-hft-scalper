@@ -19,7 +19,8 @@ import {
   isPaperTradingEnabled,
   validateConfig,
 } from './config.js';
-import { getDayPnlState } from './day-pnl-state.js';
+import { CostBasisLedger } from './cost-basis-ledger.js';
+import { getDayPnlState, recordDayPnlDelta } from './day-pnl-state.js';
 import { FillTracker, type ConfirmedFill } from './fill-tracker.js';
 import { buildFlattenSignals } from './flatten-signals.js';
 import { logger, TradeLogger } from './logger.js';
@@ -71,7 +72,7 @@ import {
   isQuotingSignalType,
   type StrategySignal,
 } from './strategy-types.js';
-import { pruneSetEntries, roundTo, sleep } from './utils.js';
+import { formatDayKey, pruneSetEntries, roundTo, sleep } from './utils.js';
 
 const MAX_TRACKED_SLOT_REPORTS = 2_048;
 const UNCONFIRMED_ORDER_COOLDOWN_MS = 15_000;
@@ -126,6 +127,7 @@ export class MarketMakerRuntime {
   private readonly marketWork = new Map<string, Promise<void>>();
   private readonly pendingSlotReports = new Set<string>();
   private readonly printedSlotReports = new Set<string>();
+  private readonly costBasisLedger = new CostBasisLedger();
   private readonly pendingLiveOrders = new Map<string, number>();
   private readonly settlementCooldowns = new Map<string, number>();
   private readonly settlementStartedAt = new Map<string, number>();
@@ -143,6 +145,8 @@ export class MarketMakerRuntime {
   private readonly latencyWindow: LatencySample[] = [];
   private latencyPaused = false;
   private readonly activeMarketIds = new Set<string>();
+  private redeemPnlToday = 0;
+  private redeemPnlDayKey = formatDayKey(new Date());
   private running = false;
   private stopping = false;
 
@@ -163,6 +167,44 @@ export class MarketMakerRuntime {
 
     this.redeemer.on('redeem-success', (payload) => {
       this.productTestMode.recordRedeemSuccess(payload);
+      const conditionId = String(payload?.conditionId ?? '').trim();
+      const redeemedShares = Number(payload?.redeemedAmount ?? 0);
+      const redeemedAt = resolveRedeemTimestamp(payload?.timestampMs);
+
+      this.resetRedeemPnlDayIfNeeded(redeemedAt);
+      if (conditionId && redeemedShares > 0) {
+        const entry = this.costBasisLedger.get(conditionId);
+        const result = this.costBasisLedger.calculateRedeemPnl(conditionId, redeemedShares);
+        if (result.found && Number.isFinite(result.pnl)) {
+          const dayState = recordDayPnlDelta(result.pnl, redeemedAt, config);
+          this.redeemPnlToday = roundTo(this.redeemPnlToday + result.pnl, 4);
+          logger.info('Redeem PnL recorded', {
+            conditionId,
+            title: String(payload?.title ?? entry?.marketTitle ?? 'Unknown'),
+            redeemedShares,
+            costBasis: entry?.totalCostUsd ?? 0,
+            soldShares: entry?.soldShares ?? 0,
+            soldProceeds: entry?.soldProceeds ?? 0,
+            remainingShares: result.remainingShares,
+            remainingCost: result.remainingCost,
+            redeemPayout: result.redeemPayout,
+            redeemPnl: result.pnl,
+            newDayPnl: dayState.dayPnl,
+          });
+          this.syncRuntimeStatus({
+            totalDayPnl: dayState.dayPnl,
+            dayDrawdown: dayState.drawdown,
+          });
+        } else {
+          logger.warn('Redeem PnL skipped — no cost basis', {
+            conditionId,
+            redeemedShares,
+            reason: 'Position may have been opened before bot restart or by another system',
+          });
+        }
+
+        this.costBasisLedger.consume(conditionId);
+      }
       if (this.productTestMode.isCompleted()) {
         logger.info('PRODUCT_TEST_MODE completed after redeem success');
         this.stop();
@@ -365,9 +407,11 @@ export class MarketMakerRuntime {
   }
 
   private async runCycle(): Promise<void> {
+    this.resetRedeemPnlDayIfNeeded();
     for (const fill of this.fillTracker.drainConfirmedFills()) {
       this.applyConfirmedFill(fill);
     }
+    this.costBasisLedger.prune(30 * 60 * 1000);
     this.pruneSettlementConfirmationState();
 
     this.consumeControlCommands();
@@ -661,6 +705,12 @@ export class MarketMakerRuntime {
         : beforeSnapshot;
 
     if (effectiveShares > 0) {
+      this.recordCostBasisFill({
+        market,
+        side: signal.action,
+        shares: effectiveShares,
+        price: effectivePrice,
+      });
       this.clearPendingLiveOrder(pendingOrderKey);
       recordExecution({
         slotKey,
@@ -1032,6 +1082,13 @@ export class MarketMakerRuntime {
       timestamp: new Date(fill.filledAt).toISOString(),
       orderId: fill.orderId,
     });
+    this.recordCostBasisFill({
+      market,
+      side: fill.side,
+      shares: fill.filledShares,
+      price: fill.fillPrice,
+      filledAt: fill.filledAt,
+    });
     if (fill.side === 'BUY') {
       this.armSettlementConfirmation(fill.marketId, fill.outcome, fill.filledAt);
       this.executor.invalidateOutcomeBalanceCache(fill.tokenId);
@@ -1288,6 +1345,8 @@ export class MarketMakerRuntime {
 
   private syncRuntimeStatus(overrides: Parameters<typeof writeRuntimeStatus>[0]): void {
     const openPositions = this.buildRuntimePositionSnapshots();
+    const dayState = getDayPnlState();
+    this.resetRedeemPnlDayIfNeeded();
     writeRuntimeStatus(
       {
         running: this.running && !this.stopping,
@@ -1296,8 +1355,10 @@ export class MarketMakerRuntime {
         isPaused: this.statusMonitor.isPaused(),
         pauseReason: this.statusMonitor.getState().reason,
         pauseSource: this.statusMonitor.getState().source,
-        totalDayPnl: getDayPnlState().dayPnl,
-        dayDrawdown: getDayPnlState().drawdown,
+        totalDayPnl: dayState.dayPnl,
+        dayDrawdown: dayState.drawdown,
+        costBasisTracked: this.costBasisLedger.size,
+        redeemPnlToday: this.redeemPnlToday,
         lastSignals: this.recentSignals,
         recentSkippedSignals: this.recentSkippedSignals,
         averageLatencyMs: this.getAverageLatencyMs(),
@@ -1321,6 +1382,52 @@ export class MarketMakerRuntime {
       },
       config
     );
+  }
+
+  private recordCostBasisFill(params: {
+    market: MarketCandidate;
+    side: 'BUY' | 'SELL';
+    shares: number;
+    price: number;
+    filledAt?: number;
+  }): void {
+    const shares = Number.isFinite(params.shares) ? Math.max(0, params.shares) : 0;
+    const price = Number.isFinite(params.price) ? Math.max(0, params.price) : 0;
+    if (shares <= 0 || price <= 0) {
+      return;
+    }
+
+    const timestamp =
+      typeof params.filledAt === 'number' && Number.isFinite(params.filledAt)
+        ? new Date(params.filledAt).toISOString()
+        : new Date().toISOString();
+    if (params.side === 'BUY') {
+      this.costBasisLedger.recordBuy({
+        conditionId: params.market.conditionId,
+        marketTitle: params.market.title,
+        shares,
+        price,
+        timestamp,
+      });
+      return;
+    }
+
+    this.costBasisLedger.recordSell({
+      conditionId: params.market.conditionId,
+      shares,
+      price,
+      timestamp,
+    });
+  }
+
+  private resetRedeemPnlDayIfNeeded(now: Date = new Date()): void {
+    const dayKey = formatDayKey(now);
+    if (dayKey === this.redeemPnlDayKey) {
+      return;
+    }
+
+    this.redeemPnlDayKey = dayKey;
+    this.redeemPnlToday = 0;
   }
 
   private recordRuntimeSlotReport(slotKey: string): void {
@@ -2426,6 +2533,21 @@ function getSettlementCooldownKey(
   outcome: StrategySignal['outcome']
 ): string {
   return `${marketId}:${outcome}`;
+}
+
+function resolveRedeemTimestamp(timestampMs: unknown): Date {
+  const numeric =
+    typeof timestampMs === 'number'
+      ? timestampMs
+      : typeof timestampMs === 'string'
+        ? Number.parseFloat(timestampMs)
+        : Number.NaN;
+  if (!Number.isFinite(numeric)) {
+    return new Date();
+  }
+
+  const timestamp = new Date(numeric);
+  return Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
 }
 
 export function shouldDeferSignalForSettlement(params: {

@@ -78,6 +78,17 @@ export function evaluateDayDrawdown(
   };
 }
 
+/**
+ * Returns true when new entries should be halted by the day drawdown guard.
+ * Reduce-only exits should continue to be allowed even while halted.
+ */
+export function isEntryHalted(
+  now: Date = new Date(),
+  runtimeConfig: AppConfig = config
+): boolean {
+  return getDayPnlState(now, runtimeConfig).tradingHalted;
+}
+
 export function resetDayPnlStateCache(): void {
   stateCache = null;
 }

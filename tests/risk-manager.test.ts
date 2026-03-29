@@ -148,3 +148,43 @@ test('risk manager halts entries and flattens inventory after drawdown breach', 
   rmSync(stateFile, { force: true });
   resetDayPnlStateCache();
 });
+
+test('risk manager keeps reduce-only flatten signals when drawdown halt is active', () => {
+  const stateFile = path.resolve(process.cwd(), 'reports', 'risk-manager-reduce-only-test.json');
+  rmSync(stateFile, { force: true });
+  resetDayPnlStateCache();
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    STATE_FILE: './reports/risk-manager-reduce-only-test.json',
+    MAX_DRAWDOWN_USDC: '-10',
+  });
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const manager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager(runtimeConfig);
+
+  manager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 8,
+    price: 0.45,
+  });
+  recordDayPnlDelta(20, new Date('2026-03-18T11:01:00.000Z'), runtimeConfig);
+  recordDayPnlDelta(-40, new Date('2026-03-18T11:02:00.000Z'), runtimeConfig);
+
+  const assessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager: manager,
+    now: new Date('2026-03-18T11:02:00.000Z'),
+  });
+  const flattenSignal = assessment.forcedSignals.find((signal) => signal.signalType === 'RISK_LIMIT');
+
+  assert.ok(flattenSignal);
+  assert.equal(flattenSignal.reduceOnly, true);
+  assert.equal(flattenSignal.action, 'SELL');
+
+  rmSync(stateFile, { force: true });
+  resetDayPnlStateCache();
+});
