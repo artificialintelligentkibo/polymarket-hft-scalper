@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,8 +8,10 @@ import {
   buildModeOverrides,
   applyEnvUpdatesToText,
   collectTodayResetTargets,
+  resolveDisplayedDayPnl,
 } from '../cli/helpers.js';
 import { createConfig } from '../src/config.js';
+import { recordDayPnlDelta, resetDayPnlStateCache } from '../src/day-pnl-state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -123,4 +125,35 @@ test('CLI source registers pause, resume, monitor, and dashboard commands', () =
   assert.equal(cliSource.includes(".command('monitor')"), true);
   assert.equal(cliSource.includes(".command('dashboard')"), true);
   assert.equal(cliSource.includes(".option('--watch'"), true);
+});
+
+test('dashboard day pnl display prefers day-pnl-state over stale runtime status values', () => {
+  const stateFile = path.resolve(process.cwd(), 'reports', 'cli-day-pnl-state.json');
+  rmSync(stateFile, { force: true });
+  resetDayPnlStateCache();
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    STATE_FILE: './reports/cli-day-pnl-state.json',
+    MAX_DRAWDOWN_USDC: '-100',
+  });
+  const now = new Date('2026-03-29T12:01:00.000Z');
+
+  recordDayPnlDelta(12, now, runtimeConfig);
+  recordDayPnlDelta(-5, now, runtimeConfig);
+
+  const resolved = resolveDisplayedDayPnl({
+    runtimeConfig,
+    runtimeStatus: {
+      totalDayPnl: 999,
+      dayDrawdown: -999,
+    },
+    now,
+  });
+
+  assert.equal(resolved.totalDayPnl, 7);
+  assert.equal(resolved.drawdown, -5);
+
+  rmSync(stateFile, { force: true });
+  resetDayPnlStateCache();
 });

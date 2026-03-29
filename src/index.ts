@@ -31,6 +31,7 @@ import {
   type MarketCandidate,
 } from './monitor.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
+import { meetsClobMinimums, resolveMinimumTradableShares } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
 import { ProductTestModeController } from './product-test-mode.js';
 import {
@@ -128,6 +129,15 @@ export class MarketMakerRuntime {
   private readonly pendingSlotReports = new Set<string>();
   private readonly printedSlotReports = new Set<string>();
   private readonly costBasisLedger = new CostBasisLedger();
+  private readonly blockedExitRemainders = new Map<
+    string,
+    {
+      marketId: string;
+      outcome: StrategySignal['outcome'];
+      shares: number;
+      updatedAt: string;
+    }
+  >();
   private readonly pendingLiveOrders = new Map<string, number>();
   private readonly settlementCooldowns = new Map<string, number>();
   private readonly settlementStartedAt = new Map<string, number>();
@@ -184,6 +194,7 @@ export class MarketMakerRuntime {
             redeemedShares,
             costBasis: entry?.totalCostUsd ?? 0,
             soldShares: entry?.soldShares ?? 0,
+            soldCostUsd: entry?.soldCostUsd ?? 0,
             soldProceeds: entry?.soldProceeds ?? 0,
             remainingShares: result.remainingShares,
             remainingCost: result.remainingCost,
@@ -412,6 +423,7 @@ export class MarketMakerRuntime {
       this.applyConfirmedFill(fill);
     }
     this.costBasisLedger.prune(30 * 60 * 1000);
+    this.pruneBlockedExitRemainders();
     this.pruneSettlementConfirmationState();
 
     this.consumeControlCommands();
@@ -613,7 +625,16 @@ export class MarketMakerRuntime {
     slotKey: string,
     binanceAssessment?: BinanceEdgeAssessment
   ): Promise<OrderExecutionReport | null> {
-    if (signal.targetPrice === null || signal.shares <= 0) {
+    if (signal.shares <= 0) {
+      return null;
+    }
+
+    if (
+      signal.targetPrice === null &&
+      signal.midPrice === null &&
+      signal.referencePrice === null &&
+      signal.tokenPrice === null
+    ) {
       return null;
     }
 
@@ -628,10 +649,61 @@ export class MarketMakerRuntime {
       return null;
     }
 
+    const book = signal.outcome === 'YES' ? orderbook.yes : orderbook.no;
+    const exitGuardPrice = resolveReduceOnlySellReferencePrice({
+      signal,
+      outcome: signal.outcome,
+      book,
+      positionManager,
+    });
+    const guardedSell = resolveReduceOnlySellGuard({
+      signal,
+      availableShares: positionManager.getShares(signal.outcome),
+      referencePrice: exitGuardPrice,
+    });
+    if (signal.action === 'SELL' && signal.reduceOnly) {
+      this.setBlockedExitRemainder(
+        market.marketId,
+        signal.outcome,
+        guardedSell.blockedRemainderShares
+      );
+      if (guardedSell.skip) {
+        this.recordSkippedSignal({
+          signal,
+          filterReason: 'MIN_ORDER_SIZE',
+          details: `shares=${guardedSell.requestedShares.toFixed(4)} minimum=${guardedSell.minimumShares.toFixed(4)}`,
+        });
+        logger.warn('Reduce-only exit skipped below minimum order size', {
+          marketId: market.marketId,
+          signalType: signal.signalType,
+          outcome: signal.outcome,
+          requestedShares: guardedSell.requestedShares,
+          minimumShares: guardedSell.minimumShares,
+          blockedExitRemainderShares: guardedSell.blockedRemainderShares,
+          referencePrice: exitGuardPrice,
+          reason: guardedSell.reason,
+        });
+        return null;
+      }
+    }
+
+    const executionSignal =
+      guardedSell.executionShares > 0 &&
+      roundTo(guardedSell.executionShares, 4) !== roundTo(signal.shares, 4)
+        ? {
+            ...signal,
+            shares: guardedSell.executionShares,
+            reason: `${signal.reason} | adjusted to executable size ${guardedSell.executionShares.toFixed(4)}`,
+          }
+        : signal;
+
     const paperTradingEnabled = isPaperTradingEnabled(config);
-    const pendingOrderKey = this.getPendingOrderKey(market.marketId, signal.outcome);
+    const pendingOrderKey = this.getPendingOrderKey(market.marketId, executionSignal.outcome);
     if (!paperTradingEnabled) {
-      const trackerPending = this.fillTracker.hasPendingOrderFor(market.marketId, signal.outcome);
+      const trackerPending = this.fillTracker.hasPendingOrderFor(
+        market.marketId,
+        executionSignal.outcome
+      );
       if (!trackerPending) {
         this.clearPendingLiveOrder(pendingOrderKey);
       }
@@ -639,30 +711,37 @@ export class MarketMakerRuntime {
       if (this.hasPendingLiveOrder(pendingOrderKey) || trackerPending) {
         logger.debug('Skipping signal because live resting order is still pending', {
           marketId: market.marketId,
-          signalType: signal.signalType,
-          outcome: signal.outcome,
-          action: signal.action,
+          signalType: executionSignal.signalType,
+          outcome: executionSignal.outcome,
+          action: executionSignal.action,
         });
         return null;
       }
     }
 
     const nowMs = Date.now();
-    const tokenId = signal.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
-    const settlementCooldownKey = getSettlementCooldownKey(market.marketId, signal.outcome);
+    const tokenId = executionSignal.outcome === 'YES' ? market.yesTokenId : market.noTokenId;
+    const settlementCooldownKey = getSettlementCooldownKey(
+      market.marketId,
+      executionSignal.outcome
+    );
     const settlementCooldownUntil = this.settlementCooldowns.get(settlementCooldownKey);
-    if (!paperTradingEnabled && signal.action === 'SELL' && signal.signalType !== 'HARD_STOP') {
+    if (
+      !paperTradingEnabled &&
+      executionSignal.action === 'SELL' &&
+      executionSignal.signalType !== 'HARD_STOP'
+    ) {
       if (
         shouldDeferSignalForSettlement({
-          signal,
+          signal: executionSignal,
           cooldownUntilMs: settlementCooldownUntil,
           nowMs,
         })
       ) {
         logger.debug('SELL deferred: waiting for token settlement after BUY fill', {
           marketId: market.marketId,
-          signalType: signal.signalType,
-          outcome: signal.outcome,
+          signalType: executionSignal.signalType,
+          outcome: executionSignal.outcome,
           remainingMs: Math.max(0, (settlementCooldownUntil ?? nowMs) - nowMs),
         });
         return null;
@@ -670,7 +749,7 @@ export class MarketMakerRuntime {
 
       const settlementReady = await this.confirmSettlementForSell({
         market,
-        signal,
+        signal: executionSignal,
         tokenId,
         nowMs,
       });
@@ -679,13 +758,12 @@ export class MarketMakerRuntime {
       }
     }
 
-    const book = signal.outcome === 'YES' ? orderbook.yes : orderbook.no;
     const beforeSnapshot = positionManager.getSnapshot();
     const startedAt = Date.now();
     const execution = await this.executor.executeSignal({
       market,
       orderbook,
-      signal,
+      signal: executionSignal,
     });
     const effectiveShares = execution.fillConfirmed ? execution.filledShares : 0;
     const effectivePrice = execution.fillPrice ?? execution.price;
@@ -695,8 +773,8 @@ export class MarketMakerRuntime {
     const afterSnapshot =
       effectiveShares > 0
         ? positionManager.applyFill({
-            outcome: signal.outcome,
-            side: signal.action,
+            outcome: executionSignal.outcome,
+            side: executionSignal.action,
             shares: effectiveShares,
             price: effectivePrice,
             timestamp: new Date().toISOString(),
@@ -707,17 +785,23 @@ export class MarketMakerRuntime {
     if (effectiveShares > 0) {
       this.recordCostBasisFill({
         market,
-        side: signal.action,
+        side: executionSignal.action,
         shares: effectiveShares,
         price: effectivePrice,
       });
+      this.syncBlockedExitRemainderFromInventory(
+        market.marketId,
+        executionSignal.outcome,
+        executionSignal.outcome === 'YES' ? afterSnapshot.yesShares : afterSnapshot.noShares,
+        effectivePrice
+      );
       this.clearPendingLiveOrder(pendingOrderKey);
       recordExecution({
         slotKey,
         marketId: market.marketId,
         marketTitle: market.title,
-        outcome: resolveSlotOutcome(market, signal.outcome),
-        action: signal.action,
+        outcome: resolveSlotOutcome(market, executionSignal.outcome),
+        action: executionSignal.action,
         notionalUsd: effectiveNotionalUsd,
         slotStart: market.startTime,
         slotEnd: market.endTime,
@@ -729,11 +813,11 @@ export class MarketMakerRuntime {
         marketId: market.marketId,
         slotKey,
         tokenId,
-        outcome: signal.outcome,
-        side: signal.action,
+        outcome: executionSignal.outcome,
+        side: executionSignal.action,
         submittedShares: execution.shares,
         submittedPrice: execution.price,
-        signalType: signal.signalType,
+        signalType: executionSignal.signalType,
         placedAt: startedAt,
         slotEndTime:
           market.endTime ??
@@ -743,9 +827,9 @@ export class MarketMakerRuntime {
       });
       logger.warn('Live order submitted without confirmed fill; skipped position mutation', {
         marketId: market.marketId,
-        signalType: signal.signalType,
-        outcome: signal.outcome,
-        action: signal.action,
+        signalType: executionSignal.signalType,
+        outcome: executionSignal.outcome,
+        action: executionSignal.action,
         orderId: execution.orderId,
         submittedShares: execution.shares,
         submittedPrice: execution.price,
@@ -762,25 +846,29 @@ export class MarketMakerRuntime {
         slotKey,
         market.marketId,
         market.title,
-        resolveSlotOutcome(market, signal.outcome),
+        resolveSlotOutcome(market, executionSignal.outcome),
         realizedDelta,
         market.startTime,
         market.endTime
       );
     }
     const completedAt = Date.now();
-    if (!paperTradingEnabled && effectiveShares > 0 && signal.action === 'BUY') {
-      this.armSettlementConfirmation(market.marketId, signal.outcome, completedAt);
+    if (!paperTradingEnabled && effectiveShares > 0 && executionSignal.action === 'BUY') {
+      this.armSettlementConfirmation(market.marketId, executionSignal.outcome, completedAt);
       this.executor.invalidateOutcomeBalanceCache(tokenId);
       this.executor.invalidateBalanceValidationCache();
-    } else if (!paperTradingEnabled && effectiveShares > 0 && signal.action === 'SELL') {
-      this.clearSettlementConfirmation(market.marketId, signal.outcome);
+    } else if (!paperTradingEnabled && effectiveShares > 0 && executionSignal.action === 'SELL') {
+      this.clearSettlementConfirmation(market.marketId, executionSignal.outcome);
       this.executor.invalidateOutcomeBalanceCache(tokenId);
       this.executor.invalidateBalanceValidationCache();
     }
-    if (effectiveShares > 0 && signal.signalType === 'HARD_STOP' && signal.action === 'SELL') {
+    if (
+      effectiveShares > 0 &&
+      executionSignal.signalType === 'HARD_STOP' &&
+      executionSignal.action === 'SELL'
+    ) {
       positionManager.setEntryCooldown(
-        signal.outcome,
+        executionSignal.outcome,
         config.strategy.hardStopCooldownMs,
         new Date(completedAt)
       );
@@ -788,7 +876,7 @@ export class MarketMakerRuntime {
     if (effectiveShares > 0) {
       this.signalEngine.recordExecution({
         market,
-        signal,
+        signal: executionSignal,
         filledShares: effectiveShares,
         fillPrice: effectivePrice,
         executedAtMs: completedAt,
@@ -798,12 +886,14 @@ export class MarketMakerRuntime {
     const slotMetrics = getSlotMetrics(slotKey);
     const dayState = getDayPnlState(new Date(completedAt));
     const latencyRoundTripMs =
-      signal.generatedAt !== undefined ? Math.max(0, completedAt - signal.generatedAt) : undefined;
+      executionSignal.generatedAt !== undefined
+        ? Math.max(0, completedAt - executionSignal.generatedAt)
+        : undefined;
     this.updateLatencyPause(latencyRoundTripMs ?? execution.latencySignalToOrderMs);
 
     this.productTestMode.recordExecution({
       market,
-      signal,
+      signal: executionSignal,
       latencySignalToOrderMs: execution.latencySignalToOrderMs,
       latencyRoundTripMs,
     });
@@ -812,9 +902,9 @@ export class MarketMakerRuntime {
       timestampMs: completedAt,
       marketId: market.marketId,
       marketTitle: market.title,
-      signalType: signal.signalType,
-      action: signal.action,
-      outcome: signal.outcome,
+      signalType: executionSignal.signalType,
+      action: executionSignal.action,
+      outcome: executionSignal.outcome,
       orderId: execution.orderId,
       latencySignalToOrderMs: execution.latencySignalToOrderMs,
       latencyRoundTripMs,
@@ -837,32 +927,32 @@ export class MarketMakerRuntime {
       slotStart: market.startTime,
       slotEnd: market.endTime,
       tokenId,
-      outcome: signal.outcome,
-      outcomeIndex: signal.outcomeIndex,
-      action: signal.action,
-      reason: signal.reason,
-      signalType: signal.signalType,
-      priority: signal.priority,
+      outcome: executionSignal.outcome,
+      outcomeIndex: executionSignal.outcomeIndex,
+      action: executionSignal.action,
+      reason: executionSignal.reason,
+      signalType: executionSignal.signalType,
+      priority: executionSignal.priority,
       urgency: execution.urgency,
-      reduceOnly: signal.reduceOnly,
-      tokenPrice: signal.tokenPrice,
-      referencePrice: signal.referencePrice,
-      fairValue: signal.fairValue,
-      midPrice: signal.midPrice,
+      reduceOnly: executionSignal.reduceOnly,
+      tokenPrice: executionSignal.tokenPrice,
+      referencePrice: executionSignal.referencePrice,
+      fairValue: executionSignal.fairValue,
+      midPrice: executionSignal.midPrice,
       bestBid: book.bestBid,
       bestAsk: book.bestAsk,
-      combinedBid: signal.combinedBid,
-      combinedAsk: signal.combinedAsk,
-      combinedMid: signal.combinedMid,
-      combinedDiscount: signal.combinedDiscount,
-      combinedPremium: signal.combinedPremium,
-      edgeAmount: signal.edgeAmount,
+      combinedBid: executionSignal.combinedBid,
+      combinedAsk: executionSignal.combinedAsk,
+      combinedMid: executionSignal.combinedMid,
+      combinedDiscount: executionSignal.combinedDiscount,
+      combinedPremium: executionSignal.combinedPremium,
+      edgeAmount: executionSignal.edgeAmount,
       shares: effectiveShares,
       notionalUsd: effectiveNotionalUsd,
       liquidityUsd: market.liquidityUsd,
-      fillRatio: signal.fillRatio,
-      capitalClamp: signal.capitalClamp,
-      priceMultiplier: signal.priceMultiplier,
+      fillRatio: executionSignal.fillRatio,
+      capitalClamp: executionSignal.capitalClamp,
+      priceMultiplier: executionSignal.priceMultiplier,
       inventoryImbalance: afterSnapshot.inventoryImbalance,
       grossExposureShares: afterSnapshot.grossExposureShares,
       netYesShares: afterSnapshot.yesShares,
@@ -896,11 +986,11 @@ export class MarketMakerRuntime {
 
     logger.info('Signal executed', {
       marketId: market.marketId,
-      signalType: signal.signalType,
-      outcome: signal.outcome,
-      action: signal.action,
-      reason: signal.reason,
-      fairValue: signal.fairValue,
+      signalType: executionSignal.signalType,
+      outcome: executionSignal.outcome,
+      action: executionSignal.action,
+      reason: executionSignal.reason,
+      fairValue: executionSignal.fairValue,
       shares: effectiveShares,
       submittedShares: execution.shares,
       price: effectivePrice,
@@ -921,9 +1011,9 @@ export class MarketMakerRuntime {
     this.recordRuntimeSignal({
       timestamp: new Date(completedAt).toISOString(),
       marketId: market.marketId,
-      signalType: signal.signalType,
-      action: signal.action,
-      outcome: signal.outcome,
+      signalType: executionSignal.signalType,
+      action: executionSignal.action,
+      outcome: executionSignal.outcome,
       latencyMs:
         latencyRoundTripMs ?? execution.latencySignalToOrderMs ?? null,
     });
@@ -1082,6 +1172,12 @@ export class MarketMakerRuntime {
       timestamp: new Date(fill.filledAt).toISOString(),
       orderId: fill.orderId,
     });
+    this.syncBlockedExitRemainderFromInventory(
+      fill.marketId,
+      fill.outcome,
+      fill.outcome === 'YES' ? afterSnapshot.yesShares : afterSnapshot.noShares,
+      fill.fillPrice
+    );
     this.recordCostBasisFill({
       market,
       side: fill.side,
@@ -1347,6 +1443,8 @@ export class MarketMakerRuntime {
     const openPositions = this.buildRuntimePositionSnapshots();
     const dayState = getDayPnlState();
     this.resetRedeemPnlDayIfNeeded();
+    this.pruneBlockedExitRemainders();
+    const exitRemainderSummary = this.getBlockedExitRemainderSummary();
     writeRuntimeStatus(
       {
         running: this.running && !this.stopping,
@@ -1359,6 +1457,8 @@ export class MarketMakerRuntime {
         dayDrawdown: dayState.drawdown,
         costBasisTracked: this.costBasisLedger.size,
         redeemPnlToday: this.redeemPnlToday,
+        dustPositionsCount: exitRemainderSummary.dustPositionsCount,
+        blockedExitRemainderShares: exitRemainderSummary.blockedExitRemainderShares,
         lastSignals: this.recentSignals,
         recentSkippedSignals: this.recentSkippedSignals,
         averageLatencyMs: this.getAverageLatencyMs(),
@@ -1428,6 +1528,72 @@ export class MarketMakerRuntime {
 
     this.redeemPnlDayKey = dayKey;
     this.redeemPnlToday = 0;
+  }
+
+  private setBlockedExitRemainder(
+    marketId: string,
+    outcome: StrategySignal['outcome'],
+    shares: number
+  ): void {
+    const normalizedShares = roundTo(Math.max(0, shares), 4);
+    const key = getSettlementCooldownKey(marketId, outcome);
+    if (normalizedShares <= 0) {
+      this.blockedExitRemainders.delete(key);
+      return;
+    }
+
+    this.blockedExitRemainders.set(key, {
+      marketId,
+      outcome,
+      shares: normalizedShares,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  private syncBlockedExitRemainderFromInventory(
+    marketId: string,
+    outcome: StrategySignal['outcome'],
+    remainingShares: number,
+    referencePrice: number | null
+  ): void {
+    const normalizedShares = roundTo(Math.max(0, remainingShares), 4);
+    if (normalizedShares <= 0) {
+      this.setBlockedExitRemainder(marketId, outcome, 0);
+      return;
+    }
+
+    const minimumShares = resolveMinimumTradableShares(referencePrice ?? Number.NaN, 0);
+    if (normalizedShares < minimumShares) {
+      this.setBlockedExitRemainder(marketId, outcome, normalizedShares);
+      return;
+    }
+
+    this.setBlockedExitRemainder(marketId, outcome, 0);
+  }
+
+  private pruneBlockedExitRemainders(): void {
+    for (const [key, remainder] of this.blockedExitRemainders.entries()) {
+      const positionManager = this.positions.get(remainder.marketId);
+      if (!positionManager || positionManager.getShares(remainder.outcome) <= 0) {
+        this.blockedExitRemainders.delete(key);
+      }
+    }
+  }
+
+  private getBlockedExitRemainderSummary(): {
+    dustPositionsCount: number;
+    blockedExitRemainderShares: number;
+  } {
+    return {
+      dustPositionsCount: this.blockedExitRemainders.size,
+      blockedExitRemainderShares: roundTo(
+        Array.from(this.blockedExitRemainders.values()).reduce(
+          (sum, entry) => sum + entry.shares,
+          0
+        ),
+        4
+      ),
+    };
   }
 
   private recordRuntimeSlotReport(slotKey: string): void {
@@ -2602,6 +2768,101 @@ export function filterSignalsForLatencyPause(
   return signals.filter((signal) => signal.reduceOnly || signal.action === 'SELL');
 }
 
+export interface ReduceOnlySellGuardResult {
+  readonly skip: boolean;
+  readonly reason:
+    | 'not_reduce_only_sell'
+    | 'no_inventory'
+    | 'invalid_price'
+    | 'below_minimum'
+    | 'valid';
+  readonly requestedShares: number;
+  readonly executionShares: number;
+  readonly minimumShares: number;
+  readonly remainingShares: number;
+  readonly blockedRemainderShares: number;
+}
+
+export function resolveReduceOnlySellGuard(params: {
+  signal: Pick<StrategySignal, 'action' | 'reduceOnly' | 'shares'>;
+  availableShares: number;
+  referencePrice: number | null;
+}): ReduceOnlySellGuardResult {
+  const availableShares = roundTo(Math.max(0, params.availableShares), 4);
+  const requestedShares = roundTo(
+    Math.min(availableShares, Math.max(0, params.signal.shares)),
+    4
+  );
+  const price =
+    params.referencePrice !== null &&
+    Number.isFinite(params.referencePrice) &&
+    params.referencePrice > 0
+      ? params.referencePrice
+      : null;
+  const minimumShares = resolveMinimumTradableShares(price ?? Number.NaN, 0);
+
+  if (params.signal.action !== 'SELL' || !params.signal.reduceOnly) {
+    const remainingShares = roundTo(Math.max(0, availableShares - requestedShares), 4);
+    return {
+      skip: false,
+      reason: 'not_reduce_only_sell',
+      requestedShares,
+      executionShares: requestedShares,
+      minimumShares,
+      remainingShares,
+      blockedRemainderShares: 0,
+    };
+  }
+
+  if (requestedShares <= 0 || availableShares <= 0) {
+    return {
+      skip: true,
+      reason: 'no_inventory',
+      requestedShares,
+      executionShares: 0,
+      minimumShares,
+      remainingShares: availableShares,
+      blockedRemainderShares: 0,
+    };
+  }
+
+  if (price === null) {
+    return {
+      skip: true,
+      reason: 'invalid_price',
+      requestedShares,
+      executionShares: 0,
+      minimumShares,
+      remainingShares: availableShares,
+      blockedRemainderShares: requestedShares,
+    };
+  }
+
+  if (!meetsClobMinimums(requestedShares, price)) {
+    return {
+      skip: true,
+      reason: 'below_minimum',
+      requestedShares,
+      executionShares: 0,
+      minimumShares,
+      remainingShares: availableShares,
+      blockedRemainderShares: requestedShares,
+    };
+  }
+
+  const remainingShares = roundTo(Math.max(0, availableShares - requestedShares), 4);
+  return {
+    skip: false,
+    reason: 'valid',
+    requestedShares,
+    executionShares: requestedShares,
+    minimumShares,
+    remainingShares,
+    blockedRemainderShares:
+      remainingShares > 0 && remainingShares < minimumShares ? remainingShares : 0,
+  };
+}
+
 export function filterSignalsForApiEntryGate(params: {
   signals: readonly StrategySignal[];
   apiEntryGateOpen: boolean;
@@ -2689,6 +2950,25 @@ export function evaluateLatencyPauseState(params: {
     averageLatencyMs,
     transition: 'none',
   };
+}
+
+function resolveReduceOnlySellReferencePrice(params: {
+  signal: Pick<
+    StrategySignal,
+    'action' | 'reduceOnly' | 'outcome' | 'targetPrice' | 'referencePrice' | 'tokenPrice'
+  >;
+  outcome: StrategySignal['outcome'];
+  book: MarketOrderbookSnapshot['yes'] | MarketOrderbookSnapshot['no'];
+  positionManager: PositionManager;
+}): number | null {
+  return (
+    params.signal.targetPrice ??
+    params.book.bestBid ??
+    params.book.midPrice ??
+    params.signal.referencePrice ??
+    params.signal.tokenPrice ??
+    params.positionManager.getAvgEntryPrice(params.outcome)
+  );
 }
 
 const isDirectRun =

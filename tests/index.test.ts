@@ -9,6 +9,7 @@ import {
   hasSettledOutcomeBalance,
   pruneLatencyPauseSamples,
   pruneExpiredSettlementCooldowns,
+  resolveReduceOnlySellGuard,
   shouldDeferSignalForSettlement,
 } from '../src/index.js';
 import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
@@ -254,6 +255,29 @@ test('exit signals always pass through during latency pause', () => {
   );
 });
 
+test('reduce-only signals pass through while the bot is paused', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.statusMonitor = {
+    isPaused: () => true,
+    getState: () => ({ reason: 'manual pause', source: 'manual' }),
+  };
+  runtime.recordSkippedSignal = () => {};
+
+  const filtered = runtime.applyPauseFilter(createMarket(), [
+    createSignal({ signalType: 'FAIR_VALUE_BUY', action: 'BUY', reduceOnly: false }),
+    createSignal({
+      signalType: 'TRAILING_TAKE_PROFIT',
+      action: 'SELL',
+      reduceOnly: true,
+      outcome: 'NO',
+      outcomeIndex: 1,
+    }),
+  ]);
+
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0]?.signalType, 'TRAILING_TAKE_PROFIT');
+});
+
 test('API entry gate is bypassed in simulation/paper mode so entry signals survive', () => {
   const entrySignal = createSignal({
     signalType: 'PAIRED_ARB_BUY_YES',
@@ -358,6 +382,89 @@ test('settled outcome balance requires a small confirmation margin before SELL',
   assert.equal(getRequiredSettledShares(10), 9.9);
   assert.equal(hasSettledOutcomeBalance(9.89, 10), false);
   assert.equal(hasSettledOutcomeBalance(9.9, 10), true);
+});
+
+test('reduce-only sell guard blocks sub-minimum exits and reports the blocked remainder', () => {
+  const result = resolveReduceOnlySellGuard({
+    signal: createSignal({
+      signalType: 'TRAILING_TAKE_PROFIT',
+      action: 'SELL',
+      reduceOnly: true,
+      shares: 2.53,
+    }),
+    availableShares: 2.53,
+    referencePrice: 0.5,
+  });
+
+  assert.equal(result.skip, true);
+  assert.equal(result.reason, 'below_minimum');
+  assert.equal(result.executionShares, 0);
+  assert.equal(result.blockedRemainderShares, 2.53);
+});
+
+test('reduce-only sell guard preserves dust remainder after a valid partial exit', () => {
+  const result = resolveReduceOnlySellGuard({
+    signal: createSignal({
+      signalType: 'TRAILING_TAKE_PROFIT',
+      action: 'SELL',
+      reduceOnly: true,
+      shares: 5,
+    }),
+    availableShares: 7.53,
+    referencePrice: 0.5,
+  });
+
+  assert.equal(result.skip, false);
+  assert.equal(result.executionShares, 5);
+  assert.equal(result.remainingShares, 2.53);
+  assert.equal(result.blockedRemainderShares, 2.53);
+});
+
+test('sub-minimum reduce-only exits are not submitted to the executor', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 2.53,
+    price: 0.5,
+  });
+
+  let executorCalls = 0;
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.executor = {
+    executeSignal: async () => {
+      executorCalls += 1;
+      return createExecutionReport({
+        side: 'SELL',
+        shares: 2.53,
+        filledShares: 2.53,
+      });
+    },
+  };
+  runtime.recordSkippedSignal = () => {};
+
+  const result = await runtime.executeSignal(
+    market,
+    orderbook,
+    positionManager,
+    createSignal({
+      signalType: 'TRAILING_TAKE_PROFIT',
+      action: 'SELL',
+      reduceOnly: true,
+      shares: 2.53,
+      urgency: 'cross',
+    }),
+    'slot-1'
+  );
+
+  assert.equal(result, null);
+  assert.equal(executorCalls, 0);
 });
 
 test('executePairedArbAtomic unwinds leg1 when leg2 does not fill', async () => {

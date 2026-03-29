@@ -1,6 +1,8 @@
 import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { type AppConfig } from '../src/config.js';
+import { getDayPnlState } from '../src/day-pnl-state.js';
+import type { RuntimeStatusSnapshot } from '../src/runtime-status.js';
 import { formatDayKey } from '../src/utils.js';
 
 export type CliMode = 'simulation' | 'product_test' | 'production';
@@ -116,6 +118,18 @@ export function collectTodayResetTargets(
   }
 
   return [...targets];
+}
+
+export function resolveDisplayedDayPnl(params: {
+  runtimeConfig: AppConfig;
+  runtimeStatus?: Pick<RuntimeStatusSnapshot, 'totalDayPnl' | 'dayDrawdown'> | null;
+  now?: Date;
+}): { totalDayPnl: number; drawdown: number } {
+  const dayState = getDayPnlState(params.now ?? new Date(), params.runtimeConfig);
+  return {
+    totalDayPnl: dayState.dayPnl,
+    drawdown: dayState.drawdown,
+  };
 }
 
 function formatEnvValue(value: string): string {

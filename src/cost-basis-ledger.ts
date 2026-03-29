@@ -6,6 +6,7 @@ export interface CostBasisEntry {
   totalCostUsd: number;
   totalShares: number;
   soldShares: number;
+  soldCostUsd: number;
   soldProceeds: number;
   createdAt: string;
   updatedAt: string;
@@ -52,6 +53,7 @@ export class CostBasisLedger {
         totalCostUsd: roundTo(shares * price, 4),
         totalShares: roundTo(shares, 4),
         soldShares: 0,
+        soldCostUsd: 0,
         soldProceeds: 0,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -86,8 +88,23 @@ export class CostBasisLedger {
       return;
     }
 
-    entry.soldShares = roundTo(Math.min(entry.totalShares, entry.soldShares + shares), 4);
-    entry.soldProceeds = roundTo(entry.soldProceeds + shares * price, 4);
+    const remainingSharesBeforeSell = roundTo(Math.max(0, entry.totalShares - entry.soldShares), 4);
+    const remainingCostBeforeSell = roundTo(Math.max(0, entry.totalCostUsd - entry.soldCostUsd), 4);
+    if (remainingSharesBeforeSell <= 0) {
+      return;
+    }
+
+    const effectiveSellShares = roundTo(Math.min(shares, remainingSharesBeforeSell), 4);
+    const averageRemainingCost =
+      remainingSharesBeforeSell > 0 ? remainingCostBeforeSell / remainingSharesBeforeSell : 0;
+    const soldCostUsd = roundTo(effectiveSellShares * averageRemainingCost, 4);
+
+    entry.soldShares = roundTo(Math.min(entry.totalShares, entry.soldShares + effectiveSellShares), 4);
+    entry.soldCostUsd = roundTo(
+      Math.min(entry.totalCostUsd, entry.soldCostUsd + soldCostUsd),
+      4
+    );
+    entry.soldProceeds = roundTo(entry.soldProceeds + effectiveSellShares * price, 4);
     entry.updatedAt = normalizeTimestamp(params.timestamp);
   }
 
@@ -108,7 +125,7 @@ export class CostBasisLedger {
     }
 
     const remainingShares = roundTo(Math.max(0, entry.totalShares - entry.soldShares), 4);
-    const remainingCost = roundTo(Math.max(0, entry.totalCostUsd - entry.soldProceeds), 4);
+    const remainingCost = roundTo(Math.max(0, entry.totalCostUsd - entry.soldCostUsd), 4);
     const normalizedRedeemedShares = normalizePositive(redeemedShares);
     if (normalizedRedeemedShares <= 0) {
       return {
@@ -125,8 +142,11 @@ export class CostBasisLedger {
       4
     );
     const redeemPayout = roundTo(effectiveRedeemedShares, 4);
+    const averageRemainingCost =
+      remainingShares > 0 ? roundTo(remainingCost / remainingShares, 8) : 0;
+    const redeemedCost = roundTo(averageRemainingCost * effectiveRedeemedShares, 4);
     return {
-      pnl: roundTo(redeemPayout - remainingCost, 4),
+      pnl: roundTo(redeemPayout - redeemedCost, 4),
       remainingShares,
       remainingCost,
       redeemPayout,

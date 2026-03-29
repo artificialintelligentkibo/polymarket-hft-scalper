@@ -35,6 +35,7 @@ import {
   applyEnvUpdatesToText,
   buildModeOverrides,
   collectTodayResetTargets,
+  resolveDisplayedDayPnl,
   type CliMode,
 } from './helpers.js';
 
@@ -332,9 +333,10 @@ async function stopBot(
 function printStatus(runtimeConfig: AppConfig): void {
   const inspection = inspectBot(runtimeConfig);
   const runtimeStatus = inspection.runtimeStatus;
-  const dayState = getDayPnlState(new Date(), runtimeConfig);
-  const totalDayPnl = runtimeStatus?.totalDayPnl ?? dayState.dayPnl;
-  const drawdown = runtimeStatus?.dayDrawdown ?? dayState.drawdown;
+  const { totalDayPnl, drawdown } = resolveDisplayedDayPnl({
+    runtimeConfig,
+    runtimeStatus,
+  });
 
   console.log('');
   console.log(color.bold(color.cyan('Polymarket Scalper Status')));
@@ -353,6 +355,10 @@ function printStatus(runtimeConfig: AppConfig): void {
   console.log(`${label('Manager')} ${inspection.manager ?? 'n/a'}`);
   console.log(`${label('Day PnL')} ${formatSignedCurrency(totalDayPnl)}`);
   console.log(`${label('Drawdown')} ${formatSignedCurrency(drawdown)}`);
+  console.log(`${label('Dust exits')} ${String(runtimeStatus?.dustPositionsCount ?? 0)}`);
+  console.log(
+    `${label('Blocked rem')} ${(runtimeStatus?.blockedExitRemainderShares ?? 0).toFixed(4)} sh`
+  );
   console.log(`${label('Active slots')} ${String(runtimeStatus?.activeSlotsCount ?? 0)}`);
   console.log(
     `${label('Avg latency')} ${
@@ -604,9 +610,10 @@ function renderPerformance(
   runtimeStatus: RuntimeStatusSnapshot | null,
   runtimeConfig: AppConfig
 ): string {
-  const dayState = getDayPnlState(new Date(), runtimeConfig);
-  const totalDayPnl = runtimeStatus?.totalDayPnl ?? dayState.dayPnl;
-  const drawdown = runtimeStatus?.dayDrawdown ?? dayState.drawdown;
+  const { totalDayPnl, drawdown } = resolveDisplayedDayPnl({
+    runtimeConfig,
+    runtimeStatus,
+  });
   const activeSlots = runtimeStatus?.activeSlotsCount ?? 0;
   const openPositions = runtimeStatus?.openPositionsCount ?? 0;
   const averageLatency =
@@ -638,6 +645,8 @@ function renderPerformance(
   const mmMarkets = runtimeStatus
     ? `${runtimeStatus.mmActiveMarkets}/${runtimeStatus.mmMaxConcurrentMarkets}`
     : 'n/a';
+  const dustPositions = runtimeStatus?.dustPositionsCount ?? 0;
+  const blockedExitRemainder = runtimeStatus?.blockedExitRemainderShares ?? 0;
 
   return renderTable(
     ['METRIC', 'VALUE', 'METRIC', 'VALUE'],
@@ -647,6 +656,7 @@ function renderPerformance(
       ['Day PnL', formatSignedCurrency(totalDayPnl), 'Drawdown', formatSignedCurrency(drawdown)],
       ['Active slots', color.bold(String(activeSlots)), 'Open positions', color.bold(String(openPositions))],
       ['MM exposure', color.bold(mmExposure), 'MM markets', color.bold(mmMarkets)],
+      ['Dust exits', color.bold(String(dustPositions)), 'Blocked remainder', color.bold(`${blockedExitRemainder.toFixed(4)} sh`)],
       ['Avg latency', color.bold(averageLatency), 'Latency gate', latencyGate],
       ['API gate', apiGate, 'FV smoothing', bayesianFv],
       ['Manager', color.bold(inspection.manager ?? 'n/a'), 'Status', runtimeStatus?.isPaused ? color.red('PAUSED') : color.green('OK')],

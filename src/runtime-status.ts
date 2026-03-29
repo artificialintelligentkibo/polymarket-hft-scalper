@@ -104,6 +104,8 @@ export interface RuntimeStatusSnapshot {
   readonly dayDrawdown: number;
   readonly costBasisTracked: number;
   readonly redeemPnlToday: number;
+  readonly dustPositionsCount: number;
+  readonly blockedExitRemainderShares: number;
   readonly averageLatencyMs: number | null;
   readonly bayesianFvEnabled: boolean;
   readonly bayesianFvAlpha: number;
@@ -166,6 +168,8 @@ export function createRuntimeStatusSnapshot(
     dayDrawdown: dayState.drawdown,
     costBasisTracked: 0,
     redeemPnlToday: 0,
+    dustPositionsCount: 0,
+    blockedExitRemainderShares: 0,
     averageLatencyMs: null,
     bayesianFvEnabled: runtimeConfig.BAYESIAN_FV_ENABLED,
     bayesianFvAlpha: runtimeConfig.BAYESIAN_FV_ALPHA,
@@ -281,10 +285,12 @@ function normalizeRuntimeStatus(
     latencyPaused: Boolean(value.latencyPaused),
     latencyPauseAverageMs: normalizeNullableNumber(value.latencyPauseAverageMs),
     apiCircuitBreakers: normalizeCircuitBreakers(value.apiCircuitBreakers),
-    totalDayPnl: normalizeNumber(value.totalDayPnl, dayState.dayPnl),
-    dayDrawdown: normalizeNumber(value.dayDrawdown, dayState.drawdown),
+    totalDayPnl: dayState.dayPnl,
+    dayDrawdown: dayState.drawdown,
     costBasisTracked: normalizeCount(value.costBasisTracked),
     redeemPnlToday: normalizeNumber(value.redeemPnlToday, 0),
+    dustPositionsCount: normalizeCount(value.dustPositionsCount),
+    blockedExitRemainderShares: normalizeNumber(value.blockedExitRemainderShares, 0),
     averageLatencyMs: normalizeNullableNumber(value.averageLatencyMs),
     bayesianFvEnabled:
       typeof value.bayesianFvEnabled === 'boolean'
