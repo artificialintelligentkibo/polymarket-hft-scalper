@@ -44,6 +44,7 @@ import {
 import { writeLatencyLog } from './reports.js';
 import { RiskManager } from './risk-manager.js';
 import {
+  resolveRuntimeMode,
   type RuntimeMmQuoteSnapshot,
   writeRuntimeStatus,
   type RuntimeMarketSnapshot,
@@ -1448,6 +1449,7 @@ export class MarketMakerRuntime {
     writeRuntimeStatus(
       {
         running: this.running && !this.stopping,
+        mode: resolveRuntimeMode(config),
         pid: process.pid,
         systemStatus: this.statusMonitor.isPaused() ? 'PAUSED' : 'OK',
         isPaused: this.statusMonitor.isPaused(),

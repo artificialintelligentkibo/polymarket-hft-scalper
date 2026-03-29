@@ -266,10 +266,7 @@ function normalizeRuntimeStatus(
         : new Date().toISOString(),
     pid: typeof value.pid === 'number' && Number.isFinite(value.pid) ? Math.round(value.pid) : null,
     running: Boolean(value.running),
-    mode:
-      value.mode === 'simulation' || value.mode === 'product_test' || value.mode === 'production'
-        ? value.mode
-        : resolveRuntimeMode(runtimeConfig),
+    mode: resolveRuntimeMode(runtimeConfig),
     systemStatus: isPaused ? 'PAUSED' : 'OK',
     isPaused,
     pauseReason: typeof value.pauseReason === 'string' && value.pauseReason.trim() ? value.pauseReason : null,
