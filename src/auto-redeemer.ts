@@ -314,6 +314,8 @@ export class AutoRedeemer extends EventEmitter {
         conditionId: group.conditionId,
         title: group.title,
         redeemedAmount: roundTo(group.totalShares, 4),
+        yesShares: roundTo(group.yesShares, 4),
+        noShares: roundTo(group.noShares, 4),
         transactionId: execution.transactionId,
         transactionHash: execution.transactionHash,
         state: execution.state,

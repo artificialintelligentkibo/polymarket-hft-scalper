@@ -110,8 +110,17 @@ export class CostBasisLedger {
 
   /**
    * Calculate redeem PnL for shares held through settlement.
+   *
+   * When `actualPayoutUsd` is supplied, it is treated as the real USDC payout
+   * returned by redeem settlement. This avoids overstating PnL when both sides
+   * of a binary market are redeemed together and only the guaranteed paired
+   * cancellation value should be recognized.
    */
-  calculateRedeemPnl(conditionId: string, redeemedShares: number): RedeemPnlCalculation {
+  calculateRedeemPnl(
+    conditionId: string,
+    redeemedShares: number,
+    actualPayoutUsd?: number
+  ): RedeemPnlCalculation {
     const normalizedConditionId = String(conditionId || '').trim();
     const entry = this.entries.get(normalizedConditionId);
     if (!entry) {
@@ -141,7 +150,10 @@ export class CostBasisLedger {
       Math.min(normalizedRedeemedShares, remainingShares),
       4
     );
-    const redeemPayout = roundTo(effectiveRedeemedShares, 4);
+    const redeemPayout =
+      actualPayoutUsd !== undefined && Number.isFinite(actualPayoutUsd)
+        ? roundTo(Math.max(0, actualPayoutUsd), 4)
+        : roundTo(effectiveRedeemedShares, 4);
     const averageRemainingCost =
       remainingShares > 0 ? roundTo(remainingCost / remainingShares, 8) : 0;
     const redeemedCost = roundTo(averageRemainingCost * effectiveRedeemedShares, 4);

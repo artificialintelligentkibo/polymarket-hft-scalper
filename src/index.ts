@@ -180,13 +180,22 @@ export class MarketMakerRuntime {
     this.redeemer.on('redeem-success', (payload) => {
       this.productTestMode.recordRedeemSuccess(payload);
       const conditionId = String(payload?.conditionId ?? '').trim();
-      const redeemedShares = Number(payload?.redeemedAmount ?? 0);
+      const redeemSettlement = resolveRedeemSettlementAmounts({
+        redeemedShares: payload?.redeemedAmount,
+        yesShares: payload?.yesShares,
+        noShares: payload?.noShares,
+      });
+      const redeemedShares = redeemSettlement.redeemedShares;
       const redeemedAt = resolveRedeemTimestamp(payload?.timestampMs);
 
       this.resetRedeemPnlDayIfNeeded(redeemedAt);
       if (conditionId && redeemedShares > 0) {
         const entry = this.costBasisLedger.get(conditionId);
-        const result = this.costBasisLedger.calculateRedeemPnl(conditionId, redeemedShares);
+        const result = this.costBasisLedger.calculateRedeemPnl(
+          conditionId,
+          redeemedShares,
+          redeemSettlement.actualPayoutUsd
+        );
         if (result.found && Number.isFinite(result.pnl)) {
           const dayState = recordDayPnlDelta(result.pnl, redeemedAt, config);
           this.redeemPnlToday = roundTo(this.redeemPnlToday + result.pnl, 4);
@@ -194,6 +203,10 @@ export class MarketMakerRuntime {
             conditionId,
             title: String(payload?.title ?? entry?.marketTitle ?? 'Unknown'),
             redeemedShares,
+            yesShares: redeemSettlement.yesShares,
+            noShares: redeemSettlement.noShares,
+            pairedShares: redeemSettlement.pairedShares,
+            actualPayoutUsd: redeemSettlement.actualPayoutUsd,
             costBasis: entry?.totalCostUsd ?? 0,
             soldShares: entry?.soldShares ?? 0,
             soldCostUsd: entry?.soldCostUsd ?? 0,
@@ -209,9 +222,12 @@ export class MarketMakerRuntime {
             dayDrawdown: dayState.drawdown,
           });
         } else {
-          logger.warn('Redeem PnL skipped — no cost basis', {
+          logger.warn('Redeem PnL skipped - no cost basis', {
             conditionId,
             redeemedShares,
+            yesShares: redeemSettlement.yesShares,
+            noShares: redeemSettlement.noShares,
+            actualPayoutUsd: redeemSettlement.actualPayoutUsd,
             reason: 'Position may have been opened before bot restart or by another system',
           });
         }
@@ -2827,6 +2843,50 @@ function resolveRedeemTimestamp(timestampMs: unknown): Date {
 
   const timestamp = new Date(numeric);
   return Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
+}
+
+function resolveRedeemSettlementAmounts(params: {
+  redeemedShares: unknown;
+  yesShares: unknown;
+  noShares: unknown;
+}): {
+  redeemedShares: number;
+  yesShares: number;
+  noShares: number;
+  pairedShares: number;
+  actualPayoutUsd: number;
+} {
+  const redeemedShares = normalizeRedeemSettlementShares(params.redeemedShares);
+  const yesShares = normalizeRedeemSettlementShares(params.yesShares);
+  const noShares = normalizeRedeemSettlementShares(params.noShares);
+  const pairedShares = roundTo(Math.min(yesShares, noShares), 4);
+
+  let actualPayoutUsd = redeemedShares;
+  if (yesShares > 0 && noShares > 0) {
+    actualPayoutUsd = pairedShares;
+  } else if (yesShares > 0) {
+    actualPayoutUsd = yesShares;
+  } else if (noShares > 0) {
+    actualPayoutUsd = noShares;
+  }
+
+  return {
+    redeemedShares,
+    yesShares,
+    noShares,
+    pairedShares,
+    actualPayoutUsd: roundTo(Math.max(0, actualPayoutUsd), 4),
+  };
+}
+
+function normalizeRedeemSettlementShares(value: unknown): number {
+  const numeric =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number.parseFloat(value)
+        : Number.NaN;
+  return Number.isFinite(numeric) ? roundTo(Math.max(0, numeric), 4) : 0;
 }
 
 export function shouldDeferSignalForSettlement(params: {

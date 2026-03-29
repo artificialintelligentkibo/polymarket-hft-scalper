@@ -63,7 +63,99 @@ test('cost basis ledger tracks SELL fills against remaining basis', () => {
   assert.equal(entry.soldProceeds, 2.8);
 });
 
-test('cost basis ledger calculates redeem pnl for a full hold', () => {
+test('cost basis ledger calculates paired redeem pnl without phantom profit', () => {
+  const ledger = new CostBasisLedger();
+  ledger.recordBuy({
+    conditionId: 'cond-1',
+    marketTitle: 'BTC up/down',
+    shares: 6,
+    price: 0.5,
+  });
+  ledger.recordBuy({
+    conditionId: 'cond-1',
+    marketTitle: 'BTC up/down',
+    shares: 6,
+    price: 0.5,
+  });
+
+  const result = ledger.calculateRedeemPnl('cond-1', 12, 6);
+  assert.equal(result.found, true);
+  assert.equal(result.remainingShares, 12);
+  assert.equal(result.remainingCost, 6);
+  assert.equal(result.redeemPayout, 6);
+  assert.equal(result.pnl, 0);
+});
+
+test('cost basis ledger calculates profitable paired redeem pnl from actual payout', () => {
+  const ledger = new CostBasisLedger();
+  ledger.recordBuy({
+    conditionId: 'cond-1',
+    marketTitle: 'BTC up/down',
+    shares: 6,
+    price: 0.4,
+  });
+  ledger.recordBuy({
+    conditionId: 'cond-1',
+    marketTitle: 'BTC up/down',
+    shares: 6,
+    price: 0.4,
+  });
+
+  const result = ledger.calculateRedeemPnl('cond-1', 12, 6);
+  assert.equal(result.found, true);
+  assert.equal(result.remainingShares, 12);
+  assert.equal(result.remainingCost, 4.8);
+  assert.equal(result.redeemPayout, 6);
+  assert.equal(result.pnl, 1.2);
+});
+
+test('cost basis ledger calculates redeem pnl after partial sells using actual payout', () => {
+  const ledger = new CostBasisLedger();
+  ledger.recordBuy({
+    conditionId: 'cond-1',
+    marketTitle: 'BTC up/down',
+    shares: 6,
+    price: 0.5,
+  });
+  ledger.recordBuy({
+    conditionId: 'cond-1',
+    marketTitle: 'BTC up/down',
+    shares: 6,
+    price: 0.5,
+  });
+  ledger.recordSell({
+    conditionId: 'cond-1',
+    shares: 6,
+    price: 0.8,
+  });
+
+  const realizedSellPnl = 1.8;
+  const redeem = ledger.calculateRedeemPnl('cond-1', 6, 6);
+  assert.equal(redeem.remainingShares, 6);
+  assert.equal(redeem.remainingCost, 3);
+  assert.equal(redeem.redeemPayout, 6);
+  assert.equal(redeem.pnl, 3);
+  assert.equal(realizedSellPnl + redeem.pnl, 4.8);
+});
+
+test('cost basis ledger calculates single-sided winning redeem pnl from actual payout', () => {
+  const ledger = new CostBasisLedger();
+  ledger.recordBuy({
+    conditionId: 'cond-1',
+    marketTitle: 'ETH up',
+    shares: 6,
+    price: 0.3,
+  });
+
+  const result = ledger.calculateRedeemPnl('cond-1', 6, 6);
+  assert.equal(result.found, true);
+  assert.equal(result.remainingShares, 6);
+  assert.equal(result.remainingCost, 1.8);
+  assert.equal(result.redeemPayout, 6);
+  assert.equal(result.pnl, 4.2);
+});
+
+test('cost basis ledger retains backward-compatible redeem payout when actual payout is omitted', () => {
   const ledger = new CostBasisLedger();
   ledger.recordBuy({
     conditionId: 'cond-1',
@@ -74,13 +166,11 @@ test('cost basis ledger calculates redeem pnl for a full hold', () => {
 
   const result = ledger.calculateRedeemPnl('cond-1', 10);
   assert.equal(result.found, true);
-  assert.equal(result.remainingShares, 10);
-  assert.equal(result.remainingCost, 5);
   assert.equal(result.redeemPayout, 10);
   assert.equal(result.pnl, 5);
 });
 
-test('cost basis ledger calculates redeem pnl after partial sells', () => {
+test('cost basis ledger records zero-payout redeems as losses on remaining cost basis', () => {
   const ledger = new CostBasisLedger();
   ledger.recordBuy({
     conditionId: 'cond-1',
@@ -88,38 +178,11 @@ test('cost basis ledger calculates redeem pnl after partial sells', () => {
     shares: 10,
     price: 0.5,
   });
-  ledger.recordSell({
-    conditionId: 'cond-1',
-    shares: 4,
-    price: 0.7,
-  });
 
-  const result = ledger.calculateRedeemPnl('cond-1', 6);
+  const result = ledger.calculateRedeemPnl('cond-1', 10, 0);
   assert.equal(result.found, true);
-  assert.equal(result.remainingShares, 6);
-  assert.equal(result.remainingCost, 3);
-  assert.equal(result.redeemPayout, 6);
-  assert.equal(result.pnl, 3);
-});
-
-test('cost basis ledger avoids double counting between sell pnl and redeem pnl', () => {
-  const ledger = new CostBasisLedger();
-  ledger.recordBuy({
-    conditionId: 'cond-1',
-    marketTitle: 'ETH up',
-    shares: 10,
-    price: 0.5,
-  });
-  ledger.recordSell({
-    conditionId: 'cond-1',
-    shares: 4,
-    price: 0.7,
-  });
-
-  const realizedSellPnl = 0.8;
-  const redeem = ledger.calculateRedeemPnl('cond-1', 6);
-  assert.equal(redeem.pnl, 3);
-  assert.equal(realizedSellPnl + redeem.pnl, 3.8);
+  assert.equal(result.redeemPayout, 0);
+  assert.equal(result.pnl, -5);
 });
 
 test('cost basis ledger returns zero pnl for zero-share redeem payloads', () => {
@@ -131,7 +194,7 @@ test('cost basis ledger returns zero pnl for zero-share redeem payloads', () => 
     price: 0.5,
   });
 
-  const result = ledger.calculateRedeemPnl('cond-1', 0);
+  const result = ledger.calculateRedeemPnl('cond-1', 0, 0);
   assert.equal(result.found, true);
   assert.equal(result.pnl, 0);
   assert.equal(result.redeemPayout, 0);
