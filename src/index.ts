@@ -20,7 +20,7 @@ import {
   validateConfig,
 } from './config.js';
 import { CostBasisLedger } from './cost-basis-ledger.js';
-import { getDayPnlState, recordDayPnlDelta } from './day-pnl-state.js';
+import { getDayPnlState } from './day-pnl-state.js';
 import { FillTracker, type ConfirmedFill } from './fill-tracker.js';
 import { buildFlattenSignals } from './flatten-signals.js';
 import { logger, TradeLogger } from './logger.js';
@@ -191,53 +191,22 @@ export class MarketMakerRuntime {
 
       this.resetRedeemPnlDayIfNeeded(redeemedAt);
       if (conditionId && redeemedShares > 0) {
-        let dayStateOverride:
-          | {
-              totalDayPnl: number;
-              dayDrawdown: number;
-            }
-          | null = null;
         const entry = this.costBasisLedger.get(conditionId);
-        const result = this.costBasisLedger.calculateRedeemPnl(
+        logger.warn('Redeem PnL deferred - payout not verified', {
           conditionId,
+          title: String(payload?.title ?? entry?.marketTitle ?? 'Unknown'),
           redeemedShares,
-          redeemSettlement.actualPayoutUsd
-        );
-        if (result.found && Number.isFinite(result.pnl)) {
-          const dayState = recordDayPnlDelta(result.pnl, redeemedAt, config);
-          this.redeemPnlToday = roundTo(this.redeemPnlToday + result.pnl, 4);
-          logger.info('Redeem PnL recorded', {
-            conditionId,
-            title: String(payload?.title ?? entry?.marketTitle ?? 'Unknown'),
-            redeemedShares,
-            yesShares: redeemSettlement.yesShares,
-            noShares: redeemSettlement.noShares,
-            pairedShares: redeemSettlement.pairedShares,
-            actualPayoutUsd: redeemSettlement.actualPayoutUsd,
-            costBasis: entry?.totalCostUsd ?? 0,
-            soldShares: entry?.soldShares ?? 0,
-            soldCostUsd: entry?.soldCostUsd ?? 0,
-            soldProceeds: entry?.soldProceeds ?? 0,
-            remainingShares: result.remainingShares,
-            remainingCost: result.remainingCost,
-            redeemPayout: result.redeemPayout,
-            redeemPnl: result.pnl,
-            newDayPnl: dayState.dayPnl,
-          });
-          dayStateOverride = {
-            totalDayPnl: dayState.dayPnl,
-            dayDrawdown: dayState.drawdown,
-          };
-        } else {
-          logger.warn('Redeem PnL skipped - no cost basis', {
-            conditionId,
-            redeemedShares,
-            yesShares: redeemSettlement.yesShares,
-            noShares: redeemSettlement.noShares,
-            actualPayoutUsd: redeemSettlement.actualPayoutUsd,
-            reason: 'Position may have been opened before bot restart or by another system',
-          });
-        }
+          yesShares: redeemSettlement.yesShares,
+          noShares: redeemSettlement.noShares,
+          pairedShares: redeemSettlement.pairedShares,
+          costBasisFound: Boolean(entry),
+          costBasis: entry?.totalCostUsd ?? 0,
+          soldShares: entry?.soldShares ?? 0,
+          soldCostUsd: entry?.soldCostUsd ?? 0,
+          soldProceeds: entry?.soldProceeds ?? 0,
+          reason:
+            'Resolution-aware redeem settlement is not implemented yet; skipping redeem PnL to avoid phantom profits',
+        });
 
         this.costBasisLedger.consume(conditionId);
         this.clearDustAbandonmentForCondition(conditionId);
@@ -248,7 +217,7 @@ export class MarketMakerRuntime {
             marketIds: clearedMarketIds,
           });
         }
-        this.syncRuntimeStatus(dayStateOverride ?? {});
+        this.syncRuntimeStatus({});
       }
       if (this.productTestMode.isCompleted()) {
         logger.info('PRODUCT_TEST_MODE completed after redeem success');
@@ -2964,28 +2933,17 @@ function resolveRedeemSettlementAmounts(params: {
   yesShares: number;
   noShares: number;
   pairedShares: number;
-  actualPayoutUsd: number;
 } {
   const redeemedShares = normalizeRedeemSettlementShares(params.redeemedShares);
   const yesShares = normalizeRedeemSettlementShares(params.yesShares);
   const noShares = normalizeRedeemSettlementShares(params.noShares);
   const pairedShares = roundTo(Math.min(yesShares, noShares), 4);
 
-  let actualPayoutUsd = redeemedShares;
-  if (yesShares > 0 && noShares > 0) {
-    actualPayoutUsd = pairedShares;
-  } else if (yesShares > 0) {
-    actualPayoutUsd = yesShares;
-  } else if (noShares > 0) {
-    actualPayoutUsd = noShares;
-  }
-
   return {
     redeemedShares,
     yesShares,
     noShares,
     pairedShares,
-    actualPayoutUsd: roundTo(Math.max(0, actualPayoutUsd), 4),
   };
 }
 

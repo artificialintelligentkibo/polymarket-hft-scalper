@@ -19,7 +19,7 @@ test('runtime status reads and writes day pnl from day-pnl-state as the source o
     STATE_FILE: './reports/runtime-status-truth/state.json',
     MAX_DRAWDOWN_USDC: '-100',
   });
-  const now = new Date('2026-03-29T12:10:00.000Z');
+  const now = new Date();
 
   recordDayPnlDelta(12, now, runtimeConfig);
   recordDayPnlDelta(-4, now, runtimeConfig);

@@ -625,6 +625,45 @@ test('redeem-success clears local runtime positions for settled conditions', () 
   assert.equal(runtime.positions.has(market.marketId), false);
 });
 
+test('redeem-success defers live redeem pnl until payout is verified', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.5,
+  });
+
+  runtime.markets.set(market.marketId, market);
+  runtime.positions.set(market.marketId, positionManager);
+  let syncedOverrides: Record<string, unknown> | null = null;
+  runtime.syncRuntimeStatus = (overrides: Record<string, unknown>) => {
+    syncedOverrides = overrides;
+  };
+  runtime.costBasisLedger.recordBuy({
+    conditionId: market.conditionId,
+    marketTitle: market.title,
+    shares: 6,
+    price: 0.5,
+  });
+
+  runtime.redeemer.emit('redeem-success', {
+    timestampMs: Date.now(),
+    conditionId: market.conditionId,
+    title: market.title,
+    redeemedAmount: 6,
+    yesShares: 6,
+    noShares: 0,
+  });
+
+  assert.equal(runtime.redeemPnlToday, 0);
+  assert.equal(runtime.costBasisLedger.size, 0);
+  assert.equal(runtime.positions.has(market.marketId), false);
+  assert.deepEqual(syncedOverrides, {});
+});
+
 test('live wallet reconciliation clears zero-balance ghost positions', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const market = createMarket();

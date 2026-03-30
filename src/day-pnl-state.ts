@@ -29,6 +29,7 @@ interface PersistedDayPnlState {
 }
 
 let stateCache: PersistedDayPnlState | null = null;
+let stateCacheFilePath: string | null = null;
 
 export function getDayPnlState(
   now: Date = new Date(),
@@ -91,6 +92,7 @@ export function isEntryHalted(
 
 export function resetDayPnlStateCache(): void {
   stateCache = null;
+  stateCacheFilePath = null;
 }
 
 export function resetDayPnlState(
@@ -99,14 +101,19 @@ export function resetDayPnlState(
 ): DayPnlStateSnapshot {
   const next = createEmptyState(formatDayKey(now), now.toISOString());
   stateCache = next;
+  stateCacheFilePath = resolveStateFilePath(runtimeConfig);
   persistState(next, runtimeConfig);
   return { ...next };
 }
 
 export function clearDayPnlStateFile(runtimeConfig: AppConfig = config): void {
-  stateCache = null;
+  const targetFilePath = resolveStateFilePath(runtimeConfig);
+  if (stateCacheFilePath === targetFilePath) {
+    stateCache = null;
+    stateCacheFilePath = null;
+  }
   try {
-    rmSync(resolveStateFilePath(runtimeConfig), { force: true });
+    rmSync(targetFilePath, { force: true });
   } catch {
     // ignore reset cleanup failures
   }
@@ -117,17 +124,24 @@ function loadOrCreateState(
   runtimeConfig: AppConfig
 ): PersistedDayPnlState {
   const currentDayKey = formatDayKey(now);
-  if (stateCache && stateCache.dayKey === currentDayKey) {
+  const stateFilePath = resolveStateFilePath(runtimeConfig);
+  if (
+    stateCache &&
+    stateCache.dayKey === currentDayKey &&
+    stateCacheFilePath === stateFilePath
+  ) {
     return stateCache;
   }
 
   const persisted = readPersistedState(runtimeConfig);
   if (persisted && persisted.dayKey === currentDayKey) {
     stateCache = normalizeState(persisted, currentDayKey, persisted.updatedAt);
+    stateCacheFilePath = stateFilePath;
     return stateCache;
   }
 
   stateCache = createEmptyState(currentDayKey, now.toISOString());
+  stateCacheFilePath = stateFilePath;
   persistState(stateCache, runtimeConfig);
   return stateCache;
 }
