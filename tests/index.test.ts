@@ -827,6 +827,78 @@ test('live wallet reconciliation preserves positions with non-zero balances', as
   assert.equal(runtime.positions.has(market.marketId), true);
 });
 
+test('wallet-backed live positions appear in runtime snapshots even without local fill state', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.walletPositionSnapshots = new Map([
+    [
+      'wallet-market-1',
+      {
+        marketId: 'wallet-market-1',
+        title: 'Bitcoin Up or Down - March 30, 9:55AM',
+        slotStart: null,
+        slotEnd: null,
+        dustAbandoned: false,
+        yesShares: 6,
+        noShares: 0,
+        grossExposureShares: 6,
+        markValueUsd: 0.03,
+        unrealizedPnl: -2.25,
+        totalPnl: -2.25,
+        roiPct: -98.68,
+        updatedAt: new Date().toISOString(),
+      },
+    ],
+  ]);
+  const snapshots = runtime.buildRuntimePositionSnapshots();
+
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0]?.marketId, 'wallet-market-1');
+  assert.equal(snapshots[0]?.yesShares, 6);
+  assert.equal(snapshots[0]?.totalPnl, -2.25);
+});
+
+test('wallet-backed live positions enrich local runtime snapshots with actual wallet shares', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 4,
+    price: 0.4,
+  });
+
+  runtime.markets.set(market.marketId, market);
+  runtime.positions.set(market.marketId, positionManager);
+  runtime.walletPositionSnapshots = new Map([
+    [
+      market.marketId,
+      {
+        marketId: market.marketId,
+        title: market.title,
+        slotStart: null,
+        slotEnd: null,
+        dustAbandoned: false,
+        yesShares: 6,
+        noShares: 0,
+        grossExposureShares: 6,
+        markValueUsd: 2.28,
+        unrealizedPnl: -2.25,
+        totalPnl: -2.25,
+        roiPct: -98.68,
+        updatedAt: new Date().toISOString(),
+      },
+    ],
+  ]);
+  const snapshots = runtime.buildRuntimePositionSnapshots();
+
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0]?.marketId, market.marketId);
+  assert.equal(snapshots[0]?.yesShares, 6);
+  assert.equal(snapshots[0]?.markValueUsd, 2.28);
+  assert.equal(snapshots[0]?.totalPnl, -2.25);
+});
+
 test('pending quote exposure counts only remaining BUY quote shares', () => {
   const runtime = new MarketMakerRuntime() as any;
   runtime.fillTracker = {

@@ -157,3 +157,54 @@ test('dashboard day pnl display prefers day-pnl-state over stale runtime status 
   rmSync(stateFile, { force: true });
   resetDayPnlStateCache();
 });
+
+test('dashboard day pnl display refreshes when day state file changes on disk', async () => {
+  const stateFile = path.resolve(process.cwd(), 'reports', 'cli-day-pnl-refresh.json');
+  rmSync(stateFile, { force: true });
+  resetDayPnlStateCache();
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    STATE_FILE: './reports/cli-day-pnl-refresh.json',
+    MAX_DRAWDOWN_USDC: '-100',
+  });
+  const now = new Date('2026-03-30T13:52:30.000Z');
+
+  recordDayPnlDelta(1.44, now, runtimeConfig);
+
+  const first = resolveDisplayedDayPnl({
+    runtimeConfig,
+    now,
+  });
+  assert.equal(first.totalDayPnl, 1.44);
+  assert.equal(first.drawdown, 0);
+
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  writeFileSync(
+    stateFile,
+    `${JSON.stringify(
+      {
+        dayKey: '2026-03-30',
+        dayPnl: -0.83,
+        peakPnl: 4.93,
+        drawdown: -5.76,
+        tradingHalted: false,
+        haltReason: null,
+        updatedAt: '2026-03-30T13:52:25.000Z',
+      },
+      null,
+      2
+    )}\n`,
+    'utf8'
+  );
+
+  const refreshed = resolveDisplayedDayPnl({
+    runtimeConfig,
+    now,
+  });
+  assert.equal(refreshed.totalDayPnl, -0.83);
+  assert.equal(refreshed.drawdown, -5.76);
+
+  rmSync(stateFile, { force: true });
+  resetDayPnlStateCache();
+});

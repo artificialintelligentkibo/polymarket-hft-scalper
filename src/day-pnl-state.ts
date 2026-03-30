@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { config, type AppConfig } from './config.js';
 import { formatDayKey, roundTo } from './utils.js';
@@ -30,6 +30,7 @@ interface PersistedDayPnlState {
 
 let stateCache: PersistedDayPnlState | null = null;
 let stateCacheFilePath: string | null = null;
+let stateCacheMtimeMs: number | null = null;
 
 export function getDayPnlState(
   now: Date = new Date(),
@@ -93,6 +94,7 @@ export function isEntryHalted(
 export function resetDayPnlStateCache(): void {
   stateCache = null;
   stateCacheFilePath = null;
+  stateCacheMtimeMs = null;
 }
 
 export function resetDayPnlState(
@@ -111,6 +113,7 @@ export function clearDayPnlStateFile(runtimeConfig: AppConfig = config): void {
   if (stateCacheFilePath === targetFilePath) {
     stateCache = null;
     stateCacheFilePath = null;
+    stateCacheMtimeMs = null;
   }
   try {
     rmSync(targetFilePath, { force: true });
@@ -125,11 +128,30 @@ function loadOrCreateState(
 ): PersistedDayPnlState {
   const currentDayKey = formatDayKey(now);
   const stateFilePath = resolveStateFilePath(runtimeConfig);
+  const fileMtimeMs = readStateFileMtimeMs(stateFilePath);
   if (
     stateCache &&
     stateCache.dayKey === currentDayKey &&
     stateCacheFilePath === stateFilePath
   ) {
+    if (fileMtimeMs === null) {
+      stateCache = createEmptyState(currentDayKey, now.toISOString());
+      persistState(stateCache, runtimeConfig);
+      return stateCache;
+    }
+
+    if (stateCacheMtimeMs !== null && fileMtimeMs <= stateCacheMtimeMs) {
+      return stateCache;
+    }
+
+    const refreshed = readPersistedState(runtimeConfig);
+    if (refreshed && refreshed.dayKey === currentDayKey) {
+      stateCache = normalizeState(refreshed, currentDayKey, refreshed.updatedAt);
+      stateCacheFilePath = stateFilePath;
+      stateCacheMtimeMs = fileMtimeMs;
+      return stateCache;
+    }
+
     return stateCache;
   }
 
@@ -137,6 +159,7 @@ function loadOrCreateState(
   if (persisted && persisted.dayKey === currentDayKey) {
     stateCache = normalizeState(persisted, currentDayKey, persisted.updatedAt);
     stateCacheFilePath = stateFilePath;
+    stateCacheMtimeMs = fileMtimeMs;
     return stateCache;
   }
 
@@ -173,6 +196,7 @@ function persistState(state: PersistedDayPnlState, runtimeConfig: AppConfig): vo
   const filePath = resolveStateFilePath(runtimeConfig);
   mkdirSync(path.dirname(filePath), { recursive: true });
   writeFileSync(filePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  stateCacheMtimeMs = readStateFileMtimeMs(filePath);
 }
 
 function normalizeState(
@@ -208,6 +232,17 @@ function createEmptyState(dayKey: string, updatedAt: string): PersistedDayPnlSta
 
 function resolveStateFilePath(runtimeConfig: AppConfig): string {
   return path.resolve(process.cwd(), runtimeConfig.STATE_FILE);
+}
+
+function readStateFileMtimeMs(filePath: string): number | null {
+  try {
+    if (!existsSync(filePath)) {
+      return null;
+    }
+    return statSync(filePath).mtimeMs;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeFinite(value: unknown): number {

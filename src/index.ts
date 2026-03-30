@@ -85,11 +85,15 @@ import {
   isQuotingSignalType,
   type StrategySignal,
 } from './strategy-types.js';
-import { formatDayKey, pruneSetEntries, roundTo, sleep } from './utils.js';
+import { formatDayKey, pruneSetEntries, roundTo, safeNumber, sleep } from './utils.js';
 
 const MAX_TRACKED_SLOT_REPORTS = 2_048;
 const UNCONFIRMED_ORDER_COOLDOWN_MS = 15_000;
 const LIVE_POSITION_RECONCILIATION_EPSILON = 0.0001;
+const POSITIONS_API_URL = 'https://data-api.polymarket.com/positions';
+const POSITIONS_PAGE_LIMIT = 500;
+const MAX_POSITION_PAGES = 10;
+const LIVE_WALLET_POSITION_REFRESH_MS = 10_000;
 
 interface SignalExecutionCandidate {
   readonly signal: StrategySignal;
@@ -158,6 +162,8 @@ export class MarketMakerRuntime {
   private readonly settlementStartedAt = new Map<string, number>();
   private readonly settlementAttempts = new Map<string, number>();
   private readonly paperResolutionTimers = new Map<string, NodeJS.Timeout>();
+  private walletPositionSnapshots = new Map<string, RuntimePositionSnapshot>();
+  private lastWalletPositionRefreshAtMs = 0;
   private userStreamCredentials: {
     apiKey: string;
     secret: string;
@@ -546,6 +552,7 @@ export class MarketMakerRuntime {
     for (const market of markets) {
       this.markets.set(market.marketId, market);
     }
+    await this.refreshWalletPositionSnapshots();
     await this.reconcileLivePositionsWithWallet();
     this.syncRuntimeStatus({
       running: true,
@@ -1804,6 +1811,162 @@ export class MarketMakerRuntime {
     }
   }
 
+  /**
+   * Refreshes wallet-backed live positions so the dashboard can show holdings
+   * that were opened before the current process started or outside local memory.
+   */
+  private async refreshWalletPositionSnapshots(force = false): Promise<void> {
+    if (isDryRunMode(config) || isPaperTradingEnabled(config)) {
+      this.walletPositionSnapshots = new Map();
+      this.lastWalletPositionRefreshAtMs = 0;
+      return;
+    }
+
+    const positionsUser = this.resolvePositionsApiUser();
+    if (!positionsUser) {
+      return;
+    }
+
+    const nowMs = Date.now();
+    if (!force && nowMs - this.lastWalletPositionRefreshAtMs < LIVE_WALLET_POSITION_REFRESH_MS) {
+      return;
+    }
+
+    try {
+      const snapshots = await this.fetchWalletPositionSnapshots(positionsUser);
+      this.walletPositionSnapshots = new Map(
+        snapshots.map((snapshot) => [snapshot.marketId, snapshot] as const)
+      );
+      this.lastWalletPositionRefreshAtMs = nowMs;
+    } catch (error: any) {
+      logger.debug('Wallet position snapshot refresh failed', {
+        positionsUser,
+        message: error?.message || 'Unknown error',
+      });
+    }
+  }
+
+  /**
+   * Returns the wallet address that should be used for live position polling.
+   */
+  private resolvePositionsApiUser(): string | null {
+    const funderAddress = String(config.auth.funderAddress || '').trim();
+    return funderAddress || null;
+  }
+
+  /**
+   * Fetches open wallet positions from Polymarket's positions API and converts
+   * them into dashboard/runtime snapshots.
+   */
+  private async fetchWalletPositionSnapshots(
+    positionsUser: string
+  ): Promise<RuntimePositionSnapshot[]> {
+    const grouped = new Map<
+      string,
+      {
+        title: string;
+        yesShares: number;
+        noShares: number;
+        markValueUsd: number;
+        totalPnl: number;
+        roiPct: number | null;
+      }
+    >();
+
+    for (let page = 0; page < MAX_POSITION_PAGES; page += 1) {
+      const offset = page * POSITIONS_PAGE_LIMIT;
+      const url = new URL(POSITIONS_API_URL);
+      url.searchParams.set('user', positionsUser.toLowerCase());
+      url.searchParams.set('sizeThreshold', '0');
+      url.searchParams.set('limit', String(POSITIONS_PAGE_LIMIT));
+      url.searchParams.set('offset', String(offset));
+
+      const response = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`Positions API returned ${response.status} ${response.statusText}`);
+      }
+
+      const payload = (await response.json()) as unknown;
+      const rows = Array.isArray(payload) ? payload : [];
+      for (const row of rows) {
+        const normalized = normalizeWalletPositionRow(row);
+        if (!normalized) {
+          continue;
+        }
+
+        const existing = grouped.get(normalized.marketId) ?? {
+          title: normalized.title,
+          yesShares: 0,
+          noShares: 0,
+          markValueUsd: 0,
+          totalPnl: 0,
+          roiPct: null,
+        };
+
+        if (normalized.outcome === 'YES') {
+          existing.yesShares = roundTo(existing.yesShares + normalized.shares, 4);
+        } else {
+          existing.noShares = roundTo(existing.noShares + normalized.shares, 4);
+        }
+
+        existing.title = existing.title || normalized.title;
+        existing.markValueUsd = roundTo(existing.markValueUsd + normalized.markValueUsd, 4);
+        existing.totalPnl = roundTo(existing.totalPnl + normalized.totalPnl, 4);
+        existing.roiPct =
+          normalized.roiPct !== null
+            ? roundTo(
+                (existing.roiPct ?? 0) + normalized.roiPct,
+                4
+              )
+            : existing.roiPct;
+
+        grouped.set(normalized.marketId, existing);
+      }
+
+      if (rows.length < POSITIONS_PAGE_LIMIT) {
+        break;
+      }
+    }
+
+    const snapshots: RuntimePositionSnapshot[] = [];
+    for (const [marketId, snapshot] of grouped.entries()) {
+      const grossExposureShares = roundTo(snapshot.yesShares + snapshot.noShares, 4);
+      if (grossExposureShares <= LIVE_POSITION_RECONCILIATION_EPSILON) {
+        continue;
+      }
+
+      const roiPct =
+        snapshot.roiPct !== null
+          ? roundTo(snapshot.roiPct, 2)
+          : snapshot.markValueUsd > 0
+            ? roundTo((snapshot.totalPnl / snapshot.markValueUsd) * 100, 2)
+            : null;
+
+      snapshots.push({
+        marketId,
+        title: snapshot.title || marketId,
+        slotStart: null,
+        slotEnd: null,
+        dustAbandoned: false,
+        yesShares: roundTo(snapshot.yesShares, 4),
+        noShares: roundTo(snapshot.noShares, 4),
+        grossExposureShares,
+        markValueUsd: roundTo(snapshot.markValueUsd, 2),
+        unrealizedPnl: roundTo(snapshot.totalPnl, 2),
+        totalPnl: roundTo(snapshot.totalPnl, 2),
+        roiPct,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    return snapshots.sort((left, right) => Math.abs(right.markValueUsd) - Math.abs(left.markValueUsd));
+  }
+
   private filterDustAbandonedSignals(
     market: MarketCandidate,
     signals: readonly StrategySignal[]
@@ -2804,7 +2967,7 @@ export class MarketMakerRuntime {
   }
 
   private buildRuntimePositionSnapshots(): RuntimePositionSnapshot[] {
-    return Array.from(this.positions.entries())
+    const localSnapshots = Array.from(this.positions.entries())
       .map(([marketId, positionManager]) => {
         const snapshot = positionManager.getSnapshot();
         if (snapshot.grossExposureShares <= 0) {
@@ -2844,7 +3007,35 @@ export class MarketMakerRuntime {
           updatedAt: snapshot.lastUpdatedAt,
         } satisfies RuntimePositionSnapshot;
       })
-      .filter((entry): entry is RuntimePositionSnapshot => entry !== null)
+      .filter((entry): entry is RuntimePositionSnapshot => entry !== null);
+
+    const merged = new Map<string, RuntimePositionSnapshot>();
+    for (const walletSnapshot of this.walletPositionSnapshots.values()) {
+      merged.set(walletSnapshot.marketId, walletSnapshot);
+    }
+
+    for (const localSnapshot of localSnapshots) {
+      const walletSnapshot = merged.get(localSnapshot.marketId);
+      if (!walletSnapshot) {
+        merged.set(localSnapshot.marketId, localSnapshot);
+        continue;
+      }
+
+      merged.set(localSnapshot.marketId, {
+        ...localSnapshot,
+        title: localSnapshot.title || walletSnapshot.title,
+        yesShares: walletSnapshot.yesShares,
+        noShares: walletSnapshot.noShares,
+        grossExposureShares: walletSnapshot.grossExposureShares,
+        markValueUsd:
+          walletSnapshot.markValueUsd > 0 ? walletSnapshot.markValueUsd : localSnapshot.markValueUsd,
+        unrealizedPnl: walletSnapshot.unrealizedPnl,
+        totalPnl: walletSnapshot.totalPnl,
+        roiPct: walletSnapshot.roiPct,
+      });
+    }
+
+    return Array.from(merged.values())
       .sort((left, right) => Math.abs(right.markValueUsd) - Math.abs(left.markValueUsd))
       .slice(0, 8);
   }
@@ -3323,6 +3514,131 @@ export function filterSignalsForApiEntryGate(params: {
     apiEntryGateOpen: true,
     bypassed: false,
   };
+}
+
+interface NormalizedWalletPositionRow {
+  readonly marketId: string;
+  readonly title: string;
+  readonly outcome: 'YES' | 'NO';
+  readonly shares: number;
+  readonly markValueUsd: number;
+  readonly totalPnl: number;
+  readonly roiPct: number | null;
+}
+
+function normalizeWalletPositionRow(value: unknown): NormalizedWalletPositionRow | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const marketId = String(
+    record.conditionId ??
+      record.condition_id ??
+      record.market ??
+      record.marketId ??
+      record.market_id ??
+      ''
+  ).trim();
+  const title = String(record.title ?? record.question ?? marketId).trim() || marketId;
+  const shares = roundTo(
+    Math.max(0, safeNumber(record.size ?? record.balance ?? record.shares, 0)),
+    4
+  );
+  if (!marketId || shares <= LIVE_POSITION_RECONCILIATION_EPSILON) {
+    return null;
+  }
+
+  const outcome = resolveWalletPositionOutcome(record);
+  if (!outcome) {
+    return null;
+  }
+
+  const currentPrice = safeNumber(
+    record.curPrice ??
+      record.cur_price ??
+      record.currentPrice ??
+      record.current_price ??
+      record.price,
+    Number.NaN
+  );
+  const markValueUsd = roundTo(
+    Math.max(
+      0,
+      safeNumber(record.currentValue ?? record.current_value, Number.NaN)
+    ),
+    4
+  );
+  const fallbackMarkValueUsd =
+    Number.isFinite(currentPrice) && currentPrice >= 0
+      ? roundTo(shares * currentPrice, 4)
+      : 0;
+  const totalPnl = roundTo(
+    safeNumber(
+      record.cashPnl ??
+        record.cash_pnl ??
+        record.totalPnl ??
+        record.total_pnl ??
+        record.pnl,
+      0
+    ),
+    4
+  );
+  const roiPct = normalizeRuntimeNumber(
+    safeNumber(
+      record.percentPnl ??
+        record.percent_pnl ??
+        record.roi ??
+        record.roiPct ??
+        record.roi_pct,
+      Number.NaN
+    )
+  );
+
+  return {
+    marketId,
+    title,
+    outcome,
+    shares,
+    markValueUsd: markValueUsd > 0 ? markValueUsd : fallbackMarkValueUsd,
+    totalPnl,
+    roiPct: roiPct !== null ? roundTo(roiPct, 4) : null,
+  };
+}
+
+function resolveWalletPositionOutcome(
+  record: Record<string, unknown>
+): 'YES' | 'NO' | null {
+  const outcomeIndexValue = safeNumber(
+    record.outcomeIndex ?? record.outcome_index,
+    Number.NaN
+  );
+  if (outcomeIndexValue === 0) {
+    return 'YES';
+  }
+  if (outcomeIndexValue === 1) {
+    return 'NO';
+  }
+
+  const outcomeLabel = String(record.outcome ?? record.side ?? '').trim().toUpperCase();
+  if (
+    outcomeLabel === 'YES' ||
+    outcomeLabel === 'UP' ||
+    outcomeLabel === 'TRUE' ||
+    outcomeLabel === 'LONG'
+  ) {
+    return 'YES';
+  }
+  if (
+    outcomeLabel === 'NO' ||
+    outcomeLabel === 'DOWN' ||
+    outcomeLabel === 'FALSE' ||
+    outcomeLabel === 'SHORT'
+  ) {
+    return 'NO';
+  }
+
+  return null;
 }
 
 export function pruneLatencyPauseSamples(
