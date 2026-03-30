@@ -782,6 +782,100 @@ test('live wallet reconciliation preserves positions with non-zero balances', as
   assert.equal(runtime.positions.has(market.marketId), true);
 });
 
+test('pending quote exposure counts only remaining BUY quote shares', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.fillTracker = {
+    getPendingOrders: () => [
+      {
+        orderId: 'quote-buy-yes',
+        marketId: 'market-1',
+        slotKey: 'slot-1',
+        tokenId: 'yes-token',
+        outcome: 'YES',
+        side: 'BUY',
+        submittedShares: 8,
+        submittedPrice: 0.4,
+        signalType: 'MM_QUOTE_BID',
+        placedAt: Date.now(),
+        slotEndTime: new Date(Date.now() + 60_000).toISOString(),
+        lastCheckedAt: 0,
+        filledSharesSoFar: 3,
+      },
+      {
+        orderId: 'quote-buy-no',
+        marketId: 'market-1',
+        slotKey: 'slot-1',
+        tokenId: 'no-token',
+        outcome: 'NO',
+        side: 'BUY',
+        submittedShares: 2,
+        submittedPrice: 0.55,
+        signalType: 'DYNAMIC_QUOTE_BOTH',
+        placedAt: Date.now(),
+        slotEndTime: new Date(Date.now() + 60_000).toISOString(),
+        lastCheckedAt: 0,
+        filledSharesSoFar: 0,
+      },
+      {
+        orderId: 'quote-sell',
+        marketId: 'market-1',
+        slotKey: 'slot-1',
+        tokenId: 'yes-token',
+        outcome: 'YES',
+        side: 'SELL',
+        submittedShares: 5,
+        submittedPrice: 0.52,
+        signalType: 'MM_QUOTE_ASK',
+        placedAt: Date.now(),
+        slotEndTime: new Date(Date.now() + 60_000).toISOString(),
+        lastCheckedAt: 0,
+        filledSharesSoFar: 0,
+      },
+      {
+        orderId: 'non-quote-buy',
+        marketId: 'market-1',
+        slotKey: 'slot-1',
+        tokenId: 'yes-token',
+        outcome: 'YES',
+        side: 'BUY',
+        submittedShares: 9,
+        submittedPrice: 0.38,
+        signalType: 'FAIR_VALUE_BUY',
+        placedAt: Date.now(),
+        slotEndTime: new Date(Date.now() + 60_000).toISOString(),
+        lastCheckedAt: 0,
+        filledSharesSoFar: 0,
+      },
+      {
+        orderId: 'other-market',
+        marketId: 'market-2',
+        slotKey: 'slot-2',
+        tokenId: 'yes-token-2',
+        outcome: 'YES',
+        side: 'BUY',
+        submittedShares: 7,
+        submittedPrice: 0.31,
+        signalType: 'MM_QUOTE_BID',
+        placedAt: Date.now(),
+        slotEndTime: new Date(Date.now() + 60_000).toISOString(),
+        lastCheckedAt: 0,
+        filledSharesSoFar: 2,
+      },
+    ],
+  };
+
+  assert.deepEqual(runtime.getPendingQuoteExposure('market-1'), {
+    yesShares: 5,
+    noShares: 2,
+    grossExposureUsd: 3.1,
+  });
+  assert.deepEqual(runtime.getPendingQuoteExposure(), {
+    yesShares: 10,
+    noShares: 2,
+    grossExposureUsd: 4.65,
+  });
+});
+
 test('executePairedArbAtomic unwinds leg1 when leg2 does not fill', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const calls: StrategySignal[] = [];

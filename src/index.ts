@@ -21,7 +21,11 @@ import {
 } from './config.js';
 import { CostBasisLedger } from './cost-basis-ledger.js';
 import { getDayPnlState, recordDayPnlDelta } from './day-pnl-state.js';
-import { FillTracker, type ConfirmedFill } from './fill-tracker.js';
+import {
+  FillTracker,
+  type ConfirmedFill,
+  type PendingOrder,
+} from './fill-tracker.js';
 import { buildFlattenSignals } from './flatten-signals.js';
 import { logger, TradeLogger } from './logger.js';
 import {
@@ -39,6 +43,7 @@ import {
   countActiveMMMarkets,
   QuotingEngine,
   type ActiveQuoteOrder,
+  type PendingQuoteExposureSnapshot,
   type QuoteRefreshPlan,
 } from './quoting-engine.js';
 import { writeLatencyLog } from './reports.js';
@@ -626,6 +631,7 @@ export class MarketMakerRuntime {
         riskAssessment,
         quoteSignals,
         allowEntryQuotes,
+        pendingQuoteExposure: this.getPendingQuoteExposure(market.marketId),
         binanceFairValueAdjustment,
         deepBinanceAssessment,
       });
@@ -1953,6 +1959,45 @@ export class MarketMakerRuntime {
     return false;
   }
 
+  /**
+   * Aggregates unconfirmed live quote buys so MM limits treat pending bids as
+   * inventory until fills confirm or the orders disappear from tracking.
+   */
+  private getPendingQuoteExposure(
+    marketId?: string
+  ): PendingQuoteExposureSnapshot {
+    let yesShares = 0;
+    let noShares = 0;
+    let grossExposureUsd = 0;
+
+    for (const pending of this.fillTracker.getPendingOrders()) {
+      if (marketId && pending.marketId !== marketId) {
+        continue;
+      }
+      if (pending.side !== 'BUY' || !isQuotingSignalType(pending.signalType)) {
+        continue;
+      }
+
+      const remainingShares = resolvePendingOrderRemainingShares(pending);
+      if (remainingShares <= 0) {
+        continue;
+      }
+
+      if (pending.outcome === 'YES') {
+        yesShares += remainingShares;
+      } else {
+        noShares += remainingShares;
+      }
+      grossExposureUsd += remainingShares * pending.submittedPrice;
+    }
+
+    return {
+      yesShares: roundTo(yesShares, 4),
+      noShares: roundTo(noShares, 4),
+      grossExposureUsd: roundTo(grossExposureUsd, 4),
+    };
+  }
+
   private getPendingOrderKey(marketId: string, outcome: StrategySignal['outcome']): string {
     return `${marketId}:${outcome}`;
   }
@@ -2795,10 +2840,15 @@ export class MarketMakerRuntime {
           orderbook,
           positionManager,
           riskAssessment,
+          pendingQuoteExposure: this.getPendingQuoteExposure(market.marketId),
           deepBinanceAssessment,
         },
         activeQuoteOrders: plan.activeQuoteOrders,
-        currentMMExposureUsd: this.quotingEngine.getCurrentMMExposureUsd(),
+        currentMMExposureUsd: roundTo(
+          this.quotingEngine.getCurrentMMExposureUsd() +
+            this.getPendingQuoteExposure().grossExposureUsd,
+          4
+        ),
         runtimeConfig: config,
         now: new Date(),
       });
@@ -3196,6 +3246,13 @@ export function resolveReduceOnlySellGuard(params: {
     blockedRemainderShares:
       remainingShares > 0 && remainingShares < minimumShares ? remainingShares : 0,
   };
+}
+
+function resolvePendingOrderRemainingShares(pending: PendingOrder): number {
+  return roundTo(
+    Math.max(0, pending.submittedShares - pending.filledSharesSoFar),
+    4
+  );
 }
 
 export function filterSignalsForApiEntryGate(params: {

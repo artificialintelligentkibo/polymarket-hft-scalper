@@ -170,6 +170,18 @@ function createRiskAssessment(positionManager: PositionManager): RiskAssessment 
   };
 }
 
+function createPendingQuoteExposure(
+  yesShares: number,
+  noShares: number,
+  grossExposureUsd = 0
+) {
+  return {
+    yesShares,
+    noShares,
+    grossExposureUsd,
+  };
+}
+
 function seedInventory(
   positionManager: PositionManager,
   yesShares: number,
@@ -622,4 +634,93 @@ test('autonomous MM suppresses bids on a market that is over the concurrent-mark
 
   assert.equal(plan.signals.some((signal) => signal.action === 'BUY'), false);
   assert.equal(plan.signals.some((signal) => signal.action === 'SELL'), true);
+});
+
+test('autonomous MM blocks YES bids when pending YES exposure already breaches directional limit', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 6);
+
+  const runtimeConfig = createMmConfig({
+    MM_QUOTE_SHARES: '4',
+    MM_MAX_NET_DIRECTIONAL: '10',
+  });
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      pendingQuoteExposure: createPendingQuoteExposure(7, 0, 2.45),
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig,
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'YES'
+    ),
+    false
+  );
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'NO'
+    ),
+    true
+  );
+});
+
+test('autonomous MM allows YES bids again once pending YES exposure is gone', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 6);
+
+  const runtimeConfig = createMmConfig({
+    MM_QUOTE_SHARES: '4',
+    MM_MAX_NET_DIRECTIONAL: '10',
+  });
+
+  const blockedPlan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      pendingQuoteExposure: createPendingQuoteExposure(7, 0, 2.45),
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig,
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  const clearedPlan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      pendingQuoteExposure: createPendingQuoteExposure(0, 0, 0),
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig,
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(
+    blockedPlan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'YES'
+    ),
+    false
+  );
+  assert.equal(
+    clearedPlan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'YES'
+    ),
+    true
+  );
 });

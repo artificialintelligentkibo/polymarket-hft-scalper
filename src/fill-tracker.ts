@@ -228,6 +228,13 @@ export class FillTracker {
     this.orphanRealtimeFills.delete(orderId);
   }
 
+  /**
+   * Returns a snapshot of all currently tracked pending orders.
+   */
+  getPendingOrders(): PendingOrder[] {
+    return Array.from(this.pendingOrders.values(), (pending) => ({ ...pending }));
+  }
+
   getPendingCount(): number {
     return this.pendingOrders.size;
   }

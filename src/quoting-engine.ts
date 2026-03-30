@@ -34,8 +34,15 @@ export interface QuoteContext {
   readonly riskAssessment: RiskAssessment;
   readonly quoteSignals: readonly StrategySignal[];
   readonly allowEntryQuotes?: boolean;
+  readonly pendingQuoteExposure?: PendingQuoteExposureSnapshot;
   readonly binanceFairValueAdjustment?: FairValueBinanceAdjustment;
   readonly deepBinanceAssessment?: DeepBinanceAssessment;
+}
+
+export interface PendingQuoteExposureSnapshot {
+  readonly yesShares: number;
+  readonly noShares: number;
+  readonly grossExposureUsd: number;
 }
 
 export interface ActiveQuoteOrder {
@@ -241,16 +248,23 @@ function generateAutonomousQuoteSignals(params: {
 }): StrategySignal[] {
   const { context, runtimeConfig, now } = params;
   const snapshot = context.positionManager.getSnapshot();
-  const imbalancePercent = resolveInventoryImbalancePercent(snapshot);
+  const pendingQuoteExposure = normalizePendingQuoteExposure(
+    context.pendingQuoteExposure
+  );
+  const effectiveSnapshot = applyPendingQuoteExposure(snapshot, pendingQuoteExposure);
+  const imbalancePercent = resolveInventoryImbalancePercent(effectiveSnapshot);
   const overweightOutcome =
     imbalancePercent > runtimeConfig.MAX_IMBALANCE_PERCENT
-      ? snapshot.inventoryImbalance > 0
+      ? effectiveSnapshot.inventoryImbalance > 0
         ? 'YES'
-        : snapshot.inventoryImbalance < 0
+        : effectiveSnapshot.inventoryImbalance < 0
           ? 'NO'
           : null
       : null;
-  const netInventory = snapshot.yesShares - snapshot.noShares;
+  const netInventory = roundTo(
+    effectiveSnapshot.yesShares - effectiveSnapshot.noShares,
+    4
+  );
   const skewFactor = runtimeConfig.MM_INVENTORY_SKEW_FACTOR;
   const skewAdjustment =
     -clamp(
@@ -263,7 +277,7 @@ function generateAutonomousQuoteSignals(params: {
     runtimeConfig.MM_MIN_SPREAD_TICKS
   );
   const builtSignals: StrategySignal[] = [];
-  let projectedExposureUsd = Math.max(0, params.currentMMExposureUsd);
+  let projectedExposureUsd = Math.max(0, roundTo(params.currentMMExposureUsd, 4));
 
   for (const outcome of ['YES', 'NO'] as const satisfies readonly Outcome[]) {
     const book = getBookForOutcome(context.orderbook, outcome);
@@ -363,14 +377,12 @@ function generateAutonomousQuoteSignals(params: {
 
     const bidShares = roundTo(runtimeConfig.MM_QUOTE_SHARES, 4);
     const bidNotionalUsd = roundTo(bidShares * bidPrice, 4);
-    const entryCapacity = context.positionManager.getAvailableEntryCapacity(outcome, {
+    const entryCapacity = resolvePendingAwareEntryCapacity({
+      outcome,
+      snapshot,
+      pendingQuoteExposure,
       maxNetYes: runtimeConfig.strategy.maxNetYes,
       maxNetNo: runtimeConfig.strategy.maxNetNo,
-      inventoryImbalanceThreshold: runtimeConfig.strategy.inventoryImbalanceThreshold,
-      inventoryRebalanceFraction: runtimeConfig.strategy.inventoryRebalanceFraction,
-      trailingTakeProfit: runtimeConfig.strategy.trailingTakeProfit,
-      hardStopLoss: runtimeConfig.strategy.hardStopLoss,
-      exitBeforeEndMs: runtimeConfig.strategy.exitBeforeEndMs,
     });
     const projectedDirectionalInventory =
       netInventory + (outcome === 'YES' ? bidShares : -bidShares);
@@ -828,6 +840,66 @@ function resolveInventoryImbalancePercent(snapshot: {
     (Math.abs(snapshot.inventoryImbalance) / snapshot.grossExposureShares) * 100,
     4
   );
+}
+
+function normalizePendingQuoteExposure(
+  exposure?: PendingQuoteExposureSnapshot | null
+): PendingQuoteExposureSnapshot {
+  return {
+    yesShares: roundTo(Math.max(0, exposure?.yesShares ?? 0), 4),
+    noShares: roundTo(Math.max(0, exposure?.noShares ?? 0), 4),
+    grossExposureUsd: roundTo(Math.max(0, exposure?.grossExposureUsd ?? 0), 4),
+  };
+}
+
+function applyPendingQuoteExposure(
+  snapshot: {
+    yesShares: number;
+    noShares: number;
+  },
+  pendingQuoteExposure: PendingQuoteExposureSnapshot
+): {
+  yesShares: number;
+  noShares: number;
+  inventoryImbalance: number;
+  grossExposureShares: number;
+} {
+  const yesShares = roundTo(
+    Math.max(0, snapshot.yesShares + pendingQuoteExposure.yesShares),
+    4
+  );
+  const noShares = roundTo(
+    Math.max(0, snapshot.noShares + pendingQuoteExposure.noShares),
+    4
+  );
+
+  return {
+    yesShares,
+    noShares,
+    inventoryImbalance: roundTo(yesShares - noShares, 4),
+    grossExposureShares: roundTo(yesShares + noShares, 4),
+  };
+}
+
+function resolvePendingAwareEntryCapacity(params: {
+  outcome: Outcome;
+  snapshot: {
+    yesShares: number;
+    noShares: number;
+  };
+  pendingQuoteExposure: PendingQuoteExposureSnapshot;
+  maxNetYes: number;
+  maxNetNo: number;
+}): number {
+  const confirmedShares =
+    params.outcome === 'YES' ? params.snapshot.yesShares : params.snapshot.noShares;
+  const pendingShares =
+    params.outcome === 'YES'
+      ? params.pendingQuoteExposure.yesShares
+      : params.pendingQuoteExposure.noShares;
+  const effectiveShares = roundTo(Math.max(0, confirmedShares + pendingShares), 4);
+  const maxShares = params.outcome === 'YES' ? params.maxNetYes : params.maxNetNo;
+  return Math.max(0, roundTo(maxShares - effectiveShares, 4));
 }
 
 function getBookForOutcome(
