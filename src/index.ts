@@ -20,7 +20,7 @@ import {
   validateConfig,
 } from './config.js';
 import { CostBasisLedger } from './cost-basis-ledger.js';
-import { getDayPnlState } from './day-pnl-state.js';
+import { getDayPnlState, recordDayPnlDelta } from './day-pnl-state.js';
 import { FillTracker, type ConfirmedFill } from './fill-tracker.js';
 import { buildFlattenSignals } from './flatten-signals.js';
 import { logger, TradeLogger } from './logger.js';
@@ -42,6 +42,11 @@ import {
   type QuoteRefreshPlan,
 } from './quoting-engine.js';
 import { writeLatencyLog } from './reports.js';
+import type { ProductTestRedeemRecord } from './product-test-mode.js';
+import {
+  ResolutionChecker,
+  resolveVerifiedRedeemPayoutUsd,
+} from './resolution-checker.js';
 import { RiskManager } from './risk-manager.js';
 import {
   resolveRuntimeMode,
@@ -115,6 +120,7 @@ export class MarketMakerRuntime {
   private readonly signalEngine = new SignalScalper();
   private readonly quotingEngine = new QuotingEngine();
   private readonly redeemer = new AutoRedeemer();
+  private readonly resolutionChecker = new ResolutionChecker();
   private readonly fillTracker = new FillTracker(
     {
       getOrderStatus: (orderId) => this.executor.getOrderStatus(orderId),
@@ -179,50 +185,11 @@ export class MarketMakerRuntime {
     });
 
     this.redeemer.on('redeem-success', (payload) => {
-      this.productTestMode.recordRedeemSuccess(payload);
-      const conditionId = String(payload?.conditionId ?? '').trim();
-      const redeemSettlement = resolveRedeemSettlementAmounts({
-        redeemedShares: payload?.redeemedAmount,
-        yesShares: payload?.yesShares,
-        noShares: payload?.noShares,
-      });
-      const redeemedShares = redeemSettlement.redeemedShares;
-      const redeemedAt = resolveRedeemTimestamp(payload?.timestampMs);
-
-      this.resetRedeemPnlDayIfNeeded(redeemedAt);
-      if (conditionId && redeemedShares > 0) {
-        const entry = this.costBasisLedger.get(conditionId);
-        logger.warn('Redeem PnL deferred - payout not verified', {
-          conditionId,
-          title: String(payload?.title ?? entry?.marketTitle ?? 'Unknown'),
-          redeemedShares,
-          yesShares: redeemSettlement.yesShares,
-          noShares: redeemSettlement.noShares,
-          pairedShares: redeemSettlement.pairedShares,
-          costBasisFound: Boolean(entry),
-          costBasis: entry?.totalCostUsd ?? 0,
-          soldShares: entry?.soldShares ?? 0,
-          soldCostUsd: entry?.soldCostUsd ?? 0,
-          soldProceeds: entry?.soldProceeds ?? 0,
-          reason:
-            'Resolution-aware redeem settlement is not implemented yet; skipping redeem PnL to avoid phantom profits',
+      void this.handleRedeemSuccess(payload).catch((error) => {
+        logger.error('Redeem success handler failed', {
+          message: error instanceof Error ? error.message : String(error),
         });
-
-        this.costBasisLedger.consume(conditionId);
-        this.clearDustAbandonmentForCondition(conditionId);
-        const clearedMarketIds = this.clearPositionStateForCondition(conditionId);
-        if (clearedMarketIds.length > 0) {
-          logger.info('Cleared local runtime positions after redeem settlement', {
-            conditionId,
-            marketIds: clearedMarketIds,
-          });
-        }
-        this.syncRuntimeStatus({});
-      }
-      if (this.productTestMode.isCompleted()) {
-        logger.info('PRODUCT_TEST_MODE completed after redeem success');
-        this.stop();
-      }
+      });
     });
 
     this.redeemer.on('redeem-failed', (payload) => {
@@ -260,6 +227,123 @@ export class MarketMakerRuntime {
         pauseSource: null,
       });
     });
+  }
+
+  private async handleRedeemSuccess(payload: unknown): Promise<void> {
+    this.productTestMode.recordRedeemSuccess(payload as ProductTestRedeemRecord);
+    const conditionId = String((payload as { conditionId?: unknown })?.conditionId ?? '').trim();
+    const redeemSettlement = resolveRedeemSettlementAmounts({
+      redeemedShares: (payload as { redeemedAmount?: unknown })?.redeemedAmount,
+      yesShares: (payload as { yesShares?: unknown })?.yesShares,
+      noShares: (payload as { noShares?: unknown })?.noShares,
+    });
+    const redeemedShares = redeemSettlement.redeemedShares;
+    const redeemedAt = resolveRedeemTimestamp(
+      (payload as { timestampMs?: unknown })?.timestampMs
+    );
+
+    this.resetRedeemPnlDayIfNeeded(redeemedAt);
+    if (conditionId && redeemedShares > 0) {
+      const entry = this.costBasisLedger.get(conditionId);
+      const market = this.findTrackedMarketByConditionId(conditionId);
+      const resolution = await this.resolutionChecker.checkResolution({
+        conditionId,
+        slug: market?.slug ?? null,
+      });
+      const actualPayoutUsd = resolveVerifiedRedeemPayoutUsd({
+        yesShares: redeemSettlement.yesShares,
+        noShares: redeemSettlement.noShares,
+        winningOutcome: resolution.winningOutcome,
+      });
+
+      let dayStateOverride:
+        | {
+            totalDayPnl: number;
+            dayDrawdown: number;
+          }
+        | null = null;
+
+      if (!entry) {
+        logger.warn('Redeem PnL skipped - no cost basis', {
+          conditionId,
+          title: String((payload as { title?: unknown })?.title ?? market?.title ?? 'Unknown'),
+          redeemedShares,
+          yesShares: redeemSettlement.yesShares,
+          noShares: redeemSettlement.noShares,
+          winningOutcome: resolution.winningOutcome,
+          yesFinalPrice: resolution.yesFinalPrice,
+          noFinalPrice: resolution.noFinalPrice,
+          reason: 'Position may have been opened before bot restart or by another system',
+        });
+      } else if (resolution.resolved && resolution.winningOutcome) {
+        const result = this.costBasisLedger.calculateRedeemPnl(
+          conditionId,
+          redeemedShares,
+          actualPayoutUsd
+        );
+        if (result.found && Number.isFinite(result.pnl)) {
+          const dayState = recordDayPnlDelta(result.pnl, redeemedAt, config);
+          this.redeemPnlToday = roundTo(this.redeemPnlToday + result.pnl, 4);
+          logger.info('Redeem PnL recorded', {
+            conditionId,
+            title: String((payload as { title?: unknown })?.title ?? entry.marketTitle ?? 'Unknown'),
+            redeemedShares,
+            yesShares: redeemSettlement.yesShares,
+            noShares: redeemSettlement.noShares,
+            pairedShares: redeemSettlement.pairedShares,
+            winningOutcome: resolution.winningOutcome,
+            yesFinalPrice: resolution.yesFinalPrice,
+            noFinalPrice: resolution.noFinalPrice,
+            actualPayoutUsd,
+            costBasis: entry.totalCostUsd,
+            soldShares: entry.soldShares,
+            soldCostUsd: entry.soldCostUsd,
+            soldProceeds: entry.soldProceeds,
+            remainingShares: result.remainingShares,
+            remainingCost: result.remainingCost,
+            redeemPayout: result.redeemPayout,
+            redeemPnl: result.pnl,
+            newDayPnl: dayState.dayPnl,
+          });
+          dayStateOverride = {
+            totalDayPnl: dayState.dayPnl,
+            dayDrawdown: dayState.drawdown,
+          };
+        }
+      } else {
+        logger.warn('Redeem PnL deferred - market resolution unavailable', {
+          conditionId,
+          title: String((payload as { title?: unknown })?.title ?? entry.marketTitle ?? 'Unknown'),
+          redeemedShares,
+          yesShares: redeemSettlement.yesShares,
+          noShares: redeemSettlement.noShares,
+          pairedShares: redeemSettlement.pairedShares,
+          yesFinalPrice: resolution.yesFinalPrice,
+          noFinalPrice: resolution.noFinalPrice,
+          costBasis: entry.totalCostUsd,
+          soldShares: entry.soldShares,
+          soldCostUsd: entry.soldCostUsd,
+          soldProceeds: entry.soldProceeds,
+          reason: 'Resolution lookup did not return a verified winning outcome',
+        });
+      }
+
+      this.costBasisLedger.consume(conditionId);
+      this.clearDustAbandonmentForCondition(conditionId);
+      const clearedMarketIds = this.clearPositionStateForCondition(conditionId);
+      if (clearedMarketIds.length > 0) {
+        logger.info('Cleared local runtime positions after redeem settlement', {
+          conditionId,
+          marketIds: clearedMarketIds,
+        });
+      }
+      this.syncRuntimeStatus(dayStateOverride ?? {});
+    }
+
+    if (this.productTestMode.isCompleted()) {
+      logger.info('PRODUCT_TEST_MODE completed after redeem success');
+      this.stop();
+    }
   }
 
   async initialize(): Promise<void> {
@@ -1628,6 +1712,16 @@ export class MarketMakerRuntime {
     }
 
     return Array.from(clearedMarketIds.values());
+  }
+
+  private findTrackedMarketByConditionId(conditionId: string): MarketCandidate | null {
+    for (const market of this.markets.values()) {
+      if (market.conditionId === conditionId) {
+        return market;
+      }
+    }
+
+    return null;
   }
 
   /**
