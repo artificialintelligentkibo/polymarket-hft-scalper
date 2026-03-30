@@ -1,6 +1,6 @@
 # Configuration Reference
 
-For a browser-friendly environment-variable guide, open [CONFIG_HELP.html](/C:/GitHub/polymarket-hft-scalper/docs/CONFIG_HELP.html). It is a visual companion to `.env.example` and is the quickest way to understand what each configuration section is used for before editing your live or paper setup.
+For a browser-friendly environment-variable guide, open [CONFIG_HELP.html](./CONFIG_HELP.html). It is a visual companion to `.env.example` and is the quickest way to understand what each configuration section is used for before editing your live or paper setup.
 
 This bot now supports four entry modes:
 
