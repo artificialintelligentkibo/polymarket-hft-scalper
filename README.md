@@ -17,7 +17,7 @@ Dual-sided Polymarket CLOB market-maker for 5-minute markets. The runtime now co
 
 ## Quick Start
 
-Use the full config reference in [docs/CONFIGURATION.md](/C:/GitHub/polymarket-hft-scalper/docs/CONFIGURATION.md) and the strategy walkthrough in [docs/STRATEGY_GUIDE.md](/C:/GitHub/polymarket-hft-scalper/docs/STRATEGY_GUIDE.md).
+Use the full config reference in [docs/CONFIGURATION.md](/C:/GitHub/polymarket-hft-scalper/docs/CONFIGURATION.md), the visual browser-friendly config helper in [docs/CONFIG_HELP.html](/C:/GitHub/polymarket-hft-scalper/docs/CONFIG_HELP.html), and the strategy walkthrough in [docs/STRATEGY_GUIDE.md](/C:/GitHub/polymarket-hft-scalper/docs/STRATEGY_GUIDE.md).
 
 Recommended first paper test:
 
@@ -127,6 +127,8 @@ tests/
 ## Key Configuration
 
 Main strategy controls live in [src/config.ts](/C:/GitHub/polymarket-hft-scalper/src/config.ts):
+
+If you want a faster way to understand what a knob does before editing `.env`, open [docs/CONFIG_HELP.html](/C:/GitHub/polymarket-hft-scalper/docs/CONFIG_HELP.html) in a browser. It mirrors the structure of `.env.example` and is meant to be used as a practical environment-variable explorer.
 
 - `MIN_COMBINED_DISCOUNT`
 - `EXTREME_SELL_THRESHOLD`
