@@ -119,6 +119,9 @@ export interface RuntimeStatusSnapshot {
   readonly mmQuoteShares: number;
   readonly mmMaxGrossExposure: number;
   readonly mmCurrentExposure: number;
+  readonly mmPendingExposure: number;
+  readonly mmPendingYesShares: number;
+  readonly mmPendingNoShares: number;
   readonly mmActiveMarkets: number;
   readonly mmMaxConcurrentMarkets: number;
   readonly mmInventorySkew: number;
@@ -185,6 +188,9 @@ export function createRuntimeStatusSnapshot(
     mmQuoteShares: runtimeConfig.MM_QUOTE_SHARES,
     mmMaxGrossExposure: runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD,
     mmCurrentExposure: 0,
+    mmPendingExposure: 0,
+    mmPendingYesShares: 0,
+    mmPendingNoShares: 0,
     mmActiveMarkets: 0,
     mmMaxConcurrentMarkets: runtimeConfig.MM_MAX_CONCURRENT_MARKETS,
     mmInventorySkew: runtimeConfig.MM_INVENTORY_SKEW_FACTOR,
@@ -322,6 +328,9 @@ function normalizeRuntimeStatus(
       runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
     ),
     mmCurrentExposure: normalizeNumber(value.mmCurrentExposure, 0),
+    mmPendingExposure: normalizeNumber(value.mmPendingExposure, 0),
+    mmPendingYesShares: normalizeNumber(value.mmPendingYesShares, 0),
+    mmPendingNoShares: normalizeNumber(value.mmPendingNoShares, 0),
     mmActiveMarkets: normalizeCount(value.mmActiveMarkets),
     mmMaxConcurrentMarkets: Math.max(
       1,

@@ -585,6 +585,8 @@ function renderMmQuotes(runtimeStatus: RuntimeStatusSnapshot | null): string {
 
   const summary = [
     `Exposure ${runtimeStatus.mmCurrentExposure.toFixed(2)}/${runtimeStatus.mmMaxGrossExposure.toFixed(2)} USDC`,
+    `Pending ${runtimeStatus.mmPendingExposure.toFixed(2)} USDC`,
+    `Pend Y/N ${runtimeStatus.mmPendingYesShares.toFixed(2)}/${runtimeStatus.mmPendingNoShares.toFixed(2)}`,
     `Markets ${runtimeStatus.mmActiveMarkets}/${runtimeStatus.mmMaxConcurrentMarkets}`,
     `Skew ${runtimeStatus.mmInventorySkew.toFixed(2)}`,
     `Net limit ${runtimeStatus.mmMaxNetDirectional.toFixed(0)} sh`,
@@ -651,6 +653,9 @@ function renderPerformance(
   const mmExposure = runtimeStatus
     ? `${runtimeStatus.mmCurrentExposure.toFixed(2)}/${runtimeStatus.mmMaxGrossExposure.toFixed(2)}`
     : 'n/a';
+  const mmPending = runtimeStatus
+    ? `${runtimeStatus.mmPendingExposure.toFixed(2)} USDC`
+    : 'n/a';
   const mmMarkets = runtimeStatus
     ? `${runtimeStatus.mmActiveMarkets}/${runtimeStatus.mmMaxConcurrentMarkets}`
     : 'n/a';
@@ -665,6 +670,7 @@ function renderPerformance(
       ['Day PnL', formatSignedCurrency(totalDayPnl), 'Drawdown', formatSignedCurrency(drawdown)],
       ['Active slots', color.bold(String(activeSlots)), 'Open positions', color.bold(String(openPositions))],
       ['MM exposure', color.bold(mmExposure), 'MM markets', color.bold(mmMarkets)],
+      ['MM pending', color.bold(mmPending), 'Pending Y/N', color.bold(runtimeStatus ? `${runtimeStatus.mmPendingYesShares.toFixed(2)}/${runtimeStatus.mmPendingNoShares.toFixed(2)}` : 'n/a')],
       ['Dust exits', color.bold(String(dustPositions)), 'Dust wait', color.bold(String(runtimeStatus?.dustAbandonedCount ?? 0))],
       ['Blocked remainder', color.bold(`${blockedExitRemainder.toFixed(4)} sh`), 'Avg latency', color.bold(averageLatency)],
       ['Latency gate', latencyGate, 'API gate', apiGate],

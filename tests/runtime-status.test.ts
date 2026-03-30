@@ -167,3 +167,34 @@ test('runtime status preserves dust abandonment fields for dashboard visibility'
   rmSync(reportsDir, { recursive: true, force: true });
   resetDayPnlStateCache();
 });
+
+test('runtime status preserves pending MM exposure fields for dashboard visibility', () => {
+  const reportsDir = path.resolve(process.cwd(), 'reports', 'runtime-status-mm-pending');
+  rmSync(reportsDir, { recursive: true, force: true });
+  mkdirSync(reportsDir, { recursive: true });
+  resetDayPnlStateCache();
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    REPORTS_DIR: './reports/runtime-status-mm-pending',
+    STATE_FILE: './reports/runtime-status-mm-pending/state.json',
+  });
+
+  const status = writeRuntimeStatus(
+    {
+      mmCurrentExposure: 7.79,
+      mmPendingExposure: 2.45,
+      mmPendingYesShares: 5,
+      mmPendingNoShares: 0,
+    },
+    runtimeConfig
+  );
+
+  assert.equal(status.mmCurrentExposure, 7.79);
+  assert.equal(status.mmPendingExposure, 2.45);
+  assert.equal(status.mmPendingYesShares, 5);
+  assert.equal(status.mmPendingNoShares, 0);
+
+  rmSync(reportsDir, { recursive: true, force: true });
+  resetDayPnlStateCache();
+});

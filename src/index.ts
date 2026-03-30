@@ -1547,6 +1547,7 @@ export class MarketMakerRuntime {
   private syncRuntimeStatus(overrides: Parameters<typeof writeRuntimeStatus>[0]): void {
     const openPositions = this.buildRuntimePositionSnapshots();
     const dayState = getDayPnlState();
+    const pendingQuoteExposure = this.getPendingQuoteExposure();
     this.resetRedeemPnlDayIfNeeded();
     this.pruneBlockedExitRemainders();
     this.pruneDustAbandonedPositions();
@@ -1582,6 +1583,9 @@ export class MarketMakerRuntime {
         mmQuoteShares: config.MM_QUOTE_SHARES,
         mmMaxGrossExposure: config.MM_MAX_GROSS_EXPOSURE_USD,
         mmCurrentExposure: this.quotingEngine.getCurrentMMExposureUsd(),
+        mmPendingExposure: pendingQuoteExposure.grossExposureUsd,
+        mmPendingYesShares: pendingQuoteExposure.yesShares,
+        mmPendingNoShares: pendingQuoteExposure.noShares,
         mmActiveMarkets: countActiveMMMarkets(this.quotingEngine),
         mmMaxConcurrentMarkets: config.MM_MAX_CONCURRENT_MARKETS,
         mmInventorySkew: config.MM_INVENTORY_SKEW_FACTOR,
