@@ -75,6 +75,7 @@ import {
   ensureSlotResult,
   getSlotMetrics,
   printSlotReport,
+  recordSettlementPnl,
   recordExecution,
   recordSkippedSignal as recordSlotReporterSkip,
   recordTrade,
@@ -287,7 +288,18 @@ export class MarketMakerRuntime {
           actualPayoutUsd
         );
         if (result.found && Number.isFinite(result.pnl)) {
-          const dayState = recordDayPnlDelta(result.pnl, redeemedAt, config);
+          const dayState = market
+            ? recordSettlementPnl({
+                slotKey: getSlotKey(market),
+                marketId: market.marketId,
+                marketTitle: market.title,
+                pnl: result.pnl,
+                outcome: resolveSlotOutcome(market, resolution.winningOutcome),
+                slotStart: market.startTime,
+                slotEnd: market.endTime,
+                now: redeemedAt,
+              })
+            : recordDayPnlDelta(result.pnl, redeemedAt, config);
           this.redeemPnlToday = roundTo(this.redeemPnlToday + result.pnl, 4);
           logger.info('Redeem PnL recorded', {
             conditionId,
@@ -341,6 +353,9 @@ export class MarketMakerRuntime {
           conditionId,
           marketIds: clearedMarketIds,
         });
+      }
+      if (market) {
+        this.writeSlotReportSnapshot(getSlotKey(market));
       }
       this.syncRuntimeStatus(dayStateOverride ?? {});
     }
@@ -2144,14 +2159,18 @@ export class MarketMakerRuntime {
     this.pendingLiveOrders.delete(key);
   }
 
+  private writeSlotReportSnapshot(slotKey: string): void {
+    printSlotReport(slotKey);
+    this.recordRuntimeSlotReport(slotKey);
+    this.notifyProductTestSlotReport(slotKey);
+  }
+
   private maybePrintSlotReport(slotKey: string): void {
     if (!this.pendingSlotReports.has(slotKey) || this.printedSlotReports.has(slotKey)) {
       return;
     }
 
-    printSlotReport(slotKey);
-    this.recordRuntimeSlotReport(slotKey);
-    this.notifyProductTestSlotReport(slotKey);
+    this.writeSlotReportSnapshot(slotKey);
     this.pendingSlotReports.delete(slotKey);
     this.printedSlotReports.add(slotKey);
     this.pruneSlotReportState();
@@ -2164,9 +2183,7 @@ export class MarketMakerRuntime {
         continue;
       }
 
-      printSlotReport(slotKey);
-      this.recordRuntimeSlotReport(slotKey);
-      this.notifyProductTestSlotReport(slotKey);
+      this.writeSlotReportSnapshot(slotKey);
       this.pendingSlotReports.delete(slotKey);
       this.printedSlotReports.add(slotKey);
     }
@@ -2569,10 +2586,26 @@ export class MarketMakerRuntime {
       pnl: resolution.pnl,
     });
 
+    recordSettlementPnl({
+      slotKey: getSlotKey(market),
+      marketId: market.marketId,
+      marketTitle: market.title,
+      pnl: resolution.pnl,
+      outcome: resolveSlotOutcome(market, winningOutcome),
+      slotStart: market.startTime,
+      slotEnd: market.endTime,
+    });
+
     this.positions.delete(market.marketId);
     this.clearDustAbandonmentForMarket(market.marketId);
     this.latestBooks.delete(market.marketId);
     this.marketActions.delete(market.marketId);
+    this.writeSlotReportSnapshot(getSlotKey(market));
+    const dayState = getDayPnlState();
+    this.syncRuntimeStatus({
+      totalDayPnl: dayState.dayPnl,
+      dayDrawdown: dayState.drawdown,
+    });
   }
 
   private getBinanceFairValueAdjustment(

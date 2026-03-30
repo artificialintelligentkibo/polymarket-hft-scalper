@@ -143,6 +143,40 @@ export function recordTrade(
   recordDayPnlDelta(pnl, new Date(data.updatedAt));
 }
 
+/**
+ * Records settlement-stage PnL for a slot without pretending it came from a
+ * regular SELL fill. This is used for paper-slot resolution and live redeem
+ * settlement, where the market is finalized outside the normal execution path.
+ */
+export function recordSettlementPnl(params: {
+  slotKey: string;
+  marketId: string;
+  marketTitle: string;
+  pnl: number;
+  outcome?: SlotOutcome | null;
+  slotStart?: string | null;
+  slotEnd?: string | null;
+  now?: Date;
+}): ReturnType<typeof getDayPnlState> {
+  const data = ensureSlotResult(
+    params.slotKey,
+    params.marketId,
+    params.marketTitle,
+    params.slotStart,
+    params.slotEnd
+  );
+  const now = params.now ?? new Date();
+  data.dayKey = formatDayKey(now);
+  if (params.outcome === 'Up') {
+    data.upPnl = roundCurrency(data.upPnl + params.pnl);
+  } else if (params.outcome === 'Down') {
+    data.downPnl = roundCurrency(data.downPnl + params.pnl);
+  }
+  data.total = roundCurrency(data.total + params.pnl);
+  data.updatedAt = now.toISOString();
+  return recordDayPnlDelta(params.pnl, now);
+}
+
 export function recordSkippedSignal(params: {
   slotKey: string;
   marketId: string;

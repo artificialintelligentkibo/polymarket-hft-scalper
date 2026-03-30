@@ -16,6 +16,8 @@ import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
 import type { MarketCandidate } from '../src/monitor.js';
 import { PositionManager } from '../src/position-manager.js';
 import type { StrategySignal } from '../src/strategy-types.js';
+import { clearDayPnlStateFile, resetDayPnlStateCache } from '../src/day-pnl-state.js';
+import { getSlotMetrics, recordSettlementPnl, resetSlotReporterState } from '../src/slot-reporter.js';
 
 function createSignal(
   overrides: Partial<StrategySignal> = {}
@@ -685,6 +687,9 @@ test('redeem-success defers live redeem pnl until payout is verified', async () 
 });
 
 test('redeem-success records redeem pnl when the winning outcome is verified', async () => {
+  resetSlotReporterState();
+  resetDayPnlStateCache();
+  clearDayPnlStateFile();
   const runtime = new MarketMakerRuntime() as any;
   const market = createMarket();
   const positionManager = new PositionManager(market.marketId, market.endTime);
@@ -733,6 +738,46 @@ test('redeem-success records redeem pnl when the winning outcome is verified', a
   assert.ok(syncedOverrides);
   assert.equal(typeof syncedOverrides['totalDayPnl'], 'number');
   assert.equal(typeof syncedOverrides['dayDrawdown'], 'number');
+  const slotMetrics = getSlotMetrics(`${market.marketId}:${market.startTime}:${market.endTime}`);
+  assert.equal(slotMetrics?.total, 3);
+  clearDayPnlStateFile();
+  resetDayPnlStateCache();
+});
+
+test('slot report snapshots reflect settlement pnl after a report refresh', () => {
+  resetSlotReporterState();
+  resetDayPnlStateCache();
+  clearDayPnlStateFile();
+
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  let syncedOverrides: Record<string, unknown> | null = null;
+  runtime.syncRuntimeStatus = (overrides: Record<string, unknown>) => {
+    syncedOverrides = overrides;
+  };
+  runtime.markets.set(market.marketId, market);
+
+  recordSettlementPnl({
+    slotKey: `${market.marketId}:${market.startTime}:${market.endTime}`,
+    marketId: market.marketId,
+    marketTitle: market.title,
+    pnl: 1.75,
+    outcome: 'Up',
+    slotStart: market.startTime,
+    slotEnd: market.endTime,
+    now: new Date(),
+  });
+
+  runtime.writeSlotReportSnapshot(`${market.marketId}:${market.startTime}:${market.endTime}`);
+
+  const slotMetrics = getSlotMetrics(`${market.marketId}:${market.startTime}:${market.endTime}`);
+  assert.equal(slotMetrics?.total, 1.75);
+  assert.equal(slotMetrics?.upPnl, 1.75);
+  assert.ok(syncedOverrides);
+  const lastSlotReport = syncedOverrides?.['lastSlotReport'] as { netPnl?: number } | undefined;
+  assert.equal(lastSlotReport?.netPnl, 1.75);
+  clearDayPnlStateFile();
+  resetDayPnlStateCache();
 });
 
 test('live wallet reconciliation clears zero-balance ghost positions', async () => {
