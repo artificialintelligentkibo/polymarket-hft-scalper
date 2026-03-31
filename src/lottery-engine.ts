@@ -4,7 +4,7 @@ import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
 import type { StrategySignal } from './strategy-types.js';
-import { roundTo } from './utils.js';
+import { clamp, roundTo } from './utils.js';
 
 export interface LotteryEntry {
   readonly marketId: string;
@@ -38,18 +38,31 @@ export class LotteryEngine {
     slotKey: string;
   }): StrategySignal | null {
     const { market, orderbook, positionManager, config, slotKey } = params;
-    if (!config.enabled) {
+    const skip = (reason: string, details?: Record<string, unknown>): null => {
+      logger.debug('Lottery ticket skipped', {
+        marketId: market.marketId,
+        triggerSignalType: params.triggerSignalType,
+        triggerOutcome: params.triggerOutcome,
+        reason,
+        details,
+      });
       return null;
+    };
+
+    if (!config.enabled) {
+      return skip('disabled');
     }
 
     if (config.onlyAfterSniper && params.triggerSignalType !== 'SNIPER_BUY') {
-      return null;
+      return skip('trigger_not_sniper');
     }
 
     const lotteryOutcome: Outcome = params.triggerOutcome === 'YES' ? 'NO' : 'YES';
     const key = this.getEntryKey(market.marketId, lotteryOutcome);
     if (this.activeEntries.has(key)) {
-      return null;
+      return skip('existing_ticket', {
+        lotteryOutcome,
+      });
     }
 
     const existingLayer = positionManager.getPositionLayer(lotteryOutcome);
@@ -58,36 +71,48 @@ export class LotteryEngine {
       existingLayer !== null &&
       existingLayer !== 'LOTTERY'
     ) {
-      return null;
+      return skip('existing_non_lottery_inventory', {
+        lotteryOutcome,
+        existingLayer,
+        shares: positionManager.getShares(lotteryOutcome),
+      });
     }
 
     const slotCount = this.slotLotteryCounts.get(slotKey) ?? 0;
     if (slotCount >= config.maxPerSlot) {
-      return null;
+      return skip('slot_limit', {
+        slotKey,
+        slotCount,
+        maxPerSlot: config.maxPerSlot,
+      });
     }
 
     const book = lotteryOutcome === 'YES' ? orderbook.yes : orderbook.no;
-    const bestAsk = book.bestAsk;
     if (
-      bestAsk === null ||
-      !Number.isFinite(bestAsk) ||
-      bestAsk < config.minCents ||
-      bestAsk > config.maxCents
+      (book.bestBid === null || !Number.isFinite(book.bestBid)) &&
+      (book.bestAsk === null || !Number.isFinite(book.bestAsk))
     ) {
-      return null;
+      return skip('missing_book_prices', {
+        lotteryOutcome,
+      });
     }
 
+    const targetPrice = roundTo(clamp(book.bestBid ?? config.maxCents, config.minCents, config.maxCents), 6);
     const shares = roundTo(
       Math.min(
-        config.maxRiskUsdc / bestAsk,
-        Math.max(0, book.depthSharesAsk),
+        config.maxRiskUsdc / targetPrice,
         config.maxRiskUsdc / config.minCents
       ),
       4
     );
-    const riskUsdc = roundTo(shares * bestAsk, 4);
+    const riskUsdc = roundTo(shares * targetPrice, 4);
     if (shares < 5 || riskUsdc < 1) {
-      return null;
+      return skip('below_clob_minimum', {
+        lotteryOutcome,
+        shares,
+        riskUsdc,
+        targetPrice,
+      });
     }
 
     logger.info('Lottery ticket generated', {
@@ -96,7 +121,9 @@ export class LotteryEngine {
       triggerOutcome: params.triggerOutcome,
       triggerFillPrice: roundTo(params.triggerFillPrice, 4),
       triggerFilledShares: roundTo(params.triggerFilledShares, 4),
-      bestAsk: roundTo(bestAsk, 4),
+      currentBestBid: book.bestBid,
+      currentBestAsk: book.bestAsk,
+      targetPrice,
       shares: roundTo(shares, 2),
       riskUsdc: roundTo(riskUsdc, 2),
       maxRiskUsdc: config.maxRiskUsdc,
@@ -112,9 +139,9 @@ export class LotteryEngine {
       outcome: lotteryOutcome,
       outcomeIndex: lotteryOutcome === 'YES' ? 0 : 1,
       shares,
-      targetPrice: roundTo(bestAsk, 6),
+      targetPrice,
       referencePrice: null,
-      tokenPrice: book.lastTradePrice ?? bestAsk,
+      tokenPrice: book.lastTradePrice ?? book.bestBid ?? book.bestAsk ?? targetPrice,
       midPrice: book.midPrice,
       fairValue: null,
       edgeAmount: 0,
@@ -129,7 +156,7 @@ export class LotteryEngine {
       urgency: 'passive',
       reduceOnly: false,
       reason:
-        `Lottery ticket: opposite-side ${lotteryOutcome}@${bestAsk.toFixed(3)} ` +
+        `Lottery ticket: resting opposite-side ${lotteryOutcome} bid @${targetPrice.toFixed(3)} ` +
         `after SNIPER ${params.triggerOutcome} fill | ` +
         `risk $${riskUsdc.toFixed(2)} / max $${config.maxRiskUsdc.toFixed(2)}`,
       strategyLayer: 'LOTTERY',

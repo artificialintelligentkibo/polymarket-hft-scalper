@@ -711,9 +711,6 @@ test('confirmed sniper buys can trigger a best-effort lottery ticket on the oppo
     const runtime = new MarketMakerRuntime() as any;
     const market = createMarket();
     const orderbook = createOrderbook();
-    orderbook.no.bestAsk = 0.05;
-    orderbook.no.midPrice = 0.05;
-    orderbook.no.lastTradePrice = 0.05;
 
     const positionManager = new PositionManager(market.marketId, market.endTime);
     const calls: string[] = [];
@@ -730,6 +727,7 @@ test('confirmed sniper buys can trigger a best-effort lottery ticket on the oppo
           assert.equal(params.signal.outcome, 'NO');
           assert.equal(params.signal.urgency, 'passive');
           assert.equal(params.signal.strategyLayer, 'LOTTERY');
+          assert.equal(params.signal.targetPrice, 0.07);
           return createExecutionReport({
             orderId: 'lottery-order',
             tokenId: 'no-token',

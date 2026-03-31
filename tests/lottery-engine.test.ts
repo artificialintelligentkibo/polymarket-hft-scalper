@@ -51,18 +51,18 @@ function createOrderbook(): MarketOrderbookSnapshot {
     },
     no: {
       tokenId: 'no-token',
-      bids: [{ price: 0.04, size: 300 }],
-      asks: [{ price: 0.05, size: 300 }],
-      bestBid: 0.04,
-      bestAsk: 0.05,
-      midPrice: 0.045,
+      bids: [{ price: 0.53, size: 300 }],
+      asks: [{ price: 0.54, size: 300 }],
+      bestBid: 0.53,
+      bestAsk: 0.54,
+      midPrice: 0.535,
       spread: 0.01,
       spreadBps: 0,
       depthSharesBid: 300,
       depthSharesAsk: 300,
-      depthNotionalBid: 12,
-      depthNotionalAsk: 15,
-      lastTradePrice: 0.045,
+      depthNotionalBid: 159,
+      depthNotionalAsk: 162,
+      lastTradePrice: 0.535,
       lastTradeSize: 15,
       source: 'rest',
       updatedAt: new Date().toISOString(),
@@ -99,7 +99,7 @@ test('lottery engine stays inert when the layer is disabled', () => {
   assert.equal(signal, null);
 });
 
-test('lottery engine generates a passive opposite-side ticket within the configured risk budget', () => {
+test('lottery engine generates a passive opposite-side resting bid within the configured risk budget', () => {
   const runtimeConfig = createConfig({
     ...process.env,
     LOTTERY_LAYER_ENABLED: 'true',
@@ -126,9 +126,9 @@ test('lottery engine generates a passive opposite-side ticket within the configu
   assert.equal(signal.outcome, 'NO');
   assert.equal(signal.urgency, 'passive');
   assert.equal(signal.reduceOnly, false);
-  assert.equal(signal.targetPrice, 0.05);
-  assert.equal(signal.shares <= 240, true);
-  assert.equal(signal.shares * (signal.targetPrice ?? 0) <= 12, true);
+  assert.equal(signal.targetPrice, 0.07);
+  assert.equal(signal.shares <= 171.43, true);
+  assert.equal(signal.shares * (signal.targetPrice ?? 0) <= 12.01, true);
 });
 
 test('lottery engine enforces one ticket per slot and tracks stats after execution', () => {

@@ -80,3 +80,33 @@ test('paper trading reports a closed CLOB circuit breaker snapshot', () => {
   assert.equal(snapshot.failureThreshold, 5);
   assert.equal(snapshot.resetTimeoutMs, 30_000);
 });
+
+test('lottery passive buys respect the configured cheap target price', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+  });
+
+  const executor = new OrderExecutor(undefined, runtimeConfig) as any;
+  const plan = executor.buildExecutionPlan(
+    createSignal({
+      signalType: 'LOTTERY_BUY',
+      urgency: 'passive',
+      targetPrice: 0.07,
+      referencePrice: 0.07,
+      tokenPrice: 0.07,
+      midPrice: 0.07,
+    }),
+    {
+      bids: [{ price: 0.53, size: 100 }],
+      asks: [{ price: 0.54, size: 100 }],
+      bestBid: 0.53,
+      bestAsk: 0.54,
+    }
+  );
+
+  assert.equal(plan.price, 0.07);
+  assert.equal(plan.postOnly, true);
+  assert.equal(plan.urgency, 'passive');
+});

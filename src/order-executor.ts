@@ -379,6 +379,16 @@ export class OrderExecutor {
     const bestAsk = book.bestAsk;
 
     if (signal.action === 'BUY') {
+      if (signal.signalType === 'LOTTERY_BUY' && effectiveUrgency !== 'cross') {
+        const makerCap = bestAsk !== null ? Math.max(0.01, bestAsk - tick) : fallbackPrice;
+        return {
+          price: roundTo(Math.min(fallbackPrice, makerCap), 6),
+          postOnly: true,
+          orderType: resolveOrderType(signal, this.runtimeConfig),
+          urgency: effectiveUrgency,
+        };
+      }
+
       if (effectiveUrgency === 'cross') {
         return {
           price: bestAsk ?? fallbackPrice,
