@@ -11,6 +11,7 @@ import {
   pruneLatencyPauseSamples,
   pruneExpiredSettlementCooldowns,
   resolveReduceOnlySellGuard,
+  resolveSettledOutcomeSellExecution,
   shouldBlockSniperSelectionForApiGate,
   shouldDeferSignalForSettlement,
 } from '../src/index.js';
@@ -440,6 +441,44 @@ test('settled outcome balance requires a small confirmation margin before SELL',
   assert.equal(hasSettledOutcomeBalance(9.9, 10), true);
 });
 
+test('settled outcome sell execution clamps live exits to tradable settled balance', () => {
+  const result = resolveSettledOutcomeSellExecution({
+    signal: createSignal({
+      signalType: 'SNIPER_SCALP_EXIT',
+      action: 'SELL',
+      reduceOnly: true,
+      outcome: 'NO',
+      outcomeIndex: 1,
+      shares: 8,
+    }),
+    availableShares: 7.7005,
+    referencePrice: 0.49,
+  });
+
+  assert.equal(result.ready, true);
+  assert.equal(result.requiredShares, 7.92);
+  assert.equal(result.availableShares, 7.7005);
+  assert.equal(result.executionShares, 7.7005);
+});
+
+test('settled outcome sell execution keeps waiting when only dust has settled', () => {
+  const result = resolveSettledOutcomeSellExecution({
+    signal: createSignal({
+      signalType: 'SNIPER_SCALP_EXIT',
+      action: 'SELL',
+      reduceOnly: true,
+      outcome: 'NO',
+      outcomeIndex: 1,
+      shares: 8,
+    }),
+    availableShares: 0.29,
+    referencePrice: 0.49,
+  });
+
+  assert.equal(result.ready, false);
+  assert.equal(result.executionShares, 0);
+});
+
 test('reduce-only sell guard blocks sub-minimum exits and reports the blocked remainder', () => {
   const result = resolveReduceOnlySellGuard({
     signal: createSignal({
@@ -652,6 +691,72 @@ test('valid SLOT_FLATTEN orders still execute normally above the minimum size', 
   assert.equal(executorCalls, 1);
   assert.equal(result?.fillConfirmed, true);
   assert.equal(runtime.dustAbandonedPositions.size, 0);
+});
+
+test('live reduce-only exits are clamped to the settled token balance after BUY fills', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'NO',
+    side: 'BUY',
+    shares: 8,
+    price: 0.49,
+  });
+
+  runtime.syncRuntimeStatus = () => {};
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.recordSkippedSignal = () => {};
+  runtime.settlementStartedAt.set('market-1:NO', Date.now() - 1_000);
+  runtime.settlementAttempts.set('market-1:NO', 0);
+
+  let submittedSignal: StrategySignal | null = null;
+  runtime.executor = {
+    getOutcomeTokenBalance: async () => 7.7005,
+    executeSignal: async (params: { signal: StrategySignal }) => {
+      submittedSignal = params.signal;
+      return createExecutionReport({
+        outcome: 'NO',
+        side: 'SELL',
+        shares: 7.7005,
+        filledShares: 7.7005,
+        price: 0.49,
+        fillPrice: 0.49,
+      });
+    },
+    invalidateOutcomeBalanceCache: () => {},
+    invalidateBalanceValidationCache: () => {},
+  };
+
+  const result = await runtime.executeSignal(
+    market,
+    orderbook,
+    positionManager,
+    createSignal({
+      signalType: 'SNIPER_SCALP_EXIT',
+      action: 'SELL',
+      reduceOnly: true,
+      outcome: 'NO',
+      outcomeIndex: 1,
+      shares: 8,
+      targetPrice: 0.49,
+      referencePrice: 0.49,
+      tokenPrice: 0.49,
+      midPrice: 0.49,
+      fairValue: 0.49,
+      urgency: 'cross',
+    }),
+    'slot-1'
+  );
+
+  assert.equal(submittedSignal?.shares, 7.7005);
+  assert.match(submittedSignal?.reason ?? '', /clamped to settled balance 7\.7005/);
+  assert.equal(result?.fillConfirmed, true);
+  assert.equal(positionManager.getShares('NO'), 0.2995);
 });
 
 test('redeem-success clears local runtime positions for settled conditions', async () => {

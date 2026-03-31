@@ -939,7 +939,7 @@ export class MarketMakerRuntime {
       book,
       positionManager,
     });
-    const guardedSell = resolveReduceOnlySellGuard({
+    let guardedSell = resolveReduceOnlySellGuard({
       signal,
       availableShares: positionManager.getShares(signal.outcome),
       referencePrice: exitGuardPrice,
@@ -967,7 +967,7 @@ export class MarketMakerRuntime {
       }
     }
 
-    const executionSignal =
+    let executionSignal =
       guardedSell.executionShares > 0 &&
       roundTo(guardedSell.executionShares, 4) !== roundTo(signal.shares, 4)
         ? {
@@ -1032,9 +1032,39 @@ export class MarketMakerRuntime {
         signal: executionSignal,
         tokenId,
         nowMs,
+        referencePrice: exitGuardPrice,
       });
-      if (!settlementReady) {
+      if (!settlementReady.ready) {
         return null;
+      }
+
+      if (
+        settlementReady.executionShares > 0 &&
+        roundTo(settlementReady.executionShares, 4) !== roundTo(executionSignal.shares, 4)
+      ) {
+        guardedSell = resolveReduceOnlySellGuard({
+          signal: executionSignal,
+          availableShares: settlementReady.executionShares,
+          referencePrice: exitGuardPrice,
+        });
+        this.setBlockedExitRemainder(
+          market.marketId,
+          executionSignal.outcome,
+          guardedSell.blockedRemainderShares
+        );
+        executionSignal = {
+          ...executionSignal,
+          shares: guardedSell.executionShares,
+          reason: `${executionSignal.reason} | clamped to settled balance ${guardedSell.executionShares.toFixed(4)}`,
+        };
+        logger.info('Live reduce-only SELL clamped to settled token balance', {
+          marketId: market.marketId,
+          signalType: executionSignal.signalType,
+          outcome: executionSignal.outcome,
+          requestedShares: roundTo(signal.shares, 4),
+          executionShares: guardedSell.executionShares,
+          availableShares: settlementReady.availableShares,
+        });
       }
     }
 
@@ -2369,13 +2399,18 @@ export class MarketMakerRuntime {
     signal: StrategySignal;
     tokenId: string;
     nowMs: number;
-  }): Promise<boolean> {
+    referencePrice: number | null;
+  }): Promise<SettledOutcomeSellExecutionResolution> {
     const key = getSettlementCooldownKey(params.market.marketId, params.signal.outcome);
     if (!this.settlementStartedAt.has(key)) {
-      return true;
+      return {
+        ready: true,
+        requiredShares: getRequiredSettledShares(params.signal.shares),
+        availableShares: roundTo(params.signal.shares, 4),
+        executionShares: roundTo(params.signal.shares, 4),
+      };
     }
 
-    const requiredShares = getRequiredSettledShares(params.signal.shares);
     let latestBalance = 0;
     let attempts = this.settlementAttempts.get(key) ?? 0;
 
@@ -2383,19 +2418,25 @@ export class MarketMakerRuntime {
       const forceRefresh = index > 0;
       latestBalance = await this.executor.getOutcomeTokenBalance(params.tokenId, forceRefresh);
       attempts += 1;
-      if (hasSettledOutcomeBalance(latestBalance, params.signal.shares)) {
+      const resolution = resolveSettledOutcomeSellExecution({
+        signal: params.signal,
+        availableShares: latestBalance,
+        referencePrice: params.referencePrice,
+      });
+      if (resolution.ready) {
         const startedAtMs = this.settlementStartedAt.get(key) ?? params.nowMs;
         const delayMs = Math.max(0, Date.now() - startedAtMs);
         this.clearSettlementConfirmation(params.market.marketId, params.signal.outcome);
         logger.info('Token settlement confirmed after BUY fill', {
           marketId: params.market.marketId,
           outcome: params.signal.outcome,
-          requiredShares,
-          availableShares: roundTo(latestBalance, 4),
+          requiredShares: resolution.requiredShares,
+          availableShares: resolution.availableShares,
+          executionShares: resolution.executionShares,
           attempts,
           settlementDelayMs: delayMs,
         });
-        return true;
+        return resolution;
       }
 
       if (index < 2) {
@@ -2403,6 +2444,7 @@ export class MarketMakerRuntime {
       }
     }
 
+    const requiredShares = getRequiredSettledShares(params.signal.shares);
     const nextCheckAtMs = Date.now() + 1_000;
     this.settlementCooldowns.set(key, nextCheckAtMs);
     this.settlementAttempts.set(key, attempts);
@@ -2415,7 +2457,12 @@ export class MarketMakerRuntime {
       attempts,
       nextCheckAt: new Date(nextCheckAtMs).toISOString(),
     });
-    return false;
+    return {
+      ready: false,
+      requiredShares,
+      availableShares: roundTo(latestBalance, 4),
+      executionShares: 0,
+    };
   }
 
   private pruneSettlementConfirmationState(nowMs = Date.now()): void {
@@ -3563,6 +3610,13 @@ export function hasSettledOutcomeBalance(
   return availableShares >= getRequiredSettledShares(requestedShares);
 }
 
+export interface SettledOutcomeSellExecutionResolution {
+  readonly ready: boolean;
+  readonly requiredShares: number;
+  readonly availableShares: number;
+  readonly executionShares: number;
+}
+
 export function pruneExpiredSettlementCooldowns(
   cooldowns: ReadonlyMap<string, number>,
   nowMs: number
@@ -3703,6 +3757,45 @@ export function resolveReduceOnlySellGuard(params: {
     remainingShares,
     blockedRemainderShares:
       remainingShares > 0 && remainingShares < minimumShares ? remainingShares : 0,
+  };
+}
+
+export function resolveSettledOutcomeSellExecution(params: {
+  signal: Pick<StrategySignal, 'action' | 'reduceOnly' | 'shares'>;
+  availableShares: number;
+  referencePrice: number | null;
+}): SettledOutcomeSellExecutionResolution {
+  const availableShares = roundTo(Math.max(0, params.availableShares), 4);
+  const requestedShares = roundTo(Math.max(0, params.signal.shares), 4);
+  const requiredShares = getRequiredSettledShares(requestedShares);
+  if (hasSettledOutcomeBalance(availableShares, requestedShares)) {
+    return {
+      ready: true,
+      requiredShares,
+      availableShares,
+      executionShares: requestedShares,
+    };
+  }
+
+  const guardedSell = resolveReduceOnlySellGuard({
+    signal: params.signal,
+    availableShares,
+    referencePrice: params.referencePrice,
+  });
+  if (!guardedSell.skip && guardedSell.executionShares > 0) {
+    return {
+      ready: true,
+      requiredShares,
+      availableShares,
+      executionShares: guardedSell.executionShares,
+    };
+  }
+
+  return {
+    ready: false,
+    requiredShares,
+    availableShares,
+    executionShares: 0,
   };
 }
 
