@@ -198,3 +198,38 @@ test('runtime status preserves pending MM exposure fields for dashboard visibili
   rmSync(reportsDir, { recursive: true, force: true });
   resetDayPnlStateCache();
 });
+
+test('runtime status preserves wallet fund fields for production header visibility', () => {
+  const reportsDir = path.resolve(process.cwd(), 'reports', 'runtime-status-wallet-funds');
+  rmSync(reportsDir, { recursive: true, force: true });
+  mkdirSync(reportsDir, { recursive: true });
+  resetDayPnlStateCache();
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    REPORTS_DIR: './reports/runtime-status-wallet-funds',
+    STATE_FILE: './reports/runtime-status-wallet-funds/state.json',
+  });
+
+  const status = writeRuntimeStatus(
+    {
+      walletCashUsd: 83.27,
+      portfolioValueUsd: 87.72,
+      availableToTradeUsd: 80.82,
+    },
+    runtimeConfig
+  );
+
+  assert.equal(status.walletCashUsd, 83.27);
+  assert.equal(status.portfolioValueUsd, 87.72);
+  assert.equal(status.availableToTradeUsd, 80.82);
+
+  const persisted = readRuntimeStatus(runtimeConfig);
+  assert.ok(persisted);
+  assert.equal(persisted.walletCashUsd, 83.27);
+  assert.equal(persisted.portfolioValueUsd, 87.72);
+  assert.equal(persisted.availableToTradeUsd, 80.82);
+
+  rmSync(reportsDir, { recursive: true, force: true });
+  resetDayPnlStateCache();
+});

@@ -443,6 +443,14 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
     ? color.red(`PAUSED - ${runtimeStatus.pauseReason ?? 'manual'}`)
     : color.green('OK');
 
+  const headerSupplementalEntries: Array<readonly [string, string]> =
+    inspection.mode === 'production'
+      ? buildProductionHeaderBalanceEntries(runtimeStatus)
+      : [
+          ['process', inspection.runtimeStatus?.pid ? `pid ${inspection.runtimeStatus.pid}` : 'n/a'],
+          ['manager', inspection.manager ?? 'n/a'],
+        ];
+
   const lines = [
     renderBanner(
       'POLYMARKET SCALPER  |  LIVE RUNTIME DASHBOARD',
@@ -452,8 +460,7 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
       ['time', now],
       ['mode', stripAnsi(formatModeLabel(inspection.mode))],
       ['status', stripAnsi(statusLabel)],
-      ['process', inspection.runtimeStatus?.pid ? `pid ${inspection.runtimeStatus.pid}` : 'n/a'],
-      ['manager', inspection.manager ?? 'n/a'],
+      ...headerSupplementalEntries,
     ]),
   ];
 
@@ -536,6 +543,16 @@ function renderInfoBar(entries: Array<readonly [string, string]>): string {
     .map(([key, value]) => `${color.dim(`${key}`)} ${color.bold(value)}`)
     .join('   ');
   return rendered;
+}
+
+function buildProductionHeaderBalanceEntries(
+  runtimeStatus: RuntimeStatusSnapshot | null
+): Array<readonly [string, string]> {
+  return [
+    ['portfolio', formatHeaderCurrency(runtimeStatus?.portfolioValueUsd ?? null)],
+    ['cash', formatHeaderCurrency(runtimeStatus?.walletCashUsd ?? null)],
+    ['available', formatHeaderCurrency(runtimeStatus?.availableToTradeUsd ?? null)],
+  ];
 }
 
 function renderSection(title: string, body: string): string {
@@ -1044,6 +1061,12 @@ function formatSignedShares(value: number): string {
 
 function formatPlainCurrency(value: number): string {
   return color.bold(`$${roundTo(value, 2).toFixed(2)}`);
+}
+
+function formatHeaderCurrency(value: number | null): string {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? `$${roundTo(value, 2).toFixed(2)}`
+    : 'n/a';
 }
 
 function colorizeSignedPercent(value: number): string {

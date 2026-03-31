@@ -279,6 +279,13 @@ export class OrderExecutor {
     return this.trader?.getOutcomeTokenBalance(tokenId, forceRefresh) ?? 0;
   }
 
+  async getUsdcBalance(forceRefresh = false): Promise<number | null> {
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      return null;
+    }
+    return this.trader?.getUsdcBalance(forceRefresh) ?? null;
+  }
+
   invalidateBalanceValidationCache(): void {
     this.trader?.invalidateBalanceValidationCache();
   }

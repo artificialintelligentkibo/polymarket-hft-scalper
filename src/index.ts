@@ -94,6 +94,7 @@ const POSITIONS_API_URL = 'https://data-api.polymarket.com/positions';
 const POSITIONS_PAGE_LIMIT = 500;
 const MAX_POSITION_PAGES = 10;
 const LIVE_WALLET_POSITION_REFRESH_MS = 10_000;
+const LIVE_WALLET_FUNDS_REFRESH_MS = 10_000;
 
 interface SignalExecutionCandidate {
   readonly signal: StrategySignal;
@@ -121,6 +122,11 @@ interface RuntimeMarketActionSnapshot {
   readonly action: string;
   readonly signalCount: number;
   readonly updatedAt: string;
+}
+
+interface RuntimeWalletFundsSnapshot {
+  readonly walletCashUsd: number | null;
+  readonly updatedAt: string | null;
 }
 
 export interface LatencyPauseEvaluation {
@@ -181,6 +187,11 @@ export class MarketMakerRuntime {
   private readonly paperResolutionTimers = new Map<string, NodeJS.Timeout>();
   private walletPositionSnapshots = new Map<string, RuntimePositionSnapshot>();
   private lastWalletPositionRefreshAtMs = 0;
+  private walletFundsSnapshot: RuntimeWalletFundsSnapshot = {
+    walletCashUsd: null,
+    updatedAt: null,
+  };
+  private lastWalletFundsRefreshAtMs = 0;
   private userStreamCredentials: {
     apiKey: string;
     secret: string;
@@ -571,6 +582,7 @@ export class MarketMakerRuntime {
     }
     await this.refreshWalletPositionSnapshots();
     await this.reconcileLivePositionsWithWallet();
+    await this.refreshWalletFundsSnapshot();
     this.syncRuntimeStatus({
       running: true,
       isPaused: this.statusMonitor.isPaused(),
@@ -1777,6 +1789,21 @@ export class MarketMakerRuntime {
     const openPositions = this.buildRuntimePositionSnapshots();
     const dayState = getDayPnlState();
     const pendingQuoteExposure = this.getPendingQuoteExposure();
+    const walletCashUsd =
+      typeof this.walletFundsSnapshot.walletCashUsd === 'number' &&
+      Number.isFinite(this.walletFundsSnapshot.walletCashUsd)
+        ? roundTo(this.walletFundsSnapshot.walletCashUsd, 2)
+        : null;
+    const openPositionValueUsd = roundTo(
+      openPositions.reduce((sum, position) => sum + position.markValueUsd, 0),
+      2
+    );
+    const portfolioValueUsd =
+      walletCashUsd !== null ? roundTo(walletCashUsd + openPositionValueUsd, 2) : null;
+    const availableToTradeUsd =
+      walletCashUsd !== null
+        ? roundTo(Math.max(0, walletCashUsd - pendingQuoteExposure.grossExposureUsd), 2)
+        : null;
     this.resetRedeemPnlDayIfNeeded();
     this.pruneBlockedExitRemainders();
     this.pruneDustAbandonedPositions();
@@ -1804,6 +1831,9 @@ export class MarketMakerRuntime {
         latencyPaused: this.latencyPaused,
         latencyPauseAverageMs: this.getLatencyPauseAverageMs(),
         apiCircuitBreakers: this.getApiCircuitBreakers(),
+        portfolioValueUsd,
+        walletCashUsd,
+        availableToTradeUsd,
         activeMarkets: this.buildRuntimeMarketSnapshots(),
         openPositions,
         openPositionsCount: openPositions.length,
@@ -2050,6 +2080,38 @@ export class MarketMakerRuntime {
       logger.debug('Wallet position snapshot refresh failed', {
         positionsUser,
         message: error?.message || 'Unknown error',
+      });
+    }
+  }
+
+  private async refreshWalletFundsSnapshot(force = false): Promise<void> {
+    if (isDryRunMode(config) || isPaperTradingEnabled(config)) {
+      this.walletFundsSnapshot = {
+        walletCashUsd: null,
+        updatedAt: null,
+      };
+      this.lastWalletFundsRefreshAtMs = 0;
+      return;
+    }
+
+    const nowMs = Date.now();
+    if (!force && nowMs - this.lastWalletFundsRefreshAtMs < LIVE_WALLET_FUNDS_REFRESH_MS) {
+      return;
+    }
+
+    try {
+      const walletCashUsd = await this.executor.getUsdcBalance(false);
+      this.walletFundsSnapshot = {
+        walletCashUsd:
+          typeof walletCashUsd === 'number' && Number.isFinite(walletCashUsd)
+            ? roundTo(walletCashUsd, 2)
+            : null,
+        updatedAt: new Date(nowMs).toISOString(),
+      };
+      this.lastWalletFundsRefreshAtMs = nowMs;
+    } catch (error) {
+      logger.debug('Wallet funds snapshot refresh failed', {
+        message: error instanceof Error ? error.message : String(error),
       });
     }
   }

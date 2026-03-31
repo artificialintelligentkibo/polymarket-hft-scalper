@@ -129,6 +129,9 @@ export interface RuntimeStatusSnapshot {
     readonly clob: CircuitBreakerSnapshot;
     readonly gamma: CircuitBreakerSnapshot;
   };
+  readonly portfolioValueUsd: number | null;
+  readonly walletCashUsd: number | null;
+  readonly availableToTradeUsd: number | null;
   readonly totalDayPnl: number;
   readonly dayDrawdown: number;
   readonly costBasisTracked: number;
@@ -199,6 +202,9 @@ export function createRuntimeStatusSnapshot(
       clob: createDefaultCircuitBreakerSnapshot('clob'),
       gamma: createDefaultCircuitBreakerSnapshot('gamma'),
     },
+    portfolioValueUsd: null,
+    walletCashUsd: null,
+    availableToTradeUsd: null,
     totalDayPnl: dayState.dayPnl,
     dayDrawdown: dayState.drawdown,
     costBasisTracked: 0,
@@ -323,6 +329,9 @@ function normalizeRuntimeStatus(
     latencyPaused: Boolean(value.latencyPaused),
     latencyPauseAverageMs: normalizeNullableNumber(value.latencyPauseAverageMs),
     apiCircuitBreakers: normalizeCircuitBreakers(value.apiCircuitBreakers),
+    portfolioValueUsd: normalizeNullableNumber(value.portfolioValueUsd),
+    walletCashUsd: normalizeNullableNumber(value.walletCashUsd),
+    availableToTradeUsd: normalizeNullableNumber(value.availableToTradeUsd),
     totalDayPnl: dayState.dayPnl,
     dayDrawdown: dayState.drawdown,
     costBasisTracked: normalizeCount(value.costBasisTracked),

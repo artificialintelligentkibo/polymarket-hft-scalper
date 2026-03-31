@@ -426,6 +426,19 @@ export class Trader {
     );
   }
 
+  async getUsdcBalance(forceRefresh = false): Promise<number> {
+    await this.initialize();
+
+    if (isDryRunMode(this.runtimeConfig)) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const owner = this.executionContext.funderAddress;
+    const decimals = await this.getUsdcDecimals();
+    const balance = await this.readUsdcBalance(owner, forceRefresh);
+    return Number.parseFloat(ethers.utils.formatUnits(balance, decimals));
+  }
+
   invalidateBalanceValidationCache(): void {
     this.balanceCache.clear();
     this.allowanceCache.clear();
@@ -680,7 +693,7 @@ export class Trader {
     forceRefresh: boolean;
   }): Promise<void> {
     const [balance, allowanceToCtf, allowanceToExchange] = await Promise.all([
-      this.getUsdcBalance(params.owner, params.forceRefresh),
+      this.readUsdcBalance(params.owner, params.forceRefresh),
       this.getUsdcAllowance(params.owner, this.runtimeConfig.contracts.ctf, params.forceRefresh),
       this.getUsdcAllowance(params.owner, params.spender, params.forceRefresh),
     ]);
@@ -705,7 +718,7 @@ export class Trader {
     }
   }
 
-  private async getUsdcBalance(owner: string, forceRefresh: boolean): Promise<ethers.BigNumber> {
+  private async readUsdcBalance(owner: string, forceRefresh: boolean): Promise<ethers.BigNumber> {
     const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.provider);
     return this.readCachedBigNumber({
       cache: this.balanceCache,
