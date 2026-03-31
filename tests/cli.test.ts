@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   buildModeOverrides,
   applyEnvUpdatesToText,
+  collectResetTargets,
   collectTodayResetTargets,
   resolveDisplayedDayPnl,
 } from '../cli/helpers.js';
@@ -88,6 +89,51 @@ test('collectTodayResetTargets includes dated logs plus state and pid files', ()
         'reports/runtime-status.json',
         'reports/status-control.json',
         `reports/slot-reports_${dayKey}.log`,
+        'reports/state.json',
+      ].sort()
+    );
+  } finally {
+    process.chdir(originalCwd);
+  }
+});
+
+test('collectResetTargets with includeHistory clears all report and log files', () => {
+  const originalCwd = process.cwd();
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'scalper-cli-reset-all-'));
+  process.chdir(tempRoot);
+
+  try {
+    mkdirSync(path.join('logs', 'archive'), { recursive: true });
+    mkdirSync(path.join('reports', 'nested'), { recursive: true });
+
+    writeFileSync(path.join('logs', 'events_2029-01-01.jsonl'), '{}\n', 'utf8');
+    writeFileSync(path.join('logs', 'archive', 'events_2029-02-01.jsonl'), '{}\n', 'utf8');
+    writeFileSync(path.join('reports', 'slot-reports_2029-01-01.log'), 'report\n', 'utf8');
+    writeFileSync(path.join('reports', 'nested', 'paper-trades.jsonl'), '{}\n', 'utf8');
+    writeFileSync(path.join('reports', 'runtime-status.json'), '{}\n', 'utf8');
+    writeFileSync(path.join('reports', 'state.json'), '{}\n', 'utf8');
+    writeFileSync(path.join('reports', '.gitkeep'), '', 'utf8');
+
+    const runtimeConfig = createConfig({
+      ...process.env,
+      LOG_DIRECTORY: 'logs',
+      REPORTS_DIR: './reports',
+      STATE_FILE: './reports/state.json',
+      PAPER_TRADING_TRADE_LOG: './reports/nested/paper-trades.jsonl',
+    });
+
+    const targets = collectResetTargets(runtimeConfig, {
+      includeHistory: true,
+    }).map((entry) => path.relative(tempRoot, entry).replace(/\\/g, '/'));
+
+    assert.deepEqual(
+      targets.sort(),
+      [
+        'logs/archive/events_2029-02-01.jsonl',
+        'logs/events_2029-01-01.jsonl',
+        'reports/nested/paper-trades.jsonl',
+        'reports/runtime-status.json',
+        'reports/slot-reports_2029-01-01.log',
         'reports/state.json',
       ].sort()
     );

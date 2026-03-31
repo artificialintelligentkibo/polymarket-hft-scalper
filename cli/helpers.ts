@@ -82,6 +82,21 @@ export function collectTodayResetTargets(
   runtimeConfig: AppConfig,
   dayKey = formatDayKey(new Date())
 ): string[] {
+  return collectResetTargets(runtimeConfig, {
+    includeHistory: false,
+    dayKey,
+  });
+}
+
+export function collectResetTargets(
+  runtimeConfig: AppConfig,
+  options: {
+    includeHistory?: boolean;
+    dayKey?: string;
+  } = {}
+): string[] {
+  const includeHistory = options.includeHistory ?? false;
+  const dayKey = options.dayKey ?? formatDayKey(new Date());
   const directories = [
     path.resolve(process.cwd(), runtimeConfig.logging.directory),
     path.resolve(process.cwd(), runtimeConfig.REPORTS_DIR),
@@ -93,15 +108,10 @@ export function collectTodayResetTargets(
       continue;
     }
 
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (!entry.isFile()) {
-        continue;
-      }
-
-      if (entry.name.includes(dayKey)) {
-        targets.add(path.join(directory, entry.name));
-      }
-    }
+    collectDirectoryFiles(directory, targets, {
+      includeHistory,
+      dayKey,
+    });
   }
 
   const alwaysReset = [
@@ -109,6 +119,7 @@ export function collectTodayResetTargets(
     path.resolve(process.cwd(), runtimeConfig.REPORTS_DIR, 'runtime-status.json'),
     path.resolve(process.cwd(), runtimeConfig.REPORTS_DIR, 'status-control.json'),
     path.resolve(process.cwd(), runtimeConfig.REPORTS_DIR, 'polymarket-scalper.pid'),
+    path.resolve(process.cwd(), runtimeConfig.paperTrading.tradeLogFile),
   ];
 
   for (const filePath of alwaysReset) {
@@ -118,6 +129,35 @@ export function collectTodayResetTargets(
   }
 
   return [...targets];
+}
+
+function collectDirectoryFiles(
+  directory: string,
+  targets: Set<string>,
+  options: {
+    includeHistory: boolean;
+    dayKey: string;
+  }
+): void {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.name === '.gitkeep') {
+      continue;
+    }
+
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      collectDirectoryFiles(entryPath, targets, options);
+      continue;
+    }
+
+    if (!entry.isFile()) {
+      continue;
+    }
+
+    if (options.includeHistory || entry.name.includes(options.dayKey)) {
+      targets.add(entryPath);
+    }
+  }
 }
 
 export function resolveDisplayedDayPnl(params: {

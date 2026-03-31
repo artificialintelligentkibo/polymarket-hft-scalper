@@ -35,7 +35,7 @@ import { roundTo, sleep } from '../src/utils.js';
 import {
   applyEnvUpdatesToText,
   buildModeOverrides,
-  collectTodayResetTargets,
+  collectResetTargets,
   resolveDisplayedDayPnl,
   type CliMode,
 } from './helpers.js';
@@ -70,7 +70,11 @@ async function resetCommand(): Promise<void> {
   const document = loadEnvDocument();
   await stopBot(document.runtimeConfig, { quiet: true });
 
-  const removed = deleteFiles(collectTodayResetTargets(document.runtimeConfig));
+  const removed = deleteFiles(
+    collectResetTargets(document.runtimeConfig, {
+      includeHistory: true,
+    })
+  );
   resetSlotReporterState();
   resetDayPnlStateCache();
   clearDayPnlStateFile(document.runtimeConfig);
@@ -91,7 +95,7 @@ async function resetCommand(): Promise<void> {
   );
 
   console.log(
-    `${color.green('Reset complete.')} Removed ${removed} file(s). Day PnL, drawdown, runtime status, and slot caches were reset to zero.`
+    `${color.green('Reset complete.')} Removed ${removed} file(s). Reports, logs, runtime status, and day PnL state were fully cleared.`
   );
 }
 
