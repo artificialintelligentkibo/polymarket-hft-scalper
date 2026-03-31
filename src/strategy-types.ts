@@ -2,7 +2,7 @@ import type { Outcome } from './clob-fetcher.js';
 
 export type SignalAction = 'BUY' | 'SELL';
 export type SignalUrgency = 'passive' | 'improve' | 'cross';
-export type StrategyLayer = 'SNIPER' | 'MM_QUOTE' | 'PAIRED_ARB';
+export type StrategyLayer = 'SNIPER' | 'MM_QUOTE' | 'PAIRED_ARB' | 'LOTTERY';
 export type SignalType =
   | 'COMBINED_DISCOUNT_BUY_BOTH'
   | 'DEEP_BINANCE_SIGNAL'
@@ -12,6 +12,7 @@ export type SignalType =
   | 'FAIR_VALUE_BUY'
   | 'FAIR_VALUE_SELL'
   | 'LATENCY_MOMENTUM_BUY'
+  | 'LOTTERY_BUY'
   | 'MM_QUOTE_ASK'
   | 'MM_QUOTE_BID'
   | 'INVENTORY_REBALANCE'
@@ -45,6 +46,7 @@ export function bypassesBinanceEdge(signalType: SignalType): boolean {
     signalType === 'LATENCY_MOMENTUM_BUY' ||
     signalType === 'MM_QUOTE_BID' ||
     signalType === 'MM_QUOTE_ASK' ||
+    signalType === 'LOTTERY_BUY' ||
     signalType === 'PAIRED_ARB_BUY_YES' ||
     signalType === 'PAIRED_ARB_BUY_NO' ||
     signalType === 'PAIRED_ARB_REBALANCE' ||
@@ -79,6 +81,8 @@ export function resolveStrategyLayer(signalType: SignalType): StrategyLayer {
     case 'PAIRED_ARB_BUY_NO':
     case 'PAIRED_ARB_REBALANCE':
       return 'PAIRED_ARB';
+    case 'LOTTERY_BUY':
+      return 'LOTTERY';
     default:
       return 'SNIPER';
   }
@@ -94,7 +98,11 @@ export function isLayerConflict(
 
   return !(
     (existingLayer === 'SNIPER' && newLayer === 'MM_QUOTE') ||
-    (existingLayer === 'MM_QUOTE' && newLayer === 'SNIPER')
+    (existingLayer === 'MM_QUOTE' && newLayer === 'SNIPER') ||
+    (existingLayer === 'SNIPER' && newLayer === 'LOTTERY') ||
+    (existingLayer === 'LOTTERY' && newLayer === 'SNIPER') ||
+    (existingLayer === 'MM_QUOTE' && newLayer === 'LOTTERY') ||
+    (existingLayer === 'LOTTERY' && newLayer === 'MM_QUOTE')
   );
 }
 

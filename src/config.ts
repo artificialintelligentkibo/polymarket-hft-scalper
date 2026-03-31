@@ -73,6 +73,21 @@ export interface SniperConfig {
   readonly volatilityScale: number;
 }
 
+export interface LotteryConfig {
+  /** Master switch for convex opposite-side tickets. */
+  readonly enabled: boolean;
+  /** Maximum USDC risk per lottery ticket. */
+  readonly maxRiskUsdc: number;
+  /** Cheapest ask considered valid for a lottery entry. */
+  readonly minCents: number;
+  /** Most expensive ask considered valid for a lottery entry. */
+  readonly maxCents: number;
+  /** Only trigger lottery entries after a confirmed sniper fill. */
+  readonly onlyAfterSniper: boolean;
+  /** Maximum number of lottery tickets allowed inside the same 5-minute slot. */
+  readonly maxPerSlot: number;
+}
+
 export interface AppConfig {
   readonly PRODUCT_TEST_MODE: boolean;
   readonly SIMULATION_MODE: boolean;
@@ -309,6 +324,8 @@ export interface AppConfig {
   readonly latencyMomentum: LatencyMomentumConfig;
   /** Runtime sniper-engine configuration for Binance-led aggressive entries. */
   readonly sniper: SniperConfig;
+  /** Runtime lottery-layer configuration for convex opposite-side tickets. */
+  readonly lottery: LotteryConfig;
   readonly paperTrading: PaperTraderConfig;
   readonly evKelly: EVKellyConfig;
   readonly trading: {
@@ -865,6 +882,14 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ),
       volatilityScale: parseFloatOrDefault(env.SNIPER_VOLATILITY_SCALE, '0.003'),
     },
+    lottery: {
+      enabled: parseBoolean(env.LOTTERY_LAYER_ENABLED, false),
+      maxRiskUsdc: parseFloatOrDefault(env.LOTTERY_MAX_RISK_USDC, '12'),
+      minCents: parseFloatOrDefault(env.LOTTERY_MIN_CENTS, '0.03'),
+      maxCents: parseFloatOrDefault(env.LOTTERY_MAX_CENTS, '0.07'),
+      onlyAfterSniper: parseBoolean(env.LOTTERY_ONLY_AFTER_SNIPER, true),
+      maxPerSlot: Math.max(0, parseIntOrDefault(env.LOTTERY_MAX_PER_SLOT, '1')),
+    },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
       simulatedLatencyMinMs: Math.max(
@@ -1216,6 +1241,18 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error(
       'SNIPER_MAX_POSITION_SHARES must be greater than or equal to SNIPER_BASE_SHARES.'
     );
+  }
+
+  if (candidate.lottery.maxRiskUsdc <= 0) {
+    throw new Error('LOTTERY_MAX_RISK_USDC must be positive.');
+  }
+
+  if (candidate.lottery.minCents <= 0 || candidate.lottery.minCents >= 1) {
+    throw new Error('LOTTERY_MIN_CENTS must be in range (0, 1).');
+  }
+
+  if (candidate.lottery.maxCents <= candidate.lottery.minCents) {
+    throw new Error('LOTTERY_MAX_CENTS must be greater than LOTTERY_MIN_CENTS.');
   }
 
   if (candidate.sniper.maxConcurrentSameDirection < 1) {

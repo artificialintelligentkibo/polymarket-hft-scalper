@@ -106,6 +106,41 @@ test('risk manager emits slot flatten signal near end of slot', () => {
   assert.equal(assessment.forcedSignals[0]?.action, 'SELL');
 });
 
+test('risk manager skips hard-stop and trailing exits for lottery positions but still allows slot flatten', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const manager = new PositionManager(market.marketId, market.endTime);
+  const riskManager = new RiskManager();
+
+  manager.applyFill({
+    outcome: 'NO',
+    side: 'BUY',
+    shares: 20,
+    price: 0.4,
+    strategyLayer: 'LOTTERY',
+  });
+  manager.markToMarket({
+    NO: 0.2,
+  });
+
+  const midSlotAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager: manager,
+    now: new Date('2026-03-18T11:02:00.000Z'),
+  });
+  assert.equal(midSlotAssessment.forcedSignals.length, 0);
+
+  const nearEndAssessment = riskManager.checkRiskLimits({
+    market,
+    orderbook,
+    positionManager: manager,
+    now: new Date('2026-03-18T11:04:50.000Z'),
+  });
+  assert.equal(nearEndAssessment.forcedSignals[0]?.signalType, 'SLOT_FLATTEN');
+  assert.equal(nearEndAssessment.forcedSignals[0]?.outcome, 'NO');
+});
+
 test('risk manager halts entries and flattens inventory after drawdown breach', () => {
   const stateFile = path.resolve(process.cwd(), 'reports', 'risk-manager-test-state.json');
   rmSync(stateFile, { force: true });

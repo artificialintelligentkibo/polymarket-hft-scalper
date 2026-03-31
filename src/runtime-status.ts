@@ -32,6 +32,7 @@ export interface RuntimeGlobalExposureSnapshot {
   readonly sniperUsd: number;
   readonly mmUsd: number;
   readonly pairedArbUsd: number;
+  readonly lotteryUsd: number;
   readonly totalUsd: number;
   readonly maxUsd: number;
 }
@@ -132,6 +133,16 @@ export interface SniperStatsSnapshot {
   readonly currentDirectionWindow: SniperDirectionWindowSnapshot | null;
 }
 
+export interface LotteryStatsSnapshot {
+  readonly enabled: boolean;
+  readonly totalTickets: number;
+  readonly totalHits: number;
+  readonly activeEntries: number;
+  readonly hitRate: string;
+  readonly totalRiskUsdc: number;
+  readonly totalPayoutUsdc: number;
+}
+
 export interface RuntimeStatusSnapshot {
   readonly updatedAt: string;
   readonly pid: number | null;
@@ -168,6 +179,7 @@ export interface RuntimeStatusSnapshot {
   readonly strategyLayers: readonly RuntimeLayerStatusSnapshot[];
   readonly globalExposure: RuntimeGlobalExposureSnapshot;
   readonly sniperStats: SniperStatsSnapshot;
+  readonly lotteryStats: LotteryStatsSnapshot;
   readonly mmEnabled: boolean;
   readonly mmAutonomousQuotes: boolean;
   readonly mmQuoteShares: number;
@@ -243,6 +255,7 @@ export function createRuntimeStatusSnapshot(
     strategyLayers: createDefaultStrategyLayersSnapshot(runtimeConfig),
     globalExposure: createDefaultGlobalExposureSnapshot(runtimeConfig),
     sniperStats: createDefaultSniperStatsSnapshot(runtimeConfig),
+    lotteryStats: createDefaultLotteryStatsSnapshot(runtimeConfig),
     mmEnabled: isDynamicQuotingEnabled(runtimeConfig),
     mmAutonomousQuotes: runtimeConfig.MM_AUTONOMOUS_QUOTES,
     mmQuoteShares: runtimeConfig.MM_QUOTE_SHARES,
@@ -390,6 +403,7 @@ function normalizeRuntimeStatus(
     strategyLayers,
     globalExposure: normalizeGlobalExposure(value.globalExposure, runtimeConfig),
     sniperStats: normalizeSniperStats(value.sniperStats, runtimeConfig),
+    lotteryStats: normalizeLotteryStats(value.lotteryStats, runtimeConfig),
     mmEnabled:
       typeof value.mmEnabled === 'boolean'
         ? value.mmEnabled
@@ -497,6 +511,20 @@ function createDefaultSniperStatsSnapshot(
   };
 }
 
+function createDefaultLotteryStatsSnapshot(
+  runtimeConfig: AppConfig
+): LotteryStatsSnapshot {
+  return {
+    enabled: runtimeConfig.lottery.enabled,
+    totalTickets: 0,
+    totalHits: 0,
+    activeEntries: 0,
+    hitRate: '0.0%',
+    totalRiskUsdc: 0,
+    totalPayoutUsdc: 0,
+  };
+}
+
 function createDefaultStrategyLayersSnapshot(
   runtimeConfig: AppConfig
 ): RuntimeLayerStatusSnapshot[] {
@@ -531,6 +559,15 @@ function createDefaultStrategyLayersSnapshot(
       exposureUsd: 0,
       pnlUsd: 0,
     },
+    {
+      layer: 'LOTTERY',
+      enabled: runtimeConfig.lottery.enabled,
+      status: runtimeConfig.lottery.enabled ? 'WATCHING' : 'OFF',
+      positionCount: 0,
+      marketCount: 0,
+      exposureUsd: 0,
+      pnlUsd: 0,
+    },
   ];
 }
 
@@ -541,6 +578,7 @@ function createDefaultGlobalExposureSnapshot(
     sniperUsd: 0,
     mmUsd: 0,
     pairedArbUsd: 0,
+    lotteryUsd: 0,
     totalUsd: 0,
     maxUsd: runtimeConfig.GLOBAL_MAX_EXPOSURE_USD,
   };
@@ -615,6 +653,32 @@ function normalizeSniperStats(
   };
 }
 
+function normalizeLotteryStats(
+  value: unknown,
+  runtimeConfig: AppConfig
+): LotteryStatsSnapshot {
+  if (!value || typeof value !== 'object') {
+    return createDefaultLotteryStatsSnapshot(runtimeConfig);
+  }
+
+  const record = value as Partial<LotteryStatsSnapshot>;
+  return {
+    enabled:
+      typeof record.enabled === 'boolean'
+        ? record.enabled
+        : runtimeConfig.lottery.enabled,
+    totalTickets: normalizeCount(record.totalTickets),
+    totalHits: normalizeCount(record.totalHits),
+    activeEntries: normalizeCount(record.activeEntries),
+    hitRate:
+      typeof record.hitRate === 'string' && record.hitRate.trim()
+        ? record.hitRate
+        : '0.0%',
+    totalRiskUsdc: normalizeNumber(record.totalRiskUsdc, 0),
+    totalPayoutUsdc: normalizeNumber(record.totalPayoutUsdc, 0),
+  };
+}
+
 function normalizeSniperDirectionWindow(
   value: unknown
 ): SniperDirectionWindowSnapshot | null {
@@ -656,7 +720,8 @@ function normalizeRuntimeSignal(value: unknown): RuntimeSignalSnapshot | null {
   const strategyLayer =
     record.strategyLayer === 'SNIPER' ||
     record.strategyLayer === 'MM_QUOTE' ||
-    record.strategyLayer === 'PAIRED_ARB'
+    record.strategyLayer === 'PAIRED_ARB' ||
+    record.strategyLayer === 'LOTTERY'
       ? record.strategyLayer
       : null;
   const action = record.action === 'BUY' || record.action === 'SELL' ? record.action : null;
@@ -692,7 +757,8 @@ function normalizeRuntimeLayerStatus(
   const layer =
     record.layer === 'SNIPER' ||
     record.layer === 'MM_QUOTE' ||
-    record.layer === 'PAIRED_ARB'
+    record.layer === 'PAIRED_ARB' ||
+    record.layer === 'LOTTERY'
       ? record.layer
       : null;
   const fallback = createDefaultStrategyLayersSnapshot(runtimeConfig).find(
@@ -729,6 +795,7 @@ function normalizeGlobalExposure(
     sniperUsd: normalizeNumber(record.sniperUsd, 0),
     mmUsd: normalizeNumber(record.mmUsd, 0),
     pairedArbUsd: normalizeNumber(record.pairedArbUsd, 0),
+    lotteryUsd: normalizeNumber(record.lotteryUsd, 0),
     totalUsd: normalizeNumber(record.totalUsd, 0),
     maxUsd: normalizeNumber(record.maxUsd, runtimeConfig.GLOBAL_MAX_EXPOSURE_USD),
   };

@@ -1,6 +1,6 @@
 # Strategy Layers
 
-This runtime can operate as a coordinated three-layer system modeled on the real Polymarket trading pattern seen in high-frequency 5-minute crypto wallets such as vague-sourdough.
+This runtime can operate as a coordinated four-layer system modeled on the real Polymarket trading pattern seen in high-frequency 5-minute crypto wallets such as vague-sourdough.
 
 ## Overview
 
@@ -9,10 +9,11 @@ ORCHESTRATOR (src/index.ts)
   -> SNIPER
   -> MM_QUOTE
   -> PAIRED_ARB
+  -> LOTTERY
   -> shared risk, exposure, and conflict rules
 ```
 
-The important change is not just that all three layers exist. The important change is that they now share one orchestration path, one global exposure budget, and one set of coexistence rules.
+The important change is not just that all four layers exist. The important change is that they now share one orchestration path, one global exposure budget, and one set of coexistence rules.
 
 ## Layer 1: SNIPER
 
@@ -34,7 +35,7 @@ Exit logic:
 - Binance reversal stop if the move flips against the position
 - time stop when `SNIPER_MAX_HOLD_MS` is reached and the trade is not working
 
-Legacy `HARD_STOP`, `TRAILING_TAKE_PROFIT`, and `SLOT_FLATTEN` are suppressed for tagged sniper positions because sniper manages its own exits.
+Legacy `HARD_STOP` and `TRAILING_TAKE_PROFIT` are suppressed for tagged sniper positions because sniper manages its own exits. `SLOT_FLATTEN` still acts as universal slot-end cleanup.
 
 ## Layer 2: MM_QUOTE
 
@@ -67,17 +68,50 @@ Behavior:
 - protected from sniper-style hard stops and trailing exits
 - only the global `RISK_LIMIT` emergency brake can force the position out early
 
+## Layer 4: LOTTERY
+
+Purpose:
+
+- convex opposite-side betting after a confirmed sniper fill
+- fixed-cost asymmetric upside
+- lowest execution priority and never allowed to block sniper flow
+
+Behavior:
+
+- runs through `src/lottery-engine.ts`
+- triggers only after a successful `SNIPER_BUY` when enabled
+- targets the opposite outcome in a cheap price band, usually `3-7` cents
+- always submits passive `LOTTERY_BUY` orders
+- uses fixed-risk sizing from `LOTTERY_MAX_RISK_USDC`
+- holds to settlement or slot-end cleanup instead of routine profit-taking
+
+Why it exists:
+
+- sniper generates many small directional edges
+- lottery adds rare but outsized reversal payouts
+- fixed entry cost makes the downside explicit: the maximum loss is the ticket cost
+
+Risk behavior:
+
+- no legacy `HARD_STOP`
+- no legacy `TRAILING_TAKE_PROFIT`
+- `SLOT_FLATTEN` still closes lottery inventory at slot end if the market has not settled yet
+- tiny sub-minimum tails can fall through to auto-redeem / settlement cleanup
+
 ## Layer Interaction Rules
 
 Allowed:
 
 - `SNIPER + MM_QUOTE`
+- `SNIPER + LOTTERY`
+- `MM_QUOTE + LOTTERY`
 - same layer across multiple markets within per-layer caps
 
 Blocked:
 
 - `SNIPER + PAIRED_ARB`
 - `MM_QUOTE + PAIRED_ARB`
+- `LOTTERY + PAIRED_ARB`
 
 Conflict handling is controlled by:
 
@@ -94,6 +128,7 @@ Per-layer limits still apply:
 - sniper position caps
 - MM gross/net inventory caps
 - paired-arb per-side limits
+- lottery fixed-risk ticket caps
 
 Shared controls now apply on top:
 
@@ -130,11 +165,13 @@ SNIPER_MODE_ENABLED=true
 MARKET_MAKER_MODE=true
 DYNAMIC_QUOTING_ENABLED=true
 PAIRED_ARB_ENABLED=true
+LOTTERY_LAYER_ENABLED=true
 SNIPER_BASE_SHARES=6
 SNIPER_STRONG_SHARES=10
 SNIPER_MAX_POSITION_SHARES=12
 MM_MAX_GROSS_EXPOSURE_USD=10
 PAIRED_ARB_MAX_SHARES=8
+LOTTERY_MAX_RISK_USDC=12
 GLOBAL_MAX_EXPOSURE_USD=50
 ```
 
@@ -145,13 +182,32 @@ SNIPER_MODE_ENABLED=true
 MARKET_MAKER_MODE=true
 DYNAMIC_QUOTING_ENABLED=true
 PAIRED_ARB_ENABLED=true
+LOTTERY_LAYER_ENABLED=true
 SNIPER_BASE_SHARES=8
 SNIPER_STRONG_SHARES=12
 SNIPER_MAX_POSITION_SHARES=16
 MM_MAX_GROSS_EXPOSURE_USD=15
 PAIRED_ARB_MAX_SHARES=10
+LOTTERY_MAX_RISK_USDC=20
 GLOBAL_MAX_EXPOSURE_USD=75
 ```
+
+## Lottery Configuration
+
+| Parameter | Default | Description |
+|---|---:|---|
+| `LOTTERY_LAYER_ENABLED` | `false` | Master switch for the lottery layer. |
+| `LOTTERY_MAX_RISK_USDC` | `12` | Maximum risk per lottery ticket. |
+| `LOTTERY_MIN_CENTS` | `0.03` | Minimum acceptable opposite-side ask. |
+| `LOTTERY_MAX_CENTS` | `0.07` | Maximum acceptable opposite-side ask. |
+| `LOTTERY_ONLY_AFTER_SNIPER` | `true` | Restricts lottery entries to confirmed `SNIPER_BUY` fills. |
+| `LOTTERY_MAX_PER_SLOT` | `1` | Caps lottery tickets per five-minute slot. |
+
+Recommended settings:
+
+- Conservative: `LOTTERY_MAX_RISK_USDC=8`, `LOTTERY_MAX_CENTS=0.05`
+- Moderate: `LOTTERY_MAX_RISK_USDC=12`, `LOTTERY_MAX_CENTS=0.07`
+- Aggressive: `LOTTERY_MAX_RISK_USDC=20`, `LOTTERY_MAX_CENTS=0.10`
 
 ## Dashboard Guide
 
@@ -159,6 +215,7 @@ The production dashboard now includes:
 
 - `portfolio`, `cash`, and `available` in the header
 - `STRATEGY LAYERS` with per-layer status, position count, exposure, and PnL
+- `LOTTERY LAYER` with tickets, hits, active entries, total risk, payout, and ROI
 - `RECENT SIGNALS` with a `LAYER` column
 
 Interpretation:
@@ -188,6 +245,14 @@ Why is PAIRED_ARB not firing?
 - verify both sides are below `PAIRED_ARB_MAX_PAIR_COST`
 - check minimum depth and share floors
 - check market conflict rules if sniper or MM are already active on that market
+
+Why is LOTTERY not firing?
+
+- confirm `LOTTERY_LAYER_ENABLED=true`
+- confirm the trigger was a filled `SNIPER_BUY`
+- confirm the opposite-side ask is inside `LOTTERY_MIN_CENTS` / `LOTTERY_MAX_CENTS`
+- check `LOTTERY_MAX_PER_SLOT`
+- check `globalExposure.totalUsd` if fresh entries are blocked
 
 Why are new entries blocked?
 

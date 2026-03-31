@@ -86,7 +86,7 @@ export class RiskManager {
       const exit = positionManager.getExitSignal(outcome, now, limits, {
         suppressHardStop: !useLegacyManagedExits,
         suppressTrailingTP: !useLegacyManagedExits,
-        suppressSlotFlatten: !useLegacyManagedExits,
+        suppressSlotFlatten: false,
       });
       if (exit) {
         forcedSignals.push(this.fromExitSignal(exit, market, orderbook));

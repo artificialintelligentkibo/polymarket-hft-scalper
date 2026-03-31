@@ -19,6 +19,7 @@ import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
 import type { MarketCandidate } from '../src/monitor.js';
 import { PositionManager } from '../src/position-manager.js';
 import type { StrategySignal } from '../src/strategy-types.js';
+import { resetConfigCache } from '../src/config.js';
 import { clearDayPnlStateFile, resetDayPnlStateCache } from '../src/day-pnl-state.js';
 import { getSlotMetrics, recordSettlementPnl, resetSlotReporterState } from '../src/slot-reporter.js';
 
@@ -655,6 +656,7 @@ test('valid SLOT_FLATTEN orders still execute normally above the minimum size', 
     getState: () => ({ reason: null, source: null }),
   };
   runtime.executor = {
+    getOutcomeTokenBalance: async () => 6,
     executeSignal: async (params: { signal: StrategySignal }) => {
       executorCalls += 1;
       assert.equal(params.signal.signalType, 'SLOT_FLATTEN');
@@ -692,6 +694,103 @@ test('valid SLOT_FLATTEN orders still execute normally above the minimum size', 
   assert.equal(executorCalls, 1);
   assert.equal(result?.fillConfirmed, true);
   assert.equal(runtime.dustAbandonedPositions.size, 0);
+});
+
+test('confirmed sniper buys can trigger a best-effort lottery ticket on the opposite side', async () => {
+  const originalLotteryEnabled = process.env.LOTTERY_LAYER_ENABLED;
+  const originalLotteryMin = process.env.LOTTERY_MIN_CENTS;
+  const originalLotteryMax = process.env.LOTTERY_MAX_CENTS;
+  const originalLotteryRisk = process.env.LOTTERY_MAX_RISK_USDC;
+  process.env.LOTTERY_LAYER_ENABLED = 'true';
+  process.env.LOTTERY_MIN_CENTS = '0.03';
+  process.env.LOTTERY_MAX_CENTS = '0.07';
+  process.env.LOTTERY_MAX_RISK_USDC = '10';
+  resetConfigCache();
+
+  try {
+    const runtime = new MarketMakerRuntime() as any;
+    const market = createMarket();
+    const orderbook = createOrderbook();
+    orderbook.no.bestAsk = 0.05;
+    orderbook.no.midPrice = 0.05;
+    orderbook.no.lastTradePrice = 0.05;
+
+    const positionManager = new PositionManager(market.marketId, market.endTime);
+    const calls: string[] = [];
+
+    runtime.syncRuntimeStatus = () => {};
+    runtime.statusMonitor = {
+      isPaused: () => false,
+      getState: () => ({ reason: null, source: null }),
+    };
+    runtime.executor = {
+      executeSignal: async (params: { signal: StrategySignal }) => {
+        calls.push(params.signal.signalType);
+        if (params.signal.signalType === 'LOTTERY_BUY') {
+          assert.equal(params.signal.outcome, 'NO');
+          assert.equal(params.signal.urgency, 'passive');
+          assert.equal(params.signal.strategyLayer, 'LOTTERY');
+          return createExecutionReport({
+            orderId: 'lottery-order',
+            tokenId: 'no-token',
+            outcome: 'NO',
+            side: 'BUY',
+            shares: 100,
+            filledShares: 100,
+            price: 0.05,
+            fillPrice: 0.05,
+          });
+        }
+
+        return createExecutionReport({
+          orderId: 'sniper-order',
+          tokenId: 'yes-token',
+          outcome: 'YES',
+          side: 'BUY',
+          shares: 6,
+          filledShares: 6,
+          price: 0.32,
+          fillPrice: 0.32,
+        });
+      },
+      invalidateOutcomeBalanceCache: () => {},
+      invalidateBalanceValidationCache: () => {},
+    };
+
+    const result = await runtime.executeSignal(
+      market,
+      orderbook,
+      positionManager,
+      createSignal({
+        signalType: 'SNIPER_BUY',
+        priority: 1200,
+        action: 'BUY',
+        outcome: 'YES',
+        shares: 6,
+        targetPrice: 0.32,
+        referencePrice: 0.32,
+        tokenPrice: 0.32,
+        midPrice: 0.32,
+        fairValue: 0.48,
+        urgency: 'cross',
+        strategyLayer: 'SNIPER',
+      }),
+      'slot-1'
+    );
+
+    assert.equal(result?.fillConfirmed, true);
+    assert.deepEqual(calls, ['SNIPER_BUY', 'LOTTERY_BUY']);
+    assert.equal(positionManager.getShares('YES'), 6);
+    assert.equal(positionManager.getShares('NO'), 100);
+    assert.equal(positionManager.getPositionLayer('NO'), 'LOTTERY');
+    assert.equal(runtime.lotteryEngine.getStats().totalTickets, 1);
+  } finally {
+    process.env.LOTTERY_LAYER_ENABLED = originalLotteryEnabled;
+    process.env.LOTTERY_MIN_CENTS = originalLotteryMin;
+    process.env.LOTTERY_MAX_CENTS = originalLotteryMax;
+    process.env.LOTTERY_MAX_RISK_USDC = originalLotteryRisk;
+    resetConfigCache();
+  }
 });
 
 test('live reduce-only exits are clamped to the settled token balance after BUY fills', async () => {

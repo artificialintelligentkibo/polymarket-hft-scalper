@@ -100,6 +100,12 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.sniper.velocityWindowMs, 5000);
   assert.equal(candidate.sniper.minVelocityPctPerSec, 0.005);
   assert.equal(candidate.sniper.volatilityScale, 0.003);
+  assert.equal(candidate.lottery.enabled, false);
+  assert.equal(candidate.lottery.maxRiskUsdc, 12);
+  assert.equal(candidate.lottery.minCents, 0.03);
+  assert.equal(candidate.lottery.maxCents, 0.07);
+  assert.equal(candidate.lottery.onlyAfterSniper, true);
+  assert.equal(candidate.lottery.maxPerSlot, 1);
   assert.equal(candidate.strategy.minCombinedDiscount, 0.01);
   assert.equal(candidate.strategy.extremeSellThreshold, 0.93);
   assert.equal(candidate.strategy.extremeBuyThreshold, 0.04);

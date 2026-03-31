@@ -27,6 +27,7 @@ import {
   type PendingOrder,
 } from './fill-tracker.js';
 import { buildFlattenSignals } from './flatten-signals.js';
+import { LotteryEngine } from './lottery-engine.js';
 import { logger, TradeLogger } from './logger.js';
 import {
   MarketMonitor,
@@ -138,6 +139,7 @@ interface LayerExposureAccumulator {
   sniperUsd: number;
   mmUsd: number;
   pairedArbUsd: number;
+  lotteryUsd: number;
   totalUsd: number;
   maxUsd: number;
 }
@@ -164,6 +166,7 @@ export class MarketMakerRuntime {
   private readonly tradeLogger = new TradeLogger();
   private readonly riskManager = new RiskManager();
   private readonly signalEngine = new SignalScalper();
+  private readonly lotteryEngine = new LotteryEngine(config);
   private readonly quotingEngine = new QuotingEngine();
   private readonly redeemer = new AutoRedeemer();
   private readonly resolutionChecker = new ResolutionChecker();
@@ -334,6 +337,12 @@ export class MarketMakerRuntime {
           redeemedShares,
           actualPayoutUsd
         );
+        const lotteryMarketId = market?.marketId ?? conditionId;
+        this.lotteryEngine.recordSettlement({
+          marketId: lotteryMarketId,
+          outcome: resolution.winningOutcome,
+          payoutUsd: actualPayoutUsd,
+        });
         if (result.found && Number.isFinite(result.pnl)) {
           const dayState = market
             ? recordSettlementPnl({
@@ -1125,6 +1134,7 @@ export class MarketMakerRuntime {
     }
 
     const beforeSnapshot = positionManager.getSnapshot();
+    const beforeOutcomeLayer = positionManager.getPositionLayer(executionSignal.outcome);
     const startedAt = Date.now();
     const execution = await this.executor.executeSignal({
       market,
@@ -1152,6 +1162,16 @@ export class MarketMakerRuntime {
         : beforeSnapshot;
 
     if (effectiveShares > 0) {
+      if (executionSignal.signalType === 'LOTTERY_BUY' && executionSignal.action === 'BUY') {
+        this.lotteryEngine.recordExecution({
+          marketId: market.marketId,
+          outcome: executionSignal.outcome,
+          filledShares: effectiveShares,
+          fillPrice: effectivePrice,
+          signalType: executionSignal.signalType,
+          slotKey,
+        });
+      }
       this.recordCostBasisFill({
         market,
         side: executionSignal.action,
@@ -1252,6 +1272,64 @@ export class MarketMakerRuntime {
         price: roundTo(effectivePrice, 4),
         shares: roundTo(effectiveShares, 4),
       });
+    }
+    if (
+      effectiveShares > 0 &&
+      executionSignal.signalType === 'SNIPER_BUY' &&
+      executionSignal.action === 'BUY' &&
+      config.lottery.enabled
+    ) {
+      const lotterySignal = this.lotteryEngine.generateLotterySignal({
+        market,
+        orderbook,
+        positionManager,
+        triggerSignalType: executionSignal.signalType,
+        triggerOutcome: executionSignal.outcome,
+        triggerFillPrice: effectivePrice,
+        triggerFilledShares: effectiveShares,
+        config: config.lottery,
+        slotKey,
+      });
+      if (lotterySignal) {
+        if (this.shouldAllowFollowOnEntry(market.marketId, positionManager, lotterySignal)) {
+          try {
+            const lotteryExecution = await this.executeSignal(
+              market,
+              orderbook,
+              positionManager,
+              lotterySignal,
+              slotKey
+            );
+            if (lotteryExecution?.fillConfirmed && lotteryExecution.filledShares > 0) {
+              logger.info('Lottery ticket filled', {
+                marketId: market.marketId,
+                outcome: lotterySignal.outcome,
+                shares: lotteryExecution.filledShares,
+                price: lotteryExecution.fillPrice ?? lotteryExecution.price,
+                riskUsdc: roundTo(
+                  lotteryExecution.filledShares *
+                    (lotteryExecution.fillPrice ?? lotteryExecution.price),
+                  2
+                ),
+              });
+            }
+          } catch (error) {
+            logger.debug('Lottery ticket execution failed', {
+              marketId: market.marketId,
+              outcome: lotterySignal.outcome,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+    }
+    if (
+      effectiveShares > 0 &&
+      executionSignal.action === 'SELL' &&
+      beforeOutcomeLayer === 'LOTTERY' &&
+      positionManager.getShares(executionSignal.outcome) <= LIVE_POSITION_RECONCILIATION_EPSILON
+    ) {
+      this.lotteryEngine.recordExit(market.marketId, executionSignal.outcome);
     }
     if (
       effectiveShares > 0 &&
@@ -1557,6 +1635,7 @@ export class MarketMakerRuntime {
 
     const positionManager = this.getPositionManager(market);
     const beforeSnapshot = positionManager.getSnapshot();
+    const beforeOutcomeLayer = positionManager.getPositionLayer(fill.outcome);
     const afterSnapshot = positionManager.applyFill({
       outcome: fill.outcome,
       side: fill.side,
@@ -1566,6 +1645,16 @@ export class MarketMakerRuntime {
       orderId: fill.orderId,
       strategyLayer: fill.strategyLayer ?? resolveStrategyLayer(fill.signalType),
     });
+    if (fill.signalType === 'LOTTERY_BUY' && fill.side === 'BUY') {
+      this.lotteryEngine.recordExecution({
+        marketId: fill.marketId,
+        outcome: fill.outcome,
+        filledShares: fill.filledShares,
+        fillPrice: fill.fillPrice,
+        signalType: fill.signalType,
+        slotKey: fill.slotKey,
+      });
+    }
     this.syncBlockedExitRemainderFromInventory(
       fill.marketId,
       fill.outcome,
@@ -1601,10 +1690,51 @@ export class MarketMakerRuntime {
           shares: roundTo(fill.filledShares, 4),
         });
       }
+      if (fill.signalType === 'SNIPER_BUY' && config.lottery.enabled) {
+        const orderbook =
+          this.latestBooks.get(fill.marketId) ?? this.quotingEngine.getContext(fill.marketId)?.orderbook;
+        if (orderbook) {
+          const lotterySignal = this.lotteryEngine.generateLotterySignal({
+            market,
+            orderbook,
+            positionManager,
+            triggerSignalType: fill.signalType,
+            triggerOutcome: fill.outcome,
+            triggerFillPrice: fill.fillPrice,
+            triggerFilledShares: fill.filledShares,
+            config: config.lottery,
+            slotKey: fill.slotKey,
+          });
+          if (lotterySignal) {
+            if (this.shouldAllowFollowOnEntry(fill.marketId, positionManager, lotterySignal)) {
+              void this.executeSignal(
+                market,
+                orderbook,
+                positionManager,
+                lotterySignal,
+                fill.slotKey
+              ).catch((error) => {
+                logger.debug('Lottery ticket execution failed after delayed sniper fill', {
+                  marketId: fill.marketId,
+                  outcome: lotterySignal.outcome,
+                  message: error instanceof Error ? error.message : String(error),
+                });
+              });
+            }
+          }
+        }
+      }
     } else {
       this.clearSettlementConfirmation(fill.marketId, fill.outcome);
       this.executor.invalidateOutcomeBalanceCache(fill.tokenId);
       this.executor.invalidateBalanceValidationCache();
+    }
+    if (
+      fill.side === 'SELL' &&
+      beforeOutcomeLayer === 'LOTTERY' &&
+      positionManager.getShares(fill.outcome) <= LIVE_POSITION_RECONCILIATION_EPSILON
+    ) {
+      this.lotteryEngine.recordExit(fill.marketId, fill.outcome);
     }
     const notionalUsd = roundTo(fill.filledShares * fill.fillPrice, 2);
     const pendingOrderKey = this.getPendingOrderKey(fill.marketId, fill.outcome);
@@ -1908,8 +2038,10 @@ export class MarketMakerRuntime {
         return 2;
       case 'MM_QUOTE':
         return 3;
-      default:
+      case 'LOTTERY':
         return 4;
+      default:
+        return 5;
     }
   }
 
@@ -1953,10 +2085,13 @@ export class MarketMakerRuntime {
       case 'PAIRED_ARB':
         exposure.pairedArbUsd = roundTo(exposure.pairedArbUsd + amountUsd, 4);
         break;
+      case 'LOTTERY':
+        exposure.lotteryUsd = roundTo(exposure.lotteryUsd + amountUsd, 4);
+        break;
     }
 
     exposure.totalUsd = roundTo(
-      exposure.sniperUsd + exposure.mmUsd + exposure.pairedArbUsd,
+      exposure.sniperUsd + exposure.mmUsd + exposure.pairedArbUsd + exposure.lotteryUsd,
       4
     );
   }
@@ -2016,11 +2151,24 @@ export class MarketMakerRuntime {
           pnlUsd: 0,
         },
       ],
+      [
+        'LOTTERY',
+        {
+          layer: 'LOTTERY',
+          enabled: config.lottery.enabled,
+          status: config.lottery.enabled ? 'WATCHING' : 'OFF',
+          positionCount: 0,
+          marketCount: 0,
+          exposureUsd: 0,
+          pnlUsd: 0,
+        },
+      ],
     ]);
     const layerMarkets = new Map<StrategyLayer, Set<string>>([
       ['SNIPER', new Set<string>()],
       ['MM_QUOTE', new Set<string>()],
       ['PAIRED_ARB', new Set<string>()],
+      ['LOTTERY', new Set<string>()],
     ]);
 
     for (const [marketId, positionManager] of this.positions.entries()) {
@@ -2079,7 +2227,7 @@ export class MarketMakerRuntime {
       });
     }
 
-    const strategyLayers = (['SNIPER', 'MM_QUOTE', 'PAIRED_ARB'] as const).map((layer) => {
+    const strategyLayers = (['SNIPER', 'MM_QUOTE', 'PAIRED_ARB', 'LOTTERY'] as const).map((layer) => {
       const snapshot = base.get(layer)!;
       return {
         ...snapshot,
@@ -2094,6 +2242,8 @@ export class MarketMakerRuntime {
         mmUsd: strategyLayers.find((entry) => entry.layer === 'MM_QUOTE')?.exposureUsd ?? 0,
         pairedArbUsd:
           strategyLayers.find((entry) => entry.layer === 'PAIRED_ARB')?.exposureUsd ?? 0,
+        lotteryUsd:
+          strategyLayers.find((entry) => entry.layer === 'LOTTERY')?.exposureUsd ?? 0,
         totalUsd: roundTo(
           strategyLayers.reduce((sum, entry) => sum + entry.exposureUsd, 0),
           4
@@ -2311,6 +2461,7 @@ export class MarketMakerRuntime {
         strategyLayers: layerSummary.strategyLayers,
         globalExposure: layerSummary.globalExposure,
         sniperStats: this.signalEngine.getSniperStats(),
+        lotteryStats: this.lotteryEngine.getStats(),
         mmEnabled: isDynamicQuotingEnabled(config),
         mmAutonomousQuotes: config.MM_AUTONOMOUS_QUOTES,
         mmQuoteShares: config.MM_QUOTE_SHARES,
@@ -2423,6 +2574,8 @@ export class MarketMakerRuntime {
    */
   private clearPositionStateForMarket(marketId: string): void {
     const market = this.markets.get(marketId);
+    this.lotteryEngine.recordExit(marketId, 'YES');
+    this.lotteryEngine.recordExit(marketId, 'NO');
     this.positions.delete(marketId);
     this.latestBooks.delete(marketId);
     this.marketActions.delete(marketId);
@@ -2912,6 +3065,53 @@ export class MarketMakerRuntime {
       },
     });
     return false;
+  }
+
+  private shouldAllowFollowOnEntry(
+    marketId: string,
+    positionManager: PositionManager,
+    signal: StrategySignal
+  ): boolean {
+    if (!this.isEntrySignal(signal)) {
+      return true;
+    }
+
+    if (config.LAYER_CONFLICT_RESOLUTION === 'BLOCK') {
+      const requestedLayer = this.resolveSignalLayer(signal);
+      const conflictingLayers = this.getActiveLayersForMarket(marketId, positionManager).filter(
+        (layer) => isLayerConflict(layer, requestedLayer)
+      );
+      if (conflictingLayers.length > 0) {
+        logger.debug('Follow-on layer entry skipped', {
+          marketId,
+          signalType: signal.signalType,
+          reason: 'layer_conflict',
+          details: {
+            existingLayers: conflictingLayers,
+            requestedLayer,
+          },
+        });
+        return false;
+      }
+    }
+
+    const globalExposure = this.getGlobalExposure();
+    const requestedExposureUsd = this.estimateSignalExposureUsd(signal);
+    if (globalExposure.totalUsd + requestedExposureUsd > config.GLOBAL_MAX_EXPOSURE_USD) {
+      logger.debug('Follow-on layer entry skipped', {
+        marketId,
+        signalType: signal.signalType,
+        reason: 'global_exposure_limit',
+        details: {
+          totalExposureUsd: globalExposure.totalUsd,
+          requestedExposureUsd,
+          maxExposureUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+        },
+      });
+      return false;
+    }
+
+    return true;
   }
 
   /**

@@ -2,13 +2,14 @@
 
 For a browser-friendly environment-variable guide, open [CONFIG_HELP.html](./CONFIG_HELP.html). It is a visual companion to `.env.example` and is the quickest way to understand what each configuration section is used for before editing your live or paper setup.
 
-## Three-Layer Strategy System
+## Four-Layer Strategy System
 
-The runtime can now coordinate three independently switchable layers:
+The runtime can now coordinate four independently switchable layers:
 
 - `SNIPER`
 - `MM_QUOTE`
 - `PAIRED_ARB`
+- `LOTTERY`
 
 Recommended entry point:
 
@@ -17,6 +18,7 @@ SNIPER_MODE_ENABLED=true
 MARKET_MAKER_MODE=true
 DYNAMIC_QUOTING_ENABLED=true
 PAIRED_ARB_ENABLED=true
+LOTTERY_LAYER_ENABLED=true
 MM_AUTO_ACTIVATE_AFTER_SNIPER=true
 LAYER_CONFLICT_RESOLUTION=BLOCK
 GLOBAL_MAX_EXPOSURE_USD=50
@@ -26,7 +28,8 @@ Important notes:
 
 - `ENTRY_STRATEGY` is still supported for backward compatibility, but coordinated production setups should prefer the layer switches above
 - `SNIPER + MM_QUOTE` may coexist on one market
-- `PAIRED_ARB` conflicts with both `SNIPER` and `MM_QUOTE`
+- `SNIPER + LOTTERY` and `MM_QUOTE + LOTTERY` may coexist on one market
+- `PAIRED_ARB` conflicts with `SNIPER`, `MM_QUOTE`, and `LOTTERY`
 - `MAX_DRAWDOWN_USDC` is still the global emergency stop
 
 ## Layer Coordination
@@ -37,11 +40,12 @@ Important notes:
 | `MARKET_MAKER_MODE` | bool | `false` | Enables market-maker logic. |
 | `DYNAMIC_QUOTING_ENABLED` | bool | `false` | Starts the dedicated quoting loop. |
 | `PAIRED_ARB_ENABLED` | bool | `false` | Enables paired-arbitrage opportunities. |
+| `LOTTERY_LAYER_ENABLED` | bool | `false` | Enables the lottery follow-on layer. |
 | `MM_AUTO_ACTIVATE_AFTER_SNIPER` | bool | `true` | Activates MM quoting for a market after a confirmed sniper entry. |
 | `LAYER_CONFLICT_RESOLUTION` | enum | `BLOCK` | `BLOCK` rejects conflicting layers on the same market. `OVERRIDE` allows them. |
 | `GLOBAL_MAX_EXPOSURE_USD` | float | `50` | Shared gross exposure budget across all layers. |
 
-## Recommended Three-Layer Production Baseline
+## Recommended Four-Layer Production Baseline
 
 ```env
 SNIPER_MODE_ENABLED=true
@@ -67,6 +71,13 @@ PAIRED_ARB_ENABLED=true
 PAIRED_ARB_MIN_NET_EDGE=0.008
 PAIRED_ARB_MAX_PAIR_COST=0.995
 PAIRED_ARB_MAX_SHARES=8
+
+LOTTERY_LAYER_ENABLED=true
+LOTTERY_MAX_RISK_USDC=12
+LOTTERY_MIN_CENTS=0.03
+LOTTERY_MAX_CENTS=0.07
+LOTTERY_ONLY_AFTER_SNIPER=true
+LOTTERY_MAX_PER_SLOT=1
 
 GLOBAL_MAX_EXPOSURE_USD=50
 MAX_DRAWDOWN_USDC=-10
@@ -151,6 +162,53 @@ Important safeguards:
 - If leg 2 fails, leg 1 is unwound immediately.
 - `HARD_STOP` is deferred briefly while a paired leg is still pending completion.
 - CLOB minimums still apply per leg: at least `5` shares and at least `$1` notional.
+
+## Lottery Layer
+
+| Parameter | Type | Default | Description |
+|---|---|---:|---|
+| `LOTTERY_LAYER_ENABLED` | bool | `false` | Master switch for opposite-side lottery entries. |
+| `LOTTERY_MAX_RISK_USDC` | float | `12` | Maximum fixed risk per lottery ticket. |
+| `LOTTERY_MIN_CENTS` | float | `0.03` | Minimum acceptable opposite-side ask. |
+| `LOTTERY_MAX_CENTS` | float | `0.07` | Maximum acceptable opposite-side ask. |
+| `LOTTERY_ONLY_AFTER_SNIPER` | bool | `true` | Restricts lottery entries to successful `SNIPER_BUY` fills. |
+| `LOTTERY_MAX_PER_SLOT` | int | `1` | Caps tickets per five-minute slot. |
+
+Behavior:
+
+- lottery only submits passive `LOTTERY_BUY` orders
+- fixed max loss equals the ticket cost
+- legacy `HARD_STOP` and `TRAILING_TAKE_PROFIT` do not manage lottery inventory
+- `SLOT_FLATTEN` still cleans up lottery positions at slot end
+
+Recommended tuning:
+
+Conservative:
+
+```env
+LOTTERY_LAYER_ENABLED=true
+LOTTERY_MAX_RISK_USDC=8
+LOTTERY_MAX_CENTS=0.05
+LOTTERY_MAX_PER_SLOT=1
+```
+
+Moderate:
+
+```env
+LOTTERY_LAYER_ENABLED=true
+LOTTERY_MAX_RISK_USDC=12
+LOTTERY_MAX_CENTS=0.07
+LOTTERY_MAX_PER_SLOT=1
+```
+
+Aggressive:
+
+```env
+LOTTERY_LAYER_ENABLED=true
+LOTTERY_MAX_RISK_USDC=20
+LOTTERY_MAX_CENTS=0.10
+LOTTERY_MAX_PER_SLOT=2
+```
 
 ## Latency Momentum
 

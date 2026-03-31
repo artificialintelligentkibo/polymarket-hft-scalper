@@ -525,6 +525,13 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   lines.push('');
   lines.push(
     renderSection(
+      'LOTTERY LAYER',
+      renderLotteryStats(runtimeStatus)
+    )
+  );
+  lines.push('');
+  lines.push(
+    renderSection(
       'RECENT SIGNALS',
       renderRecentSignals(runtimeStatus?.lastSignals ?? [])
     )
@@ -865,6 +872,28 @@ function renderSniperStats(stats: SniperStatsSnapshot | undefined): string {
   }
 
   return lines.join('\n');
+}
+
+function renderLotteryStats(runtimeStatus: RuntimeStatusSnapshot | null): string {
+  const stats = runtimeStatus?.lotteryStats;
+  if (!stats || !stats.enabled) {
+    return color.dim('Lottery layer is disabled.');
+  }
+
+  const roiPct =
+    stats.totalRiskUsdc > 0
+      ? roundTo(((stats.totalPayoutUsdc - stats.totalRiskUsdc) / stats.totalRiskUsdc) * 100, 1)
+      : null;
+  const activeLabel =
+    stats.activeEntries === 1
+      ? '1 entry'
+      : `${stats.activeEntries} entries`;
+
+  return [
+    `Status: ${color.green('ENABLED')} | Tickets: ${color.bold(String(stats.totalTickets))} | Hits: ${color.bold(String(stats.totalHits))} | Hit rate: ${color.bold(stats.hitRate)}`,
+    `Active: ${activeLabel} | Total risk: ${color.bold(formatPlainCurrency(stats.totalRiskUsdc))} | Total payout: ${color.bold(formatPlainCurrency(stats.totalPayoutUsdc))}`,
+    `ROI: ${roiPct !== null ? colorizeSignedPercent(roiPct) : color.dim('n/a')}`,
+  ].join('\n');
 }
 
 function resolveActiveMarketAction(

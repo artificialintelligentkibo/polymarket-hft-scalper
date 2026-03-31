@@ -276,22 +276,41 @@ test('runtime status preserves strategy layer snapshots and signal layers for da
           exposureUsd: 0,
           pnlUsd: 0,
         },
+        {
+          layer: 'LOTTERY',
+          enabled: true,
+          status: 'ACTIVE',
+          positionCount: 1,
+          marketCount: 1,
+          exposureUsd: 0.31,
+          pnlUsd: -0.12,
+        },
       ],
       globalExposure: {
         sniperUsd: 6.5,
         mmUsd: 1.25,
         pairedArbUsd: 0,
-        totalUsd: 7.75,
+        lotteryUsd: 0.31,
+        totalUsd: 8.06,
         maxUsd: 50,
+      },
+      lotteryStats: {
+        enabled: true,
+        totalTickets: 4,
+        totalHits: 1,
+        activeEntries: 1,
+        hitRate: '25.0%',
+        totalRiskUsdc: 18.4,
+        totalPayoutUsdc: 24.6,
       },
       lastSignals: [
         {
           timestamp: new Date().toISOString(),
           marketId: 'market-1',
-          strategyLayer: 'SNIPER',
-          signalType: 'SNIPER_BUY',
+          strategyLayer: 'LOTTERY',
+          signalType: 'LOTTERY_BUY',
           action: 'BUY',
-          outcome: 'YES',
+          outcome: 'NO',
           latencyMs: 712,
         },
       ],
@@ -301,8 +320,9 @@ test('runtime status preserves strategy layer snapshots and signal layers for da
 
   assert.equal(status.strategyLayers[0]?.layer, 'SNIPER');
   assert.equal(status.strategyLayers[0]?.status, 'ACTIVE');
-  assert.equal(status.globalExposure.totalUsd, 7.75);
-  assert.equal(status.lastSignals[0]?.strategyLayer, 'SNIPER');
+  assert.equal(status.globalExposure.totalUsd, 8.06);
+  assert.equal(status.lotteryStats.totalTickets, 4);
+  assert.equal(status.lastSignals[0]?.strategyLayer, 'LOTTERY');
 
   rmSync(reportsDir, { recursive: true, force: true });
   resetDayPnlStateCache();

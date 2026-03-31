@@ -18,7 +18,7 @@ Dual-sided Polymarket CLOB market-maker for 5-minute markets. The runtime now co
 
 ## Quick Start
 
-Use the full config reference in [docs/CONFIGURATION.md](docs/CONFIGURATION.md), the visual browser-friendly config helper in [docs/CONFIG_HELP.html](docs/CONFIG_HELP.html), the legacy strategy walkthrough in [docs/STRATEGY_GUIDE.md](docs/STRATEGY_GUIDE.md), and the coordinated three-layer overview in [docs/STRATEGY_LAYERS.md](docs/STRATEGY_LAYERS.md).
+Use the full config reference in [docs/CONFIGURATION.md](docs/CONFIGURATION.md), the visual browser-friendly config helper in [docs/CONFIG_HELP.html](docs/CONFIG_HELP.html), the legacy strategy walkthrough in [docs/STRATEGY_GUIDE.md](docs/STRATEGY_GUIDE.md), and the coordinated four-layer overview in [docs/STRATEGY_LAYERS.md](docs/STRATEGY_LAYERS.md).
 
 Recommended first paper test:
 
@@ -54,9 +54,9 @@ Recommended strategy presets:
 - `ENTRY_STRATEGY=ALL`
   Highest activity. Disable weak legacy long entries first.
 
-## Three-Layer Strategy System
+## Four-Layer Strategy System
 
-The runtime now supports a coordinated three-layer architecture instead of treating every strategy as an unrelated signal source:
+The runtime now supports a coordinated four-layer architecture instead of treating every strategy as an unrelated signal source:
 
 1. `SNIPER`
    Binance-led directional entries with fast profit-taking, reversal stops, and time stops.
@@ -64,12 +64,17 @@ The runtime now supports a coordinated three-layer architecture instead of treat
    Passive dual-sided quote management that can auto-activate after a successful sniper fill.
 3. `PAIRED_ARB`
    Both-sides-cheap execution that prefers holding to settlement and is protected from routine sniper-style exits.
+4. `LOTTERY`
+   Small passive opposite-side entries after a confirmed sniper fill, sized as fixed-risk convex tickets that either expire near-zero or settle at `1.00`.
 
 Shared coordination rules:
 
 - `SNIPER + MM_QUOTE` can coexist on the same market.
-- `PAIRED_ARB` conflicts with both `SNIPER` and `MM_QUOTE` on the same market.
-- legacy `HARD_STOP`, `TRAILING_TAKE_PROFIT`, and `SLOT_FLATTEN` now target sniper or untagged positions only
+- `SNIPER + LOTTERY` can coexist on the same market.
+- `MM_QUOTE + LOTTERY` can coexist on the same market.
+- `PAIRED_ARB` conflicts with `SNIPER`, `MM_QUOTE`, and `LOTTERY` on the same market.
+- legacy `HARD_STOP` and `TRAILING_TAKE_PROFIT` now target sniper or untagged positions only
+- `LOTTERY` is exempt from legacy `HARD_STOP` and `TRAILING_TAKE_PROFIT`, but still participates in `SLOT_FLATTEN`
 - `RISK_LIMIT` remains the global emergency brake across every layer
 - `GLOBAL_MAX_EXPOSURE_USD` blocks fresh entries across all layers once the shared budget is full
 
@@ -80,6 +85,7 @@ SNIPER_MODE_ENABLED=true
 MARKET_MAKER_MODE=true
 DYNAMIC_QUOTING_ENABLED=true
 PAIRED_ARB_ENABLED=true
+LOTTERY_LAYER_ENABLED=true
 MM_AUTO_ACTIVATE_AFTER_SNIPER=true
 LAYER_CONFLICT_RESOLUTION=BLOCK
 GLOBAL_MAX_EXPOSURE_USD=50
@@ -89,9 +95,13 @@ SNIPER_MAX_POSITION_SHARES=12
 MM_MAX_GROSS_EXPOSURE_USD=10
 MM_MAX_NET_DIRECTIONAL=8
 PAIRED_ARB_MAX_SHARES=8
+LOTTERY_MAX_RISK_USDC=12
+LOTTERY_MIN_CENTS=0.03
+LOTTERY_MAX_CENTS=0.07
+LOTTERY_MAX_PER_SLOT=1
 ```
 
-The production dashboard now shows per-layer status, exposure, and recent signal layer tags, plus live `portfolio`, `cash`, and `available` balances in the header.
+The production dashboard now shows per-layer status, exposure, lottery statistics, and recent signal layer tags, plus live `portfolio`, `cash`, and `available` balances in the header.
 
 ## Strategy Model
 
@@ -100,10 +110,11 @@ Entry engines now include:
 1. `PAIRED_ARB_BUY_YES` / `PAIRED_ARB_BUY_NO`
 2. `LATENCY_MOMENTUM_BUY`
 3. `SNIPER_BUY` / `SNIPER_SCALP_EXIT`
-4. `COMBINED_DISCOUNT_BUY_BOTH`
-5. `EXTREME_BUY` / `EXTREME_SELL`
-6. `FAIR_VALUE_BUY` / `FAIR_VALUE_SELL`
-7. `INVENTORY_REBALANCE`
+4. `LOTTERY_BUY`
+5. `COMBINED_DISCOUNT_BUY_BOTH`
+6. `EXTREME_BUY` / `EXTREME_SELL`
+7. `FAIR_VALUE_BUY` / `FAIR_VALUE_SELL`
+8. `INVENTORY_REBALANCE`
 
 Paired-arb notes:
 
