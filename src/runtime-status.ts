@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { CircuitBreakerSnapshot } from './api-retry.js';
 import { config, isDryRunMode, isDynamicQuotingEnabled, type AppConfig } from './config.js';
 import { getDayPnlState } from './day-pnl-state.js';
+import type { StrategyLayer } from './strategy-types.js';
 import { roundTo } from './utils.js';
 
 export type RuntimeMode = 'simulation' | 'product_test' | 'production';
@@ -10,10 +11,29 @@ export type RuntimeMode = 'simulation' | 'product_test' | 'production';
 export interface RuntimeSignalSnapshot {
   readonly timestamp: string;
   readonly marketId: string;
+  readonly strategyLayer: StrategyLayer;
   readonly signalType: string;
   readonly action: 'BUY' | 'SELL';
   readonly outcome: 'YES' | 'NO';
   readonly latencyMs: number | null;
+}
+
+export interface RuntimeLayerStatusSnapshot {
+  readonly layer: StrategyLayer;
+  readonly enabled: boolean;
+  readonly status: 'ACTIVE' | 'WATCHING' | 'OFF';
+  readonly positionCount: number;
+  readonly marketCount: number;
+  readonly exposureUsd: number;
+  readonly pnlUsd: number;
+}
+
+export interface RuntimeGlobalExposureSnapshot {
+  readonly sniperUsd: number;
+  readonly mmUsd: number;
+  readonly pairedArbUsd: number;
+  readonly totalUsd: number;
+  readonly maxUsd: number;
 }
 
 export interface SkippedSignalRecord {
@@ -145,6 +165,8 @@ export interface RuntimeStatusSnapshot {
   readonly bayesianFvAlpha: number;
   readonly activeMarkets: readonly RuntimeMarketSnapshot[];
   readonly openPositions: readonly RuntimePositionSnapshot[];
+  readonly strategyLayers: readonly RuntimeLayerStatusSnapshot[];
+  readonly globalExposure: RuntimeGlobalExposureSnapshot;
   readonly sniperStats: SniperStatsSnapshot;
   readonly mmEnabled: boolean;
   readonly mmAutonomousQuotes: boolean;
@@ -218,6 +240,8 @@ export function createRuntimeStatusSnapshot(
     bayesianFvAlpha: runtimeConfig.BAYESIAN_FV_ALPHA,
     activeMarkets: [],
     openPositions: [],
+    strategyLayers: createDefaultStrategyLayersSnapshot(runtimeConfig),
+    globalExposure: createDefaultGlobalExposureSnapshot(runtimeConfig),
     sniperStats: createDefaultSniperStatsSnapshot(runtimeConfig),
     mmEnabled: isDynamicQuotingEnabled(runtimeConfig),
     mmAutonomousQuotes: runtimeConfig.MM_AUTONOMOUS_QUOTES,
@@ -300,6 +324,16 @@ function normalizeRuntimeStatus(
         .filter((entry): entry is RuntimePositionSnapshot => entry !== null)
         .slice(0, 8)
     : [];
+  const strategyLayerDefaults = createDefaultStrategyLayersSnapshot(runtimeConfig);
+  const strategyLayerEntries = Array.isArray(value.strategyLayers)
+    ? value.strategyLayers
+        .map((entry) => normalizeRuntimeLayerStatus(entry, runtimeConfig))
+        .filter((entry): entry is RuntimeLayerStatusSnapshot => entry !== null)
+    : [];
+  const strategyLayers = strategyLayerDefaults.map(
+    (fallback) =>
+      strategyLayerEntries.find((entry) => entry.layer === fallback.layer) ?? fallback
+  );
   const mmQuotes = Array.isArray(value.mmQuotes)
     ? value.mmQuotes
         .map(normalizeRuntimeMmQuote)
@@ -353,6 +387,8 @@ function normalizeRuntimeStatus(
     bayesianFvAlpha: normalizeNumber(value.bayesianFvAlpha, runtimeConfig.BAYESIAN_FV_ALPHA),
     activeMarkets,
     openPositions,
+    strategyLayers,
+    globalExposure: normalizeGlobalExposure(value.globalExposure, runtimeConfig),
     sniperStats: normalizeSniperStats(value.sniperStats, runtimeConfig),
     mmEnabled:
       typeof value.mmEnabled === 'boolean'
@@ -458,6 +494,55 @@ function createDefaultSniperStatsSnapshot(
     nearMissCount: 0,
     coinStats: {},
     currentDirectionWindow: null,
+  };
+}
+
+function createDefaultStrategyLayersSnapshot(
+  runtimeConfig: AppConfig
+): RuntimeLayerStatusSnapshot[] {
+  return [
+    {
+      layer: 'SNIPER',
+      enabled: runtimeConfig.SNIPER_MODE_ENABLED,
+      status: runtimeConfig.SNIPER_MODE_ENABLED ? 'WATCHING' : 'OFF',
+      positionCount: 0,
+      marketCount: 0,
+      exposureUsd: 0,
+      pnlUsd: 0,
+    },
+    {
+      layer: 'MM_QUOTE',
+      enabled: runtimeConfig.MARKET_MAKER_MODE && isDynamicQuotingEnabled(runtimeConfig),
+      status:
+        runtimeConfig.MARKET_MAKER_MODE && isDynamicQuotingEnabled(runtimeConfig)
+          ? 'WATCHING'
+          : 'OFF',
+      positionCount: 0,
+      marketCount: 0,
+      exposureUsd: 0,
+      pnlUsd: 0,
+    },
+    {
+      layer: 'PAIRED_ARB',
+      enabled: runtimeConfig.PAIRED_ARB_ENABLED,
+      status: runtimeConfig.PAIRED_ARB_ENABLED ? 'WATCHING' : 'OFF',
+      positionCount: 0,
+      marketCount: 0,
+      exposureUsd: 0,
+      pnlUsd: 0,
+    },
+  ];
+}
+
+function createDefaultGlobalExposureSnapshot(
+  runtimeConfig: AppConfig
+): RuntimeGlobalExposureSnapshot {
+  return {
+    sniperUsd: 0,
+    mmUsd: 0,
+    pairedArbUsd: 0,
+    totalUsd: 0,
+    maxUsd: runtimeConfig.GLOBAL_MAX_EXPOSURE_USD,
   };
 }
 
@@ -568,23 +653,84 @@ function normalizeRuntimeSignal(value: unknown): RuntimeSignalSnapshot | null {
   }
 
   const record = value as Partial<RuntimeSignalSnapshot>;
+  const strategyLayer =
+    record.strategyLayer === 'SNIPER' ||
+    record.strategyLayer === 'MM_QUOTE' ||
+    record.strategyLayer === 'PAIRED_ARB'
+      ? record.strategyLayer
+      : null;
   const action = record.action === 'BUY' || record.action === 'SELL' ? record.action : null;
   const outcome = record.outcome === 'YES' || record.outcome === 'NO' ? record.outcome : null;
   const timestamp = typeof record.timestamp === 'string' ? record.timestamp : '';
   const marketId = typeof record.marketId === 'string' ? record.marketId : '';
   const signalType = typeof record.signalType === 'string' ? record.signalType : '';
 
-  if (!action || !outcome || !timestamp || !marketId || !signalType) {
+  if (!strategyLayer || !action || !outcome || !timestamp || !marketId || !signalType) {
     return null;
   }
 
   return {
     timestamp,
     marketId,
+    strategyLayer,
     signalType,
     action,
     outcome,
     latencyMs: normalizeNullableNumber(record.latencyMs),
+  };
+}
+
+function normalizeRuntimeLayerStatus(
+  value: unknown,
+  runtimeConfig: AppConfig
+): RuntimeLayerStatusSnapshot | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Partial<RuntimeLayerStatusSnapshot>;
+  const layer =
+    record.layer === 'SNIPER' ||
+    record.layer === 'MM_QUOTE' ||
+    record.layer === 'PAIRED_ARB'
+      ? record.layer
+      : null;
+  const fallback = createDefaultStrategyLayersSnapshot(runtimeConfig).find(
+    (entry) => entry.layer === layer
+  );
+  if (!layer || !fallback) {
+    return null;
+  }
+
+  return {
+    layer,
+    enabled: typeof record.enabled === 'boolean' ? record.enabled : fallback.enabled,
+    status:
+      record.status === 'ACTIVE' || record.status === 'WATCHING' || record.status === 'OFF'
+        ? record.status
+        : fallback.status,
+    positionCount: normalizeCount(record.positionCount),
+    marketCount: normalizeCount(record.marketCount),
+    exposureUsd: normalizeNumber(record.exposureUsd, 0),
+    pnlUsd: normalizeNumber(record.pnlUsd, 0),
+  };
+}
+
+function normalizeGlobalExposure(
+  value: unknown,
+  runtimeConfig: AppConfig
+): RuntimeGlobalExposureSnapshot {
+  if (!value || typeof value !== 'object') {
+    return createDefaultGlobalExposureSnapshot(runtimeConfig);
+  }
+
+  const record = value as Partial<RuntimeGlobalExposureSnapshot>;
+  return {
+    sniperUsd: normalizeNumber(record.sniperUsd, 0),
+    mmUsd: normalizeNumber(record.mmUsd, 0),
+    pairedArbUsd: normalizeNumber(record.pairedArbUsd, 0),
+    totalUsd: normalizeNumber(record.totalUsd, 0),
+    maxUsd: normalizeNumber(record.maxUsd, runtimeConfig.GLOBAL_MAX_EXPOSURE_USD),
   };
 }
 

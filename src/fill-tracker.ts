@@ -1,7 +1,7 @@
 import type { AppConfig } from './config.js';
 import type { Outcome, UserTradeFillEvent } from './clob-fetcher.js';
 import { logger } from './logger.js';
-import type { SignalType } from './strategy-types.js';
+import type { SignalType, StrategyLayer } from './strategy-types.js';
 import { roundTo } from './utils.js';
 
 const REST_FALLBACK_POLL_INTERVAL_MS = 10_000;
@@ -18,6 +18,7 @@ export interface PendingOrder {
   readonly submittedShares: number;
   readonly submittedPrice: number;
   readonly signalType: SignalType;
+  readonly strategyLayer?: StrategyLayer;
   readonly placedAt: number;
   readonly slotEndTime: string;
   readonly lastCheckedAt: number;
@@ -34,6 +35,7 @@ export interface ConfirmedFill {
   readonly filledShares: number;
   readonly fillPrice: number;
   readonly signalType: SignalType;
+  readonly strategyLayer?: StrategyLayer;
   readonly filledAt: number;
 }
 
@@ -309,6 +311,7 @@ export class FillTracker {
           filledShares: deltaShares,
           fillPrice: normalized.fillPrice ?? pending.submittedPrice,
           signalType: pending.signalType,
+          strategyLayer: pending.strategyLayer,
           filledAt: nowMs,
         });
 
@@ -373,6 +376,7 @@ export class FillTracker {
       filledShares: cappedDelta,
       fillPrice: event.fillPrice,
       signalType: pending.signalType,
+      strategyLayer: pending.strategyLayer,
       filledAt: event.matchedAtMs,
     });
 

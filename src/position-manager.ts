@@ -1,4 +1,5 @@
 import type { Outcome } from './clob-fetcher.js';
+import type { StrategyLayer } from './strategy-types.js';
 import { roundTo } from './utils.js';
 
 export type TradeSide = 'BUY' | 'SELL';
@@ -10,6 +11,7 @@ export interface Fill {
   price: number;
   timestamp?: string;
   orderId?: string;
+  strategyLayer?: StrategyLayer;
 }
 
 export interface PositionRiskLimits {
@@ -46,6 +48,12 @@ export interface ExitSignal {
   targetPrice: number | null;
 }
 
+export interface ExitSignalOptions {
+  suppressHardStop?: boolean;
+  suppressTrailingTP?: boolean;
+  suppressSlotFlatten?: boolean;
+}
+
 export interface BoundaryCorrection {
   signalType: 'RISK_LIMIT' | 'INVENTORY_REBALANCE_QUOTE';
   action: TradeSide;
@@ -76,6 +84,7 @@ const EPSILON = 0.000001;
 export class PositionManager {
   private readonly yes: OutcomeState = this.createEmptyState();
   private readonly no: OutcomeState = this.createEmptyState();
+  private readonly positionLayers = new Map<Outcome, StrategyLayer>();
   private slotEndsAt: string | null;
 
   constructor(private readonly marketId: string, slotEndsAt?: string | null) {
@@ -121,12 +130,51 @@ export class PositionManager {
     return roundTo(this.getState(outcome).avgEntryPrice, 6);
   }
 
+  getOutcomeRealizedPnl(outcome: Outcome): number {
+    return roundTo(this.getState(outcome).realizedPnl, 4);
+  }
+
+  getOutcomeUnrealizedPnl(outcome: Outcome): number {
+    return roundTo(this.getOutcomeUnrealized(outcome), 4);
+  }
+
+  getOutcomeTotalPnl(outcome: Outcome): number {
+    return roundTo(
+      this.getState(outcome).realizedPnl + this.getOutcomeUnrealized(outcome),
+      4
+    );
+  }
+
   getSignedNetShares(): number {
     return this.yes.shares - this.no.shares;
   }
 
   getGrossExposureShares(): number {
     return this.yes.shares + this.no.shares;
+  }
+
+  getGrossExposureUsd(): number {
+    const yesExposure =
+      this.yes.shares > EPSILON && this.yes.lastMarkPrice !== null
+        ? this.yes.shares * this.yes.lastMarkPrice
+        : 0;
+    const noExposure =
+      this.no.shares > EPSILON && this.no.lastMarkPrice !== null
+        ? this.no.shares * this.no.lastMarkPrice
+        : 0;
+    return roundTo(yesExposure + noExposure, 4);
+  }
+
+  setPositionLayer(outcome: Outcome, layer: StrategyLayer): void {
+    this.positionLayers.set(outcome, layer);
+  }
+
+  getPositionLayer(outcome: Outcome): StrategyLayer | null {
+    return this.positionLayers.get(outcome) ?? null;
+  }
+
+  getActivePositionLayers(): StrategyLayer[] {
+    return Array.from(new Set(this.positionLayers.values()));
   }
 
   isEntryCoolingDown(outcome: Outcome, now: Date = new Date()): boolean {
@@ -185,6 +233,7 @@ export class PositionManager {
       state.lastFillAt = timestamp;
       state.lastMarkPrice = fill.price;
       state.peakMarkPrice = Math.max(state.peakMarkPrice ?? fill.price, fill.price);
+      this.recordPositionLayer(fill.outcome, fill.strategyLayer);
       return this.getSnapshot();
     }
 
@@ -205,6 +254,7 @@ export class PositionManager {
       state.avgEntryPrice = 0;
       state.peakMarkPrice = null;
       state.lastMarkPrice = null;
+      this.positionLayers.delete(fill.outcome);
     }
 
     return this.getSnapshot();
@@ -276,7 +326,8 @@ export class PositionManager {
   getExitSignal(
     outcome: Outcome,
     now: Date,
-    limits: PositionRiskLimits
+    limits: PositionRiskLimits,
+    options: ExitSignalOptions = {}
   ): ExitSignal | null {
     const state = this.getState(outcome);
     if (state.shares <= EPSILON) {
@@ -284,7 +335,7 @@ export class PositionManager {
     }
 
     const mark = state.lastMarkPrice;
-    if (this.slotEndsAt) {
+    if (!options.suppressSlotFlatten && this.slotEndsAt) {
       const slotEndMs = Date.parse(this.slotEndsAt);
       if (Number.isFinite(slotEndMs) && slotEndMs - now.getTime() <= limits.exitBeforeEndMs) {
         return {
@@ -297,7 +348,11 @@ export class PositionManager {
       }
     }
 
-    if (mark !== null && mark <= state.avgEntryPrice - limits.hardStopLoss) {
+    if (
+      !options.suppressHardStop &&
+      mark !== null &&
+      mark <= state.avgEntryPrice - limits.hardStopLoss
+    ) {
       return {
         signalType: 'HARD_STOP',
         outcome,
@@ -308,6 +363,7 @@ export class PositionManager {
     }
 
     if (
+      !options.suppressTrailingTP &&
       mark !== null &&
       state.peakMarkPrice !== null &&
       state.peakMarkPrice - state.avgEntryPrice >= limits.trailingTakeProfit &&
@@ -371,5 +427,29 @@ export class PositionManager {
       lastFillAt: null,
       cooldownUntilAt: null,
     };
+  }
+
+  private recordPositionLayer(
+    outcome: Outcome,
+    strategyLayer: StrategyLayer | undefined
+  ): void {
+    if (!strategyLayer) {
+      return;
+    }
+
+    const existing = this.positionLayers.get(outcome);
+    if (!existing) {
+      this.positionLayers.set(outcome, strategyLayer);
+      return;
+    }
+
+    if (strategyLayer === 'SNIPER' || strategyLayer === 'PAIRED_ARB') {
+      this.positionLayers.set(outcome, strategyLayer);
+      return;
+    }
+
+    if (existing !== 'SNIPER' && existing !== 'PAIRED_ARB') {
+      this.positionLayers.set(outcome, strategyLayer);
+    }
   }
 }

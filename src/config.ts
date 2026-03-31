@@ -12,6 +12,7 @@ export type OrderMode = 'GTC' | 'FOK' | 'FAK';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 export type OrderUrgency = 'passive' | 'improve' | 'cross';
 export type TradeableCoin = 'BTC' | 'SOL' | 'XRP' | 'ETH';
+export type LayerConflictResolution = 'BLOCK' | 'OVERRIDE';
 
 export interface PriceMultiplierLevel {
   readonly maxPrice: number;
@@ -112,6 +113,9 @@ export interface AppConfig {
    * Recommended production default (2026): false for backward compatibility.
    */
   readonly DYNAMIC_QUOTING_ENABLED: boolean;
+  readonly MM_AUTO_ACTIVATE_AFTER_SNIPER: boolean;
+  readonly LAYER_CONFLICT_RESOLUTION: LayerConflictResolution;
+  readonly GLOBAL_MAX_EXPOSURE_USD: number;
   /**
    * When true, market-maker execution must remain passive/improve-only and
    * never intentionally cross the spread. In this codebase, `passive` is the
@@ -443,6 +447,17 @@ function parseLogLevel(value?: string): LogLevel {
   return 'info';
 }
 
+function parseLayerConflictResolution(value?: string): LayerConflictResolution {
+  const normalized = value?.trim().toUpperCase();
+  if (!normalized || normalized === 'BLOCK') {
+    return 'BLOCK';
+  }
+  if (normalized === 'OVERRIDE') {
+    return 'OVERRIDE';
+  }
+  throw new Error(`Invalid LAYER_CONFLICT_RESOLUTION: ${value}. Expected BLOCK or OVERRIDE.`);
+}
+
 function parseEntryStrategy(value?: string): EntryStrategy {
   const normalized = value?.trim().toUpperCase();
   if (!normalized || normalized === 'LEGACY') {
@@ -556,6 +571,9 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     SNIPER_MODE_ENABLED: parseBoolean(env.SNIPER_MODE_ENABLED, false),
     MARKET_MAKER_MODE: parseBoolean(env.MARKET_MAKER_MODE, false),
     DYNAMIC_QUOTING_ENABLED: parseBoolean(env.DYNAMIC_QUOTING_ENABLED, false),
+    MM_AUTO_ACTIVATE_AFTER_SNIPER: parseBoolean(env.MM_AUTO_ACTIVATE_AFTER_SNIPER, true),
+    LAYER_CONFLICT_RESOLUTION: parseLayerConflictResolution(env.LAYER_CONFLICT_RESOLUTION),
+    GLOBAL_MAX_EXPOSURE_USD: parseFloatOrDefault(env.GLOBAL_MAX_EXPOSURE_USD, '50'),
     POST_ONLY_ONLY: parseBoolean(env.POST_ONLY_ONLY, true),
     QUOTING_INTERVAL_MS: Math.max(
       50,

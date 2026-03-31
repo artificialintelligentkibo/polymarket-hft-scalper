@@ -233,3 +233,77 @@ test('runtime status preserves wallet fund fields for production header visibili
   rmSync(reportsDir, { recursive: true, force: true });
   resetDayPnlStateCache();
 });
+
+test('runtime status preserves strategy layer snapshots and signal layers for dashboard visibility', () => {
+  const reportsDir = path.resolve(process.cwd(), 'reports', 'runtime-status-layers');
+  rmSync(reportsDir, { recursive: true, force: true });
+  mkdirSync(reportsDir, { recursive: true });
+  resetDayPnlStateCache();
+
+  const runtimeConfig = createConfig({
+    ...process.env,
+    REPORTS_DIR: './reports/runtime-status-layers',
+    STATE_FILE: './reports/runtime-status-layers/state.json',
+  });
+
+  const status = writeRuntimeStatus(
+    {
+      strategyLayers: [
+        {
+          layer: 'SNIPER',
+          enabled: true,
+          status: 'ACTIVE',
+          positionCount: 2,
+          marketCount: 2,
+          exposureUsd: 6.5,
+          pnlUsd: 0.42,
+        },
+        {
+          layer: 'MM_QUOTE',
+          enabled: true,
+          status: 'WATCHING',
+          positionCount: 0,
+          marketCount: 1,
+          exposureUsd: 1.25,
+          pnlUsd: 0,
+        },
+        {
+          layer: 'PAIRED_ARB',
+          enabled: false,
+          status: 'OFF',
+          positionCount: 0,
+          marketCount: 0,
+          exposureUsd: 0,
+          pnlUsd: 0,
+        },
+      ],
+      globalExposure: {
+        sniperUsd: 6.5,
+        mmUsd: 1.25,
+        pairedArbUsd: 0,
+        totalUsd: 7.75,
+        maxUsd: 50,
+      },
+      lastSignals: [
+        {
+          timestamp: new Date().toISOString(),
+          marketId: 'market-1',
+          strategyLayer: 'SNIPER',
+          signalType: 'SNIPER_BUY',
+          action: 'BUY',
+          outcome: 'YES',
+          latencyMs: 712,
+        },
+      ],
+    },
+    runtimeConfig
+  );
+
+  assert.equal(status.strategyLayers[0]?.layer, 'SNIPER');
+  assert.equal(status.strategyLayers[0]?.status, 'ACTIVE');
+  assert.equal(status.globalExposure.totalUsd, 7.75);
+  assert.equal(status.lastSignals[0]?.strategyLayer, 'SNIPER');
+
+  rmSync(reportsDir, { recursive: true, force: true });
+  resetDayPnlStateCache();
+});

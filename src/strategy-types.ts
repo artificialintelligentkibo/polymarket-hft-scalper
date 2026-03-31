@@ -2,6 +2,7 @@ import type { Outcome } from './clob-fetcher.js';
 
 export type SignalAction = 'BUY' | 'SELL';
 export type SignalUrgency = 'passive' | 'improve' | 'cross';
+export type StrategyLayer = 'SNIPER' | 'MM_QUOTE' | 'PAIRED_ARB';
 export type SignalType =
   | 'COMBINED_DISCOUNT_BUY_BOTH'
   | 'DEEP_BINANCE_SIGNAL'
@@ -52,6 +53,51 @@ export function bypassesBinanceEdge(signalType: SignalType): boolean {
   );
 }
 
+export function resolveStrategyLayer(signalType: SignalType): StrategyLayer {
+  switch (signalType) {
+    case 'SNIPER_BUY':
+    case 'SNIPER_SCALP_EXIT':
+    case 'LATENCY_MOMENTUM_BUY':
+    case 'COMBINED_DISCOUNT_BUY_BOTH':
+    case 'EXTREME_BUY':
+    case 'EXTREME_SELL':
+    case 'FAIR_VALUE_BUY':
+    case 'FAIR_VALUE_SELL':
+    case 'INVENTORY_REBALANCE':
+    case 'RISK_LIMIT':
+    case 'TRAILING_TAKE_PROFIT':
+    case 'HARD_STOP':
+    case 'SLOT_FLATTEN':
+      return 'SNIPER';
+    case 'MM_QUOTE_BID':
+    case 'MM_QUOTE_ASK':
+    case 'DYNAMIC_QUOTE_BOTH':
+    case 'INVENTORY_REBALANCE_QUOTE':
+    case 'DEEP_BINANCE_SIGNAL':
+      return 'MM_QUOTE';
+    case 'PAIRED_ARB_BUY_YES':
+    case 'PAIRED_ARB_BUY_NO':
+    case 'PAIRED_ARB_REBALANCE':
+      return 'PAIRED_ARB';
+    default:
+      return 'SNIPER';
+  }
+}
+
+export function isLayerConflict(
+  existingLayer: StrategyLayer | null,
+  newLayer: StrategyLayer
+): boolean {
+  if (existingLayer === null || existingLayer === newLayer) {
+    return false;
+  }
+
+  return !(
+    (existingLayer === 'SNIPER' && newLayer === 'MM_QUOTE') ||
+    (existingLayer === 'MM_QUOTE' && newLayer === 'SNIPER')
+  );
+}
+
 export interface StrategySignal {
   readonly marketId: string;
   readonly marketTitle: string;
@@ -82,4 +128,5 @@ export interface StrategySignal {
   readonly urgency: SignalUrgency;
   readonly reduceOnly: boolean;
   readonly reason: string;
+  readonly strategyLayer?: StrategyLayer;
 }

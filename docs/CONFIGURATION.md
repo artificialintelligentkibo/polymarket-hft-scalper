@@ -2,7 +2,77 @@
 
 For a browser-friendly environment-variable guide, open [CONFIG_HELP.html](./CONFIG_HELP.html). It is a visual companion to `.env.example` and is the quickest way to understand what each configuration section is used for before editing your live or paper setup.
 
-This bot now supports four entry modes:
+## Three-Layer Strategy System
+
+The runtime can now coordinate three independently switchable layers:
+
+- `SNIPER`
+- `MM_QUOTE`
+- `PAIRED_ARB`
+
+Recommended entry point:
+
+```env
+SNIPER_MODE_ENABLED=true
+MARKET_MAKER_MODE=true
+DYNAMIC_QUOTING_ENABLED=true
+PAIRED_ARB_ENABLED=true
+MM_AUTO_ACTIVATE_AFTER_SNIPER=true
+LAYER_CONFLICT_RESOLUTION=BLOCK
+GLOBAL_MAX_EXPOSURE_USD=50
+```
+
+Important notes:
+
+- `ENTRY_STRATEGY` is still supported for backward compatibility, but coordinated production setups should prefer the layer switches above
+- `SNIPER + MM_QUOTE` may coexist on one market
+- `PAIRED_ARB` conflicts with both `SNIPER` and `MM_QUOTE`
+- `MAX_DRAWDOWN_USDC` is still the global emergency stop
+
+## Layer Coordination
+
+| Parameter | Type | Default | Description |
+|---|---|---:|---|
+| `SNIPER_MODE_ENABLED` | bool | `false` | Enables the sniper layer. |
+| `MARKET_MAKER_MODE` | bool | `false` | Enables market-maker logic. |
+| `DYNAMIC_QUOTING_ENABLED` | bool | `false` | Starts the dedicated quoting loop. |
+| `PAIRED_ARB_ENABLED` | bool | `false` | Enables paired-arbitrage opportunities. |
+| `MM_AUTO_ACTIVATE_AFTER_SNIPER` | bool | `true` | Activates MM quoting for a market after a confirmed sniper entry. |
+| `LAYER_CONFLICT_RESOLUTION` | enum | `BLOCK` | `BLOCK` rejects conflicting layers on the same market. `OVERRIDE` allows them. |
+| `GLOBAL_MAX_EXPOSURE_USD` | float | `50` | Shared gross exposure budget across all layers. |
+
+## Recommended Three-Layer Production Baseline
+
+```env
+SNIPER_MODE_ENABLED=true
+SNIPER_BASE_SHARES=6
+SNIPER_STRONG_SHARES=10
+SNIPER_MAX_POSITION_SHARES=12
+SNIPER_MIN_BINANCE_MOVE_PCT=0.07
+SNIPER_MIN_EDGE_AFTER_FEES=0.02
+SNIPER_SCALP_EXIT_EDGE=0.04
+SNIPER_STOP_LOSS_PCT=0.08
+SNIPER_MAX_HOLD_MS=90000
+
+MARKET_MAKER_MODE=true
+DYNAMIC_QUOTING_ENABLED=true
+MM_AUTO_ACTIVATE_AFTER_SNIPER=true
+MM_QUOTE_SHARES=6
+MM_MAX_GROSS_EXPOSURE_USD=10
+MM_MAX_NET_DIRECTIONAL=8
+MM_MIN_EDGE_AFTER_FEE=0.005
+QUOTING_SPREAD_TICKS=3
+
+PAIRED_ARB_ENABLED=true
+PAIRED_ARB_MIN_NET_EDGE=0.008
+PAIRED_ARB_MAX_PAIR_COST=0.995
+PAIRED_ARB_MAX_SHARES=8
+
+GLOBAL_MAX_EXPOSURE_USD=50
+MAX_DRAWDOWN_USDC=-10
+```
+
+This bot still supports four legacy entry modes for backward compatibility:
 
 - `ENTRY_STRATEGY=LEGACY`
 - `ENTRY_STRATEGY=PAIRED_ARBITRAGE`

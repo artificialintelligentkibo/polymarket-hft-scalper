@@ -11,7 +11,7 @@ import type {
   PositionManager,
   PositionSnapshot,
 } from './position-manager.js';
-import type { StrategySignal } from './strategy-types.js';
+import { resolveStrategyLayer, type StrategySignal } from './strategy-types.js';
 import { OUTCOMES } from './utils.js';
 
 export interface RiskAssessment {
@@ -81,7 +81,13 @@ export class RiskManager {
     }
 
     for (const outcome of OUTCOMES as readonly Outcome[]) {
-      const exit = positionManager.getExitSignal(outcome, now, limits);
+      const positionLayer = positionManager.getPositionLayer(outcome);
+      const useLegacyManagedExits = positionLayer === null || positionLayer === 'SNIPER';
+      const exit = positionManager.getExitSignal(outcome, now, limits, {
+        suppressHardStop: !useLegacyManagedExits,
+        suppressTrailingTP: !useLegacyManagedExits,
+        suppressSlotFlatten: !useLegacyManagedExits,
+      });
       if (exit) {
         forcedSignals.push(this.fromExitSignal(exit, market, orderbook));
       }
@@ -155,6 +161,7 @@ export class RiskManager {
       ),
       reduceOnly: true,
       reason: correction.reason,
+      strategyLayer: resolveStrategyLayer(correction.signalType),
     };
   }
 
@@ -193,6 +200,7 @@ export class RiskManager {
       urgency: resolveProductTestUrgency('cross', this.runtimeConfig),
       reduceOnly: true,
       reason: exit.reason,
+      strategyLayer: resolveStrategyLayer(exit.signalType),
     };
   }
 }

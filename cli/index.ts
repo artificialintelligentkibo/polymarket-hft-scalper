@@ -511,6 +511,13 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   lines.push('');
   lines.push(
     renderSection(
+      'STRATEGY LAYERS',
+      renderStrategyLayers(runtimeStatus)
+    )
+  );
+  lines.push('');
+  lines.push(
+    renderSection(
       'SNIPER ENGINE  -  BINANCE-LED SIGNAL STATUS',
       renderSniperStats(runtimeStatus?.sniperStats)
     )
@@ -712,6 +719,44 @@ function renderPerformance(
       ['Updated', runtimeStatus?.updatedAt ? truncateDashboardLabel(runtimeStatus.updatedAt, 28) : color.dim('n/a'), '', ''],
     ]
   );
+}
+
+function renderStrategyLayers(runtimeStatus: RuntimeStatusSnapshot | null): string {
+  if (!runtimeStatus) {
+    return color.dim('No runtime status snapshot available yet.');
+  }
+
+  const rows = runtimeStatus.strategyLayers.map((layer) => {
+    const status =
+      layer.status === 'ACTIVE'
+        ? color.green(layer.status)
+        : layer.status === 'WATCHING'
+          ? color.yellow(layer.status)
+          : color.dim(layer.status);
+    const positions =
+      layer.layer === 'MM_QUOTE'
+        ? `${layer.marketCount}/${runtimeStatus.mmMaxConcurrentMarkets} mkts`
+        : layer.positionCount > 0
+          ? String(layer.positionCount)
+          : '0';
+
+    return [
+      layer.layer,
+      status,
+      positions,
+      formatPlainCurrency(layer.exposureUsd),
+      formatSignedCurrency(layer.pnlUsd),
+    ];
+  });
+
+  return [
+    renderTable(
+      ['LAYER', 'STATUS', 'POSITIONS', 'EXPOSURE', 'PNL'],
+      [12, 10, 12, 12, 12],
+      rows
+    ),
+    `${color.dim('GLOBAL EXPOSURE:')} ${color.bold(formatPlainCurrency(runtimeStatus.globalExposure.totalUsd))} / ${color.bold(formatPlainCurrency(runtimeStatus.globalExposure.maxUsd))} max`,
+  ].join('\n');
 }
 
 function renderSniperStats(stats: SniperStatsSnapshot | undefined): string {
@@ -923,15 +968,16 @@ function renderRecentSignals(signals: RuntimeStatusSnapshot['lastSignals']): str
   }
 
   return renderTable(
-    ['TIME', 'MARKET', 'SIGNAL', 'SIDE', 'OUT', 'LAT'],
-    [20, 18, 20, 8, 6, 8],
+    ['TIME', 'MARKET', 'LAYER', 'SIGNAL', 'SIDE', 'OUT', 'LAT'],
+    [20, 18, 10, 18, 8, 6, 8],
     [...signals]
       .slice()
       .reverse()
       .map((signal) => [
         formatSignalTimestamp(signal.timestamp),
         truncateDashboardLabel(signal.marketId, 18),
-        truncateDashboardLabel(signal.signalType, 20),
+        signal.strategyLayer,
+        truncateDashboardLabel(signal.signalType, 18),
         signal.action,
         signal.outcome,
         signal.latencyMs !== null ? `${signal.latencyMs.toFixed(0)}ms` : 'n/a',

@@ -5,7 +5,7 @@ import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
 import type { SniperStatsSnapshot } from './runtime-status.js';
-import type { StrategySignal } from './strategy-types.js';
+import { resolveStrategyLayer, type StrategySignal } from './strategy-types.js';
 import { clamp, roundTo } from './utils.js';
 
 export interface SniperEntry {
@@ -165,11 +165,11 @@ export class SniperEngine {
       return false;
     }
 
-    if (signal.signalType === 'TRAILING_TAKE_PROFIT') {
-      return true;
-    }
-
-    return signal.signalType === 'SLOT_FLATTEN' && this.runtimeConfig.sniper.maxHoldMs === 0;
+    return (
+      signal.signalType === 'TRAILING_TAKE_PROFIT' ||
+      signal.signalType === 'HARD_STOP' ||
+      signal.signalType === 'SLOT_FLATTEN'
+    );
   }
 
   recordExecution(params: {
@@ -756,6 +756,7 @@ export class SniperEngine {
         ` | PM ask ${candidate.bestAsk.toFixed(3)}` +
         ` | impliedFV ${candidate.impliedFV.toFixed(3)}` +
         ` | edge ${(candidate.edge * 100).toFixed(2)}% after ${(this.runtimeConfig.sniper.takerFeePct * 100).toFixed(2)}% fee`,
+      strategyLayer: resolveStrategyLayer('SNIPER_BUY'),
     };
   }
 
@@ -974,6 +975,7 @@ function buildSniperExitSignal(
     urgency: params.urgency,
     reduceOnly: true,
     reason: params.reason,
+    strategyLayer: resolveStrategyLayer(params.signalType),
   };
 }
 

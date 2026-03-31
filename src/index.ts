@@ -55,6 +55,8 @@ import {
 import { RiskManager, type RiskAssessment } from './risk-manager.js';
 import {
   resolveRuntimeMode,
+  type RuntimeGlobalExposureSnapshot,
+  type RuntimeLayerStatusSnapshot,
   type RuntimeMmQuoteSnapshot,
   writeRuntimeStatus,
   type RuntimeMarketSnapshot,
@@ -82,7 +84,10 @@ import {
 } from './slot-reporter.js';
 import {
   bypassesBinanceEdge,
+  isLayerConflict,
   isQuotingSignalType,
+  resolveStrategyLayer,
+  type StrategyLayer,
   type StrategySignal,
 } from './strategy-types.js';
 import { formatDayKey, pruneSetEntries, roundTo, safeNumber, sleep } from './utils.js';
@@ -127,6 +132,14 @@ interface RuntimeMarketActionSnapshot {
 interface RuntimeWalletFundsSnapshot {
   readonly walletCashUsd: number | null;
   readonly updatedAt: string | null;
+}
+
+interface LayerExposureAccumulator {
+  sniperUsd: number;
+  mmUsd: number;
+  pairedArbUsd: number;
+  totalUsd: number;
+  maxUsd: number;
 }
 
 export interface LatencyPauseEvaluation {
@@ -799,12 +812,17 @@ export class MarketMakerRuntime {
       market,
       apiGuardSignals
     );
+    const coordinatedSignals = this.applyLayerCoordinationFilters(
+      market,
+      positionManager,
+      latencyPausedSignals
+    );
     const quoteSignals = isDynamicQuotingEnabled(config)
-      ? latencyPausedSignals.filter((signal) => isQuotingSignalType(signal.signalType))
+      ? coordinatedSignals.filter((signal) => isQuotingSignalType(signal.signalType))
       : [];
     const directSignals = isDynamicQuotingEnabled(config)
-      ? latencyPausedSignals.filter((signal) => !isQuotingSignalType(signal.signalType))
-      : latencyPausedSignals;
+      ? coordinatedSignals.filter((signal) => !isQuotingSignalType(signal.signalType))
+      : coordinatedSignals;
     if (isDynamicQuotingEnabled(config)) {
       const allowEntryQuotes = this.shouldAllowMarketMakingEntries(
         market.marketId,
@@ -823,10 +841,12 @@ export class MarketMakerRuntime {
         deepBinanceAssessment,
       });
     }
-    const executionCandidates = this.applyBinanceEdge(market, orderbook, directSignals);
+    const executionCandidates = this.sortExecutionCandidatesByLayerPriority(
+      this.applyBinanceEdge(market, orderbook, directSignals)
+    );
     this.rememberMarketAction(
       market,
-      dustFilteredSignals,
+      coordinatedSignals,
       executionCandidates,
       positionManager,
       quoteSignals
@@ -1125,6 +1145,9 @@ export class MarketMakerRuntime {
             price: effectivePrice,
             timestamp: new Date().toISOString(),
             orderId: execution.orderId,
+            strategyLayer:
+              executionSignal.strategyLayer ??
+              resolveStrategyLayer(executionSignal.signalType),
           })
         : beforeSnapshot;
 
@@ -1164,6 +1187,8 @@ export class MarketMakerRuntime {
         submittedShares: execution.shares,
         submittedPrice: execution.price,
         signalType: executionSignal.signalType,
+        strategyLayer:
+          executionSignal.strategyLayer ?? resolveStrategyLayer(executionSignal.signalType),
         placedAt: startedAt,
         slotEndTime:
           market.endTime ??
@@ -1207,6 +1232,26 @@ export class MarketMakerRuntime {
       this.clearSettlementConfirmation(market.marketId, executionSignal.outcome);
       this.executor.invalidateOutcomeBalanceCache(tokenId);
       this.executor.invalidateBalanceValidationCache();
+    }
+    if (
+      effectiveShares > 0 &&
+      executionSignal.signalType === 'SNIPER_BUY' &&
+      executionSignal.action === 'BUY' &&
+      isDynamicQuotingEnabled(config) &&
+      config.MM_AUTO_ACTIVATE_AFTER_SNIPER
+    ) {
+      this.quotingEngine.activateForMarket(market.marketId, {
+        triggerLayer: 'SNIPER',
+        entryOutcome: executionSignal.outcome,
+        entryPrice: effectivePrice,
+        entryShares: effectiveShares,
+      });
+      logger.info('MM_QUOTE activated after sniper entry', {
+        marketId: market.marketId,
+        outcome: executionSignal.outcome,
+        price: roundTo(effectivePrice, 4),
+        shares: roundTo(effectiveShares, 4),
+      });
     }
     if (
       effectiveShares > 0 &&
@@ -1357,6 +1402,8 @@ export class MarketMakerRuntime {
     this.recordRuntimeSignal({
       timestamp: new Date(completedAt).toISOString(),
       marketId: market.marketId,
+      strategyLayer:
+        executionSignal.strategyLayer ?? resolveStrategyLayer(executionSignal.signalType),
       signalType: executionSignal.signalType,
       action: executionSignal.action,
       outcome: executionSignal.outcome,
@@ -1517,6 +1564,7 @@ export class MarketMakerRuntime {
       price: fill.fillPrice,
       timestamp: new Date(fill.filledAt).toISOString(),
       orderId: fill.orderId,
+      strategyLayer: fill.strategyLayer ?? resolveStrategyLayer(fill.signalType),
     });
     this.syncBlockedExitRemainderFromInventory(
       fill.marketId,
@@ -1535,6 +1583,24 @@ export class MarketMakerRuntime {
       this.armSettlementConfirmation(fill.marketId, fill.outcome, fill.filledAt);
       this.executor.invalidateOutcomeBalanceCache(fill.tokenId);
       this.executor.invalidateBalanceValidationCache();
+      if (
+        fill.signalType === 'SNIPER_BUY' &&
+        isDynamicQuotingEnabled(config) &&
+        config.MM_AUTO_ACTIVATE_AFTER_SNIPER
+      ) {
+        this.quotingEngine.activateForMarket(fill.marketId, {
+          triggerLayer: 'SNIPER',
+          entryOutcome: fill.outcome,
+          entryPrice: fill.fillPrice,
+          entryShares: fill.filledShares,
+        });
+        logger.info('MM_QUOTE activated after delayed sniper fill', {
+          marketId: fill.marketId,
+          outcome: fill.outcome,
+          price: roundTo(fill.fillPrice, 4),
+          shares: roundTo(fill.filledShares, 4),
+        });
+      }
     } else {
       this.clearSettlementConfirmation(fill.marketId, fill.outcome);
       this.executor.invalidateOutcomeBalanceCache(fill.tokenId);
@@ -1672,6 +1738,410 @@ export class MarketMakerRuntime {
     });
   }
 
+  private applyLayerCoordinationFilters(
+    market: MarketCandidate,
+    positionManager: PositionManager,
+    signals: readonly StrategySignal[]
+  ): StrategySignal[] {
+    if (signals.length === 0) {
+      return [];
+    }
+
+    const pendingQuoteExposure = this.getPendingQuoteExposure();
+    const simulatedExposure: LayerExposureAccumulator = {
+      ...this.getGlobalExposure(pendingQuoteExposure),
+    };
+    const plannedLayers = new Set<StrategyLayer>(
+      this.getActiveLayersForMarket(market.marketId, positionManager)
+    );
+    const allowed: StrategySignal[] = [];
+    const atomicPairedSignals = signals.filter((signal) =>
+      isAtomicPairedArbExecutionCandidate(signal)
+    );
+    const hasValidAtomicPair =
+      atomicPairedSignals.length === 2 &&
+      new Set(atomicPairedSignals.map((signal) => signal.outcome)).size === 2;
+
+    if (atomicPairedSignals.length > 0) {
+      if (!hasValidAtomicPair) {
+        for (const signal of atomicPairedSignals) {
+          this.recordSkippedSignal({
+            signal,
+            filterReason: 'invalid_atomic_pair',
+            details: 'Paired arbitrage requires both YES and NO entry legs in the same tick.',
+          });
+        }
+      } else {
+        const pairLayer = this.resolveSignalLayer(atomicPairedSignals[0]);
+        const conflictingLayers =
+          config.LAYER_CONFLICT_RESOLUTION === 'BLOCK'
+            ? Array.from(plannedLayers).filter((layer) => isLayerConflict(layer, pairLayer))
+            : [];
+        const pairExposureUsd = roundTo(
+          atomicPairedSignals.reduce(
+            (sum, signal) => sum + this.estimateSignalExposureUsd(signal),
+            0
+          ),
+          4
+        );
+        const exceedsGlobalLimit =
+          simulatedExposure.totalUsd + pairExposureUsd > config.GLOBAL_MAX_EXPOSURE_USD;
+
+        if (conflictingLayers.length > 0) {
+          for (const signal of atomicPairedSignals) {
+            this.recordSkippedSignal({
+              signal,
+              filterReason: 'layer_conflict',
+              details: `Layer ${pairLayer} conflicts with active market layers ${conflictingLayers.join(', ')}.`,
+              context: {
+                marketId: market.marketId,
+                existingLayers: conflictingLayers,
+                requestedLayer: pairLayer,
+              },
+            });
+          }
+        } else if (exceedsGlobalLimit) {
+          for (const signal of atomicPairedSignals) {
+            this.recordSkippedSignal({
+              signal,
+              filterReason: 'global_exposure_limit',
+              details: `Global exposure cap ${config.GLOBAL_MAX_EXPOSURE_USD.toFixed(2)} would be exceeded by paired arbitrage entry.`,
+              context: {
+                marketId: market.marketId,
+                totalExposureUsd: simulatedExposure.totalUsd,
+                requestedExposureUsd: pairExposureUsd,
+                maxExposureUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+              },
+            });
+          }
+        } else {
+          allowed.push(...atomicPairedSignals);
+          plannedLayers.add(pairLayer);
+          this.addExposureToLayer(simulatedExposure, pairLayer, pairExposureUsd);
+        }
+      }
+    }
+
+    for (const signal of signals) {
+      if (isAtomicPairedArbExecutionCandidate(signal)) {
+        continue;
+      }
+
+      if (!this.isEntrySignal(signal)) {
+        allowed.push(signal);
+        continue;
+      }
+
+      const requestedLayer = this.resolveSignalLayer(signal);
+      const conflictingLayers =
+        config.LAYER_CONFLICT_RESOLUTION === 'BLOCK'
+          ? Array.from(plannedLayers).filter((layer) => isLayerConflict(layer, requestedLayer))
+          : [];
+      if (conflictingLayers.length > 0) {
+        this.recordSkippedSignal({
+          signal,
+          filterReason: 'layer_conflict',
+          details: `Layer ${requestedLayer} conflicts with active market layers ${conflictingLayers.join(', ')}.`,
+          context: {
+            marketId: market.marketId,
+            existingLayers: conflictingLayers,
+            requestedLayer,
+          },
+        });
+        continue;
+      }
+
+      const requestedExposureUsd = this.estimateSignalExposureUsd(signal);
+      if (
+        simulatedExposure.totalUsd + requestedExposureUsd >
+        config.GLOBAL_MAX_EXPOSURE_USD
+      ) {
+        this.recordSkippedSignal({
+          signal,
+          filterReason: 'global_exposure_limit',
+          details: `Global exposure cap ${config.GLOBAL_MAX_EXPOSURE_USD.toFixed(2)} would be exceeded by this entry.`,
+          context: {
+            marketId: market.marketId,
+            totalExposureUsd: simulatedExposure.totalUsd,
+            requestedExposureUsd,
+            maxExposureUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+          },
+        });
+        continue;
+      }
+
+      allowed.push(signal);
+      plannedLayers.add(requestedLayer);
+      this.addExposureToLayer(simulatedExposure, requestedLayer, requestedExposureUsd);
+    }
+
+    return allowed;
+  }
+
+  private sortExecutionCandidatesByLayerPriority(
+    candidates: readonly SignalExecutionCandidate[]
+  ): SignalExecutionCandidate[] {
+    return [...candidates].sort((left, right) => {
+      const leftPriority = this.getExecutionPriority(left.signal);
+      const rightPriority = this.getExecutionPriority(right.signal);
+      if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority;
+      }
+
+      if (left.signal.priority !== right.signal.priority) {
+        return left.signal.priority - right.signal.priority;
+      }
+
+      return left.signal.generatedAt ?? 0 - (right.signal.generatedAt ?? 0);
+    });
+  }
+
+  private getExecutionPriority(signal: StrategySignal): number {
+    if (signal.reduceOnly) {
+      return 0;
+    }
+
+    switch (this.resolveSignalLayer(signal)) {
+      case 'PAIRED_ARB':
+        return 1;
+      case 'SNIPER':
+        return 2;
+      case 'MM_QUOTE':
+        return 3;
+      default:
+        return 4;
+    }
+  }
+
+  private isEntrySignal(signal: StrategySignal): boolean {
+    return signal.action === 'BUY' && !signal.reduceOnly;
+  }
+
+  private resolveSignalLayer(
+    signal: Pick<StrategySignal, 'signalType' | 'strategyLayer'>
+  ): StrategyLayer {
+    return signal.strategyLayer ?? resolveStrategyLayer(signal.signalType);
+  }
+
+  private estimateSignalExposureUsd(signal: StrategySignal): number {
+    const referencePrice =
+      signal.targetPrice ??
+      signal.referencePrice ??
+      signal.tokenPrice ??
+      signal.midPrice ??
+      signal.fairValue ??
+      0.5;
+    return roundTo(Math.max(0, signal.shares) * Math.max(0, referencePrice), 4);
+  }
+
+  private addExposureToLayer(
+    exposure: LayerExposureAccumulator,
+    layer: StrategyLayer,
+    amountUsd: number
+  ): void {
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      return;
+    }
+
+    switch (layer) {
+      case 'SNIPER':
+        exposure.sniperUsd = roundTo(exposure.sniperUsd + amountUsd, 4);
+        break;
+      case 'MM_QUOTE':
+        exposure.mmUsd = roundTo(exposure.mmUsd + amountUsd, 4);
+        break;
+      case 'PAIRED_ARB':
+        exposure.pairedArbUsd = roundTo(exposure.pairedArbUsd + amountUsd, 4);
+        break;
+    }
+
+    exposure.totalUsd = roundTo(
+      exposure.sniperUsd + exposure.mmUsd + exposure.pairedArbUsd,
+      4
+    );
+  }
+
+  private getActiveLayersForMarket(
+    marketId: string,
+    positionManager: PositionManager
+  ): StrategyLayer[] {
+    const layers = new Set<StrategyLayer>(positionManager.getActivePositionLayers());
+    if (this.quotingEngine.hasActiveMMMarket(marketId)) {
+      layers.add('MM_QUOTE');
+    }
+    return Array.from(layers);
+  }
+
+  private collectLayerRuntimeSummary(
+    pendingQuoteExposure: PendingQuoteExposureSnapshot = this.getPendingQuoteExposure()
+  ): {
+    readonly strategyLayers: readonly RuntimeLayerStatusSnapshot[];
+    readonly globalExposure: RuntimeGlobalExposureSnapshot;
+  } {
+    const base = new Map<StrategyLayer, RuntimeLayerStatusSnapshot>([
+      [
+        'SNIPER',
+        {
+          layer: 'SNIPER',
+          enabled: config.SNIPER_MODE_ENABLED,
+          status: config.SNIPER_MODE_ENABLED ? 'WATCHING' : 'OFF',
+          positionCount: 0,
+          marketCount: 0,
+          exposureUsd: 0,
+          pnlUsd: 0,
+        },
+      ],
+      [
+        'MM_QUOTE',
+        {
+          layer: 'MM_QUOTE',
+          enabled: config.MARKET_MAKER_MODE && isDynamicQuotingEnabled(config),
+          status:
+            config.MARKET_MAKER_MODE && isDynamicQuotingEnabled(config) ? 'WATCHING' : 'OFF',
+          positionCount: 0,
+          marketCount: 0,
+          exposureUsd: 0,
+          pnlUsd: 0,
+        },
+      ],
+      [
+        'PAIRED_ARB',
+        {
+          layer: 'PAIRED_ARB',
+          enabled: config.PAIRED_ARB_ENABLED,
+          status: config.PAIRED_ARB_ENABLED ? 'WATCHING' : 'OFF',
+          positionCount: 0,
+          marketCount: 0,
+          exposureUsd: 0,
+          pnlUsd: 0,
+        },
+      ],
+    ]);
+    const layerMarkets = new Map<StrategyLayer, Set<string>>([
+      ['SNIPER', new Set<string>()],
+      ['MM_QUOTE', new Set<string>()],
+      ['PAIRED_ARB', new Set<string>()],
+    ]);
+
+    for (const [marketId, positionManager] of this.positions.entries()) {
+      const snapshot = positionManager.getSnapshot();
+      if (snapshot.grossExposureShares <= 0) {
+        continue;
+      }
+
+      for (const outcome of ['YES', 'NO'] as const) {
+        const shares = positionManager.getShares(outcome);
+        if (shares <= 0) {
+          continue;
+        }
+
+        const layer = this.resolveOutcomeLayer(marketId, positionManager, outcome);
+        const markPrice = this.resolveOutcomeMarkPrice(marketId, positionManager, outcome, snapshot);
+        const exposureUsd = roundTo(shares * markPrice, 4);
+        const pnlUsd = positionManager.getOutcomeTotalPnl(outcome);
+        const existing = base.get(layer);
+        if (!existing) {
+          continue;
+        }
+
+        base.set(layer, {
+          ...existing,
+          status: existing.enabled ? 'ACTIVE' : 'OFF',
+          positionCount: existing.positionCount + 1,
+          exposureUsd: roundTo(existing.exposureUsd + exposureUsd, 4),
+          pnlUsd: roundTo(existing.pnlUsd + pnlUsd, 4),
+        });
+        layerMarkets.get(layer)?.add(marketId);
+      }
+    }
+
+    const mmMarketIds = new Set(this.quotingEngine.getActiveMMMarketIds());
+    const mmLayer = base.get('MM_QUOTE');
+    if (mmLayer && mmLayer.enabled && mmLayer.status !== 'ACTIVE' && mmMarketIds.size > 0) {
+      base.set('MM_QUOTE', {
+        ...mmLayer,
+        status: 'ACTIVE',
+      });
+    }
+    const mmMarkets = layerMarkets.get('MM_QUOTE');
+    if (mmMarkets) {
+      for (const marketId of mmMarketIds) {
+        mmMarkets.add(marketId);
+      }
+    }
+
+    if (pendingQuoteExposure.grossExposureUsd > 0 && mmLayer) {
+      const current = base.get('MM_QUOTE') ?? mmLayer;
+      base.set('MM_QUOTE', {
+        ...current,
+        status: current.enabled ? 'ACTIVE' : 'OFF',
+        exposureUsd: roundTo(current.exposureUsd + pendingQuoteExposure.grossExposureUsd, 4),
+      });
+    }
+
+    const strategyLayers = (['SNIPER', 'MM_QUOTE', 'PAIRED_ARB'] as const).map((layer) => {
+      const snapshot = base.get(layer)!;
+      return {
+        ...snapshot,
+        marketCount: layerMarkets.get(layer)?.size ?? 0,
+      } satisfies RuntimeLayerStatusSnapshot;
+    });
+
+    return {
+      strategyLayers,
+      globalExposure: {
+        sniperUsd: strategyLayers.find((entry) => entry.layer === 'SNIPER')?.exposureUsd ?? 0,
+        mmUsd: strategyLayers.find((entry) => entry.layer === 'MM_QUOTE')?.exposureUsd ?? 0,
+        pairedArbUsd:
+          strategyLayers.find((entry) => entry.layer === 'PAIRED_ARB')?.exposureUsd ?? 0,
+        totalUsd: roundTo(
+          strategyLayers.reduce((sum, entry) => sum + entry.exposureUsd, 0),
+          4
+        ),
+        maxUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+      },
+    };
+  }
+
+  private getGlobalExposure(
+    pendingQuoteExposure: PendingQuoteExposureSnapshot = this.getPendingQuoteExposure()
+  ): RuntimeGlobalExposureSnapshot {
+    return this.collectLayerRuntimeSummary(pendingQuoteExposure).globalExposure;
+  }
+
+  private resolveOutcomeLayer(
+    marketId: string,
+    positionManager: PositionManager,
+    outcome: 'YES' | 'NO'
+  ): StrategyLayer {
+    const layer = positionManager.getPositionLayer(outcome);
+    if (layer) {
+      return layer;
+    }
+
+    return this.quotingEngine.hasActiveMMMarket(marketId) ? 'MM_QUOTE' : 'SNIPER';
+  }
+
+  private resolveOutcomeMarkPrice(
+    marketId: string,
+    positionManager: PositionManager,
+    outcome: 'YES' | 'NO',
+    snapshot: ReturnType<PositionManager['getSnapshot']>
+  ): number {
+    const orderbook =
+      this.latestBooks.get(marketId) ?? this.quotingEngine.getContext(marketId)?.orderbook;
+    const book = outcome === 'YES' ? orderbook?.yes : orderbook?.no;
+    const fallbackEntryPrice =
+      outcome === 'YES' ? snapshot.yesAvgEntryPrice : snapshot.noAvgEntryPrice;
+    return (
+      normalizeRuntimeNumber(book?.midPrice) ??
+      normalizeRuntimeNumber(book?.bestBid) ??
+      fallbackEntryPrice ??
+      positionManager.getAvgEntryPrice(outcome) ??
+      0.5
+    );
+  }
+
   private getAverageLatencyMs(): number | null {
     if (this.recentLatencySamples.length === 0) {
       return null;
@@ -1789,6 +2259,7 @@ export class MarketMakerRuntime {
     const openPositions = this.buildRuntimePositionSnapshots();
     const dayState = getDayPnlState();
     const pendingQuoteExposure = this.getPendingQuoteExposure();
+    const layerSummary = this.collectLayerRuntimeSummary(pendingQuoteExposure);
     const walletCashUsd =
       typeof this.walletFundsSnapshot.walletCashUsd === 'number' &&
       Number.isFinite(this.walletFundsSnapshot.walletCashUsd)
@@ -1837,6 +2308,8 @@ export class MarketMakerRuntime {
         activeMarkets: this.buildRuntimeMarketSnapshots(),
         openPositions,
         openPositionsCount: openPositions.length,
+        strategyLayers: layerSummary.strategyLayers,
+        globalExposure: layerSummary.globalExposure,
         sniperStats: this.signalEngine.getSniperStats(),
         mmEnabled: isDynamicQuotingEnabled(config),
         mmAutonomousQuotes: config.MM_AUTONOMOUS_QUOTES,
@@ -2388,6 +2861,36 @@ export class MarketMakerRuntime {
     marketId: string,
     positionManager: PositionManager
   ): boolean {
+    const globalExposure = this.getGlobalExposure();
+    if (globalExposure.totalUsd >= config.GLOBAL_MAX_EXPOSURE_USD) {
+      logger.debug('MM quote skipped', {
+        marketId,
+        reason: 'global_exposure_limit',
+        details: {
+          totalExposureUsd: globalExposure.totalUsd,
+          maxExposureUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+        },
+      });
+      return false;
+    }
+
+    if (config.LAYER_CONFLICT_RESOLUTION === 'BLOCK') {
+      const conflictingLayers = this.getActiveLayersForMarket(marketId, positionManager).filter(
+        (layer) => isLayerConflict(layer, 'MM_QUOTE')
+      );
+      if (conflictingLayers.length > 0) {
+        logger.debug('MM quote skipped', {
+          marketId,
+          reason: 'layer_conflict',
+          details: {
+            existingLayers: conflictingLayers,
+            requestedLayer: 'MM_QUOTE',
+          },
+        });
+        return false;
+      }
+    }
+
     const activeCount = countActiveMMMarkets(this.quotingEngine);
     if (activeCount < config.MM_MAX_CONCURRENT_MARKETS) {
       return true;
@@ -2583,35 +3086,41 @@ export class MarketMakerRuntime {
 
     let latestBalance = 0;
     let attempts = this.settlementAttempts.get(key) ?? 0;
+    let lastResolution: SettledOutcomeSellExecutionResolution | null = null;
 
     for (let index = 0; index < 3; index += 1) {
       const forceRefresh = index > 0;
       latestBalance = await this.executor.getOutcomeTokenBalance(params.tokenId, forceRefresh);
       attempts += 1;
-      const resolution = resolveSettledOutcomeSellExecution({
+      lastResolution = resolveSettledOutcomeSellExecution({
         signal: params.signal,
         availableShares: latestBalance,
         referencePrice: params.referencePrice,
       });
-      if (resolution.ready) {
+      if (lastResolution.ready) {
         const startedAtMs = this.settlementStartedAt.get(key) ?? params.nowMs;
         const delayMs = Math.max(0, Date.now() - startedAtMs);
         this.clearSettlementConfirmation(params.market.marketId, params.signal.outcome);
         logger.info('Token settlement confirmed after BUY fill', {
           marketId: params.market.marketId,
           outcome: params.signal.outcome,
-          requiredShares: resolution.requiredShares,
-          availableShares: resolution.availableShares,
-          executionShares: resolution.executionShares,
+          requiredShares: lastResolution.requiredShares,
+          availableShares: lastResolution.availableShares,
+          executionShares: lastResolution.executionShares,
           attempts,
           settlementDelayMs: delayMs,
         });
-        return resolution;
+        return lastResolution;
       }
 
       if (index < 2) {
         await sleep(1_000);
       }
+    }
+
+    if (lastResolution?.abandonToRedeem) {
+      this.settlementAttempts.delete(key);
+      return lastResolution;
     }
 
     const requiredShares = getRequiredSettledShares(params.signal.shares);
@@ -3579,7 +4088,7 @@ export async function main(): Promise<void> {
 }
 
 async function runWithConcurrency<T>(
-  values: T[],
+  values: readonly T[],
   concurrency: number,
   worker: (value: T) => Promise<void>
 ): Promise<void> {

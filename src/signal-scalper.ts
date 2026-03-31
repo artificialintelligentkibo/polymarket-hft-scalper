@@ -16,7 +16,7 @@ import {
 import type { RiskAssessment } from './risk-manager.js';
 import type { SniperStatsSnapshot } from './runtime-status.js';
 import { SniperEngine, type SniperCandidate } from './sniper-engine.js';
-import type { StrategySignal } from './strategy-types.js';
+import { resolveStrategyLayer, type StrategySignal } from './strategy-types.js';
 import { clamp, OUTCOMES, roundTo } from './utils.js';
 
 export interface SizeCalculationResult {
@@ -204,20 +204,22 @@ export class SignalScalper {
       return sniperExitSignals;
     }
 
-    const sniperSignals = this.runtimeConfig.sniper.enabled
-      ? sniperEntryOverride ?? this.sniperEngine.generateSignals({
-          market,
-          orderbook,
-          positionManager,
-          binanceAssessment,
-          binanceVelocityPctPerSec,
-          config: this.runtimeConfig.sniper,
-          blockedOutcomes: riskAssessment.blockedOutcomes,
-          nowMs: now.getTime(),
-        })
+    const sniperSignals: StrategySignal[] = this.runtimeConfig.sniper.enabled
+      ? sniperEntryOverride
+        ? [...sniperEntryOverride]
+        : this.sniperEngine.generateSignals({
+            market,
+            orderbook,
+            positionManager,
+            binanceAssessment,
+            binanceVelocityPctPerSec,
+            config: this.runtimeConfig.sniper,
+            blockedOutcomes: riskAssessment.blockedOutcomes,
+            nowMs: now.getTime(),
+          })
       : [];
     if (sniperSignals.length > 0) {
-      return sniperSignals;
+      return [...sniperSignals];
     }
 
     if (
@@ -1156,10 +1158,10 @@ function buildSignal(params: {
   reduceOnly: boolean;
   reason: string;
 }): StrategySignal {
-  return {
-    marketId: params.market.marketId,
-    marketTitle: params.market.title,
-    signalType: params.signalType,
+    return {
+      marketId: params.market.marketId,
+      marketTitle: params.market.title,
+      signalType: params.signalType,
     priority: params.priority,
     generatedAt: Date.now(),
     action: params.action,
@@ -1180,10 +1182,11 @@ function buildSignal(params: {
     fillRatio: params.fillRatio,
     capitalClamp: params.capitalClamp,
     priceMultiplier: params.priceMultiplier,
-    urgency: params.urgency,
-    reduceOnly: params.reduceOnly,
-    reason: params.reason,
-  };
+      urgency: params.urgency,
+      reduceOnly: params.reduceOnly,
+      reason: params.reason,
+      strategyLayer: resolveStrategyLayer(params.signalType),
+    };
 }
 
 function mergeSignals(signals: StrategySignal[]): StrategySignal[] {
@@ -1221,6 +1224,7 @@ function transformSignalsForMarketMaker(
       return {
         ...signal,
         urgency: resolveProductTestUrgency('passive', runtimeConfig),
+        strategyLayer: resolveStrategyLayer(signal.signalType),
       };
     }
 
@@ -1235,6 +1239,7 @@ function transformSignalsForMarketMaker(
         ...signal,
         signalType: 'DYNAMIC_QUOTE_BOTH',
         urgency: resolveProductTestUrgency('passive', runtimeConfig),
+        strategyLayer: resolveStrategyLayer('DYNAMIC_QUOTE_BOTH'),
       };
     }
 

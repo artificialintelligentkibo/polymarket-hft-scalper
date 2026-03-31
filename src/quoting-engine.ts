@@ -24,8 +24,13 @@ import {
   estimateFairValue,
   type FairValueBinanceAdjustment,
 } from './signal-scalper.js';
-import type { SignalType, StrategySignal } from './strategy-types.js';
-import { isQuotingSignalType } from './strategy-types.js';
+import {
+  isQuotingSignalType,
+  resolveStrategyLayer,
+  type SignalType,
+  type StrategyLayer,
+  type StrategySignal,
+} from './strategy-types.js';
 import { clamp, roundTo } from './utils.js';
 
 export interface QuoteContext {
@@ -39,6 +44,15 @@ export interface QuoteContext {
   readonly binanceAssessment?: BinanceEdgeAssessment;
   readonly binanceFairValueAdjustment?: FairValueBinanceAdjustment;
   readonly deepBinanceAssessment?: DeepBinanceAssessment;
+  readonly activationTrigger?: QuoteActivationTrigger;
+}
+
+export interface QuoteActivationTrigger {
+  readonly triggerLayer: StrategyLayer;
+  readonly entryOutcome: Outcome;
+  readonly entryPrice: number;
+  readonly entryShares: number;
+  readonly activatedAtMs: number;
 }
 
 export interface PendingQuoteExposureSnapshot {
@@ -296,6 +310,11 @@ function generateAutonomousQuoteSignals(params: {
   let projectedExposureUsd = Math.max(0, roundTo(params.currentMMExposureUsd, 4));
 
   for (const outcome of ['YES', 'NO'] as const satisfies readonly Outcome[]) {
+    const perOutcomeSpreadTicks =
+      context.activationTrigger?.triggerLayer === 'SNIPER' &&
+      context.activationTrigger.entryOutcome !== outcome
+        ? Math.max(runtimeConfig.MM_MIN_SPREAD_TICKS, params.quoteSpreadTicks - 1)
+        : quoteSpreadTicks;
     const book = getBookForOutcome(context.orderbook, outcome);
     if (
       book.depthNotionalBid < runtimeConfig.MM_MIN_BOOK_DEPTH_USD ||
@@ -357,8 +376,8 @@ function generateAutonomousQuoteSignals(params: {
       ),
       6
     );
-    const bidPrice = resolveBuyQuotePrice(book, skewedFairValue, quoteSpreadTicks);
-    const askPrice = resolveSellQuotePrice(book, skewedFairValue, quoteSpreadTicks);
+    const bidPrice = resolveBuyQuotePrice(book, skewedFairValue, perOutcomeSpreadTicks);
+    const askPrice = resolveSellQuotePrice(book, skewedFairValue, perOutcomeSpreadTicks);
     if (bidPrice === null || askPrice === null) {
       logger.debug('MM quote skipped', {
         marketId: context.market.marketId,
@@ -558,6 +577,7 @@ function buildAutonomousSignal(params: {
 export class QuotingEngine {
   private readonly contexts = new Map<string, QuoteContext>();
   private readonly activeQuoteOrders = new Map<string, ActiveQuoteOrder[]>();
+  private readonly activationTriggers = new Map<string, QuoteActivationTrigger>();
   private refreshTimer: NodeJS.Timeout | null = null;
   private refreshInFlight = false;
   private onRefreshPlan: ((plan: QuoteRefreshPlan) => Promise<void>) | null = null;
@@ -594,7 +614,23 @@ export class QuotingEngine {
     }
     this.contexts.clear();
     this.activeQuoteOrders.clear();
+    this.activationTriggers.clear();
     this.onRefreshPlan = null;
+  }
+
+  activateForMarket(
+    marketId: string,
+    trigger: {
+      triggerLayer: StrategyLayer;
+      entryOutcome: Outcome;
+      entryPrice: number;
+      entryShares: number;
+    }
+  ): void {
+    this.activationTriggers.set(marketId, {
+      ...trigger,
+      activatedAtMs: this.now().getTime(),
+    });
   }
 
   syncMarketContext(context: QuoteContext): void {
@@ -602,7 +638,11 @@ export class QuotingEngine {
       return;
     }
 
-    this.contexts.set(context.market.marketId, context);
+    this.contexts.set(context.market.marketId, {
+      ...context,
+      activationTrigger:
+        context.activationTrigger ?? this.activationTriggers.get(context.market.marketId),
+    });
   }
 
   getContext(marketId: string): QuoteContext | undefined {
@@ -685,6 +725,7 @@ export class QuotingEngine {
     for (const marketId of Array.from(this.contexts.keys())) {
       if (!active.has(marketId)) {
         this.contexts.delete(marketId);
+        this.activationTriggers.delete(marketId);
       }
     }
 
@@ -692,6 +733,7 @@ export class QuotingEngine {
       if (!active.has(marketId)) {
         staleOrders.push(...orders);
         this.activeQuoteOrders.delete(marketId);
+        this.activationTriggers.delete(marketId);
       }
     }
 
@@ -783,6 +825,7 @@ function buildEntryQuoteSignal(params: {
     generatedAt: params.now.getTime(),
     reduceOnly: false,
     reason: `${params.template.reason} | Market-maker bid quote`,
+    strategyLayer: resolveStrategyLayer('MM_QUOTE_BID'),
   };
 }
 
@@ -828,6 +871,10 @@ function buildReduceOnlyQuoteSignal(params: {
       params.template.signalType === 'INVENTORY_REBALANCE_QUOTE'
         ? `${params.template.reason} | Passive rebalance quote`
         : `${params.template.reason} | Market-maker ask quote`,
+    strategyLayer:
+      params.template.signalType === 'INVENTORY_REBALANCE_QUOTE'
+        ? resolveStrategyLayer('INVENTORY_REBALANCE_QUOTE')
+        : resolveStrategyLayer('MM_QUOTE_ASK'),
   };
 }
 

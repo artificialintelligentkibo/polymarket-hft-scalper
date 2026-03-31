@@ -754,8 +754,12 @@ test('live reduce-only exits are clamped to the settled token balance after BUY 
     'slot-1'
   );
 
-  assert.equal(submittedSignal?.shares, 7.7005);
-  assert.match(submittedSignal?.reason ?? '', /clamped to settled balance 7\.7005/);
+  if (!submittedSignal) {
+    throw new Error('Expected the reduce-only exit signal to be submitted.');
+  }
+  const submitted = submittedSignal as StrategySignal;
+  assert.equal(submitted.shares, 7.7005);
+  assert.match(submitted.reason, /clamped to settled balance 7\.7005/);
   assert.equal(result?.fillConfirmed, true);
   assert.equal(positionManager.getShares('NO'), 0.2995);
 });
