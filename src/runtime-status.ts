@@ -91,6 +91,12 @@ export interface SniperCoinStatsSnapshot {
   readonly maxMovePct: number;
 }
 
+export interface SniperDirectionWindowSnapshot {
+  readonly direction: 'UP' | 'DOWN' | null;
+  readonly activeCoins: readonly string[];
+  readonly capacity: string;
+}
+
 export interface SniperStatsSnapshot {
   readonly enabled: boolean;
   readonly signalsGenerated: number;
@@ -103,6 +109,7 @@ export interface SniperStatsSnapshot {
   readonly avgBinanceMove: number | null;
   readonly nearMissCount: number;
   readonly coinStats: Record<string, SniperCoinStatsSnapshot>;
+  readonly currentDirectionWindow: SniperDirectionWindowSnapshot | null;
 }
 
 export interface RuntimeStatusSnapshot {
@@ -441,6 +448,7 @@ function createDefaultSniperStatsSnapshot(
     avgBinanceMove: null,
     nearMissCount: 0,
     coinStats: {},
+    currentDirectionWindow: null,
   };
 }
 
@@ -509,6 +517,39 @@ function normalizeSniperStats(
         : normalizeNumber(record.avgBinanceMove, 0),
     nearMissCount: normalizeCount(record.nearMissCount),
     coinStats,
+    currentDirectionWindow: normalizeSniperDirectionWindow(record.currentDirectionWindow),
+  };
+}
+
+function normalizeSniperDirectionWindow(
+  value: unknown
+): SniperDirectionWindowSnapshot | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Partial<SniperDirectionWindowSnapshot>;
+  const activeCoins = Array.isArray(record.activeCoins)
+    ? record.activeCoins
+        .map((coin) => String(coin ?? '').trim().toUpperCase())
+        .filter((coin) => coin.length > 0)
+        .slice(0, 8)
+    : [];
+  const direction =
+    record.direction === 'UP' || record.direction === 'DOWN' ? record.direction : null;
+  const capacity =
+    typeof record.capacity === 'string' && record.capacity.trim()
+      ? record.capacity
+      : `${activeCoins.length}/${activeCoins.length}`;
+
+  if (!direction && activeCoins.length === 0 && !capacity.trim()) {
+    return null;
+  }
+
+  return {
+    direction,
+    activeCoins,
+    capacity,
   };
 }
 

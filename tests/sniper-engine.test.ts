@@ -6,9 +6,13 @@ import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
 import { logger } from '../src/logger.js';
 import type { MarketCandidate } from '../src/monitor.js';
 import { PositionManager } from '../src/position-manager.js';
-import { SniperEngine, estimateFairValueFromBinance } from '../src/sniper-engine.js';
+import {
+  SniperEngine,
+  estimateFairValueFromBinance,
+  type SniperCandidate,
+} from '../src/sniper-engine.js';
 
-function createMarket(): MarketCandidate {
+function createMarket(overrides: Partial<MarketCandidate> = {}): MarketCandidate {
   return {
     marketId: 'market-1',
     conditionId: 'condition-1',
@@ -25,6 +29,7 @@ function createMarket(): MarketCandidate {
     yesOutcomeIndex: 0,
     noOutcomeIndex: 1,
     acceptingOrders: true,
+    ...overrides,
   };
 }
 
@@ -508,4 +513,315 @@ test('sniper getStats returns a complete snapshot shape', () => {
   assert.equal(stats.avgBinanceMove, null);
   assert.equal(stats.nearMissCount, 0);
   assert.deepEqual(stats.coinStats, {});
+  assert.equal(stats.currentDirectionWindow, null);
+});
+
+test('sniper correlated limit allows two same-direction entries and rejects the third', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MAX_CONCURRENT_SAME_DIRECTION: '2',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const nowMs = Date.parse('2026-03-31T10:01:00.000Z');
+
+  const btcSignals = engine.generateSignals({
+    market: createMarket(),
+    orderbook: createOrderbook(),
+    positionManager: new PositionManager('market-1', '2026-03-31T10:05:00.000Z'),
+    binanceAssessment: createAssessment({
+      coin: 'BTC',
+      direction: 'DOWN',
+      binanceMovePct: -0.25,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs,
+  });
+  const ethSignals = engine.generateSignals({
+    market: createMarket({
+      marketId: 'market-2',
+      conditionId: 'condition-2',
+      title: 'ETH Up or Down - 10:00-10:05',
+      yesTokenId: 'yes-token-2',
+      noTokenId: 'no-token-2',
+    }),
+    orderbook: createOrderbook({
+      marketId: 'market-2',
+      title: 'ETH Up or Down - 10:00-10:05',
+    }),
+    positionManager: new PositionManager('market-2', '2026-03-31T10:05:00.000Z'),
+    binanceAssessment: createAssessment({
+      coin: 'ETH',
+      direction: 'DOWN',
+      binanceMovePct: -0.24,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs,
+  });
+  const solSignals = engine.generateSignals({
+    market: createMarket({
+      marketId: 'market-3',
+      conditionId: 'condition-3',
+      title: 'SOL Up or Down - 10:00-10:05',
+      yesTokenId: 'yes-token-3',
+      noTokenId: 'no-token-3',
+    }),
+    orderbook: createOrderbook({
+      marketId: 'market-3',
+      title: 'SOL Up or Down - 10:00-10:05',
+    }),
+    positionManager: new PositionManager('market-3', '2026-03-31T10:05:00.000Z'),
+    binanceAssessment: createAssessment({
+      coin: 'SOL',
+      direction: 'DOWN',
+      binanceMovePct: -0.23,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs,
+  });
+
+  assert.equal(btcSignals.length, 1);
+  assert.equal(ethSignals.length, 1);
+  assert.equal(solSignals.length, 0);
+
+  const stats = engine.getStats();
+  assert.equal(stats.lastRejection, 'correlated_risk_limit');
+  assert.equal(stats.rejections.correlated_risk_limit, 1);
+  assert.deepEqual(stats.currentDirectionWindow?.activeCoins, ['BTC', 'ETH']);
+  assert.equal(stats.currentDirectionWindow?.capacity, '2/2');
+});
+
+test('sniper correlated limit keeps separate capacity for opposite directions', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MAX_CONCURRENT_SAME_DIRECTION: '1',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const nowMs = Date.parse('2026-03-31T10:01:00.000Z');
+
+  const downSignals = engine.generateSignals({
+    market: createMarket(),
+    orderbook: createOrderbook(),
+    positionManager: new PositionManager('market-1', '2026-03-31T10:05:00.000Z'),
+    binanceAssessment: createAssessment({
+      coin: 'BTC',
+      direction: 'DOWN',
+      binanceMovePct: -0.25,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs,
+  });
+  const upSignals = engine.generateSignals({
+    market: createMarket({
+      marketId: 'market-2',
+      conditionId: 'condition-2',
+      title: 'ETH Up or Down - 10:00-10:05',
+      yesTokenId: 'yes-token-2',
+      noTokenId: 'no-token-2',
+    }),
+    orderbook: createOrderbook({
+      marketId: 'market-2',
+      title: 'ETH Up or Down - 10:00-10:05',
+    }),
+    positionManager: new PositionManager('market-2', '2026-03-31T10:05:00.000Z'),
+    binanceAssessment: createAssessment({
+      coin: 'ETH',
+      direction: 'UP',
+      binanceMovePct: 0.25,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs,
+  });
+
+  assert.equal(downSignals.length, 1);
+  assert.equal(upSignals.length, 1);
+});
+
+test('sniper blocks duplicate same-coin entries within the same direction window', () => {
+  const runtimeConfig = createRuntimeConfig();
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const nowMs = Date.parse('2026-03-31T10:01:00.000Z');
+
+  const first = engine.generateSignals({
+    market,
+    orderbook: createOrderbook(),
+    positionManager: new PositionManager(market.marketId, market.endTime),
+    binanceAssessment: createAssessment({
+      coin: 'BTC',
+      direction: 'DOWN',
+      binanceMovePct: -0.22,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs,
+  });
+  const second = engine.generateSignals({
+    market,
+    orderbook: createOrderbook(),
+    positionManager: new PositionManager(market.marketId, market.endTime),
+    binanceAssessment: createAssessment({
+      coin: 'BTC',
+      direction: 'DOWN',
+      binanceMovePct: -0.22,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs: nowMs + 500,
+  });
+
+  assert.equal(first.length, 1);
+  assert.equal(second.length, 0);
+  assert.equal(engine.getStats().lastRejection, 'correlated_risk_limit');
+});
+
+test('sniper direction window expires after five minutes', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MAX_CONCURRENT_SAME_DIRECTION: '1',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+
+  const first = engine.generateSignals({
+    market: createMarket(),
+    orderbook: createOrderbook(),
+    positionManager: new PositionManager('market-1', '2026-03-31T10:05:00.000Z'),
+    binanceAssessment: createAssessment({
+      coin: 'BTC',
+      direction: 'DOWN',
+      binanceMovePct: -0.25,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+  const second = engine.generateSignals({
+    market: createMarket({
+      marketId: 'market-2',
+      conditionId: 'condition-2',
+      title: 'SOL Up or Down - 10:06-10:11',
+      startTime: '2026-03-31T10:06:00.000Z',
+      endTime: '2026-03-31T10:11:00.000Z',
+      yesTokenId: 'yes-token-2',
+      noTokenId: 'no-token-2',
+    }),
+    orderbook: createOrderbook({
+      marketId: 'market-2',
+      title: 'SOL Up or Down - 10:06-10:11',
+    }),
+    positionManager: new PositionManager('market-2', '2026-03-31T10:11:00.000Z'),
+    binanceAssessment: createAssessment({
+      coin: 'SOL',
+      direction: 'DOWN',
+      binanceMovePct: -0.24,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:07:00.000Z'),
+  });
+
+  assert.equal(first.length, 1);
+  assert.equal(second.length, 1);
+});
+
+test('sniper selects top edges per direction when batching candidates', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MAX_CONCURRENT_SAME_DIRECTION: '2',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const nowMs = Date.parse('2026-03-31T10:01:00.000Z');
+  const candidates: SniperCandidate[] = [];
+
+  const candidateInputs = [
+    {
+      market: createMarket({
+        marketId: 'market-btc',
+        conditionId: 'condition-btc',
+        title: 'BTC Up or Down - 10:00-10:05',
+        yesTokenId: 'yes-token-btc',
+        noTokenId: 'no-token-btc',
+      }),
+      orderbook: createOrderbook({
+        marketId: 'market-btc',
+        no: {
+          ...createOrderbook().no,
+          bestAsk: 0.53,
+          midPrice: 0.52,
+        },
+      }),
+      assessment: createAssessment({
+        coin: 'BTC',
+        direction: 'DOWN',
+        binanceMovePct: -0.25,
+      }),
+    },
+    {
+      market: createMarket({
+        marketId: 'market-eth',
+        conditionId: 'condition-eth',
+        title: 'ETH Up or Down - 10:00-10:05',
+        yesTokenId: 'yes-token-eth',
+        noTokenId: 'no-token-eth',
+      }),
+      orderbook: createOrderbook({
+        marketId: 'market-eth',
+        title: 'ETH Up or Down - 10:00-10:05',
+        no: {
+          ...createOrderbook().no,
+          bestAsk: 0.48,
+          midPrice: 0.47,
+        },
+      }),
+      assessment: createAssessment({
+        coin: 'ETH',
+        direction: 'DOWN',
+        binanceMovePct: -0.25,
+      }),
+    },
+    {
+      market: createMarket({
+        marketId: 'market-sol',
+        conditionId: 'condition-sol',
+        title: 'SOL Up or Down - 10:00-10:05',
+        yesTokenId: 'yes-token-sol',
+        noTokenId: 'no-token-sol',
+      }),
+      orderbook: createOrderbook({
+        marketId: 'market-sol',
+        title: 'SOL Up or Down - 10:00-10:05',
+        no: {
+          ...createOrderbook().no,
+          bestAsk: 0.55,
+          midPrice: 0.54,
+        },
+      }),
+      assessment: createAssessment({
+        coin: 'SOL',
+        direction: 'DOWN',
+        binanceMovePct: -0.25,
+      }),
+    },
+  ];
+
+  for (const input of candidateInputs) {
+    const candidate = engine.evaluateEntryCandidate({
+      market: input.market,
+      orderbook: input.orderbook,
+      positionManager: new PositionManager(input.market.marketId, input.market.endTime),
+      binanceAssessment: input.assessment,
+      binanceVelocityPctPerSec: 0.03,
+      config: runtimeConfig.sniper,
+      nowMs,
+    });
+    assert.ok(candidate);
+    candidates.push(candidate);
+  }
+
+  const signals = engine.selectSignals(candidates, runtimeConfig.sniper, nowMs);
+  assert.deepEqual(
+    signals.map((signal) => signal.marketId).sort(),
+    ['market-btc', 'market-eth'].sort()
+  );
+  assert.equal(engine.getStats().rejections.correlated_risk_limit, 1);
 });

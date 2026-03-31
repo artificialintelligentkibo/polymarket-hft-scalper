@@ -789,6 +789,19 @@ function renderSniperStats(stats: SniperStatsSnapshot | undefined): string {
     );
   }
 
+  if (stats.currentDirectionWindow) {
+    const activeCoins =
+      stats.currentDirectionWindow.activeCoins.length > 0
+        ? stats.currentDirectionWindow.activeCoins.join(', ')
+        : 'none';
+    lines.push(
+      `${color.dim('Direction window:')} ` +
+        `${color.bold(stats.currentDirectionWindow.direction ?? 'n/a')} ` +
+        `[${activeCoins}] ` +
+        `${color.bold(stats.currentDirectionWindow.capacity)} capacity`
+    );
+  }
+
   return lines.join('\n');
 }
 
@@ -842,6 +855,7 @@ function formatRejectionLabel(reason: string): string {
     max_position_reached: 'max pos',
     no_binance_data: 'no data',
     velocity_too_low: 'slow move',
+    correlated_risk_limit: 'correlated',
   };
   return labels[reason] ?? reason.replaceAll('_', ' ');
 }

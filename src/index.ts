@@ -52,7 +52,7 @@ import {
   ResolutionChecker,
   resolveVerifiedRedeemPayoutUsd,
 } from './resolution-checker.js';
-import { RiskManager } from './risk-manager.js';
+import { RiskManager, type RiskAssessment } from './risk-manager.js';
 import {
   resolveRuntimeMode,
   type RuntimeMmQuoteSnapshot,
@@ -98,6 +98,23 @@ const LIVE_WALLET_POSITION_REFRESH_MS = 10_000;
 interface SignalExecutionCandidate {
   readonly signal: StrategySignal;
   readonly binanceAssessment?: BinanceEdgeAssessment;
+}
+
+interface PreparedMarketTick {
+  readonly market: MarketCandidate;
+  readonly slotKey: string;
+  readonly orderbook: MarketOrderbookSnapshot;
+  readonly positionManager: PositionManager;
+  readonly riskAssessment: RiskAssessment;
+  readonly binanceFairValueAdjustment?: FairValueBinanceAdjustment;
+  readonly binanceAssessment?: BinanceEdgeAssessment;
+  readonly binanceVelocityPctPerSec?: number | null;
+  readonly deepBinanceAssessment?: DeepBinanceAssessment;
+}
+
+interface SniperSelectionPlan {
+  readonly overrides: Map<string, readonly StrategySignal[]>;
+  readonly suppressedMarkets: ReadonlySet<string>;
 }
 
 interface RuntimeMarketActionSnapshot {
@@ -589,11 +606,28 @@ export class MarketMakerRuntime {
       }
     }
 
-    await runWithConcurrency(markets, config.runtime.maxConcurrentMarkets, async (market) => {
-      await this.runSerializedMarketTask(market.marketId, async () => {
-        await this.processMarket(market);
-      });
-    });
+    const cycleNow = new Date();
+    const preparedTicks = await this.prepareMarketTicks(markets);
+    const sniperSelectionPlan = config.SNIPER_MODE_ENABLED
+      ? this.buildSniperEntryOverrides(preparedTicks, cycleNow)
+      : {
+          overrides: new Map<string, readonly StrategySignal[]>(),
+          suppressedMarkets: new Set<string>(),
+        };
+
+    await runWithConcurrency(
+      preparedTicks,
+      config.runtime.maxConcurrentMarkets,
+      async (preparedTick) => {
+        await this.runSerializedMarketTask(preparedTick.market.marketId, async () => {
+          await this.processPreparedMarket(
+            preparedTick,
+            sniperSelectionPlan.overrides.get(preparedTick.market.marketId) ?? undefined,
+            sniperSelectionPlan.suppressedMarkets.has(preparedTick.market.marketId)
+          );
+        });
+      }
+    );
 
     this.syncRuntimeStatus({
       activeSlotsCount: markets.length,
@@ -601,29 +635,128 @@ export class MarketMakerRuntime {
     this.printPendingReports();
   }
 
-  private async processMarket(market: MarketCandidate): Promise<void> {
-    const slotKey = getSlotKey(market);
-    const orderbook = await this.fetcher.getMarketSnapshot(market);
-    this.latestBooks.set(market.marketId, orderbook);
-    this.executor.recordOrderbookSnapshot(orderbook);
+  private async prepareMarketTicks(
+    markets: readonly MarketCandidate[]
+  ): Promise<PreparedMarketTick[]> {
+    const prepared: PreparedMarketTick[] = [];
+    await runWithConcurrency(
+      markets,
+      config.runtime.maxConcurrentMarkets,
+      async (market) => {
+        const orderbook = await this.fetcher.getMarketSnapshot(market);
+        this.latestBooks.set(market.marketId, orderbook);
+        this.executor.recordOrderbookSnapshot(orderbook);
+        const positionManager = this.getPositionManager(market);
+        const riskAssessment = this.riskManager.checkRiskLimits({
+          market,
+          orderbook,
+          positionManager,
+        });
+        const binanceFairValueAdjustment = this.getBinanceFairValueAdjustment(market, orderbook);
+        const binanceAssessment = this.getPrimaryBinanceAssessment(market, orderbook);
+        const binanceVelocityPctPerSec = this.getBinanceVelocityPctPerSec(market);
+        const deepBinanceAssessment = this.getDeepBinanceAssessment(market, orderbook);
+        prepared.push({
+          market,
+          slotKey: getSlotKey(market),
+          orderbook,
+          positionManager,
+          riskAssessment,
+          binanceFairValueAdjustment,
+          binanceAssessment,
+          binanceVelocityPctPerSec,
+          deepBinanceAssessment,
+        } satisfies PreparedMarketTick);
+      }
+    );
 
-    const positionManager = this.getPositionManager(market);
-    const riskAssessment = this.riskManager.checkRiskLimits({
+    return prepared;
+  }
+
+  private buildSniperEntryOverrides(
+    preparedTicks: readonly PreparedMarketTick[],
+    now: Date
+  ): SniperSelectionPlan {
+    const overrides = new Map<string, readonly StrategySignal[]>();
+    const suppressedMarkets = new Set<string>();
+    for (const preparedTick of preparedTicks) {
+      overrides.set(preparedTick.market.marketId, []);
+    }
+
+    if (
+      this.statusMonitor.isPaused() ||
+      this.latencyPaused ||
+      this.isApiEntryGateOpen()
+    ) {
+      return {
+        overrides,
+        suppressedMarkets,
+      };
+    }
+
+    const candidateMarketIds = new Set<string>();
+    const candidates = preparedTicks.flatMap((preparedTick) => {
+      if (preparedTick.riskAssessment.forcedSignals.length > 0) {
+        return [];
+      }
+
+      if (this.signalEngine.hasActiveSniperEntryForMarket(preparedTick.market.marketId)) {
+        return [];
+      }
+
+      const candidate = this.signalEngine.evaluateSniperCandidate({
+        market: preparedTick.market,
+        orderbook: preparedTick.orderbook,
+        positionManager: preparedTick.positionManager,
+        riskAssessment: preparedTick.riskAssessment,
+        binanceAssessment: preparedTick.binanceAssessment,
+        binanceVelocityPctPerSec: preparedTick.binanceVelocityPctPerSec,
+        now,
+      });
+      if (!candidate) {
+        return [];
+      }
+
+      candidateMarketIds.add(preparedTick.market.marketId);
+      return [candidate];
+    });
+
+    const selectedSignals = this.signalEngine.selectSniperSignals(candidates, now);
+    const selectedMarketIds = new Set<string>();
+    for (const signal of selectedSignals) {
+      selectedMarketIds.add(signal.marketId);
+      overrides.set(signal.marketId, [signal]);
+    }
+
+    for (const marketId of candidateMarketIds) {
+      if (!selectedMarketIds.has(marketId)) {
+        suppressedMarkets.add(marketId);
+      }
+    }
+
+    return {
+      overrides,
+      suppressedMarkets,
+    };
+  }
+
+  private async processPreparedMarket(
+    preparedTick: PreparedMarketTick,
+    sniperEntryOverride?: readonly StrategySignal[],
+    suppressDirectionalEntries: boolean = false
+  ): Promise<void> {
+    const {
       market,
+      slotKey,
       orderbook,
       positionManager,
-    });
-    const binanceFairValueAdjustment = this.getBinanceFairValueAdjustment(market, orderbook);
-    const binanceAssessment = this.getPrimaryBinanceAssessment(market, orderbook);
-    const binanceVelocityPctPerSec = this.getBinanceVelocityPctPerSec(market);
-    const deepBinanceAssessment = this.getDeepBinanceAssessment(market, orderbook);
-    if (config.SNIPER_MODE_ENABLED && !binanceAssessment?.available) {
-      logger.warn('Sniper: no Binance assessment', {
-        marketId: market.marketId,
-        coin: extractCoinFromTitle(market.title) ?? 'unknown',
-        reason: binanceAssessment?.unavailableReason ?? 'not available',
-      });
-    }
+      riskAssessment,
+      binanceFairValueAdjustment,
+      binanceAssessment,
+      binanceVelocityPctPerSec,
+      deepBinanceAssessment,
+    } = preparedTick;
+
     const signals = this.signalEngine.generateSignals({
       market,
       orderbook,
@@ -632,9 +765,15 @@ export class MarketMakerRuntime {
       binanceFairValueAdjustment,
       binanceAssessment,
       binanceVelocityPctPerSec,
+      sniperEntryOverride,
     });
     this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
-    const dustFilteredSignals = this.filterDustAbandonedSignals(market, signals);
+    const sniperFilteredSignals = this.applySniperCorrelationFilter(
+      market,
+      signals,
+      suppressDirectionalEntries
+    );
+    const dustFilteredSignals = this.filterDustAbandonedSignals(market, sniperFilteredSignals);
     const statusPausedSignals = this.applyPauseFilter(market, dustFilteredSignals);
     const apiGuardSignals = this.applyApiCircuitBreakerFilter(
       market,
@@ -2489,6 +2628,42 @@ export class MarketMakerRuntime {
     return allowed;
   }
 
+  private applySniperCorrelationFilter(
+    market: MarketCandidate,
+    signals: StrategySignal[],
+    suppressDirectionalEntries: boolean
+  ): StrategySignal[] {
+    const allowed = filterSignalsForSniperCorrelationLimit(
+      signals,
+      suppressDirectionalEntries
+    );
+    if (!suppressDirectionalEntries) {
+      return allowed;
+    }
+
+    const allowedSet = new Set(allowed);
+    for (const blockedSignal of signals) {
+      if (!allowedSet.has(blockedSignal)) {
+        this.recordSkippedSignal({
+          signal: blockedSignal,
+          filterReason: 'SNIPER_CORRELATED_LIMIT',
+          details: 'Skipped because higher-edge same-direction sniper candidates already consumed the slot capacity',
+        });
+      }
+    }
+
+    if (allowed.length < signals.length) {
+      logger.debug('Sniper correlated risk limit suppressed legacy entry signals', {
+        marketId: market.marketId,
+        original: signals.length,
+        remaining: allowed.length,
+        blocked: signals.length - allowed.length,
+      });
+    }
+
+    return allowed;
+  }
+
   private applyLatencyPauseFilter(
     market: MarketCandidate,
     signals: StrategySignal[]
@@ -3403,6 +3578,17 @@ export function filterSignalsForLatencyPause(
   latencyPaused: boolean
 ): StrategySignal[] {
   if (!latencyPaused) {
+    return [...signals];
+  }
+
+  return signals.filter((signal) => signal.reduceOnly || signal.action === 'SELL');
+}
+
+export function filterSignalsForSniperCorrelationLimit(
+  signals: readonly StrategySignal[],
+  suppressDirectionalEntries: boolean
+): StrategySignal[] {
+  if (!suppressDirectionalEntries) {
     return [...signals];
   }
 

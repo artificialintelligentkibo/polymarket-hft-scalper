@@ -46,6 +46,12 @@ export interface SniperConfig {
   readonly strongShares: number;
   /** Maximum sniper inventory per market/outcome. */
   readonly maxPositionShares: number;
+  /**
+   * Maximum number of same-direction sniper entries allowed inside the same
+   * five-minute slot window after grouping by edge.
+   * Recommended production default (2026): 2.
+   */
+  readonly maxConcurrentSameDirection: number;
   /** Cooldown between sniper entries on the same market. */
   readonly cooldownMs: number;
   /** Skip slot-open noise by waiting this long before first sniper entry. */
@@ -818,6 +824,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       baseShares: parseFloatOrDefault(env.SNIPER_BASE_SHARES, '6'),
       strongShares: parseFloatOrDefault(env.SNIPER_STRONG_SHARES, '12'),
       maxPositionShares: parseFloatOrDefault(env.SNIPER_MAX_POSITION_SHARES, '20'),
+      maxConcurrentSameDirection: Math.max(
+        1,
+        parseIntOrDefault(env.SNIPER_MAX_CONCURRENT_SAME_DIRECTION, '2')
+      ),
       cooldownMs: Math.max(0, parseIntOrDefault(env.SNIPER_COOLDOWN_MS, '3000')),
       slotWarmupMs: Math.max(0, parseIntOrDefault(env.SNIPER_SLOT_WARMUP_MS, '15000')),
       exitBeforeEndMs: Math.max(
@@ -1188,6 +1198,10 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error(
       'SNIPER_MAX_POSITION_SHARES must be greater than or equal to SNIPER_BASE_SHARES.'
     );
+  }
+
+  if (candidate.sniper.maxConcurrentSameDirection < 1) {
+    throw new Error('SNIPER_MAX_CONCURRENT_SAME_DIRECTION must be at least 1.');
   }
 
   if (

@@ -90,6 +90,7 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.sniper.baseShares, 6);
   assert.equal(candidate.sniper.strongShares, 12);
   assert.equal(candidate.sniper.maxPositionShares, 20);
+  assert.equal(candidate.sniper.maxConcurrentSameDirection, 2);
   assert.equal(candidate.sniper.cooldownMs, 3000);
   assert.equal(candidate.sniper.slotWarmupMs, 15000);
   assert.equal(candidate.sniper.exitBeforeEndMs, 30000);

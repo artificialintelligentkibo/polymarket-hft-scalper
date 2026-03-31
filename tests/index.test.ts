@@ -5,6 +5,7 @@ import {
   evaluateLatencyPauseState,
   filterSignalsForApiEntryGate,
   filterSignalsForLatencyPause,
+  filterSignalsForSniperCorrelationLimit,
   getRequiredSettledShares,
   hasSettledOutcomeBalance,
   pruneLatencyPauseSamples,
@@ -254,6 +255,38 @@ test('exit signals always pass through during latency pause', () => {
   assert.deepEqual(
     filtered.map((signal) => signal.signalType),
     ['HARD_STOP', 'FAIR_VALUE_SELL']
+  );
+});
+
+test('exit signals always pass through when sniper correlated entries are suppressed', () => {
+  const buySignal = createSignal({
+    signalType: 'FAIR_VALUE_BUY',
+    action: 'BUY',
+    reduceOnly: false,
+  });
+  const hardStop = createSignal({
+    signalType: 'HARD_STOP',
+    action: 'SELL',
+    reduceOnly: true,
+    outcome: 'NO',
+    outcomeIndex: 1,
+  });
+  const sniperExit = createSignal({
+    signalType: 'SNIPER_SCALP_EXIT',
+    action: 'SELL',
+    reduceOnly: true,
+    outcome: 'NO',
+    outcomeIndex: 1,
+  });
+
+  const filtered = filterSignalsForSniperCorrelationLimit(
+    [buySignal, hardStop, sniperExit],
+    true
+  );
+
+  assert.deepEqual(
+    filtered.map((signal) => signal.signalType),
+    ['HARD_STOP', 'SNIPER_SCALP_EXIT']
   );
 });
 

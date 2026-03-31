@@ -15,7 +15,7 @@ import {
 } from './product-test-mode.js';
 import type { RiskAssessment } from './risk-manager.js';
 import type { SniperStatsSnapshot } from './runtime-status.js';
-import { SniperEngine } from './sniper-engine.js';
+import { SniperEngine, type SniperCandidate } from './sniper-engine.js';
 import type { StrategySignal } from './strategy-types.js';
 import { clamp, OUTCOMES, roundTo } from './utils.js';
 
@@ -143,6 +143,7 @@ export class SignalScalper {
     binanceFairValueAdjustment?: FairValueBinanceAdjustment;
     binanceAssessment?: BinanceEdgeAssessment;
     binanceVelocityPctPerSec?: number | null;
+    sniperEntryOverride?: readonly StrategySignal[] | null;
     now?: Date;
   }): StrategySignal[] {
     this.recentSkippedSignals.splice(0, this.recentSkippedSignals.length);
@@ -156,6 +157,7 @@ export class SignalScalper {
       binanceFairValueAdjustment,
       binanceAssessment,
       binanceVelocityPctPerSec,
+      sniperEntryOverride,
     } = params;
     this.pruneFairValueControlState(now.getTime());
     this.pruneSmoothedFairValues(now.getTime());
@@ -188,8 +190,22 @@ export class SignalScalper {
       return [];
     }
 
+    const sniperExitSignals = this.runtimeConfig.sniper.enabled
+      ? this.sniperEngine.generateExitSignals({
+          market,
+          orderbook,
+          positionManager,
+          binanceAssessment,
+          config: this.runtimeConfig.sniper,
+          nowMs: now.getTime(),
+        })
+      : [];
+    if (sniperExitSignals.length > 0) {
+      return sniperExitSignals;
+    }
+
     const sniperSignals = this.runtimeConfig.sniper.enabled
-      ? this.sniperEngine.generateSignals({
+      ? sniperEntryOverride ?? this.sniperEngine.generateSignals({
           market,
           orderbook,
           positionManager,
@@ -296,6 +312,50 @@ export class SignalScalper {
 
   getSniperStats(): SniperStatsSnapshot {
     return this.sniperEngine.getStats();
+  }
+
+  hasActiveSniperEntryForMarket(marketId: string): boolean {
+    return this.sniperEngine.hasActiveEntryForMarket(marketId);
+  }
+
+  evaluateSniperCandidate(params: {
+    market: MarketCandidate;
+    orderbook: MarketOrderbookSnapshot;
+    positionManager: PositionManager;
+    riskAssessment: RiskAssessment;
+    binanceAssessment?: BinanceEdgeAssessment;
+    binanceVelocityPctPerSec?: number | null;
+    now?: Date;
+  }): SniperCandidate | null {
+    if (!this.runtimeConfig.sniper.enabled) {
+      return null;
+    }
+
+    return this.sniperEngine.evaluateEntryCandidate({
+      market: params.market,
+      orderbook: params.orderbook,
+      positionManager: params.positionManager,
+      binanceAssessment: params.binanceAssessment,
+      binanceVelocityPctPerSec: params.binanceVelocityPctPerSec,
+      config: this.runtimeConfig.sniper,
+      blockedOutcomes: params.riskAssessment.blockedOutcomes,
+      nowMs: params.now?.getTime(),
+    });
+  }
+
+  selectSniperSignals(
+    candidates: readonly SniperCandidate[],
+    now: Date = new Date()
+  ): StrategySignal[] {
+    if (!this.runtimeConfig.sniper.enabled) {
+      return [];
+    }
+
+    return this.sniperEngine.selectSignals(
+      candidates,
+      this.runtimeConfig.sniper,
+      now.getTime()
+    );
   }
 
   setPairedArbPending(marketId: string): void {

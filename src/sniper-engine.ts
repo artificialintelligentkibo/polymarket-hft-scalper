@@ -34,6 +34,7 @@ export type SniperRejection =
   | 'cooldown_active'
   | 'max_position_reached'
   | 'velocity_too_low'
+  | 'correlated_risk_limit'
   | 'signal_generated';
 
 interface SniperEvaluation {
@@ -52,6 +53,36 @@ interface CoinEvalState {
   evals: number;
   signals: number;
   moves: number[];
+}
+
+interface DirectionWindowEntry {
+  readonly coin: string;
+  readonly marketId: string;
+  readonly enteredAtMs: number;
+  readonly edge: number;
+}
+
+interface DirectionWindowState {
+  readonly direction: 'UP' | 'DOWN';
+  readonly windowStartMs: number;
+  entries: DirectionWindowEntry[];
+}
+
+export interface SniperCandidate {
+  readonly market: MarketCandidate;
+  readonly orderbook: MarketOrderbookSnapshot;
+  readonly binanceAssessment: BinanceEdgeAssessment;
+  readonly expectedWinner: Outcome;
+  readonly bestAsk: number;
+  readonly impliedFV: number;
+  readonly edge: number;
+  readonly pmLag: number;
+  readonly shares: number;
+  readonly coin: string;
+  readonly nowMs: number;
+  readonly slotStartMs: number | null;
+  readonly slotEndMs: number | null;
+  readonly evaluation: Omit<SniperEvaluation, 'rejection'>;
 }
 
 export function estimateFairValueFromBinance(
@@ -96,6 +127,7 @@ export class SniperEngine {
   private readonly lastEntryAt = new Map<string, number>();
   private readonly rejectionCounts = new Map<SniperRejection, number>();
   private readonly coinEvals = new Map<string, CoinEvalState>();
+  private readonly directionWindows = new Map<string, DirectionWindowState>();
   private lastRejectionSummaryMs = Date.now();
   private totalSignals = 0;
   private totalExecuted = 0;
@@ -226,17 +258,6 @@ export class SniperEngine {
     nowMs?: number;
   }): StrategySignal[] {
     const nowMs = params.nowMs ?? Date.now();
-    const coin = params.binanceAssessment?.coin ?? resolveCoinLabel(params.market.title);
-    const evaluationBase: Omit<SniperEvaluation, 'rejection'> = {
-      marketId: params.market.marketId,
-      coin,
-      binanceMovePct: params.binanceAssessment?.binanceMovePct ?? null,
-      direction: params.binanceAssessment?.direction ?? null,
-      bestAsk: null,
-      edge: null,
-      pmLag: null,
-      impliedFV: null,
-    };
     const exits = this.generateExitSignals({
       market: params.market,
       orderbook: params.orderbook,
@@ -253,13 +274,47 @@ export class SniperEngine {
       return [];
     }
 
+    const candidate = this.evaluateEntryCandidate({
+      ...params,
+      nowMs,
+    });
+    if (!candidate) {
+      return [];
+    }
+
+    return this.selectSignals([candidate], params.config, nowMs);
+  }
+
+  evaluateEntryCandidate(params: {
+    market: MarketCandidate;
+    orderbook: MarketOrderbookSnapshot;
+    positionManager: PositionManager;
+    binanceAssessment?: BinanceEdgeAssessment;
+    binanceVelocityPctPerSec?: number | null;
+    config: SniperConfig;
+    blockedOutcomes?: ReadonlySet<Outcome>;
+    nowMs?: number;
+  }): SniperCandidate | null {
+    const nowMs = params.nowMs ?? Date.now();
+    const coin = params.binanceAssessment?.coin ?? resolveCoinLabel(params.market.title);
+    const evaluationBase: Omit<SniperEvaluation, 'rejection'> = {
+      marketId: params.market.marketId,
+      coin,
+      binanceMovePct: params.binanceAssessment?.binanceMovePct ?? null,
+      direction: params.binanceAssessment?.direction ?? null,
+      bestAsk: null,
+      edge: null,
+      pmLag: null,
+      impliedFV: null,
+    };
     const assessment = params.binanceAssessment;
     if (!assessment?.available) {
       this.trackCoinEval(coin, 0, false);
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         rejection: 'no_binance_data',
       });
+      return null;
     }
 
     this.trackCoinEval(assessment.coin, assessment.binanceMovePct, false);
@@ -274,17 +329,19 @@ export class SniperEngine {
 
     const movePct = Math.abs(assessment.binanceMovePct);
     if (assessment.direction === 'FLAT') {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         rejection: 'direction_flat',
       });
+      return null;
     }
 
     if (!Number.isFinite(movePct) || movePct < params.config.minBinanceMovePct) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         rejection: 'move_too_small',
       });
+      return null;
     }
 
     if (
@@ -294,33 +351,37 @@ export class SniperEngine {
         params.config.minVelocityPctPerSec
       )
     ) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         rejection: 'velocity_too_low',
       });
+      return null;
     }
 
-    const slotStartMs = Date.parse(params.market.startTime);
-    const slotEndMs = Date.parse(params.market.endTime);
-    if (Number.isFinite(slotStartMs) && nowMs - slotStartMs < params.config.slotWarmupMs) {
-      return this.reject({
+    const slotStartMs = parseSlotBoundary(params.market.startTime);
+    const slotEndMs = parseSlotBoundary(params.market.endTime);
+    if (slotStartMs !== null && nowMs - slotStartMs < params.config.slotWarmupMs) {
+      this.reject({
         ...evaluationBase,
         rejection: 'slot_too_early',
       });
+      return null;
     }
-    if (Number.isFinite(slotEndMs) && slotEndMs - nowMs < params.config.exitBeforeEndMs) {
-      return this.reject({
+    if (slotEndMs !== null && slotEndMs - nowMs < params.config.exitBeforeEndMs) {
+      this.reject({
         ...evaluationBase,
         rejection: 'slot_too_late',
       });
+      return null;
     }
 
     const expectedWinner = resolveSniperExpectedWinner(assessment.direction);
     if (!expectedWinner || params.blockedOutcomes?.has(expectedWinner)) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         rejection: 'outcome_blocked',
       });
+      return null;
     }
 
     const marketCooldownAt = this.lastEntryAt.get(params.market.marketId);
@@ -328,10 +389,11 @@ export class SniperEngine {
       marketCooldownAt !== undefined &&
       nowMs - marketCooldownAt < params.config.cooldownMs
     ) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         rejection: 'cooldown_active',
       });
+      return null;
     }
 
     const currentWinnerShares = params.positionManager.getShares(expectedWinner);
@@ -339,65 +401,71 @@ export class SniperEngine {
       expectedWinner === 'YES' ? 'NO' : 'YES'
     );
     if (oppositeWinnerShares > 0.0001 || currentWinnerShares >= params.config.maxPositionShares) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         rejection: 'max_position_reached',
       });
+      return null;
     }
 
     const book = expectedWinner === 'YES' ? params.orderbook.yes : params.orderbook.no;
     const bestAsk = book.bestAsk;
     if (bestAsk === null) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         rejection: 'no_ask_available',
       });
+      return null;
     }
     if (bestAsk < params.config.minEntryPrice) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         bestAsk,
         rejection: 'ask_price_too_low',
       });
+      return null;
     }
     if (bestAsk > params.config.maxEntryPrice) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         bestAsk,
         rejection: 'ask_price_too_high',
       });
+      return null;
     }
 
-    const binanceImpliedFV = estimateFairValueFromBinance(
+    const impliedFV = estimateFairValueFromBinance(
       assessment.binanceMovePct,
       assessment.direction,
       expectedWinner,
       params.config.volatilityScale
     );
     const totalCost = roundTo(bestAsk * (1 + params.config.takerFeePct), 6);
-    const edge = roundTo(binanceImpliedFV - totalCost, 6);
+    const edge = roundTo(impliedFV - totalCost, 6);
     this.trackEdge(edge);
     this.trackNearMiss(edge, params.config.minEdgeAfterFees);
     if (edge < params.config.minEdgeAfterFees) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         bestAsk,
         edge,
-        impliedFV: binanceImpliedFV,
+        impliedFV,
         rejection: 'edge_too_low',
       });
+      return null;
     }
 
-    const pmLag = roundTo(Math.abs(binanceImpliedFV - bestAsk), 6);
+    const pmLag = roundTo(Math.abs(impliedFV - bestAsk), 6);
     if (pmLag < params.config.minPmLagPct) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         bestAsk,
         edge,
         pmLag,
-        impliedFV: binanceImpliedFV,
+        impliedFV,
         rejection: 'pm_already_repriced',
       });
+      return null;
     }
 
     const requestedShares =
@@ -409,66 +477,102 @@ export class SniperEngine {
       4
     );
     if (shares <= 0) {
-      return this.reject({
+      this.reject({
         ...evaluationBase,
         bestAsk,
         edge,
         pmLag,
-        impliedFV: binanceImpliedFV,
+        impliedFV,
         rejection: 'max_position_reached',
       });
+      return null;
     }
 
-    this.totalSignals += 1;
-    this.lastSignalAt = new Date(nowMs).toISOString();
-    this.trackCoinSignal(assessment.coin);
-    logger.info('Sniper signal generated', {
-      marketId: params.market.marketId,
-      coin: assessment.coin,
-      direction: assessment.direction,
-      binanceMovePct: roundTo(assessment.binanceMovePct, 4),
+    return {
+      market: params.market,
+      orderbook: params.orderbook,
+      binanceAssessment: assessment,
       expectedWinner,
-      bestAsk: roundTo(bestAsk, 4),
-      impliedFV: roundTo(binanceImpliedFV, 4),
-      edge: roundTo(edge, 4),
-      pmLag: roundTo(pmLag, 4),
+      bestAsk,
+      impliedFV,
+      edge,
+      pmLag,
       shares,
-    });
-
-    return [
-      {
-        marketId: params.market.marketId,
-        marketTitle: params.market.title,
-        signalType: 'SNIPER_BUY',
-        priority: 1_200,
-        generatedAt: nowMs,
-        action: 'BUY',
-        outcome: expectedWinner,
-        outcomeIndex: expectedWinner === 'YES' ? 0 : 1,
-        shares,
-        targetPrice: roundTo(bestAsk, 6),
-        referencePrice: binanceImpliedFV,
-        tokenPrice: book.lastTradePrice ?? bestAsk,
-        midPrice: book.midPrice,
-        fairValue: binanceImpliedFV,
-        edgeAmount: edge,
-        combinedBid: params.orderbook.combined.combinedBid,
-        combinedAsk: params.orderbook.combined.combinedAsk,
-        combinedMid: params.orderbook.combined.combinedMid,
-        combinedDiscount: params.orderbook.combined.combinedDiscount,
-        combinedPremium: params.orderbook.combined.combinedPremium,
-        fillRatio: 1,
-        capitalClamp: 1,
-        priceMultiplier: movePct >= params.config.strongBinanceMovePct ? 1.5 : 1,
-        urgency: 'cross',
-        reduceOnly: false,
-        reason:
-          `Sniper BUY ${expectedWinner}: Binance ${assessment.direction} ${movePct.toFixed(3)}%` +
-          ` | PM ask ${bestAsk.toFixed(3)}` +
-          ` | impliedFV ${binanceImpliedFV.toFixed(3)}` +
-          ` | edge ${(edge * 100).toFixed(2)}% after ${(params.config.takerFeePct * 100).toFixed(2)}% fee`,
+      coin: assessment.coin,
+      nowMs,
+      slotStartMs,
+      slotEndMs,
+      evaluation: {
+        ...evaluationBase,
+        bestAsk,
+        edge,
+        pmLag,
+        impliedFV,
       },
-    ];
+    };
+  }
+
+  selectSignals(
+    candidates: readonly SniperCandidate[],
+    config: SniperConfig,
+    nowMs: number = Date.now()
+  ): StrategySignal[] {
+    if (candidates.length === 0) {
+      this.pruneDirectionWindows(nowMs);
+      return [];
+    }
+
+    this.pruneDirectionWindows(nowMs);
+    const grouped = new Map<string, SniperCandidate[]>();
+    for (const candidate of candidates) {
+      const key = this.buildDirectionWindowKey(
+        candidate.binanceAssessment.direction,
+        candidate.slotStartMs,
+        candidate.nowMs
+      );
+      const existing = grouped.get(key) ?? [];
+      existing.push(candidate);
+      grouped.set(key, existing);
+    }
+
+    const selectedSignals: StrategySignal[] = [];
+    for (const [windowKey, group] of grouped.entries()) {
+      if (group.length === 0) {
+        continue;
+      }
+
+      const direction = group[0]?.binanceAssessment.direction;
+      if (direction !== 'UP' && direction !== 'DOWN') {
+        continue;
+      }
+
+      const windowStartMs = resolveDirectionWindowStart(group[0]?.slotStartMs, nowMs);
+      const window = this.directionWindows.get(windowKey) ?? {
+        direction,
+        windowStartMs,
+        entries: [],
+      };
+      const usedCoins = new Set(window.entries.map((entry) => entry.coin));
+      let remainingCapacity = Math.max(0, config.maxConcurrentSameDirection - window.entries.length);
+
+      const ranked = [...group].sort((left, right) => right.edge - left.edge);
+      for (const candidate of ranked) {
+        if (usedCoins.has(candidate.coin) || remainingCapacity <= 0) {
+          this.reject({
+            ...candidate.evaluation,
+            rejection: 'correlated_risk_limit',
+          });
+          continue;
+        }
+
+        usedCoins.add(candidate.coin);
+        remainingCapacity -= 1;
+        this.recordDirectionEntry(windowKey, candidate, nowMs);
+        selectedSignals.push(this.buildEntrySignal(candidate));
+      }
+    }
+
+    return selectedSignals;
   }
 
   getStats(): SniperStatsSnapshot {
@@ -510,10 +614,11 @@ export class SniperEngine {
         moveCount > 0 ? roundTo(moveSum / moveCount, 4) : null,
       nearMissCount: this.nearMissCount,
       coinStats,
+      currentDirectionWindow: this.getCurrentDirectionWindowSnapshot(),
     };
   }
 
-  private generateExitSignals(params: {
+  generateExitSignals(params: {
     market: MarketCandidate;
     orderbook: MarketOrderbookSnapshot;
     positionManager: PositionManager;
@@ -598,6 +703,60 @@ export class SniperEngine {
     }
 
     return [];
+  }
+
+  private buildEntrySignal(candidate: SniperCandidate): StrategySignal {
+    const movePct = Math.abs(candidate.binanceAssessment.binanceMovePct);
+    const book = candidate.expectedWinner === 'YES' ? candidate.orderbook.yes : candidate.orderbook.no;
+    this.totalSignals += 1;
+    this.lastSignalAt = new Date(candidate.nowMs).toISOString();
+    this.trackCoinSignal(candidate.coin);
+    logger.info('Sniper signal generated', {
+      marketId: candidate.market.marketId,
+      coin: candidate.coin,
+      direction: candidate.binanceAssessment.direction,
+      binanceMovePct: roundTo(candidate.binanceAssessment.binanceMovePct, 4),
+      expectedWinner: candidate.expectedWinner,
+      bestAsk: roundTo(candidate.bestAsk, 4),
+      impliedFV: roundTo(candidate.impliedFV, 4),
+      edge: roundTo(candidate.edge, 4),
+      pmLag: roundTo(candidate.pmLag, 4),
+      shares: candidate.shares,
+    });
+
+    return {
+      marketId: candidate.market.marketId,
+      marketTitle: candidate.market.title,
+      signalType: 'SNIPER_BUY',
+      priority: 1_200,
+      generatedAt: candidate.nowMs,
+      action: 'BUY',
+      outcome: candidate.expectedWinner,
+      outcomeIndex: candidate.expectedWinner === 'YES' ? 0 : 1,
+      shares: candidate.shares,
+      targetPrice: roundTo(candidate.bestAsk, 6),
+      referencePrice: candidate.impliedFV,
+      tokenPrice: book.lastTradePrice ?? candidate.bestAsk,
+      midPrice: book.midPrice,
+      fairValue: candidate.impliedFV,
+      edgeAmount: candidate.edge,
+      combinedBid: candidate.orderbook.combined.combinedBid,
+      combinedAsk: candidate.orderbook.combined.combinedAsk,
+      combinedMid: candidate.orderbook.combined.combinedMid,
+      combinedDiscount: candidate.orderbook.combined.combinedDiscount,
+      combinedPremium: candidate.orderbook.combined.combinedPremium,
+      fillRatio: 1,
+      capitalClamp: 1,
+      priceMultiplier:
+        movePct >= this.runtimeConfig.sniper.strongBinanceMovePct ? 1.5 : 1,
+      urgency: 'cross',
+      reduceOnly: false,
+      reason:
+        `Sniper BUY ${candidate.expectedWinner}: Binance ${candidate.binanceAssessment.direction} ${movePct.toFixed(3)}%` +
+        ` | PM ask ${candidate.bestAsk.toFixed(3)}` +
+        ` | impliedFV ${candidate.impliedFV.toFixed(3)}` +
+        ` | edge ${(candidate.edge * 100).toFixed(2)}% after ${(this.runtimeConfig.sniper.takerFeePct * 100).toFixed(2)}% fee`,
+    };
   }
 
   private reject(evaluation: SniperEvaluation): StrategySignal[] {
@@ -691,6 +850,87 @@ export class SniperEngine {
       this.bestEdge = edge;
     }
   }
+
+  private pruneDirectionWindows(nowMs: number): void {
+    for (const [key, window] of this.directionWindows.entries()) {
+      window.entries = window.entries.filter(
+        (entry) => nowMs - entry.enteredAtMs < 5 * 60_000
+      );
+      if (
+        window.entries.length === 0 &&
+        nowMs - window.windowStartMs >= 5 * 60_000
+      ) {
+        this.directionWindows.delete(key);
+      }
+    }
+  }
+
+  private recordDirectionEntry(
+    windowKey: string,
+    candidate: SniperCandidate,
+    nowMs: number
+  ): void {
+    const direction = candidate.binanceAssessment.direction;
+    if (direction !== 'UP' && direction !== 'DOWN') {
+      return;
+    }
+
+    const windowStartMs = resolveDirectionWindowStart(candidate.slotStartMs, nowMs);
+    const window = this.directionWindows.get(windowKey) ?? {
+      direction,
+      windowStartMs,
+      entries: [],
+    };
+    window.entries = window.entries.filter(
+      (entry) => nowMs - entry.enteredAtMs < 5 * 60_000
+    );
+    if (window.entries.some((entry) => entry.coin === candidate.coin)) {
+      this.directionWindows.set(windowKey, window);
+      return;
+    }
+
+    window.entries.push({
+      coin: candidate.coin,
+      marketId: candidate.market.marketId,
+      enteredAtMs: nowMs,
+      edge: candidate.edge,
+    });
+    this.directionWindows.set(windowKey, window);
+  }
+
+  private buildDirectionWindowKey(
+    direction: 'UP' | 'DOWN' | 'FLAT',
+    slotStartMs: number | null,
+    nowMs: number
+  ): string {
+    return `${direction}:${resolveDirectionWindowStart(slotStartMs, nowMs)}`;
+  }
+
+  private getCurrentDirectionWindowSnapshot(): SniperStatsSnapshot['currentDirectionWindow'] {
+    let current: DirectionWindowState | null = null;
+    for (const window of this.directionWindows.values()) {
+      if (window.entries.length === 0) {
+        continue;
+      }
+
+      if (!current || window.windowStartMs > current.windowStartMs) {
+        current = window;
+      }
+    }
+
+    if (!current) {
+      return null;
+    }
+
+    const activeCoins = Array.from(
+      new Set(current.entries.map((entry) => entry.coin))
+    );
+    return {
+      direction: current.direction,
+      activeCoins,
+      capacity: `${activeCoins.length}/${this.runtimeConfig.sniper.maxConcurrentSameDirection}`,
+    };
+  }
 }
 
 function buildSniperExitSignal(
@@ -756,4 +996,22 @@ function supportsSniperVelocity(
 function resolveCoinLabel(title: string): string {
   const prefix = title.trim().split(/\s+/)[0];
   return prefix ? prefix.toUpperCase() : 'UNKNOWN';
+}
+
+function parseSlotBoundary(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function resolveDirectionWindowStart(slotStartMs: number | null, nowMs: number): number {
+  if (slotStartMs !== null) {
+    return slotStartMs;
+  }
+
+  const slotSizeMs = 5 * 60_000;
+  return Math.floor(nowMs / slotSizeMs) * slotSizeMs;
 }
