@@ -461,7 +461,7 @@ test('settled outcome sell execution clamps live exits to tradable settled balan
   assert.equal(result.executionShares, 7.7005);
 });
 
-test('settled outcome sell execution keeps waiting when only dust has settled', () => {
+test('settled outcome sell execution marks sub-minimum settled dust for redeem cleanup', () => {
   const result = resolveSettledOutcomeSellExecution({
     signal: createSignal({
       signalType: 'SNIPER_SCALP_EXIT',
@@ -477,6 +477,7 @@ test('settled outcome sell execution keeps waiting when only dust has settled', 
 
   assert.equal(result.ready, false);
   assert.equal(result.executionShares, 0);
+  assert.equal(result.abandonToRedeem, true);
 });
 
 test('reduce-only sell guard blocks sub-minimum exits and reports the blocked remainder', () => {
@@ -757,6 +758,117 @@ test('live reduce-only exits are clamped to the settled token balance after BUY 
   assert.match(submittedSignal?.reason ?? '', /clamped to settled balance 7\.7005/);
   assert.equal(result?.fillConfirmed, true);
   assert.equal(positionManager.getShares('NO'), 0.2995);
+});
+
+test('settled sub-minimum sniper exits are abandoned for redeem instead of retrying forever', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 5,
+    price: 0.49,
+  });
+
+  runtime.syncRuntimeStatus = () => {};
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.recordSkippedSignal = () => {};
+  runtime.settlementStartedAt.set('market-1:YES', Date.now() - 1_000);
+  runtime.settlementAttempts.set('market-1:YES', 0);
+
+  let executorCalls = 0;
+  runtime.executor = {
+    getOutcomeTokenBalance: async () => 4.8092,
+    executeSignal: async () => {
+      executorCalls += 1;
+      return createExecutionReport();
+    },
+    invalidateOutcomeBalanceCache: () => {},
+    invalidateBalanceValidationCache: () => {},
+  };
+
+  const result = await runtime.executeSignal(
+    market,
+    orderbook,
+    positionManager,
+    createSignal({
+      signalType: 'SNIPER_SCALP_EXIT',
+      action: 'SELL',
+      reduceOnly: true,
+      shares: 5,
+      targetPrice: 0.49,
+      referencePrice: 0.49,
+      tokenPrice: 0.49,
+      midPrice: 0.49,
+      fairValue: 0.49,
+      urgency: 'cross',
+    }),
+    'slot-1'
+  );
+
+  assert.equal(result, null);
+  assert.equal(executorCalls, 0);
+  assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), true);
+  assert.equal(runtime.settlementStartedAt.has('market-1:YES'), false);
+});
+
+test('hard stops clamp to wallet balance and abandon sub-minimum live inventory', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 5,
+    price: 0.49,
+  });
+
+  runtime.syncRuntimeStatus = () => {};
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.recordSkippedSignal = () => {};
+
+  let executorCalls = 0;
+  runtime.executor = {
+    getOutcomeTokenBalance: async () => 4.7984,
+    executeSignal: async () => {
+      executorCalls += 1;
+      return createExecutionReport();
+    },
+    invalidateOutcomeBalanceCache: () => {},
+    invalidateBalanceValidationCache: () => {},
+  };
+
+  const result = await runtime.executeSignal(
+    market,
+    orderbook,
+    positionManager,
+    createSignal({
+      signalType: 'HARD_STOP',
+      action: 'SELL',
+      reduceOnly: true,
+      shares: 5,
+      targetPrice: 0.49,
+      referencePrice: 0.49,
+      tokenPrice: 0.49,
+      midPrice: 0.49,
+      fairValue: 0.49,
+      urgency: 'cross',
+    }),
+    'slot-1'
+  );
+
+  assert.equal(result, null);
+  assert.equal(executorCalls, 0);
+  assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), true);
 });
 
 test('redeem-success clears local runtime positions for settled conditions', async () => {

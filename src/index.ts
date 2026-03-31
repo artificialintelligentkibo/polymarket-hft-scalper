@@ -1035,6 +1035,17 @@ export class MarketMakerRuntime {
         referencePrice: exitGuardPrice,
       });
       if (!settlementReady.ready) {
+        if (settlementReady.abandonToRedeem) {
+          this.skipReduceOnlySellForDust({
+            market,
+            signal: executionSignal,
+            requestedShares: settlementReady.availableShares,
+            minimumShares: settlementReady.minimumShares,
+            referencePrice: exitGuardPrice,
+            details: `settledShares=${settlementReady.availableShares.toFixed(4)} minimum=${settlementReady.minimumShares.toFixed(4)}`,
+          });
+          this.clearSettlementConfirmation(market.marketId, executionSignal.outcome);
+        }
         return null;
       }
 
@@ -1066,6 +1077,19 @@ export class MarketMakerRuntime {
           availableShares: settlementReady.availableShares,
         });
       }
+    }
+
+    if (!paperTradingEnabled && executionSignal.action === 'SELL' && executionSignal.reduceOnly) {
+      const reconciledSignal = await this.reconcileLiveReduceOnlySellSignal({
+        market,
+        signal: executionSignal,
+        tokenId,
+        referencePrice: exitGuardPrice,
+      });
+      if (!reconciledSignal) {
+        return null;
+      }
+      executionSignal = reconciledSignal;
     }
 
     const beforeSnapshot = positionManager.getSnapshot();
@@ -2394,6 +2418,88 @@ export class MarketMakerRuntime {
     this.settlementAttempts.delete(key);
   }
 
+  private skipReduceOnlySellForDust(params: {
+    market: MarketCandidate;
+    signal: StrategySignal;
+    requestedShares: number;
+    minimumShares: number;
+    referencePrice: number | null;
+    details: string;
+  }): void {
+    this.setBlockedExitRemainder(
+      params.market.marketId,
+      params.signal.outcome,
+      params.requestedShares
+    );
+    this.recordSkippedSignal({
+      signal: params.signal,
+      filterReason: 'MIN_ORDER_SIZE',
+      details: params.details,
+    });
+    this.abandonPositionForRedeem({
+      market: params.market,
+      signal: params.signal,
+      requestedShares: params.requestedShares,
+      minimumShares: params.minimumShares,
+      referencePrice: params.referencePrice,
+    });
+  }
+
+  private async reconcileLiveReduceOnlySellSignal(params: {
+    market: MarketCandidate;
+    signal: StrategySignal;
+    tokenId: string;
+    referencePrice: number | null;
+  }): Promise<StrategySignal | null> {
+    const latestBalance = await this.executor.getOutcomeTokenBalance(params.tokenId, true);
+    const guardedSell = resolveReduceOnlySellGuard({
+      signal: params.signal,
+      availableShares: latestBalance,
+      referencePrice: params.referencePrice,
+    });
+
+    this.setBlockedExitRemainder(
+      params.market.marketId,
+      params.signal.outcome,
+      guardedSell.blockedRemainderShares
+    );
+
+    if (guardedSell.skip) {
+      if (latestBalance > 0 && guardedSell.reason === 'below_minimum') {
+        this.skipReduceOnlySellForDust({
+          market: params.market,
+          signal: params.signal,
+          requestedShares: roundTo(Math.max(0, latestBalance), 4),
+          minimumShares: guardedSell.minimumShares,
+          referencePrice: params.referencePrice,
+          details: `walletShares=${roundTo(Math.max(0, latestBalance), 4).toFixed(4)} minimum=${guardedSell.minimumShares.toFixed(4)}`,
+        });
+        this.clearSettlementConfirmation(params.market.marketId, params.signal.outcome);
+        return null;
+      }
+
+      return params.signal;
+    }
+
+    if (roundTo(guardedSell.executionShares, 4) === roundTo(params.signal.shares, 4)) {
+      return params.signal;
+    }
+
+    logger.info('Live reduce-only SELL clamped to wallet outcome balance', {
+      marketId: params.market.marketId,
+      signalType: params.signal.signalType,
+      outcome: params.signal.outcome,
+      requestedShares: roundTo(params.signal.shares, 4),
+      executionShares: guardedSell.executionShares,
+      availableShares: roundTo(Math.max(0, latestBalance), 4),
+    });
+    return {
+      ...params.signal,
+      shares: guardedSell.executionShares,
+      reason: `${params.signal.reason} | clamped to wallet balance ${guardedSell.executionShares.toFixed(4)}`,
+    };
+  }
+
   private async confirmSettlementForSell(params: {
     market: MarketCandidate;
     signal: StrategySignal;
@@ -2408,6 +2514,8 @@ export class MarketMakerRuntime {
         requiredShares: getRequiredSettledShares(params.signal.shares),
         availableShares: roundTo(params.signal.shares, 4),
         executionShares: roundTo(params.signal.shares, 4),
+        abandonToRedeem: false,
+        minimumShares: 0,
       };
     }
 
@@ -2462,6 +2570,8 @@ export class MarketMakerRuntime {
       requiredShares,
       availableShares: roundTo(latestBalance, 4),
       executionShares: 0,
+      abandonToRedeem: false,
+      minimumShares: resolveMinimumTradableShares(params.referencePrice ?? Number.NaN, 0),
     };
   }
 
@@ -3615,6 +3725,8 @@ export interface SettledOutcomeSellExecutionResolution {
   readonly requiredShares: number;
   readonly availableShares: number;
   readonly executionShares: number;
+  readonly abandonToRedeem: boolean;
+  readonly minimumShares: number;
 }
 
 export function pruneExpiredSettlementCooldowns(
@@ -3774,6 +3886,8 @@ export function resolveSettledOutcomeSellExecution(params: {
       requiredShares,
       availableShares,
       executionShares: requestedShares,
+      abandonToRedeem: false,
+      minimumShares: 0,
     };
   }
 
@@ -3788,6 +3902,8 @@ export function resolveSettledOutcomeSellExecution(params: {
       requiredShares,
       availableShares,
       executionShares: guardedSell.executionShares,
+      abandonToRedeem: false,
+      minimumShares: guardedSell.minimumShares,
     };
   }
 
@@ -3796,6 +3912,8 @@ export function resolveSettledOutcomeSellExecution(params: {
     requiredShares,
     availableShares,
     executionShares: 0,
+    abandonToRedeem: availableShares > 0 && guardedSell.reason === 'below_minimum',
+    minimumShares: guardedSell.minimumShares,
   };
 }
 
