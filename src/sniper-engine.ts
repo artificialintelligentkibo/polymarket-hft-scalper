@@ -4,6 +4,7 @@ import type { AppConfig, SniperConfig } from './config.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
+import type { SniperStatsSnapshot } from './runtime-status.js';
 import type { StrategySignal } from './strategy-types.js';
 import { clamp, roundTo } from './utils.js';
 
@@ -16,6 +17,41 @@ export interface SniperEntry {
   readonly enteredAtMs: number;
   readonly binanceDirectionAtEntry: 'UP' | 'DOWN';
   readonly binanceMoveAtEntry: number;
+}
+
+export type SniperRejection =
+  | 'no_binance_data'
+  | 'move_too_small'
+  | 'direction_flat'
+  | 'outcome_blocked'
+  | 'ask_price_too_high'
+  | 'ask_price_too_low'
+  | 'no_ask_available'
+  | 'edge_too_low'
+  | 'pm_already_repriced'
+  | 'slot_too_early'
+  | 'slot_too_late'
+  | 'cooldown_active'
+  | 'max_position_reached'
+  | 'velocity_too_low'
+  | 'signal_generated';
+
+interface SniperEvaluation {
+  readonly marketId: string;
+  readonly coin: string;
+  readonly rejection: SniperRejection;
+  readonly binanceMovePct: number | null;
+  readonly direction: string | null;
+  readonly bestAsk: number | null;
+  readonly edge: number | null;
+  readonly pmLag: number | null;
+  readonly impliedFV: number | null;
+}
+
+interface CoinEvalState {
+  evals: number;
+  signals: number;
+  moves: number[];
 }
 
 export function estimateFairValueFromBinance(
@@ -58,6 +94,18 @@ export function buildSniperEntryKey(marketId: string, outcome: Outcome): string 
 export class SniperEngine {
   private readonly activeEntries = new Map<string, SniperEntry>();
   private readonly lastEntryAt = new Map<string, number>();
+  private readonly rejectionCounts = new Map<SniperRejection, number>();
+  private readonly coinEvals = new Map<string, CoinEvalState>();
+  private lastRejectionSummaryMs = Date.now();
+  private totalSignals = 0;
+  private totalExecuted = 0;
+  private bestEdge = 0;
+  private lastSignalAt: string | null = null;
+  private lastRejectionReason: string | null = null;
+  private nearMissCount = 0;
+
+  private static readonly REJECTION_SUMMARY_INTERVAL_MS = 30_000;
+  private static readonly MAX_COIN_MOVE_SAMPLES = 500;
 
   constructor(private readonly runtimeConfig: AppConfig) {}
 
@@ -107,6 +155,10 @@ export class SniperEngine {
     const shares = Math.max(0, roundTo(params.filledShares ?? params.signal.shares, 4));
     if (shares <= 0) {
       return;
+    }
+
+    if (params.signal.signalType === 'SNIPER_BUY') {
+      this.totalExecuted += 1;
     }
 
     const key = buildSniperEntryKey(params.market.marketId, params.signal.outcome);
@@ -174,6 +226,17 @@ export class SniperEngine {
     nowMs?: number;
   }): StrategySignal[] {
     const nowMs = params.nowMs ?? Date.now();
+    const coin = params.binanceAssessment?.coin ?? resolveCoinLabel(params.market.title);
+    const evaluationBase: Omit<SniperEvaluation, 'rejection'> = {
+      marketId: params.market.marketId,
+      coin,
+      binanceMovePct: params.binanceAssessment?.binanceMovePct ?? null,
+      direction: params.binanceAssessment?.direction ?? null,
+      bestAsk: null,
+      edge: null,
+      pmLag: null,
+      impliedFV: null,
+    };
     const exits = this.generateExitSignals({
       market: params.market,
       orderbook: params.orderbook,
@@ -192,14 +255,14 @@ export class SniperEngine {
 
     const assessment = params.binanceAssessment;
     if (!assessment?.available) {
-      logger.warn('Sniper: no Binance assessment', {
-        marketId: params.market.marketId,
-        marketTitle: params.market.title,
-        reason: assessment?.unavailableReason ?? 'not available',
+      this.trackCoinEval(coin, 0, false);
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'no_binance_data',
       });
-      return [];
     }
 
+    this.trackCoinEval(assessment.coin, assessment.binanceMovePct, false);
     logger.debug('Sniper: evaluating', {
       marketId: params.market.marketId,
       coin: assessment.coin,
@@ -210,12 +273,18 @@ export class SniperEngine {
     });
 
     const movePct = Math.abs(assessment.binanceMovePct);
-    if (
-      assessment.direction === 'FLAT' ||
-      !Number.isFinite(movePct) ||
-      movePct < params.config.minBinanceMovePct
-    ) {
-      return [];
+    if (assessment.direction === 'FLAT') {
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'direction_flat',
+      });
+    }
+
+    if (!Number.isFinite(movePct) || movePct < params.config.minBinanceMovePct) {
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'move_too_small',
+      });
     }
 
     if (
@@ -225,21 +294,33 @@ export class SniperEngine {
         params.config.minVelocityPctPerSec
       )
     ) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'velocity_too_low',
+      });
     }
 
     const slotStartMs = Date.parse(params.market.startTime);
     const slotEndMs = Date.parse(params.market.endTime);
     if (Number.isFinite(slotStartMs) && nowMs - slotStartMs < params.config.slotWarmupMs) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'slot_too_early',
+      });
     }
     if (Number.isFinite(slotEndMs) && slotEndMs - nowMs < params.config.exitBeforeEndMs) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'slot_too_late',
+      });
     }
 
     const expectedWinner = resolveSniperExpectedWinner(assessment.direction);
     if (!expectedWinner || params.blockedOutcomes?.has(expectedWinner)) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'outcome_blocked',
+      });
     }
 
     const marketCooldownAt = this.lastEntryAt.get(params.market.marketId);
@@ -247,7 +328,10 @@ export class SniperEngine {
       marketCooldownAt !== undefined &&
       nowMs - marketCooldownAt < params.config.cooldownMs
     ) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'cooldown_active',
+      });
     }
 
     const currentWinnerShares = params.positionManager.getShares(expectedWinner);
@@ -255,17 +339,33 @@ export class SniperEngine {
       expectedWinner === 'YES' ? 'NO' : 'YES'
     );
     if (oppositeWinnerShares > 0.0001 || currentWinnerShares >= params.config.maxPositionShares) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'max_position_reached',
+      });
     }
 
     const book = expectedWinner === 'YES' ? params.orderbook.yes : params.orderbook.no;
     const bestAsk = book.bestAsk;
-    if (
-      bestAsk === null ||
-      bestAsk < params.config.minEntryPrice ||
-      bestAsk > params.config.maxEntryPrice
-    ) {
-      return [];
+    if (bestAsk === null) {
+      return this.reject({
+        ...evaluationBase,
+        rejection: 'no_ask_available',
+      });
+    }
+    if (bestAsk < params.config.minEntryPrice) {
+      return this.reject({
+        ...evaluationBase,
+        bestAsk,
+        rejection: 'ask_price_too_low',
+      });
+    }
+    if (bestAsk > params.config.maxEntryPrice) {
+      return this.reject({
+        ...evaluationBase,
+        bestAsk,
+        rejection: 'ask_price_too_high',
+      });
     }
 
     const binanceImpliedFV = estimateFairValueFromBinance(
@@ -276,13 +376,28 @@ export class SniperEngine {
     );
     const totalCost = roundTo(bestAsk * (1 + params.config.takerFeePct), 6);
     const edge = roundTo(binanceImpliedFV - totalCost, 6);
+    this.trackEdge(edge);
+    this.trackNearMiss(edge, params.config.minEdgeAfterFees);
     if (edge < params.config.minEdgeAfterFees) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        bestAsk,
+        edge,
+        impliedFV: binanceImpliedFV,
+        rejection: 'edge_too_low',
+      });
     }
 
     const pmLag = roundTo(Math.abs(binanceImpliedFV - bestAsk), 6);
     if (pmLag < params.config.minPmLagPct) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        bestAsk,
+        edge,
+        pmLag,
+        impliedFV: binanceImpliedFV,
+        rejection: 'pm_already_repriced',
+      });
     }
 
     const requestedShares =
@@ -294,8 +409,31 @@ export class SniperEngine {
       4
     );
     if (shares <= 0) {
-      return [];
+      return this.reject({
+        ...evaluationBase,
+        bestAsk,
+        edge,
+        pmLag,
+        impliedFV: binanceImpliedFV,
+        rejection: 'max_position_reached',
+      });
     }
+
+    this.totalSignals += 1;
+    this.lastSignalAt = new Date(nowMs).toISOString();
+    this.trackCoinSignal(assessment.coin);
+    logger.info('Sniper signal generated', {
+      marketId: params.market.marketId,
+      coin: assessment.coin,
+      direction: assessment.direction,
+      binanceMovePct: roundTo(assessment.binanceMovePct, 4),
+      expectedWinner,
+      bestAsk: roundTo(bestAsk, 4),
+      impliedFV: roundTo(binanceImpliedFV, 4),
+      edge: roundTo(edge, 4),
+      pmLag: roundTo(pmLag, 4),
+      shares,
+    });
 
     return [
       {
@@ -331,6 +469,48 @@ export class SniperEngine {
           ` | edge ${(edge * 100).toFixed(2)}% after ${(params.config.takerFeePct * 100).toFixed(2)}% fee`,
       },
     ];
+  }
+
+  getStats(): SniperStatsSnapshot {
+    const rejections: Record<string, number> = {};
+    for (const [reason, count] of this.rejectionCounts.entries()) {
+      rejections[reason] = count;
+    }
+
+    const coinStats: SniperStatsSnapshot['coinStats'] = {};
+    let moveSum = 0;
+    let moveCount = 0;
+    for (const [coin, data] of this.coinEvals.entries()) {
+      const moves = data.moves.filter((move) => Number.isFinite(move) && move >= 0);
+      const avgMovePct =
+        moves.length > 0
+          ? roundTo(moves.reduce((sum, move) => sum + move, 0) / moves.length, 4)
+          : 0;
+      const maxMovePct = moves.length > 0 ? roundTo(Math.max(...moves), 4) : 0;
+      coinStats[coin] = {
+        evaluations: data.evals,
+        signals: data.signals,
+        avgMovePct,
+        maxMovePct,
+      };
+      moveSum += moves.reduce((sum, move) => sum + move, 0);
+      moveCount += moves.length;
+    }
+
+    return {
+      enabled: this.runtimeConfig.SNIPER_MODE_ENABLED,
+      signalsGenerated: this.totalSignals,
+      signalsExecuted: this.totalExecuted,
+      rejections,
+      totalRejections: Object.values(rejections).reduce((sum, count) => sum + count, 0),
+      lastSignalAt: this.lastSignalAt,
+      lastRejection: this.lastRejectionReason,
+      bestEdgeSeen: roundTo(this.bestEdge, 4),
+      avgBinanceMove:
+        moveCount > 0 ? roundTo(moveSum / moveCount, 4) : null,
+      nearMissCount: this.nearMissCount,
+      coinStats,
+    };
   }
 
   private generateExitSignals(params: {
@@ -419,6 +599,98 @@ export class SniperEngine {
 
     return [];
   }
+
+  private reject(evaluation: SniperEvaluation): StrategySignal[] {
+    this.logRejection(evaluation);
+    return [];
+  }
+
+  private logRejection(evaluation: SniperEvaluation): void {
+    logger.debug('Sniper: rejected', {
+      marketId: evaluation.marketId,
+      coin: evaluation.coin,
+      rejection: evaluation.rejection,
+      binanceMovePct:
+        evaluation.binanceMovePct !== null
+          ? roundTo(evaluation.binanceMovePct, 4)
+          : null,
+      direction: evaluation.direction,
+      bestAsk: evaluation.bestAsk !== null ? roundTo(evaluation.bestAsk, 4) : null,
+      edge: evaluation.edge !== null ? roundTo(evaluation.edge, 4) : null,
+      pmLag: evaluation.pmLag !== null ? roundTo(evaluation.pmLag, 4) : null,
+      impliedFV:
+        evaluation.impliedFV !== null ? roundTo(evaluation.impliedFV, 4) : null,
+    });
+
+    this.lastRejectionReason = evaluation.rejection;
+    this.rejectionCounts.set(
+      evaluation.rejection,
+      (this.rejectionCounts.get(evaluation.rejection) ?? 0) + 1
+    );
+
+    const nowMs = Date.now();
+    if (
+      nowMs - this.lastRejectionSummaryMs <
+      SniperEngine.REJECTION_SUMMARY_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    this.lastRejectionSummaryMs = nowMs;
+    const summary: Record<string, number> = {};
+    for (const [reason, count] of this.rejectionCounts.entries()) {
+      summary[reason] = count;
+    }
+    const total = Object.values(summary).reduce((sum, count) => sum + count, 0);
+    if (total > 0) {
+      logger.info('Sniper rejection summary (last 30s)', {
+        total,
+        ...summary,
+      });
+      this.rejectionCounts.clear();
+    }
+  }
+
+  private trackCoinEval(coin: string, movePct: number, isSignal: boolean): void {
+    const normalizedCoin = coin.trim().toUpperCase() || 'UNKNOWN';
+    const existing = this.coinEvals.get(normalizedCoin) ?? {
+      evals: 0,
+      signals: 0,
+      moves: [],
+    };
+    existing.evals += 1;
+    if (isSignal) {
+      existing.signals += 1;
+    }
+    existing.moves.push(Math.abs(movePct));
+    if (existing.moves.length > SniperEngine.MAX_COIN_MOVE_SAMPLES) {
+      existing.moves.shift();
+    }
+    this.coinEvals.set(normalizedCoin, existing);
+  }
+
+  private trackCoinSignal(coin: string): void {
+    const normalizedCoin = coin.trim().toUpperCase() || 'UNKNOWN';
+    const existing = this.coinEvals.get(normalizedCoin) ?? {
+      evals: 0,
+      signals: 0,
+      moves: [],
+    };
+    existing.signals += 1;
+    this.coinEvals.set(normalizedCoin, existing);
+  }
+
+  private trackNearMiss(edge: number, threshold: number): void {
+    if (edge > 0 && edge < threshold && edge >= threshold - 0.005) {
+      this.nearMissCount += 1;
+    }
+  }
+
+  private trackEdge(edge: number): void {
+    if (edge > this.bestEdge) {
+      this.bestEdge = edge;
+    }
+  }
 }
 
 function buildSniperExitSignal(
@@ -479,4 +751,9 @@ function supportsSniperVelocity(
   }
 
   return velocityPctPerSec <= -minVelocityPctPerSec;
+}
+
+function resolveCoinLabel(title: string): string {
+  const prefix = title.trim().split(/\s+/)[0];
+  return prefix ? prefix.toUpperCase() : 'UNKNOWN';
 }

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { BinanceEdgeAssessment } from '../src/binance-edge.js';
 import { createConfig } from '../src/config.js';
 import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
+import { logger } from '../src/logger.js';
 import type { MarketCandidate } from '../src/monitor.js';
 import { PositionManager } from '../src/position-manager.js';
 import { SniperEngine, estimateFairValueFromBinance } from '../src/sniper-engine.js';
@@ -322,4 +323,189 @@ test('sniper engine emits reversal stop when Binance flips and pnl is below stop
   assert.equal(signals[0]?.action, 'SELL');
   assert.equal(signals[0]?.urgency, 'cross');
   assert.match(signals[0]?.reason ?? '', /reversal stop/i);
+});
+
+test('sniper rejection stats capture move_too_small and coin evaluation counts', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MIN_BINANCE_MOVE_PCT: '0.20',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  const signals = engine.generateSignals({
+    market,
+    orderbook: createOrderbook(),
+    positionManager,
+    binanceAssessment: createAssessment({
+      binanceMovePct: 0.08,
+      edgeStrength: 0.08,
+    }),
+    binanceVelocityPctPerSec: 0.02,
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+
+  assert.equal(signals.length, 0);
+  const stats = engine.getStats();
+  assert.equal(stats.lastRejection, 'move_too_small');
+  assert.equal(stats.rejections.move_too_small, 1);
+  assert.equal(stats.totalRejections, 1);
+  assert.equal(stats.coinStats.BTC?.evaluations, 1);
+});
+
+test('sniper rejection stats capture ask_price_too_high', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MAX_ENTRY_PRICE: '0.40',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  engine.generateSignals({
+    market,
+    orderbook: createOrderbook({
+      yes: {
+        ...createOrderbook().yes,
+        bestAsk: 0.52,
+      },
+    }),
+    positionManager,
+    binanceAssessment: createAssessment(),
+    binanceVelocityPctPerSec: 0.02,
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+
+  const stats = engine.getStats();
+  assert.equal(stats.lastRejection, 'ask_price_too_high');
+  assert.equal(stats.rejections.ask_price_too_high, 1);
+});
+
+test('sniper tracks edge too low, near misses, and best edge seen', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MIN_BINANCE_MOVE_PCT: '0.01',
+    SNIPER_MIN_EDGE_AFTER_FEES: '0.010',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  engine.generateSignals({
+    market,
+    orderbook: createOrderbook({
+      yes: {
+        ...createOrderbook().yes,
+        bestAsk: 0.505,
+        midPrice: 0.5,
+      },
+    }),
+    positionManager,
+    binanceAssessment: createAssessment({
+      binanceMovePct: 0.02,
+      edgeStrength: 0.02,
+    }),
+    binanceVelocityPctPerSec: 0.03,
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+
+  const stats = engine.getStats();
+  assert.equal(stats.lastRejection, 'edge_too_low');
+  assert.equal(stats.rejections.edge_too_low, 1);
+  assert.ok(stats.nearMissCount >= 1);
+  assert.ok(stats.bestEdgeSeen > 0);
+});
+
+test('sniper stats track generated and executed signals', () => {
+  const runtimeConfig = createRuntimeConfig();
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const signals = engine.generateSignals({
+    market,
+    orderbook: createOrderbook({
+      yes: {
+        ...createOrderbook().yes,
+        bestAsk: 0.52,
+        midPrice: 0.5,
+      },
+    }),
+    positionManager,
+    binanceAssessment: createAssessment(),
+    binanceVelocityPctPerSec: 0.02,
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+
+  assert.equal(signals.length, 1);
+  engine.recordExecution({
+    market,
+    signal: signals[0],
+    filledShares: 6,
+    fillPrice: 0.52,
+    executedAtMs: Date.parse('2026-03-31T10:01:01.000Z'),
+  });
+
+  const stats = engine.getStats();
+  assert.equal(stats.signalsGenerated, 1);
+  assert.equal(stats.signalsExecuted, 1);
+  assert.ok(stats.lastSignalAt !== null);
+  assert.ok(stats.coinStats.BTC?.signals === 1);
+  assert.equal(stats.coinStats.BTC?.evaluations, 1);
+});
+
+test('sniper rejection summary clears interval counts after periodic summary log', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MIN_BINANCE_MOVE_PCT: '0.20',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const originalInfo = logger.info;
+  let summaryLogged = false;
+  logger.info = ((message: string) => {
+    if (message === 'Sniper rejection summary (last 30s)') {
+      summaryLogged = true;
+    }
+  }) as typeof logger.info;
+
+  try {
+    (engine as any).lastRejectionSummaryMs = Date.now() - 31_000;
+    engine.generateSignals({
+      market,
+      orderbook: createOrderbook(),
+      positionManager,
+      binanceAssessment: createAssessment({
+        binanceMovePct: 0.05,
+        edgeStrength: 0.05,
+      }),
+      binanceVelocityPctPerSec: 0.01,
+      config: runtimeConfig.sniper,
+      nowMs: Date.parse('2026-03-31T10:01:00.000Z'),
+    });
+  } finally {
+    logger.info = originalInfo;
+  }
+
+  assert.equal(summaryLogged, true);
+  assert.equal(engine.getStats().totalRejections, 0);
+});
+
+test('sniper getStats returns a complete snapshot shape', () => {
+  const runtimeConfig = createRuntimeConfig();
+  const engine = new SniperEngine(runtimeConfig);
+
+  const stats = engine.getStats();
+  assert.equal(stats.enabled, true);
+  assert.equal(stats.signalsGenerated, 0);
+  assert.equal(stats.signalsExecuted, 0);
+  assert.deepEqual(stats.rejections, {});
+  assert.equal(stats.totalRejections, 0);
+  assert.equal(stats.lastSignalAt, null);
+  assert.equal(stats.lastRejection, null);
+  assert.equal(stats.bestEdgeSeen, 0);
+  assert.equal(stats.avgBinanceMove, null);
+  assert.equal(stats.nearMissCount, 0);
+  assert.deepEqual(stats.coinStats, {});
 });

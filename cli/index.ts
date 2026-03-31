@@ -26,6 +26,7 @@ import {
   type RuntimeMmQuoteSnapshot,
   type RuntimeMode,
   type RuntimePositionSnapshot,
+  type SniperStatsSnapshot,
   type RuntimeStatusSnapshot,
 } from '../src/runtime-status.js';
 import { checkPolymarketStatus, writeStatusControlCommand } from '../src/status-monitor.js';
@@ -472,7 +473,7 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   lines.push(
     renderSection(
       'ACTIVE MARKETS  -  SCANNING LIVE SIGNALS',
-      renderActiveMarkets(runtimeStatus?.activeMarkets ?? [])
+      renderActiveMarkets(runtimeStatus?.activeMarkets ?? [], runtimeStatus?.sniperStats)
     )
   );
   lines.push('');
@@ -494,6 +495,13 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
     renderSection(
       'BOT PERFORMANCE STATS',
       renderPerformance(inspection, runtimeStatus, runtimeConfig)
+    )
+  );
+  lines.push('');
+  lines.push(
+    renderSection(
+      'SNIPER ENGINE  -  BINANCE-LED SIGNAL STATUS',
+      renderSniperStats(runtimeStatus?.sniperStats)
     )
   );
   lines.push('');
@@ -531,7 +539,10 @@ function renderSection(title: string, body: string): string {
   return [heading, body].join('\n');
 }
 
-function renderActiveMarkets(markets: readonly RuntimeMarketSnapshot[]): string {
+function renderActiveMarkets(
+  markets: readonly RuntimeMarketSnapshot[],
+  sniperStats?: SniperStatsSnapshot
+): string {
   if (markets.length === 0) {
     return color.dim('No active markets in the current runtime snapshot.');
   }
@@ -545,7 +556,7 @@ function renderActiveMarkets(markets: readonly RuntimeMarketSnapshot[]): string 
       formatMidPrice(market.pmDownMid),
       formatBinanceMove(market.binanceMovePct, market.binanceDirection),
       formatDiscount(market.combinedDiscount),
-      colorizeAction(market.action, market.signalCount),
+      resolveActiveMarketAction(market, sniperStats),
     ])
   );
 }
@@ -680,6 +691,171 @@ function renderPerformance(
       ['Updated', runtimeStatus?.updatedAt ? truncateDashboardLabel(runtimeStatus.updatedAt, 28) : color.dim('n/a'), '', ''],
     ]
   );
+}
+
+function renderSniperStats(stats: SniperStatsSnapshot | undefined): string {
+  if (!stats || !stats.enabled) {
+    return color.dim('Sniper mode is disabled.');
+  }
+
+  const lines: string[] = [];
+  const signalRate =
+    stats.signalsGenerated > 0
+      ? color.bold(`${stats.signalsGenerated} signals`)
+      : color.yellow('0 signals');
+  const hitRate =
+    stats.signalsGenerated > 0
+      ? `${Math.round((stats.signalsExecuted / stats.signalsGenerated) * 100)}% hit`
+      : 'n/a';
+  const bestEdge =
+    stats.bestEdgeSeen > 0
+      ? color.green(`${(stats.bestEdgeSeen * 100).toFixed(2)}%`)
+      : color.dim('none');
+  const nearMiss =
+    stats.nearMissCount > 0
+      ? color.yellow(`${stats.nearMissCount} near-misses`)
+      : color.dim('0');
+
+  lines.push(
+    `Signals ${signalRate}  ` +
+      `Hit rate ${color.bold(hitRate)}  ` +
+      `Best edge ${bestEdge}  ` +
+      `Near-miss ${nearMiss}  ` +
+      `Last signal ${
+        stats.lastSignalAt ? timeAgo(stats.lastSignalAt) : color.dim('never')
+      }`
+  );
+
+  const entries = Object.entries(stats.coinStats);
+  if (entries.length > 0) {
+    lines.push('');
+    lines.push(
+      renderTable(
+        ['COIN', 'EVALS', 'SIGNALS', 'AVG MOVE', 'MAX MOVE', 'STATUS'],
+        [8, 8, 8, 10, 10, 20],
+        ['BTC', 'ETH', 'SOL', 'XRP'].flatMap((coin) => {
+          const data = stats.coinStats[coin];
+          if (!data) {
+            return [];
+          }
+
+          const status =
+            data.signals > 0
+              ? color.green('ACTIVE')
+              : data.maxMovePct >= 0.05
+                ? color.yellow('WATCHING')
+                : color.dim('QUIET');
+          return [[
+            coin,
+            String(data.evaluations),
+            data.signals > 0 ? color.green(String(data.signals)) : '0',
+            `${data.avgMovePct.toFixed(3)}%`,
+            data.maxMovePct >= 0.1
+              ? color.yellow(`${data.maxMovePct.toFixed(3)}%`)
+              : `${data.maxMovePct.toFixed(3)}%`,
+            status,
+          ]];
+        })
+      )
+    );
+  }
+
+  if (stats.totalRejections > 0) {
+    lines.push('');
+    const totalEvaluations = stats.totalRejections + stats.signalsGenerated;
+    const rejectionLine = Object.entries(stats.rejections)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([reason, count]) => {
+        const pct =
+          totalEvaluations > 0 ? Math.round((count / totalEvaluations) * 100) : 0;
+        return `${formatRejectionLabel(reason)} ${color.dim(`${pct}%`)}`;
+      })
+      .join('  ');
+    lines.push(`${color.dim('Rejections:')} ${rejectionLine}`);
+  }
+
+  if (stats.lastRejection) {
+    lines.push(`${color.dim('Last rejection:')} ${formatRejectionLabel(stats.lastRejection)}`);
+  }
+
+  if (stats.avgBinanceMove !== null) {
+    lines.push(
+      `${color.dim('Average move:')} ${color.bold(`${stats.avgBinanceMove.toFixed(3)}%`)}`
+    );
+  }
+
+  return lines.join('\n');
+}
+
+function resolveActiveMarketAction(
+  market: RuntimeMarketSnapshot,
+  sniperStats?: SniperStatsSnapshot
+): string {
+  if (
+    sniperStats?.enabled &&
+    !market.action.startsWith('ENTER') &&
+    !market.action.startsWith('EXIT') &&
+    !market.action.startsWith('PAUSED')
+  ) {
+    const action = getSniperAction(market);
+    if (action === 'SNIPER READY') {
+      return color.green(action);
+    }
+    if (action === 'NEAR') {
+      return color.yellow(action);
+    }
+    return color.dim(action);
+  }
+
+  return colorizeAction(market.action, market.signalCount);
+}
+
+function getSniperAction(market: RuntimeMarketSnapshot): string {
+  const movePct = Math.abs(market.binanceMovePct ?? 0);
+  if (movePct >= 0.1) {
+    return 'SNIPER READY';
+  }
+  if (movePct >= 0.05) {
+    return 'NEAR';
+  }
+  return 'SCAN';
+}
+
+function formatRejectionLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    move_too_small: 'small move',
+    edge_too_low: 'low edge',
+    ask_price_too_high: 'price high',
+    ask_price_too_low: 'price low',
+    pm_already_repriced: 'PM caught up',
+    direction_flat: 'flat',
+    slot_too_early: 'too early',
+    slot_too_late: 'too late',
+    cooldown_active: 'cooldown',
+    no_ask_available: 'no book',
+    outcome_blocked: 'blocked',
+    max_position_reached: 'max pos',
+    no_binance_data: 'no data',
+    velocity_too_low: 'slow move',
+  };
+  return labels[reason] ?? reason.replaceAll('_', ' ');
+}
+
+function timeAgo(isoTimestamp: string): string {
+  const timestampMs = new Date(isoTimestamp).getTime();
+  if (!Number.isFinite(timestampMs)) {
+    return color.dim('unknown');
+  }
+
+  const seconds = Math.max(0, Math.floor((Date.now() - timestampMs) / 1000));
+  if (seconds < 60) {
+    return color.green(`${seconds}s ago`);
+  }
+  if (seconds < 3600) {
+    return color.yellow(`${Math.floor(seconds / 60)}m ago`);
+  }
+  return color.red(`${Math.floor(seconds / 3600)}h ago`);
 }
 
 function isAnyCircuitBreakerOpen(runtimeStatus: RuntimeStatusSnapshot): boolean {

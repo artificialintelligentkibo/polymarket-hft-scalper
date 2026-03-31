@@ -14,6 +14,7 @@ import {
   resolveProductTestUrgency,
 } from './product-test-mode.js';
 import type { RiskAssessment } from './risk-manager.js';
+import type { SniperStatsSnapshot } from './runtime-status.js';
 import { SniperEngine } from './sniper-engine.js';
 import type { StrategySignal } from './strategy-types.js';
 import { clamp, OUTCOMES, roundTo } from './utils.js';
@@ -291,6 +292,10 @@ export class SignalScalper {
     const drained = [...this.recentSkippedSignals];
     this.recentSkippedSignals.splice(0, this.recentSkippedSignals.length);
     return drained;
+  }
+
+  getSniperStats(): SniperStatsSnapshot {
+    return this.sniperEngine.getStats();
   }
 
   setPairedArbPending(marketId: string): void {

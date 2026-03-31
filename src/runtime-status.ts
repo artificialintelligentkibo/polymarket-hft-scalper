@@ -84,6 +84,27 @@ export interface RuntimeMmQuoteSnapshot {
   readonly netDirectionalShares: number;
 }
 
+export interface SniperCoinStatsSnapshot {
+  readonly evaluations: number;
+  readonly signals: number;
+  readonly avgMovePct: number;
+  readonly maxMovePct: number;
+}
+
+export interface SniperStatsSnapshot {
+  readonly enabled: boolean;
+  readonly signalsGenerated: number;
+  readonly signalsExecuted: number;
+  readonly rejections: Record<string, number>;
+  readonly totalRejections: number;
+  readonly lastSignalAt: string | null;
+  readonly lastRejection: string | null;
+  readonly bestEdgeSeen: number;
+  readonly avgBinanceMove: number | null;
+  readonly nearMissCount: number;
+  readonly coinStats: Record<string, SniperCoinStatsSnapshot>;
+}
+
 export interface RuntimeStatusSnapshot {
   readonly updatedAt: string;
   readonly pid: number | null;
@@ -114,6 +135,7 @@ export interface RuntimeStatusSnapshot {
   readonly bayesianFvAlpha: number;
   readonly activeMarkets: readonly RuntimeMarketSnapshot[];
   readonly openPositions: readonly RuntimePositionSnapshot[];
+  readonly sniperStats: SniperStatsSnapshot;
   readonly mmEnabled: boolean;
   readonly mmAutonomousQuotes: boolean;
   readonly mmQuoteShares: number;
@@ -183,6 +205,7 @@ export function createRuntimeStatusSnapshot(
     bayesianFvAlpha: runtimeConfig.BAYESIAN_FV_ALPHA,
     activeMarkets: [],
     openPositions: [],
+    sniperStats: createDefaultSniperStatsSnapshot(runtimeConfig),
     mmEnabled: isDynamicQuotingEnabled(runtimeConfig),
     mmAutonomousQuotes: runtimeConfig.MM_AUTONOMOUS_QUOTES,
     mmQuoteShares: runtimeConfig.MM_QUOTE_SHARES,
@@ -314,6 +337,7 @@ function normalizeRuntimeStatus(
     bayesianFvAlpha: normalizeNumber(value.bayesianFvAlpha, runtimeConfig.BAYESIAN_FV_ALPHA),
     activeMarkets,
     openPositions,
+    sniperStats: normalizeSniperStats(value.sniperStats, runtimeConfig),
     mmEnabled:
       typeof value.mmEnabled === 'boolean'
         ? value.mmEnabled
@@ -399,6 +423,92 @@ function createDefaultCircuitBreakerSnapshot(name: string): CircuitBreakerSnapsh
     resetTimeoutMs: 30_000,
     openedAtMs: null,
     nextAttemptAtMs: null,
+  };
+}
+
+function createDefaultSniperStatsSnapshot(
+  runtimeConfig: AppConfig
+): SniperStatsSnapshot {
+  return {
+    enabled: runtimeConfig.SNIPER_MODE_ENABLED,
+    signalsGenerated: 0,
+    signalsExecuted: 0,
+    rejections: {},
+    totalRejections: 0,
+    lastSignalAt: null,
+    lastRejection: null,
+    bestEdgeSeen: 0,
+    avgBinanceMove: null,
+    nearMissCount: 0,
+    coinStats: {},
+  };
+}
+
+function normalizeSniperStats(
+  value: unknown,
+  runtimeConfig: AppConfig
+): SniperStatsSnapshot {
+  if (!value || typeof value !== 'object') {
+    return createDefaultSniperStatsSnapshot(runtimeConfig);
+  }
+
+  const record = value as Partial<SniperStatsSnapshot> & {
+    coinStats?: Record<string, Partial<SniperCoinStatsSnapshot>>;
+  };
+  const rejections: Record<string, number> = {};
+  if (record.rejections && typeof record.rejections === 'object') {
+    for (const [reason, count] of Object.entries(record.rejections)) {
+      const normalized = normalizeCount(count);
+      if (reason.trim() && normalized > 0) {
+        rejections[reason] = normalized;
+      }
+    }
+  }
+
+  const coinStats: Record<string, SniperCoinStatsSnapshot> = {};
+  if (record.coinStats && typeof record.coinStats === 'object') {
+    for (const [coin, stats] of Object.entries(record.coinStats)) {
+      if (!coin.trim() || !stats || typeof stats !== 'object') {
+        continue;
+      }
+
+      coinStats[coin] = {
+        evaluations: normalizeCount(stats.evaluations),
+        signals: normalizeCount(stats.signals),
+        avgMovePct: normalizeNumber(stats.avgMovePct, 0),
+        maxMovePct: normalizeNumber(stats.maxMovePct, 0),
+      };
+    }
+  }
+
+  const computedTotalRejections = Object.values(rejections).reduce((sum, count) => sum + count, 0);
+  return {
+    enabled:
+      typeof record.enabled === 'boolean'
+        ? record.enabled
+        : runtimeConfig.SNIPER_MODE_ENABLED,
+    signalsGenerated: normalizeCount(record.signalsGenerated),
+    signalsExecuted: normalizeCount(record.signalsExecuted),
+    rejections,
+    totalRejections: Math.max(
+      normalizeCount(record.totalRejections),
+      computedTotalRejections
+    ),
+    lastSignalAt:
+      typeof record.lastSignalAt === 'string' && record.lastSignalAt.trim()
+        ? record.lastSignalAt
+        : null,
+    lastRejection:
+      typeof record.lastRejection === 'string' && record.lastRejection.trim()
+        ? record.lastRejection
+        : null,
+    bestEdgeSeen: normalizeNumber(record.bestEdgeSeen, 0),
+    avgBinanceMove:
+      record.avgBinanceMove === null || record.avgBinanceMove === undefined
+        ? null
+        : normalizeNumber(record.avgBinanceMove, 0),
+    nearMissCount: normalizeCount(record.nearMissCount),
+    coinStats,
   };
 }
 

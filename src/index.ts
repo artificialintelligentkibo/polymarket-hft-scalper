@@ -1610,6 +1610,7 @@ export class MarketMakerRuntime {
         activeMarkets: this.buildRuntimeMarketSnapshots(),
         openPositions,
         openPositionsCount: openPositions.length,
+        sniperStats: this.signalEngine.getSniperStats(),
         mmEnabled: isDynamicQuotingEnabled(config),
         mmAutonomousQuotes: config.MM_AUTONOMOUS_QUOTES,
         mmQuoteShares: config.MM_QUOTE_SHARES,
