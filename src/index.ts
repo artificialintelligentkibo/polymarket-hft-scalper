@@ -686,7 +686,11 @@ export class MarketMakerRuntime {
     if (
       this.statusMonitor.isPaused() ||
       this.latencyPaused ||
-      this.isApiEntryGateOpen()
+      shouldBlockSniperSelectionForApiGate({
+        apiEntryGateOpen: this.isApiEntryGateOpen(),
+        dryRunMode: isDryRunMode(config),
+        paperTradingEnabled: isPaperTradingEnabled(config),
+      })
     ) {
       return {
         overrides,
@@ -3593,6 +3597,18 @@ export function filterSignalsForSniperCorrelationLimit(
   }
 
   return signals.filter((signal) => signal.reduceOnly || signal.action === 'SELL');
+}
+
+export function shouldBlockSniperSelectionForApiGate(params: {
+  apiEntryGateOpen: boolean;
+  dryRunMode: boolean;
+  paperTradingEnabled: boolean;
+}): boolean {
+  return (
+    params.apiEntryGateOpen &&
+    !params.dryRunMode &&
+    !params.paperTradingEnabled
+  );
 }
 
 export interface ReduceOnlySellGuardResult {

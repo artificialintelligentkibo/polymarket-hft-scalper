@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createConfig } from '../src/config.js';
-import { resolveExecutionAttemptUrgencies } from '../src/order-executor.js';
+import { OrderExecutor, resolveExecutionAttemptUrgencies } from '../src/order-executor.js';
 import type { StrategySignal } from '../src/strategy-types.js';
 
 function createSignal(overrides: Partial<StrategySignal> = {}): StrategySignal {
@@ -62,4 +62,21 @@ test('live execution keeps direct cross urgency even when maker preference is en
   });
 
   assert.deepEqual(resolveExecutionAttemptUrgencies(createSignal(), runtimeConfig), ['cross']);
+});
+
+test('paper trading reports a closed CLOB circuit breaker snapshot', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    PAPER_TRADING_ENABLED: 'true',
+    SIMULATION_MODE: 'false',
+    DRY_RUN: 'true',
+  });
+
+  const executor = new OrderExecutor(undefined, runtimeConfig);
+  const snapshot = executor.getClobCircuitBreakerSnapshot();
+
+  assert.equal(snapshot.name, 'clob');
+  assert.equal(snapshot.isOpen, false);
+  assert.equal(snapshot.failureThreshold, 5);
+  assert.equal(snapshot.resetTimeoutMs, 30_000);
 });

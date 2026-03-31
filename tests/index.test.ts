@@ -11,6 +11,7 @@ import {
   pruneLatencyPauseSamples,
   pruneExpiredSettlementCooldowns,
   resolveReduceOnlySellGuard,
+  shouldBlockSniperSelectionForApiGate,
   shouldDeferSignalForSettlement,
 } from '../src/index.js';
 import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
@@ -357,6 +358,26 @@ test('API entry gate still blocks live entry signals when the gate is open', () 
   assert.deepEqual(
     filtered.allowedSignals.map((signal) => signal.signalType),
     ['HARD_STOP']
+  );
+});
+
+test('sniper selection bypasses API gate in simulation and paper mode', () => {
+  assert.equal(
+    shouldBlockSniperSelectionForApiGate({
+      apiEntryGateOpen: true,
+      dryRunMode: true,
+      paperTradingEnabled: true,
+    }),
+    false
+  );
+
+  assert.equal(
+    shouldBlockSniperSelectionForApiGate({
+      apiEntryGateOpen: true,
+      dryRunMode: false,
+      paperTradingEnabled: false,
+    }),
+    true
   );
 });
 

@@ -288,6 +288,18 @@ export class OrderExecutor {
   }
 
   getClobCircuitBreakerSnapshot(): CircuitBreakerSnapshot {
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      return {
+        name: 'clob',
+        isOpen: false,
+        consecutiveFailures: 0,
+        failureThreshold: 5,
+        resetTimeoutMs: 30_000,
+        openedAtMs: null,
+        nextAttemptAtMs: null,
+      };
+    }
+
     return (
       this.trader?.getClobCircuitBreakerSnapshot() ?? {
         name: 'clob',
