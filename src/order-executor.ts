@@ -447,6 +447,13 @@ function resolveExecutionUrgency(
     return urgency;
   }
 
+  if (
+    signal.signalType === 'SNIPER_BUY' ||
+    signal.signalType === 'SNIPER_SCALP_EXIT'
+  ) {
+    return urgency;
+  }
+
   if (urgency !== 'cross') {
     return urgency;
   }

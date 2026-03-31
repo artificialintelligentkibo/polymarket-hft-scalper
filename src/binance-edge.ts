@@ -134,6 +134,31 @@ export class BinanceEdgeProvider {
     return bestSample?.price ?? null;
   }
 
+  getVelocityPctPerSec(
+    coin: string,
+    windowMs: number,
+    nowMs = Date.now()
+  ): number | null {
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      return null;
+    }
+
+    const latestPrice = this.getLatestPrice(coin);
+    const referencePrice = this.getPriceAt(coin, nowMs - windowMs);
+    if (
+      latestPrice === null ||
+      referencePrice === null ||
+      !Number.isFinite(latestPrice) ||
+      !Number.isFinite(referencePrice) ||
+      referencePrice <= 0
+    ) {
+      return null;
+    }
+
+    const movePct = ((latestPrice - referencePrice) / referencePrice) * 100;
+    return roundTo(movePct / (windowMs / 1000), 6);
+  }
+
   assess(params: {
     coin: string;
     slotStartTime: string | null;

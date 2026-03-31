@@ -78,7 +78,12 @@ export function applyEVKellyFilter(params: {
   config: EVKellyConfig;
 }): EVKellyResult {
   const { signal, config } = params;
-  if (!config.enabled || signal.reduceOnly || isPairedArbSignal(signal)) {
+  if (
+    !config.enabled ||
+    signal.reduceOnly ||
+    isPairedArbSignal(signal) ||
+    isSniperSignal(signal)
+  ) {
     return {
       approved: true,
       ev: Number.POSITIVE_INFINITY,
@@ -190,5 +195,12 @@ export function isPairedArbSignal(signal: Pick<StrategySignal, 'signalType'>): b
     signal.signalType === 'PAIRED_ARB_BUY_YES' ||
     signal.signalType === 'PAIRED_ARB_BUY_NO' ||
     signal.signalType === 'PAIRED_ARB_REBALANCE'
+  );
+}
+
+export function isSniperSignal(signal: Pick<StrategySignal, 'signalType'>): boolean {
+  return (
+    signal.signalType === 'SNIPER_BUY' ||
+    signal.signalType === 'SNIPER_SCALP_EXIT'
   );
 }

@@ -8,6 +8,7 @@ Dual-sided Polymarket CLOB market-maker for 5-minute markets. The runtime now co
 - paired arbitrage with atomic paired-leg execution
 - async paired-arb leg accumulation
 - latency momentum driven directly by Binance spot movement
+- sniper mode for Binance-led aggressive taker entries
 - EV filtering + fractional Kelly resizing for non-paired entries
 - inventory rebalance on imbalance
 - risk-enforced flatten, hard stop, and trailing take-profit
@@ -48,6 +49,8 @@ Recommended strategy presets:
   Safest initial paper mode. Lowest directional exposure.
 - `ENTRY_STRATEGY=LATENCY_MOMENTUM`
   Directional and fee-sensitive. Use EV/Kelly.
+- `SNIPER_MODE_ENABLED=true`
+  Highest-conviction Binance-led taker strategy. Start with paper trading or `DRY_RUN=true`.
 - `ENTRY_STRATEGY=ALL`
   Highest activity. Disable weak legacy long entries first.
 
@@ -57,10 +60,11 @@ Entry engines now include:
 
 1. `PAIRED_ARB_BUY_YES` / `PAIRED_ARB_BUY_NO`
 2. `LATENCY_MOMENTUM_BUY`
-3. `COMBINED_DISCOUNT_BUY_BOTH`
-4. `EXTREME_BUY` / `EXTREME_SELL`
-5. `FAIR_VALUE_BUY` / `FAIR_VALUE_SELL`
-6. `INVENTORY_REBALANCE`
+3. `SNIPER_BUY` / `SNIPER_SCALP_EXIT`
+4. `COMBINED_DISCOUNT_BUY_BOTH`
+5. `EXTREME_BUY` / `EXTREME_SELL`
+6. `FAIR_VALUE_BUY` / `FAIR_VALUE_SELL`
+7. `INVENTORY_REBALANCE`
 
 Paired-arb notes:
 
@@ -184,6 +188,15 @@ If you want a faster way to understand what a knob does before editing `.env`, o
 - `DYNAMIC_SPREAD_VOL_FACTOR=1.5`
 - `BINANCE_FAIR_VALUE_WEIGHT=0.7`
 - `POLYMARKET_FAIR_VALUE_WEIGHT=0.2`
+- `SNIPER_MODE_ENABLED=false`
+- `SNIPER_MIN_BINANCE_MOVE_PCT=0.10`
+- `SNIPER_MIN_EDGE_AFTER_FEES=0.01`
+- `SNIPER_MAX_ENTRY_PRICE=0.55`
+- `SNIPER_BASE_SHARES=6`
+- `SNIPER_STRONG_SHARES=12`
+- `SNIPER_EXIT_BEFORE_END_MS=30000`
+- `SNIPER_SCALP_EXIT_EDGE=0.08`
+- `SNIPER_STOP_LOSS_PCT=0.15`
 
 Sizing is now driven by:
 
@@ -210,6 +223,7 @@ The main loop in [src/index.ts](src/index.ts) runs:
 13. optional Binance latency-edge post-filter for entry signals
 14. optional market-maker quoting loop for passive cancel/repost inventory management
 15. optional deep Binance perpetual depth/funding overlay for quote fair value and spread selection
+16. optional sniper-mode taker entries that take priority over passive quoting when Binance moves fast enough
 
 ## Reports
 
@@ -418,6 +432,72 @@ What changes when enabled:
 - `POST_ONLY_ONLY=true` keeps the bot in passive/improve mode and prevents `cross` urgency
 - when `DEEP_BINANCE_MODE=true`, quote fair value is blended from Polymarket mid + Binance perpetual move + funding basis
 - Binance volatility can widen `QUOTING_SPREAD_TICKS` dynamically, and excessively wide Binance spreads block fresh entry quotes without disabling safety exits
+
+## Sniper Mode (2026)
+
+`SNIPER_MODE_ENABLED` adds an optional Binance-led aggressive entry engine. It does not replace the legacy scalper unless you explicitly turn it on.
+
+How to switch:
+
+```bash
+SNIPER_MODE_ENABLED=true
+BINANCE_EDGE_ENABLED=true
+POST_ONLY=false
+DRY_RUN=true
+PAPER_TRADING_ENABLED=true
+```
+
+Mode behavior:
+
+- `SNIPER_MODE_ENABLED=false`
+  No change. Legacy scalper and optional MM flow continue to run exactly as before.
+- `SNIPER_MODE_ENABLED=true`
+  Binance assessment is evaluated before legacy entry engines. If a sniper opportunity exists, the bot sends a taker `SNIPER_BUY` and skips passive MM quoting for that market while the move is active.
+- active sniper positions manage their own exits with `SNIPER_SCALP_EXIT`, Binance reversal stops, and optional time stops
+- when `SNIPER_MAX_HOLD_MS=0`, the bot can hold conviction entries to settlement instead of forcing a routine slot flatten
+
+Recommended paper-test defaults:
+
+| Parameter | Default | Recommended | Purpose |
+|---|---:|---:|---|
+| `SNIPER_MODE_ENABLED` | `false` | `true` only in paper / dry-run first | Global sniper switch |
+| `SNIPER_MIN_BINANCE_MOVE_PCT` | `0.10` | `0.10` | Minimum Binance move before evaluating entry |
+| `SNIPER_STRONG_BINANCE_MOVE_PCT` | `0.30` | `0.30` | Larger move threshold for bigger size |
+| `SNIPER_MIN_EDGE_AFTER_FEES` | `0.01` | `0.01` | Minimum edge after taker fees |
+| `SNIPER_TAKER_FEE_PCT` | `0.0315` | `0.0315` | 5-minute crypto taker fee assumption |
+| `SNIPER_MAX_ENTRY_PRICE` | `0.55` | `0.55` | Avoid buying already-expensive outcomes |
+| `SNIPER_MIN_PM_LAG` | `0.03` | `0.03` | Require Polymarket to still lag Binance FV |
+| `SNIPER_BASE_SHARES` | `6` | `6` | Base entry size |
+| `SNIPER_STRONG_SHARES` | `12` | `12` | Strong-move entry size |
+| `SNIPER_MAX_POSITION_SHARES` | `20` | `20` | Max sniper inventory per market |
+| `SNIPER_COOLDOWN_MS` | `3000` | `3000` | Prevent repeated entries into one burst |
+| `SNIPER_SLOT_WARMUP_MS` | `15000` | `15000` | Skip unstable open prints |
+| `SNIPER_EXIT_BEFORE_END_MS` | `30000` | `30000` | Avoid late entries with no reprice window |
+| `SNIPER_MAX_HOLD_MS` | `0` | `0` | `0` means conviction hold to settlement |
+| `SNIPER_SCALP_EXIT_EDGE` | `0.08` | `0.08` | Profit target for quick PM repricing exits |
+| `SNIPER_STOP_LOSS_PCT` | `0.15` | `0.15` | Reversal loss threshold |
+| `SNIPER_VELOCITY_WINDOW_MS` | `5000` | `5000` | Binance velocity lookback |
+| `SNIPER_MIN_VELOCITY_PCT_PER_SEC` | `0.005` | `0.005` | Reject slow/noisy moves |
+| `SNIPER_VOLATILITY_SCALE` | `0.003` | `0.003` | FV model calibration for move-to-probability mapping |
+
+Suggested initial config:
+
+```env
+SIMULATION_MODE=false
+DRY_RUN=true
+PAPER_TRADING_ENABLED=true
+BINANCE_EDGE_ENABLED=true
+SNIPER_MODE_ENABLED=true
+LATENCY_MOMENTUM_ENABLED=false
+MARKET_MAKER_MODE=false
+DYNAMIC_QUOTING_ENABLED=false
+POST_ONLY=false
+SNIPER_MIN_BINANCE_MOVE_PCT=0.10
+SNIPER_MIN_EDGE_AFTER_FEES=0.01
+SNIPER_BASE_SHARES=6
+SNIPER_STRONG_SHARES=12
+SNIPER_EXIT_BEFORE_END_MS=30000
+```
 
 Turning the two feature flags back off fully restores the pre-market-maker behavior.
 

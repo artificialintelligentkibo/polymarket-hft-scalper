@@ -14,6 +14,7 @@ import {
   resolveProductTestUrgency,
 } from './product-test-mode.js';
 import type { RiskAssessment } from './risk-manager.js';
+import { SniperEngine } from './sniper-engine.js';
 import type { StrategySignal } from './strategy-types.js';
 import { clamp, OUTCOMES, roundTo } from './utils.js';
 
@@ -54,12 +55,15 @@ export class SignalScalper {
   private readonly inventoryRebalanceBlocks = new Map<string, InventoryRebalanceBlockState>();
   private readonly pairedArbEngine = new PairedArbitrageEngine();
   private readonly latencyMomentumEngine = new LatencyMomentumEngine();
+  private readonly sniperEngine: SniperEngine;
   private readonly recentSkippedSignals: SkippedSignalRecord[] = [];
   private readonly smoothedScalperFV = new Map<string, number>();
   private readonly smoothedScalperFvSeenAtMs = new Map<string, number>();
   private readonly currentTickFairValueCache = new Map<string, number | null>();
 
-  constructor(private readonly runtimeConfig: AppConfig = config) {}
+  constructor(private readonly runtimeConfig: AppConfig = config) {
+    this.sniperEngine = new SniperEngine(runtimeConfig);
+  }
 
   recordExecution(params: {
     market: MarketCandidate;
@@ -105,6 +109,8 @@ export class SignalScalper {
       });
     }
 
+    this.sniperEngine.recordExecution(params);
+
     if (params.signal.signalType === 'FAIR_VALUE_BUY' && params.signal.action === 'BUY') {
       const current = this.fairValueBuyCadence.get(key);
       this.fairValueBuyCadence.set(key, {
@@ -135,6 +141,7 @@ export class SignalScalper {
     riskAssessment: RiskAssessment;
     binanceFairValueAdjustment?: FairValueBinanceAdjustment;
     binanceAssessment?: BinanceEdgeAssessment;
+    binanceVelocityPctPerSec?: number | null;
     now?: Date;
   }): StrategySignal[] {
     this.recentSkippedSignals.splice(0, this.recentSkippedSignals.length);
@@ -147,6 +154,7 @@ export class SignalScalper {
       riskAssessment,
       binanceFairValueAdjustment,
       binanceAssessment,
+      binanceVelocityPctPerSec,
     } = params;
     this.pruneFairValueControlState(now.getTime());
     this.pruneSmoothedFairValues(now.getTime());
@@ -156,14 +164,18 @@ export class SignalScalper {
       (this.runtimeConfig.ENTRY_STRATEGY === 'PAIRED_ARBITRAGE' ||
         this.runtimeConfig.ENTRY_STRATEGY === 'ALL');
 
-    if (riskAssessment.forcedSignals.length > 0) {
+    const filteredForcedSignals = this.filterForcedSignalsForSniper(
+      market,
+      riskAssessment.forcedSignals
+    );
+    if (filteredForcedSignals.length > 0) {
       const protectedForcedSignals = pairedProtectionEnabled
         ? this.pairedArbEngine.protectSignals({
             marketId: market.marketId,
             positionManager,
-            signals: riskAssessment.forcedSignals,
+            signals: filteredForcedSignals,
           })
-        : [...riskAssessment.forcedSignals];
+        : [...filteredForcedSignals];
       const forcedSelection = takeTopSignals(protectedForcedSignals, strategy.maxSignalsPerTick);
       for (const skippedSignal of forcedSelection.skipped) {
         this.recordSkippedSignal(skippedSignal, 'MAX_SIGNALS', 'takeTopSignals limit');
@@ -172,6 +184,29 @@ export class SignalScalper {
     }
 
     if (!this.runtimeConfig.ENABLE_SIGNAL) {
+      return [];
+    }
+
+    const sniperSignals = this.runtimeConfig.sniper.enabled
+      ? this.sniperEngine.generateSignals({
+          market,
+          orderbook,
+          positionManager,
+          binanceAssessment,
+          binanceVelocityPctPerSec,
+          config: this.runtimeConfig.sniper,
+          blockedOutcomes: riskAssessment.blockedOutcomes,
+          nowMs: now.getTime(),
+        })
+      : [];
+    if (sniperSignals.length > 0) {
+      return sniperSignals;
+    }
+
+    if (
+      this.runtimeConfig.SNIPER_MODE_ENABLED &&
+      this.sniperEngine.hasActiveEntryForMarket(market.marketId)
+    ) {
       return [];
     }
 
@@ -221,7 +256,8 @@ export class SignalScalper {
 
     if (
       (entryStrategy === 'LATENCY_MOMENTUM' || entryStrategy === 'ALL') &&
-      this.runtimeConfig.LATENCY_MOMENTUM_ENABLED
+      this.runtimeConfig.LATENCY_MOMENTUM_ENABLED &&
+      !this.runtimeConfig.SNIPER_MODE_ENABLED
     ) {
       groups.push(
         this.latencyMomentumEngine.generateSignals({
@@ -911,6 +947,31 @@ export class SignalScalper {
       ...context,
       details,
     });
+  }
+
+  private filterForcedSignalsForSniper(
+    market: MarketCandidate,
+    forcedSignals: readonly StrategySignal[]
+  ): StrategySignal[] {
+    if (!this.runtimeConfig.SNIPER_MODE_ENABLED) {
+      return [...forcedSignals];
+    }
+
+    const nextSignals: StrategySignal[] = [];
+    for (const signal of forcedSignals) {
+      if (!this.sniperEngine.shouldSuppressLegacyForcedSignal(signal)) {
+        nextSignals.push(signal);
+        continue;
+      }
+
+      this.recordSkippedSignal(
+        signal,
+        'SNIPER_OWNS_EXIT',
+        `Suppressed ${signal.signalType} while sniper entry is active on ${market.marketId}`
+      );
+    }
+
+    return nextSignals;
   }
 }
 

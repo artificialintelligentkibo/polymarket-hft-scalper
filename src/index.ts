@@ -615,7 +615,15 @@ export class MarketMakerRuntime {
     });
     const binanceFairValueAdjustment = this.getBinanceFairValueAdjustment(market, orderbook);
     const binanceAssessment = this.getPrimaryBinanceAssessment(market, orderbook);
+    const binanceVelocityPctPerSec = this.getBinanceVelocityPctPerSec(market);
     const deepBinanceAssessment = this.getDeepBinanceAssessment(market, orderbook);
+    if (config.SNIPER_MODE_ENABLED && !binanceAssessment?.available) {
+      logger.warn('Sniper: no Binance assessment', {
+        marketId: market.marketId,
+        coin: extractCoinFromTitle(market.title) ?? 'unknown',
+        reason: binanceAssessment?.unavailableReason ?? 'not available',
+      });
+    }
     const signals = this.signalEngine.generateSignals({
       market,
       orderbook,
@@ -623,6 +631,7 @@ export class MarketMakerRuntime {
       riskAssessment,
       binanceFairValueAdjustment,
       binanceAssessment,
+      binanceVelocityPctPerSec,
     });
     this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
     const dustFilteredSignals = this.filterDustAbandonedSignals(market, signals);
@@ -655,6 +664,7 @@ export class MarketMakerRuntime {
         allowEntryQuotes,
         pendingQuoteExposure: this.getPendingQuoteExposure(market.marketId),
         binanceFairValueAdjustment,
+        binanceAssessment,
         deepBinanceAssessment,
       });
     }
@@ -2579,7 +2589,11 @@ export class MarketMakerRuntime {
         }
 
         if (bypassesBinanceEdge(signal.signalType)) {
-          if (signal.signalType === 'LATENCY_MOMENTUM_BUY') {
+          if (
+            signal.signalType === 'LATENCY_MOMENTUM_BUY' ||
+            signal.signalType === 'SNIPER_BUY' ||
+            signal.signalType === 'SNIPER_SCALP_EXIT'
+          ) {
             const assessment = this.binanceEdge.assess({
               coin,
               slotStartTime: market.startTime,
@@ -2666,7 +2680,7 @@ export class MarketMakerRuntime {
     orderbook: MarketOrderbookSnapshot
   ): BinanceEdgeAssessment | undefined {
     const coin = extractCoinFromTitle(market.title);
-    if (!coin || !this.binanceEdge.hasMarketData()) {
+    if (!coin) {
       return undefined;
     }
 
@@ -2678,6 +2692,19 @@ export class MarketMakerRuntime {
       signalAction: 'BUY',
       signalOutcome: 'YES',
     });
+  }
+
+  private getBinanceVelocityPctPerSec(market: MarketCandidate): number | null {
+    if (!config.SNIPER_MODE_ENABLED) {
+      return null;
+    }
+
+    const coin = extractCoinFromTitle(market.title);
+    if (!coin) {
+      return null;
+    }
+
+    return this.binanceEdge.getVelocityPctPerSec(coin, config.sniper.velocityWindowMs);
   }
 
   private schedulePaperResolution(market: MarketCandidate): void {

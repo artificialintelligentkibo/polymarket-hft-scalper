@@ -19,6 +19,8 @@ export type SignalType =
   | 'PAIRED_ARB_BUY_NO'
   | 'PAIRED_ARB_REBALANCE'
   | 'RISK_LIMIT'
+  | 'SNIPER_BUY'
+  | 'SNIPER_SCALP_EXIT'
   | 'TRAILING_TAKE_PROFIT'
   | 'HARD_STOP'
   | 'SLOT_FLATTEN';
@@ -44,7 +46,9 @@ export function bypassesBinanceEdge(signalType: SignalType): boolean {
     signalType === 'MM_QUOTE_ASK' ||
     signalType === 'PAIRED_ARB_BUY_YES' ||
     signalType === 'PAIRED_ARB_BUY_NO' ||
-    signalType === 'PAIRED_ARB_REBALANCE'
+    signalType === 'PAIRED_ARB_REBALANCE' ||
+    signalType === 'SNIPER_BUY' ||
+    signalType === 'SNIPER_SCALP_EXIT'
   );
 }
 

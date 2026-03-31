@@ -4,6 +4,7 @@ import {
   isDynamicQuotingEnabled,
   type AppConfig,
 } from './config.js';
+import type { BinanceEdgeAssessment } from './binance-edge.js';
 import {
   getDynamicSpreadTicks,
   shouldBlockSignalByBinanceSpread,
@@ -35,6 +36,7 @@ export interface QuoteContext {
   readonly quoteSignals: readonly StrategySignal[];
   readonly allowEntryQuotes?: boolean;
   readonly pendingQuoteExposure?: PendingQuoteExposureSnapshot;
+  readonly binanceAssessment?: BinanceEdgeAssessment;
   readonly binanceFairValueAdjustment?: FairValueBinanceAdjustment;
   readonly deepBinanceAssessment?: DeepBinanceAssessment;
 }
@@ -247,6 +249,20 @@ function generateAutonomousQuoteSignals(params: {
   now: Date;
 }): StrategySignal[] {
   const { context, runtimeConfig, now } = params;
+  if (
+    runtimeConfig.SNIPER_MODE_ENABLED &&
+    context.binanceAssessment?.available &&
+    context.binanceAssessment.direction !== 'FLAT' &&
+    Math.abs(context.binanceAssessment.binanceMovePct) >= runtimeConfig.sniper.minBinanceMovePct
+  ) {
+    logger.debug('MM quote suppressed - Binance directional signal active', {
+      marketId: context.market.marketId,
+      direction: context.binanceAssessment.direction,
+      movePct: context.binanceAssessment.binanceMovePct,
+    });
+    return [];
+  }
+
   const snapshot = context.positionManager.getSnapshot();
   const pendingQuoteExposure = normalizePendingQuoteExposure(
     context.pendingQuoteExposure

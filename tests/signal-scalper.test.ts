@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import type { BinanceEdgeAssessment } from '../src/binance-edge.js';
 import type { MarketOrderbookSnapshot } from '../src/clob-fetcher.js';
 import { createConfig } from '../src/config.js';
 import type { MarketCandidate } from '../src/monitor.js';
@@ -147,6 +148,27 @@ function createPairedSignalEngine(
       ...overrides,
     })
   );
+}
+
+function createSniperAssessment(
+  overrides: Partial<BinanceEdgeAssessment> = {}
+): BinanceEdgeAssessment {
+  return {
+    available: true,
+    coin: 'BTC',
+    binancePrice: 84250,
+    slotOpenPrice: 84000,
+    binanceMovePct: 0.25,
+    direction: 'UP',
+    pmUpMid: 0.48,
+    pmImpliedDirection: 'FLAT',
+    directionalAgreement: true,
+    edgeStrength: 0.25,
+    sizeMultiplier: 1.5,
+    urgencyBoost: true,
+    contraSignal: false,
+    ...overrides,
+  };
 }
 
 test('combined discount emits dual-sided BUY signals capped at two', () => {
@@ -1163,4 +1185,54 @@ test('extreme buy still passes when spread fits the extreme-specific guard', () 
     ),
     true
   );
+});
+
+test('sniper mode returns sniper buy before legacy entries when Binance move is available', () => {
+  const market = createMarket();
+  market.startTime = '2026-03-31T10:00:00.000Z';
+  market.endTime = '2026-03-31T10:05:00.000Z';
+  const orderbook = createOrderbook();
+  orderbook.yes.bestAsk = 0.52;
+  orderbook.yes.midPrice = 0.5;
+  orderbook.yes.lastTradePrice = 0.51;
+  orderbook.combined = {
+    combinedBid: 0.96,
+    combinedAsk: 1.02,
+    combinedMid: 0.99,
+    combinedDiscount: -0.02,
+    combinedPremium: 0.02,
+    pairSpread: 0.06,
+  };
+
+  const signalEngine = new SignalScalper(
+    createConfig({
+      ...process.env,
+      ENTRY_STRATEGY: 'ALL',
+      SNIPER_MODE_ENABLED: 'true',
+      BINANCE_EDGE_ENABLED: 'true',
+      LATENCY_MOMENTUM_ENABLED: 'true',
+      EXTREME_BUY_THRESHOLD: '0.001',
+    })
+  );
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const riskAssessment = new RiskManager().checkRiskLimits({
+    market,
+    orderbook,
+    positionManager,
+    now: new Date('2026-03-31T10:01:00.000Z'),
+  });
+
+  const signals = signalEngine.generateSignals({
+    market,
+    orderbook,
+    positionManager,
+    riskAssessment,
+    binanceAssessment: createSniperAssessment(),
+    binanceVelocityPctPerSec: 0.02,
+    now: new Date('2026-03-31T10:01:00.000Z'),
+  });
+
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0]?.signalType, 'SNIPER_BUY');
+  assert.equal(signals[0]?.urgency, 'cross');
 });

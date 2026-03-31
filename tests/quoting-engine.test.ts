@@ -419,6 +419,47 @@ test('quote refresh plan blocks entry quotes when Binance spread is too wide', (
   assert.equal(plan.signals.some((signal) => signal.action === 'BUY' && !signal.reduceOnly), false);
 });
 
+test('autonomous MM quotes are suppressed when sniper mode sees a directional Binance move', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 8, 8);
+
+  const runtimeConfig = createMmConfig({
+    SNIPER_MODE_ENABLED: 'true',
+    SNIPER_MIN_BINANCE_MOVE_PCT: '0.10',
+  });
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+      binanceAssessment: {
+        available: true,
+        coin: 'BTC',
+        binancePrice: 84250,
+        slotOpenPrice: 84000,
+        binanceMovePct: 0.18,
+        direction: 'UP',
+        pmUpMid: 0.45,
+        pmImpliedDirection: 'FLAT',
+        directionalAgreement: true,
+        edgeStrength: 0.18,
+        sizeMultiplier: 1.2,
+        urgencyBoost: false,
+        contraSignal: false,
+      },
+    },
+    runtimeConfig,
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(plan.signals.length, 0);
+});
+
 test('autonomous MM quotes stay disabled when MM_AUTONOMOUS_QUOTES=false', () => {
   const market = createMarket();
   const orderbook = createWideOrderbook();

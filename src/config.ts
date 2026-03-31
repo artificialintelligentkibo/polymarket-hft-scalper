@@ -18,6 +18,54 @@ export interface PriceMultiplierLevel {
   readonly multiplier: number;
 }
 
+/**
+ * Sniper mode configuration for Binance-led aggressive taker entries.
+ * This engine is intentionally feature-flagged so the legacy scalper remains
+ * unchanged until `SNIPER_MODE_ENABLED=true`.
+ */
+export interface SniperConfig {
+  /** Master switch for the sniper engine. Recommended production default (2026): false until paper-tested. */
+  readonly enabled: boolean;
+  /** Minimum Binance move percentage required before evaluating a taker entry. */
+  readonly minBinanceMovePct: number;
+  /** Move percentage that upgrades sizing from base shares to strong shares. */
+  readonly strongBinanceMovePct: number;
+  /** Minimum edge after taker fees required to buy aggressively. */
+  readonly minEdgeAfterFees: number;
+  /** Effective taker fee assumed by the sniper EV model. */
+  readonly takerFeePct: number;
+  /** Highest Polymarket ask price the sniper is allowed to pay. */
+  readonly maxEntryPrice: number;
+  /** Lowest Polymarket ask price considered valid (filters dust). */
+  readonly minEntryPrice: number;
+  /** Minimum absolute gap between Binance-implied fair value and PM ask. */
+  readonly minPmLagPct: number;
+  /** Base share size for normal-quality moves. */
+  readonly baseShares: number;
+  /** Share size for strong/high-conviction Binance moves. */
+  readonly strongShares: number;
+  /** Maximum sniper inventory per market/outcome. */
+  readonly maxPositionShares: number;
+  /** Cooldown between sniper entries on the same market. */
+  readonly cooldownMs: number;
+  /** Skip slot-open noise by waiting this long before first sniper entry. */
+  readonly slotWarmupMs: number;
+  /** Do not open new sniper entries inside this window before slot expiry. */
+  readonly exitBeforeEndMs: number;
+  /** Optional time stop; 0 means hold conviction entries to settlement. */
+  readonly maxHoldMs: number;
+  /** Profit target for fast repricing exits. */
+  readonly scalpExitEdge: number;
+  /** Reversal loss threshold once Binance direction flips. */
+  readonly stopLossPct: number;
+  /** Lookback window for Binance velocity confirmation. */
+  readonly velocityWindowMs: number;
+  /** Minimum signed velocity required to confirm the move is real. */
+  readonly minVelocityPctPerSec: number;
+  /** Move-to-probability calibration scale for Binance fair value estimation. */
+  readonly volatilityScale: number;
+}
+
 export interface AppConfig {
   readonly PRODUCT_TEST_MODE: boolean;
   readonly SIMULATION_MODE: boolean;
@@ -43,6 +91,8 @@ export interface AppConfig {
   readonly FILL_CANCEL_BEFORE_END_MS: number;
   readonly SELL_AFTER_FILL_DELAY_MS: number;
   readonly BALANCE_CACHE_TTL_MS: number;
+  /** Enables Binance-led aggressive taker entry mode. */
+  readonly SNIPER_MODE_ENABLED: boolean;
   /**
    * Enables the 2026 market-maker overlay while preserving the legacy scalper.
    * Recommended production default (2026): false until quoting has been
@@ -247,6 +297,8 @@ export interface AppConfig {
   };
   readonly pairedArbitrage: PairedArbConfig;
   readonly latencyMomentum: LatencyMomentumConfig;
+  /** Runtime sniper-engine configuration for Binance-led aggressive entries. */
+  readonly sniper: SniperConfig;
   readonly paperTrading: PaperTraderConfig;
   readonly evKelly: EVKellyConfig;
   readonly trading: {
@@ -495,6 +547,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       0,
       parseIntOrDefault(env.BALANCE_CACHE_TTL_MS, '10000')
     ),
+    SNIPER_MODE_ENABLED: parseBoolean(env.SNIPER_MODE_ENABLED, false),
     MARKET_MAKER_MODE: parseBoolean(env.MARKET_MAKER_MODE, false),
     DYNAMIC_QUOTING_ENABLED: parseBoolean(env.DYNAMIC_QUOTING_ENABLED, false),
     POST_ONLY_ONLY: parseBoolean(env.POST_ONLY_ONLY, true),
@@ -746,6 +799,43 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseIntOrDefault(env.LATENCY_MOMENTUM_COOLDOWN_MS, '10000')
       ),
       invertSignal: parseBoolean(env.LATENCY_MOMENTUM_INVERT_SIGNAL, false),
+    },
+    sniper: {
+      enabled: parseBoolean(env.SNIPER_MODE_ENABLED, false),
+      minBinanceMovePct: parseFloatOrDefault(env.SNIPER_MIN_BINANCE_MOVE_PCT, '0.10'),
+      strongBinanceMovePct: parseFloatOrDefault(
+        env.SNIPER_STRONG_BINANCE_MOVE_PCT,
+        '0.30'
+      ),
+      minEdgeAfterFees: parseFloatOrDefault(env.SNIPER_MIN_EDGE_AFTER_FEES, '0.01'),
+      takerFeePct: parseFloatOrDefault(
+        env.SNIPER_TAKER_FEE_PCT ?? env.HIGH_FEE_TAKER_FEE,
+        '0.0315'
+      ),
+      maxEntryPrice: parseFloatOrDefault(env.SNIPER_MAX_ENTRY_PRICE, '0.55'),
+      minEntryPrice: parseFloatOrDefault(env.SNIPER_MIN_ENTRY_PRICE, '0.03'),
+      minPmLagPct: parseFloatOrDefault(env.SNIPER_MIN_PM_LAG, '0.03'),
+      baseShares: parseFloatOrDefault(env.SNIPER_BASE_SHARES, '6'),
+      strongShares: parseFloatOrDefault(env.SNIPER_STRONG_SHARES, '12'),
+      maxPositionShares: parseFloatOrDefault(env.SNIPER_MAX_POSITION_SHARES, '20'),
+      cooldownMs: Math.max(0, parseIntOrDefault(env.SNIPER_COOLDOWN_MS, '3000')),
+      slotWarmupMs: Math.max(0, parseIntOrDefault(env.SNIPER_SLOT_WARMUP_MS, '15000')),
+      exitBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.SNIPER_EXIT_BEFORE_END_MS, '30000')
+      ),
+      maxHoldMs: Math.max(0, parseIntOrDefault(env.SNIPER_MAX_HOLD_MS, '0')),
+      scalpExitEdge: parseFloatOrDefault(env.SNIPER_SCALP_EXIT_EDGE, '0.08'),
+      stopLossPct: parseFloatOrDefault(env.SNIPER_STOP_LOSS_PCT, '0.15'),
+      velocityWindowMs: Math.max(
+        1_000,
+        parseIntOrDefault(env.SNIPER_VELOCITY_WINDOW_MS, '5000')
+      ),
+      minVelocityPctPerSec: parseFloatOrDefault(
+        env.SNIPER_MIN_VELOCITY_PCT_PER_SEC,
+        '0.005'
+      ),
+      volatilityScale: parseFloatOrDefault(env.SNIPER_VOLATILITY_SCALE, '0.003'),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
@@ -1080,6 +1170,59 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.latencyMomentum.pmMoveSensitivity <= 0) {
     throw new Error('LATENCY_MOMENTUM_PM_MOVE_SENSITIVITY must be positive.');
+  }
+
+  if (candidate.sniper.strongBinanceMovePct < candidate.sniper.minBinanceMovePct) {
+    throw new Error(
+      'SNIPER_STRONG_BINANCE_MOVE_PCT must be greater than or equal to SNIPER_MIN_BINANCE_MOVE_PCT.'
+    );
+  }
+
+  if (candidate.sniper.strongShares < candidate.sniper.baseShares) {
+    throw new Error(
+      'SNIPER_STRONG_SHARES must be greater than or equal to SNIPER_BASE_SHARES.'
+    );
+  }
+
+  if (candidate.sniper.maxPositionShares < candidate.sniper.baseShares) {
+    throw new Error(
+      'SNIPER_MAX_POSITION_SHARES must be greater than or equal to SNIPER_BASE_SHARES.'
+    );
+  }
+
+  if (
+    candidate.sniper.minEntryPrice <= 0 ||
+    candidate.sniper.maxEntryPrice <= 0 ||
+    candidate.sniper.maxEntryPrice >= 1 ||
+    candidate.sniper.minEntryPrice >= candidate.sniper.maxEntryPrice
+  ) {
+    throw new Error(
+      'SNIPER_MIN_ENTRY_PRICE and SNIPER_MAX_ENTRY_PRICE must be in the range (0, 1) with min < max.'
+    );
+  }
+
+  if (candidate.sniper.takerFeePct < 0 || candidate.sniper.takerFeePct >= 1) {
+    throw new Error('SNIPER_TAKER_FEE_PCT must be in the range [0, 1).');
+  }
+
+  if (candidate.sniper.minEdgeAfterFees < 0) {
+    throw new Error('SNIPER_MIN_EDGE_AFTER_FEES must be zero or positive.');
+  }
+
+  if (candidate.sniper.minPmLagPct < 0) {
+    throw new Error('SNIPER_MIN_PM_LAG must be zero or positive.');
+  }
+
+  if (candidate.sniper.velocityWindowMs < 1_000) {
+    throw new Error('SNIPER_VELOCITY_WINDOW_MS must be at least 1000.');
+  }
+
+  if (candidate.sniper.minVelocityPctPerSec < 0) {
+    throw new Error('SNIPER_MIN_VELOCITY_PCT_PER_SEC must be zero or positive.');
+  }
+
+  if (candidate.sniper.volatilityScale <= 0) {
+    throw new Error('SNIPER_VOLATILITY_SCALE must be positive.');
   }
 
   if (
