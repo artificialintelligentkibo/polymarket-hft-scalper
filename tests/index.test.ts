@@ -714,6 +714,7 @@ test('confirmed sniper buys can trigger a best-effort lottery ticket on the oppo
 
     const positionManager = new PositionManager(market.marketId, market.endTime);
     const calls: string[] = [];
+    let releaseLottery: (() => void) | null = null;
 
     runtime.syncRuntimeStatus = () => {};
     runtime.statusMonitor = {
@@ -728,15 +729,20 @@ test('confirmed sniper buys can trigger a best-effort lottery ticket on the oppo
           assert.equal(params.signal.urgency, 'passive');
           assert.equal(params.signal.strategyLayer, 'LOTTERY');
           assert.equal(params.signal.targetPrice, 0.07);
-          return createExecutionReport({
-            orderId: 'lottery-order',
-            tokenId: 'no-token',
-            outcome: 'NO',
-            side: 'BUY',
-            shares: 100,
-            filledShares: 100,
-            price: 0.05,
-            fillPrice: 0.05,
+          return new Promise((resolve) => {
+            releaseLottery = () =>
+              resolve(
+                createExecutionReport({
+                  orderId: 'lottery-order',
+                  tokenId: 'no-token',
+                  outcome: 'NO',
+                  side: 'BUY',
+                  shares: 100,
+                  filledShares: 100,
+                  price: 0.05,
+                  fillPrice: 0.05,
+                })
+              );
           });
         }
 
@@ -777,11 +783,113 @@ test('confirmed sniper buys can trigger a best-effort lottery ticket on the oppo
     );
 
     assert.equal(result?.fillConfirmed, true);
+    assert.equal(positionManager.getShares('YES'), 6);
+    assert.equal(positionManager.getShares('NO'), 0);
+    assert.equal(runtime.lotteryEngine.getStats().totalTickets, 0);
+
+    await Promise.resolve();
+    if (!releaseLottery) {
+      throw new Error('Expected lottery follow-on task to start');
+    }
+    (releaseLottery as () => void)();
+    await runtime.flushBackgroundTasks();
+
     assert.deepEqual(calls, ['SNIPER_BUY', 'LOTTERY_BUY']);
     assert.equal(positionManager.getShares('YES'), 6);
     assert.equal(positionManager.getShares('NO'), 100);
     assert.equal(positionManager.getPositionLayer('NO'), 'LOTTERY');
     assert.equal(runtime.lotteryEngine.getStats().totalTickets, 1);
+  } finally {
+    process.env.LOTTERY_LAYER_ENABLED = originalLotteryEnabled;
+    process.env.LOTTERY_MIN_CENTS = originalLotteryMin;
+    process.env.LOTTERY_MAX_CENTS = originalLotteryMax;
+    process.env.LOTTERY_MAX_RISK_USDC = originalLotteryRisk;
+    resetConfigCache();
+  }
+});
+
+test('lottery follow-ons do not pollute the displayed average latency', async () => {
+  const originalLotteryEnabled = process.env.LOTTERY_LAYER_ENABLED;
+  const originalLotteryMin = process.env.LOTTERY_MIN_CENTS;
+  const originalLotteryMax = process.env.LOTTERY_MAX_CENTS;
+  const originalLotteryRisk = process.env.LOTTERY_MAX_RISK_USDC;
+  process.env.LOTTERY_LAYER_ENABLED = 'true';
+  process.env.LOTTERY_MIN_CENTS = '0.03';
+  process.env.LOTTERY_MAX_CENTS = '0.07';
+  process.env.LOTTERY_MAX_RISK_USDC = '10';
+  resetConfigCache();
+
+  try {
+    const runtime = new MarketMakerRuntime() as any;
+    const market = createMarket();
+    const orderbook = createOrderbook();
+    const positionManager = new PositionManager(market.marketId, market.endTime);
+
+    runtime.syncRuntimeStatus = () => {};
+    runtime.statusMonitor = {
+      isPaused: () => false,
+      getState: () => ({ reason: null, source: null }),
+    };
+    runtime.executor = {
+      executeSignal: async (params: { signal: StrategySignal }) => {
+        if (params.signal.signalType === 'LOTTERY_BUY') {
+          return createExecutionReport({
+            orderId: 'lottery-order',
+            tokenId: 'no-token',
+            outcome: 'NO',
+            side: 'BUY',
+            shares: 100,
+            filledShares: 100,
+            price: 0.05,
+            fillPrice: 0.05,
+            latencySignalToOrderMs: 2,
+            latencyRoundTripMs: 9_000,
+          });
+        }
+
+        return createExecutionReport({
+          orderId: 'sniper-order',
+          tokenId: 'yes-token',
+          outcome: 'YES',
+          side: 'BUY',
+          shares: 6,
+          filledShares: 6,
+          price: 0.32,
+          fillPrice: 0.32,
+          latencySignalToOrderMs: 80,
+          latencyRoundTripMs: 150,
+        });
+      },
+      invalidateOutcomeBalanceCache: () => {},
+      invalidateBalanceValidationCache: () => {},
+    };
+
+    const result = await runtime.executeSignal(
+      market,
+      orderbook,
+      positionManager,
+      createSignal({
+        signalType: 'SNIPER_BUY',
+        priority: 1200,
+        action: 'BUY',
+        outcome: 'YES',
+        shares: 6,
+        targetPrice: 0.32,
+        referencePrice: 0.32,
+        tokenPrice: 0.32,
+        midPrice: 0.32,
+        fairValue: 0.48,
+        urgency: 'cross',
+        strategyLayer: 'SNIPER',
+      }),
+      'slot-1'
+    );
+
+    assert.equal(result?.fillConfirmed, true);
+    await runtime.flushBackgroundTasks();
+
+    assert.equal(runtime.getAverageLatencyMs(), 150);
+    assert.equal(runtime.recentSignals.some((signal: { signalType: string; latencyMs: number | null }) => signal.signalType === 'LOTTERY_BUY' && signal.latencyMs === 9000), true);
   } finally {
     process.env.LOTTERY_LAYER_ENABLED = originalLotteryEnabled;
     process.env.LOTTERY_MIN_CENTS = originalLotteryMin;

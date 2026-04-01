@@ -217,6 +217,7 @@ export class MarketMakerRuntime {
   private readonly recentSignals: RuntimeSignalSnapshot[] = [];
   private readonly recentSkippedSignals: SkippedSignalRecord[] = [];
   private readonly recentLatencySamples: number[] = [];
+  private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly latencyWindow: LatencySample[] = [];
   private latencyPaused = false;
   private readonly activeMarketIds = new Set<string>();
@@ -536,6 +537,7 @@ export class MarketMakerRuntime {
     try {
       await withTimeout(
         (async () => {
+          await this.flushBackgroundTasks();
           await this.executor.cancelAll();
           await this.flattenAllOpenPositions('SLOT_FLATTEN');
           this.printPendingReports();
@@ -1141,6 +1143,7 @@ export class MarketMakerRuntime {
       orderbook,
       signal: executionSignal,
     });
+    const executionCompletedAt = Date.now();
     const effectiveShares = execution.fillConfirmed ? execution.filledShares : 0;
     const effectivePrice = execution.fillPrice ?? execution.price;
     const effectiveNotionalUsd = execution.fillConfirmed
@@ -1243,7 +1246,7 @@ export class MarketMakerRuntime {
         market.endTime
       );
     }
-    const completedAt = Date.now();
+    const completedAt = executionCompletedAt;
     if (!paperTradingEnabled && effectiveShares > 0 && executionSignal.action === 'BUY') {
       this.armSettlementConfirmation(market.marketId, executionSignal.outcome, completedAt);
       this.executor.invalidateOutcomeBalanceCache(tokenId);
@@ -1279,7 +1282,7 @@ export class MarketMakerRuntime {
       executionSignal.action === 'BUY' &&
       config.lottery.enabled
     ) {
-      const lotterySignal = this.lotteryEngine.generateLotterySignal({
+      this.maybeScheduleLotteryFollowOn({
         market,
         orderbook,
         positionManager,
@@ -1287,41 +1290,9 @@ export class MarketMakerRuntime {
         triggerOutcome: executionSignal.outcome,
         triggerFillPrice: effectivePrice,
         triggerFilledShares: effectiveShares,
-        config: config.lottery,
         slotKey,
+        failureLogMessage: 'Lottery ticket execution failed',
       });
-      if (lotterySignal) {
-        if (this.shouldAllowFollowOnEntry(market.marketId, positionManager, lotterySignal)) {
-          try {
-            const lotteryExecution = await this.executeSignal(
-              market,
-              orderbook,
-              positionManager,
-              lotterySignal,
-              slotKey
-            );
-            if (lotteryExecution?.fillConfirmed && lotteryExecution.filledShares > 0) {
-              logger.info('Lottery ticket filled', {
-                marketId: market.marketId,
-                outcome: lotterySignal.outcome,
-                shares: lotteryExecution.filledShares,
-                price: lotteryExecution.fillPrice ?? lotteryExecution.price,
-                riskUsdc: roundTo(
-                  lotteryExecution.filledShares *
-                    (lotteryExecution.fillPrice ?? lotteryExecution.price),
-                  2
-                ),
-              });
-            }
-          } catch (error) {
-            logger.debug('Lottery ticket execution failed', {
-              marketId: market.marketId,
-              outcome: lotterySignal.outcome,
-              message: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-      }
     }
     if (
       effectiveShares > 0 &&
@@ -1355,10 +1326,13 @@ export class MarketMakerRuntime {
     const slotMetrics = getSlotMetrics(slotKey);
     const dayState = getDayPnlState(new Date(completedAt));
     const latencyRoundTripMs =
-      executionSignal.generatedAt !== undefined
+      execution.latencyRoundTripMs ??
+      (executionSignal.generatedAt !== undefined
         ? Math.max(0, completedAt - executionSignal.generatedAt)
-        : undefined;
-    this.updateLatencyPause(latencyRoundTripMs ?? execution.latencySignalToOrderMs);
+        : undefined);
+    if (this.shouldTrackLatencyForSignal(executionSignal)) {
+      this.updateLatencyPause(latencyRoundTripMs ?? execution.latencySignalToOrderMs);
+    }
 
     this.productTestMode.recordExecution({
       market,
@@ -1694,7 +1668,7 @@ export class MarketMakerRuntime {
         const orderbook =
           this.latestBooks.get(fill.marketId) ?? this.quotingEngine.getContext(fill.marketId)?.orderbook;
         if (orderbook) {
-          const lotterySignal = this.lotteryEngine.generateLotterySignal({
+          this.maybeScheduleLotteryFollowOn({
             market,
             orderbook,
             positionManager,
@@ -1702,26 +1676,9 @@ export class MarketMakerRuntime {
             triggerOutcome: fill.outcome,
             triggerFillPrice: fill.fillPrice,
             triggerFilledShares: fill.filledShares,
-            config: config.lottery,
             slotKey: fill.slotKey,
+            failureLogMessage: 'Lottery ticket execution failed after delayed sniper fill',
           });
-          if (lotterySignal) {
-            if (this.shouldAllowFollowOnEntry(fill.marketId, positionManager, lotterySignal)) {
-              void this.executeSignal(
-                market,
-                orderbook,
-                positionManager,
-                lotterySignal,
-                fill.slotKey
-              ).catch((error) => {
-                logger.debug('Lottery ticket execution failed after delayed sniper fill', {
-                  marketId: fill.marketId,
-                  outcome: lotterySignal.outcome,
-                  message: error instanceof Error ? error.message : String(error),
-                });
-              });
-            }
-          }
         }
       }
     } else {
@@ -1811,12 +1768,105 @@ export class MarketMakerRuntime {
       this.recentSignals.shift();
     }
 
-    if (signal.latencyMs !== null && Number.isFinite(signal.latencyMs)) {
+    if (
+      signal.signalType !== 'LOTTERY_BUY' &&
+      signal.latencyMs !== null &&
+      Number.isFinite(signal.latencyMs)
+    ) {
       this.recentLatencySamples.push(Math.max(0, signal.latencyMs));
       while (this.recentLatencySamples.length > 64) {
         this.recentLatencySamples.shift();
       }
     }
+  }
+
+  private shouldTrackLatencyForSignal(
+    signal: Pick<StrategySignal, 'signalType' | 'strategyLayer'>
+  ): boolean {
+    return (signal.strategyLayer ?? resolveStrategyLayer(signal.signalType)) !== 'LOTTERY';
+  }
+
+  private maybeScheduleLotteryFollowOn(params: {
+    market: MarketCandidate;
+    orderbook: MarketOrderbookSnapshot;
+    positionManager: PositionManager;
+    triggerSignalType: StrategySignal['signalType'];
+    triggerOutcome: StrategySignal['outcome'];
+    triggerFillPrice: number;
+    triggerFilledShares: number;
+    slotKey: string;
+    failureLogMessage: string;
+  }): void {
+    if (!config.lottery.enabled || this.stopping) {
+      return;
+    }
+
+    const lotterySignal = this.lotteryEngine.generateLotterySignal({
+      market: params.market,
+      orderbook: params.orderbook,
+      positionManager: params.positionManager,
+      triggerSignalType: params.triggerSignalType,
+      triggerOutcome: params.triggerOutcome,
+      triggerFillPrice: params.triggerFillPrice,
+      triggerFilledShares: params.triggerFilledShares,
+      config: config.lottery,
+      slotKey: params.slotKey,
+    });
+    if (!lotterySignal) {
+      return;
+    }
+
+    if (!this.shouldAllowFollowOnEntry(params.market.marketId, params.positionManager, lotterySignal)) {
+      return;
+    }
+
+    this.scheduleBackgroundTask(async () => {
+      try {
+        const lotteryExecution = await this.executeSignal(
+          params.market,
+          params.orderbook,
+          params.positionManager,
+          lotterySignal,
+          params.slotKey
+        );
+        if (lotteryExecution?.fillConfirmed && lotteryExecution.filledShares > 0) {
+          logger.info('Lottery ticket filled', {
+            marketId: params.market.marketId,
+            outcome: lotterySignal.outcome,
+            shares: lotteryExecution.filledShares,
+            price: lotteryExecution.fillPrice ?? lotteryExecution.price,
+            riskUsdc: roundTo(
+              lotteryExecution.filledShares * (lotteryExecution.fillPrice ?? lotteryExecution.price),
+              2
+            ),
+          });
+        }
+      } catch (error) {
+        logger.debug(params.failureLogMessage, {
+          marketId: params.market.marketId,
+          outcome: lotterySignal.outcome,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  private scheduleBackgroundTask(taskFactory: () => Promise<void>): void {
+    let task: Promise<void>;
+    task = Promise.resolve()
+      .then(taskFactory)
+      .finally(() => {
+        this.backgroundTasks.delete(task);
+      });
+    this.backgroundTasks.add(task);
+  }
+
+  private async flushBackgroundTasks(): Promise<void> {
+    if (this.backgroundTasks.size === 0) {
+      return;
+    }
+
+    await Promise.allSettled([...this.backgroundTasks]);
   }
 
   private rememberSkippedSignals(records: readonly SkippedSignalRecord[]): void {
