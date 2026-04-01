@@ -55,6 +55,21 @@ export class OrderExecutor {
     await this.trader?.initialize();
   }
 
+  async prewarmMarketMetadata(tokenIds: readonly string[]): Promise<void> {
+    if (isPaperTradingEnabled(this.runtimeConfig)) {
+      return;
+    }
+
+    try {
+      await this.trader?.prewarmMarketMetadata(tokenIds);
+    } catch (error) {
+      logger.debug('Market metadata prewarm failed', {
+        tokenCount: tokenIds.length,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   recordOrderbookSnapshot(orderbook: MarketOrderbookSnapshot): void {
     this.orderbookHistory.record(
       orderbook.marketId,

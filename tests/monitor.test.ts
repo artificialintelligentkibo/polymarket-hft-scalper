@@ -9,6 +9,7 @@ import {
   fetchPaginatedGammaEventMarkets,
   flattenGammaEventMarkets,
   isLikelyFiveMinuteMarket,
+  MarketMonitor,
   matchesTradeableCoin,
   normalizeGammaMarketSource,
   selectEligibleMarkets,
@@ -275,6 +276,49 @@ test('fetchPaginatedGammaEventMarkets paginates ordered crypto /events and flatt
   assert.equal(result.pagesFetched, 2);
   assert.equal(result.events.length, 201);
   assert.equal(result.marketSources.length, 201);
+});
+
+test('MarketMonitor caches eligible Gamma scans between fast loop iterations', async () => {
+  const fixture = loadFixture<JsonRecord[]>('fixtures/gamma-crypto-5min-event-page.json');
+  let fetchCount = 0;
+  const fetchImpl: typeof fetch = async () => {
+    fetchCount += 1;
+    return new Response(JSON.stringify(fixture), {
+      status: 200,
+      headers: {
+        'content-type': 'application/json',
+      },
+    });
+  };
+  const runtimeConfig = createConfig({
+    ...process.env,
+    TEST_MODE: 'false',
+    FILTER_5MIN_ONLY: 'true',
+    WHITELIST_CONDITION_IDS: '',
+    COINS_TO_TRADE: 'BTC,ETH,SOL,XRP',
+    MIN_LIQUIDITY_USD: '500',
+    MARKET_QUERY_LIMIT: '10',
+    MARKET_SCAN_CACHE_MS: '15000',
+  });
+  const monitor = new MarketMonitor(runtimeConfig, fetchImpl);
+  const originalDateNow = Date.now;
+  let nowMs = Date.parse('2030-11-21T15:11:00.000Z');
+  Date.now = () => nowMs;
+
+  try {
+    const first = await monitor.scanEligibleMarkets();
+    nowMs += 5_000;
+    const second = await monitor.scanEligibleMarkets();
+    nowMs += 20_000;
+    const third = await monitor.scanEligibleMarkets();
+
+    assert.equal(first.length, 1);
+    assert.equal(second.length, 1);
+    assert.equal(third.length, 1);
+    assert.equal(fetchCount, 2);
+  } finally {
+    Date.now = originalDateNow;
+  }
 });
 
 test('fetchGammaEventsPage aborts hung Gamma requests with a timeout', async () => {

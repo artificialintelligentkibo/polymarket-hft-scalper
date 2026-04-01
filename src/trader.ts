@@ -55,7 +55,20 @@ interface CacheMetricsSnapshot {
   readonly misses: number;
 }
 
+interface FundingValidationSnapshot {
+  readonly owner: string;
+  readonly spender: string;
+  readonly usdcBalance: ethers.BigNumber;
+  readonly allowanceToCtf: ethers.BigNumber;
+  readonly allowanceToSpender: ethers.BigNumber;
+  readonly updatedAtMs: number;
+}
+
 type ClobChainId = ConstructorParameters<typeof ClobClient>[1];
+
+const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const FAST_BALANCE_VALIDATION_TTL_MS = 30_000;
+const FAST_BALANCE_HEADROOM_MULTIPLIER = 4;
 
 export interface PlaceOrderRequest {
   marketId: string;
@@ -101,6 +114,7 @@ export class Trader {
   private initialized = false;
   private approvalsChecked = false;
   private readonly marketMetadataCache = new Map<string, MarketMetadata>();
+  private readonly marketMetadataLoads = new Map<string, Promise<MarketMetadata>>();
   private readonly metadataTtlMs = 60 * 60 * 1000;
   private readonly tokenDecimals = 6;
   private readonly clobCircuitBreaker = new CircuitBreaker({
@@ -111,6 +125,7 @@ export class Trader {
   private readonly balanceCache = new Map<string, BigNumberCacheEntry>();
   private readonly allowanceCache = new Map<string, BigNumberCacheEntry>();
   private readonly outcomeBalanceCache = new Map<string, BigNumberCacheEntry>();
+  private fundingValidationSnapshot: FundingValidationSnapshot | null = null;
   private usdcDecimalsPromise: Promise<number> | null = null;
   private balanceCacheHits = 0;
   private balanceCacheMisses = 0;
@@ -124,6 +139,9 @@ export class Trader {
     'function balanceOf(address account, uint256 id) view returns (uint256)',
     'function isApprovedForAll(address owner, address operator) view returns (bool)',
     'function setApprovalForAll(address operator, bool approved)',
+  ];
+  private readonly multicallAbi = [
+    'function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) view returns (tuple(bool success,bytes returnData)[] returnData)',
   ];
 
   constructor(private readonly runtimeConfig: AppConfig = config) {
@@ -389,6 +407,27 @@ export class Trader {
     return this.apiCreds ?? null;
   }
 
+  async prewarmMarketMetadata(tokenIds: readonly string[]): Promise<void> {
+    await this.initialize();
+
+    const uniqueTokenIds = Array.from(
+      new Set(tokenIds.map((tokenId) => tokenId.trim()).filter(Boolean))
+    );
+    if (uniqueTokenIds.length === 0) {
+      return;
+    }
+
+    const coldTokenIds = uniqueTokenIds.filter((tokenId) => !this.hasFreshMarketMetadata(tokenId));
+    if (coldTokenIds.length === 0) {
+      return;
+    }
+
+    await Promise.allSettled(coldTokenIds.map((tokenId) => this.getMarketMetadata(tokenId)));
+    logger.debug('Prewarmed market metadata', {
+      tokenCount: coldTokenIds.length,
+    });
+  }
+
   async getOutcomeTokenBalance(
     tokenId: string,
     forceRefresh = false
@@ -442,6 +481,7 @@ export class Trader {
   invalidateBalanceValidationCache(): void {
     this.balanceCache.clear();
     this.allowanceCache.clear();
+    this.fundingValidationSnapshot = null;
   }
 
   invalidateOutcomeBalanceCache(tokenId?: string): void {
@@ -538,6 +578,19 @@ export class Trader {
       return cached;
     }
 
+    const inflight = this.marketMetadataLoads.get(tokenId);
+    if (inflight) {
+      return inflight;
+    }
+
+    const load = this.loadMarketMetadata(tokenId).finally(() => {
+      this.marketMetadataLoads.delete(tokenId);
+    });
+    this.marketMetadataLoads.set(tokenId, load);
+    return load;
+  }
+
+  private async loadMarketMetadata(tokenId: string): Promise<MarketMetadata> {
     const [tickSizeData, negRisk, feeRateRaw] = await this.executeClobCall(
       'getMarketMetadata',
       async () =>
@@ -560,6 +613,11 @@ export class Trader {
 
     this.marketMetadataCache.set(tokenId, metadata);
     return metadata;
+  }
+
+  private hasFreshMarketMetadata(tokenId: string): boolean {
+    const cached = this.marketMetadataCache.get(tokenId);
+    return Boolean(cached && Date.now() - cached.updatedAt < this.metadataTtlMs);
   }
 
   private validatePrice(price: number, tickSize: number): number {
@@ -655,7 +713,16 @@ export class Trader {
       ? this.runtimeConfig.contracts.negRiskExchange
       : this.runtimeConfig.contracts.exchange;
 
-    await this.validateBalanceSnapshot({
+    if (this.tryUseFastFundingValidation({
+      owner,
+      spender,
+      required,
+      requiredAmount,
+    })) {
+      return;
+    }
+
+    const snapshot = await this.validateBalanceSnapshot({
       owner,
       spender,
       required,
@@ -673,7 +740,7 @@ export class Trader {
         requiredAmount,
       });
 
-      await this.validateBalanceSnapshot({
+      return this.validateBalanceSnapshot({
         owner,
         spender,
         required,
@@ -682,6 +749,9 @@ export class Trader {
         forceRefresh: true,
       });
     });
+
+    this.storeFundingValidationSnapshot(snapshot);
+    this.reserveFundingValidationSnapshot(required);
   }
 
   private async validateBalanceSnapshot(params: {
@@ -691,12 +761,13 @@ export class Trader {
     requiredAmount: number;
     decimals: number;
     forceRefresh: boolean;
-  }): Promise<void> {
-    const [balance, allowanceToCtf, allowanceToExchange] = await Promise.all([
-      this.readUsdcBalance(params.owner, params.forceRefresh),
-      this.getUsdcAllowance(params.owner, this.runtimeConfig.contracts.ctf, params.forceRefresh),
-      this.getUsdcAllowance(params.owner, params.spender, params.forceRefresh),
-    ]);
+  }): Promise<FundingValidationSnapshot> {
+    const snapshot = await this.readUsdcFundingSnapshot({
+      owner: params.owner,
+      spender: params.spender,
+      forceRefresh: params.forceRefresh,
+    });
+    const { balance, allowanceToCtf, allowanceToExchange } = snapshot;
 
     if (balance.lt(params.required)) {
       throw new Error(
@@ -716,6 +787,15 @@ export class Trader {
         `USDC.e allowance to ${params.spender} is below the required order amount.`
       );
     }
+
+    return {
+      owner: params.owner,
+      spender: params.spender,
+      usdcBalance: balance,
+      allowanceToCtf,
+      allowanceToSpender: allowanceToExchange,
+      updatedAtMs: Date.now(),
+    };
   }
 
   private async readUsdcBalance(owner: string, forceRefresh: boolean): Promise<ethers.BigNumber> {
@@ -758,6 +838,130 @@ export class Trader {
     });
   }
 
+  private async readUsdcFundingSnapshot(params: {
+    owner: string;
+    spender: string;
+    forceRefresh: boolean;
+  }): Promise<{
+    balance: ethers.BigNumber;
+    allowanceToCtf: ethers.BigNumber;
+    allowanceToExchange: ethers.BigNumber;
+  }> {
+    const owner = params.owner.toLowerCase();
+    const balanceKey = `balance:${owner}`;
+    const ctfAllowanceKey = `allowance:${owner}:${this.runtimeConfig.contracts.ctf.toLowerCase()}`;
+    const exchangeAllowanceKey = `allowance:${owner}:${params.spender.toLowerCase()}`;
+    const cachedBalance = this.getFreshCachedBigNumber(this.balanceCache, balanceKey, params.forceRefresh);
+    const cachedCtfAllowance = this.getFreshCachedBigNumber(
+      this.allowanceCache,
+      ctfAllowanceKey,
+      params.forceRefresh
+    );
+    const cachedExchangeAllowance = this.getFreshCachedBigNumber(
+      this.allowanceCache,
+      exchangeAllowanceKey,
+      params.forceRefresh
+    );
+
+    if (cachedBalance && cachedCtfAllowance && cachedExchangeAllowance) {
+      this.balanceCacheHits += 3;
+      return {
+        balance: cachedBalance.value,
+        allowanceToCtf: cachedCtfAllowance.value,
+        allowanceToExchange: cachedExchangeAllowance.value,
+      };
+    }
+
+    this.balanceCacheMisses += 3;
+    try {
+      const snapshot = await this.loadUsdcFundingSnapshotViaMulticall(params.owner, params.spender);
+      this.storeCachedBigNumber(this.balanceCache, balanceKey, snapshot.balance);
+      this.storeCachedBigNumber(this.allowanceCache, ctfAllowanceKey, snapshot.allowanceToCtf);
+      this.storeCachedBigNumber(
+        this.allowanceCache,
+        exchangeAllowanceKey,
+        snapshot.allowanceToExchange
+      );
+      return snapshot;
+    } catch (error) {
+      logger.debug('Funding snapshot multicall failed, falling back to individual RPC reads', {
+        owner: params.owner,
+        spender: params.spender,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      const [balance, allowanceToCtf, allowanceToExchange] = await Promise.all([
+        this.readUsdcBalance(params.owner, true),
+        this.getUsdcAllowance(params.owner, this.runtimeConfig.contracts.ctf, true),
+        this.getUsdcAllowance(params.owner, params.spender, true),
+      ]);
+      return {
+        balance,
+        allowanceToCtf,
+        allowanceToExchange,
+      };
+    }
+  }
+
+  private async loadUsdcFundingSnapshotViaMulticall(
+    owner: string,
+    spender: string
+  ): Promise<{
+    balance: ethers.BigNumber;
+    allowanceToCtf: ethers.BigNumber;
+    allowanceToExchange: ethers.BigNumber;
+  }> {
+    const usdcInterface = new ethers.utils.Interface(this.erc20Abi);
+    const multicall = new ethers.Contract(MULTICALL3_ADDRESS, this.multicallAbi, this.provider);
+    const calls = [
+      {
+        target: this.runtimeConfig.contracts.usdc,
+        allowFailure: false,
+        callData: usdcInterface.encodeFunctionData('balanceOf', [owner]),
+      },
+      {
+        target: this.runtimeConfig.contracts.usdc,
+        allowFailure: false,
+        callData: usdcInterface.encodeFunctionData('allowance', [
+          owner,
+          this.runtimeConfig.contracts.ctf,
+        ]),
+      },
+      {
+        target: this.runtimeConfig.contracts.usdc,
+        allowFailure: false,
+        callData: usdcInterface.encodeFunctionData('allowance', [owner, spender]),
+      },
+    ];
+
+    const results = (await retryWithBackoff(
+      async () => multicall.callStatic.aggregate3(calls),
+      {
+        maxAttempts: 3,
+        baseDelayMs: 250,
+        maxDelayMs: 2_000,
+      }
+    )) as ReadonlyArray<{ success: boolean; returnData: string }>;
+
+    if (!Array.isArray(results) || results.length < 3) {
+      throw new Error('Multicall returned an invalid funding snapshot payload.');
+    }
+
+    const decodeBigNumber = (index: number, fn: 'balanceOf' | 'allowance'): ethers.BigNumber => {
+      const result = results[index];
+      if (!result?.success) {
+        throw new Error(`Multicall ${fn} call failed at index ${index}.`);
+      }
+      const [value] = usdcInterface.decodeFunctionResult(fn, result.returnData) as [ethers.BigNumber];
+      return value;
+    };
+
+    return {
+      balance: decodeBigNumber(0, 'balanceOf'),
+      allowanceToCtf: decodeBigNumber(1, 'allowance'),
+      allowanceToExchange: decodeBigNumber(2, 'allowance'),
+    };
+  }
+
   private async getUsdcDecimals(): Promise<number> {
     if (!this.usdcDecimalsPromise) {
       const usdc = new ethers.Contract(this.runtimeConfig.contracts.usdc, this.erc20Abi, this.provider);
@@ -772,6 +976,103 @@ export class Trader {
     }
 
     return this.usdcDecimalsPromise;
+  }
+
+  private tryUseFastFundingValidation(params: {
+    owner: string;
+    spender: string;
+    required: ethers.BigNumber;
+    requiredAmount: number;
+  }): boolean {
+    const snapshot = this.fundingValidationSnapshot;
+    if (!snapshot) {
+      return false;
+    }
+
+    if (
+      snapshot.owner.toLowerCase() !== params.owner.toLowerCase() ||
+      snapshot.spender.toLowerCase() !== params.spender.toLowerCase()
+    ) {
+      return false;
+    }
+
+    const maxSnapshotAgeMs = Math.max(
+      FAST_BALANCE_VALIDATION_TTL_MS,
+      this.runtimeConfig.BALANCE_CACHE_TTL_MS
+    );
+    if (Date.now() - snapshot.updatedAtMs > maxSnapshotAgeMs) {
+      return false;
+    }
+
+    const requiredWithHeadroom = params.required.mul(FAST_BALANCE_HEADROOM_MULTIPLIER);
+    if (
+      snapshot.usdcBalance.lt(requiredWithHeadroom) ||
+      snapshot.allowanceToCtf.lt(params.required) ||
+      snapshot.allowanceToSpender.lt(params.required)
+    ) {
+      return false;
+    }
+
+    logger.debug('Using fast cached funding validation snapshot', {
+      owner: params.owner,
+      spender: params.spender,
+      requiredAmount: params.requiredAmount,
+      snapshotAgeMs: Date.now() - snapshot.updatedAtMs,
+    });
+    this.reserveFundingValidationSnapshot(params.required);
+    return true;
+  }
+
+  private storeFundingValidationSnapshot(snapshot: FundingValidationSnapshot): void {
+    this.fundingValidationSnapshot = snapshot;
+  }
+
+  private reserveFundingValidationSnapshot(required: ethers.BigNumber): void {
+    const snapshot = this.fundingValidationSnapshot;
+    if (!snapshot) {
+      return;
+    }
+
+    this.fundingValidationSnapshot = {
+      ...snapshot,
+      usdcBalance: subtractBigNumberClamped(snapshot.usdcBalance, required),
+      allowanceToCtf: subtractBigNumberClamped(snapshot.allowanceToCtf, required),
+      allowanceToSpender: subtractBigNumberClamped(snapshot.allowanceToSpender, required),
+      updatedAtMs: Date.now(),
+    };
+  }
+
+  private getFreshCachedBigNumber(
+    cache: Map<string, BigNumberCacheEntry>,
+    key: string,
+    forceRefresh: boolean
+  ): BigNumberCacheEntry | null {
+    if (forceRefresh) {
+      return null;
+    }
+
+    const cached = cache.get(key);
+    if (!cached || cached.expiresAtMs <= Date.now()) {
+      return null;
+    }
+
+    return cached;
+  }
+
+  private storeCachedBigNumber(
+    cache: Map<string, BigNumberCacheEntry>,
+    key: string,
+    value: ethers.BigNumber
+  ): void {
+    const ttlMs = this.runtimeConfig.BALANCE_CACHE_TTL_MS;
+    if (ttlMs <= 0) {
+      return;
+    }
+
+    cache.set(key, {
+      value,
+      expiresAtMs: Date.now() + ttlMs,
+    });
   }
 
   private async readCachedBigNumber(params: {
@@ -893,6 +1194,13 @@ export class Trader {
       maxFeePerGas: maxFee,
     };
   }
+}
+
+function subtractBigNumberClamped(
+  value: ethers.BigNumber,
+  decrement: ethers.BigNumber
+): ethers.BigNumber {
+  return value.gte(decrement) ? value.sub(decrement) : ethers.constants.Zero;
 }
 
 function normalizeFeeRateBps(raw: unknown): number {

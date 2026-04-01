@@ -341,10 +341,13 @@ export interface AppConfig {
   };
   readonly runtime: {
     readonly marketScanIntervalMs: number;
+    readonly marketScanCacheMs: number;
     readonly maxConcurrentMarkets: number;
     readonly marketQueryLimit: number;
     readonly onlyFiveMinuteMarkets: boolean;
     readonly gracefulShutdownTimeoutMs: number;
+    readonly walletPositionRefreshMs: number;
+    readonly walletFundsRefreshMs: number;
   };
   readonly logging: {
     readonly level: LogLevel;
@@ -949,12 +952,24 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         250,
         parseIntOrDefault(env.MARKET_SCAN_INTERVAL_MS, '2500')
       ),
+      marketScanCacheMs: Math.max(
+        0,
+        parseIntOrDefault(env.MARKET_SCAN_CACHE_MS, '15000')
+      ),
       maxConcurrentMarkets: Math.max(1, parseIntOrDefault(env.MAX_CONCURRENT_MARKETS, '6')),
       marketQueryLimit: Math.max(1, parseIntOrDefault(env.MARKET_QUERY_LIMIT, '80')),
       onlyFiveMinuteMarkets: parseBoolean(env.ONLY_FIVE_MINUTE_MARKETS, true),
       gracefulShutdownTimeoutMs: Math.max(
         1000,
         parseIntOrDefault(env.GRACEFUL_SHUTDOWN_TIMEOUT_MS, '12000')
+      ),
+      walletPositionRefreshMs: Math.max(
+        5_000,
+        parseIntOrDefault(env.WALLET_POSITION_REFRESH_MS, '30000')
+      ),
+      walletFundsRefreshMs: Math.max(
+        5_000,
+        parseIntOrDefault(env.WALLET_FUNDS_REFRESH_MS, '30000')
       ),
     },
     logging: {
@@ -1376,6 +1391,18 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.QUOTING_INTERVAL_MS < 50) {
     throw new Error('QUOTING_INTERVAL_MS must be at least 50.');
+  }
+
+  if (candidate.runtime.marketScanCacheMs < 0) {
+    throw new Error('MARKET_SCAN_CACHE_MS must be zero or positive.');
+  }
+
+  if (candidate.runtime.walletPositionRefreshMs < 5_000) {
+    throw new Error('WALLET_POSITION_REFRESH_MS must be at least 5000.');
+  }
+
+  if (candidate.runtime.walletFundsRefreshMs < 5_000) {
+    throw new Error('WALLET_FUNDS_REFRESH_MS must be at least 5000.');
   }
 
   if (candidate.MAX_IMBALANCE_PERCENT <= 0 || candidate.MAX_IMBALANCE_PERCENT > 100) {

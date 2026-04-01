@@ -90,6 +90,11 @@ interface GammaEventFetchResult {
   pagesFetched: number;
 }
 
+interface CachedEligibleMarketScan {
+  readonly fetchedAtMs: number;
+  readonly markets: readonly MarketCandidate[];
+}
+
 type FetchLike = typeof fetch;
 
 const MAX_TRACKED_SLOTS = 2_048;
@@ -119,6 +124,7 @@ export class MarketMonitor extends EventEmitter {
     failureThreshold: 5,
     resetTimeoutMs: 30_000,
   });
+  private cachedEligibleScan: CachedEligibleMarketScan | null = null;
 
   constructor(
     private readonly runtimeConfig: AppConfig = config,
@@ -128,6 +134,18 @@ export class MarketMonitor extends EventEmitter {
   }
 
   async scanEligibleMarkets(): Promise<MarketCandidate[]> {
+    const cached = this.getCachedEligibleMarkets();
+    if (cached) {
+      this.emitSlotEndedEvents(cached);
+      logger.debug('Using cached Gamma market scan', {
+        cachedMarkets: cached.length,
+        cacheAgeMs: this.cachedEligibleScan
+          ? Date.now() - this.cachedEligibleScan.fetchedAtMs
+          : null,
+      });
+      return cached;
+    }
+
     const discoveryMode = describeDiscoveryMode(this.runtimeConfig);
     let fetched: GammaEventFetchResult;
     try {
@@ -142,6 +160,17 @@ export class MarketMonitor extends EventEmitter {
         mode: discoveryMode.mode,
         message: error?.message || 'Unknown error',
       });
+      const staleCache = this.getCachedEligibleMarkets();
+      if (staleCache) {
+        this.emitSlotEndedEvents(staleCache);
+        logger.warn('Falling back to cached Gamma market scan after fetch failure', {
+          cachedMarkets: staleCache.length,
+          cacheAgeMs: this.cachedEligibleScan
+            ? Date.now() - this.cachedEligibleScan.fetchedAtMs
+            : null,
+        });
+        return staleCache;
+      }
       return [];
     }
 
@@ -237,6 +266,11 @@ export class MarketMonitor extends EventEmitter {
       logger.debug('Gamma market scan rejection samples', summary.rejectionSamples);
     }
 
+    this.cachedEligibleScan = {
+      fetchedAtMs: Date.now(),
+      markets: eligible.map((market) => ({ ...market })),
+    };
+
     return eligible;
   }
 
@@ -287,6 +321,22 @@ export class MarketMonitor extends EventEmitter {
     }
 
     return endMs - Date.now() <= this.runtimeConfig.strategy.exitBeforeEndMs;
+  }
+
+  private getCachedEligibleMarkets(): MarketCandidate[] | null {
+    const cached = this.cachedEligibleScan;
+    if (!cached) {
+      return null;
+    }
+
+    const cacheTtlMs = this.runtimeConfig.runtime.marketScanCacheMs;
+    if (cacheTtlMs <= 0 || Date.now() - cached.fetchedAtMs > cacheTtlMs) {
+      return null;
+    }
+
+    return cached.markets
+      .filter((candidate) => !isExpiredSlotCandidate(candidate))
+      .map((candidate) => ({ ...candidate }));
   }
 }
 

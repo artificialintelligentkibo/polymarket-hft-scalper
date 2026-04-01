@@ -99,8 +99,6 @@ const LIVE_POSITION_RECONCILIATION_EPSILON = 0.0001;
 const POSITIONS_API_URL = 'https://data-api.polymarket.com/positions';
 const POSITIONS_PAGE_LIMIT = 500;
 const MAX_POSITION_PAGES = 10;
-const LIVE_WALLET_POSITION_REFRESH_MS = 10_000;
-const LIVE_WALLET_FUNDS_REFRESH_MS = 10_000;
 
 interface SignalExecutionCandidate {
   readonly signal: StrategySignal;
@@ -604,9 +602,11 @@ export class MarketMakerRuntime {
     for (const market of markets) {
       this.markets.set(market.marketId, market);
     }
-    await this.refreshWalletPositionSnapshots();
+    const walletPositionRefreshPromise = this.refreshWalletPositionSnapshots();
+    const walletFundsRefreshPromise = this.refreshWalletFundsSnapshot();
+    await walletPositionRefreshPromise;
     await this.reconcileLivePositionsWithWallet();
-    await this.refreshWalletFundsSnapshot();
+    await walletFundsRefreshPromise;
     this.syncRuntimeStatus({
       running: true,
       isPaused: this.statusMonitor.isPaused(),
@@ -627,6 +627,7 @@ export class MarketMakerRuntime {
     }
 
     const tokenIds = markets.flatMap((market) => [market.yesTokenId, market.noTokenId]);
+    const metadataPrewarmPromise = this.executor.prewarmMarketMetadata?.(tokenIds) ?? Promise.resolve();
     await this.fetcher.subscribeAssets(tokenIds);
     if (!isDryRunMode(config) && !isPaperTradingEnabled(config)) {
       try {
@@ -641,6 +642,7 @@ export class MarketMakerRuntime {
         });
       }
     }
+    await metadataPrewarmPromise;
 
     const cycleNow = new Date();
     const preparedTicks = await this.prepareMarketTicks(markets);
@@ -1121,7 +1123,6 @@ export class MarketMakerRuntime {
         });
       }
     }
-
     if (!paperTradingEnabled && executionSignal.action === 'SELL' && executionSignal.reduceOnly) {
       const reconciledSignal = await this.reconcileLiveReduceOnlySellSignal({
         market,
@@ -2742,7 +2743,10 @@ export class MarketMakerRuntime {
     }
 
     const nowMs = Date.now();
-    if (!force && nowMs - this.lastWalletPositionRefreshAtMs < LIVE_WALLET_POSITION_REFRESH_MS) {
+    if (
+      !force &&
+      nowMs - this.lastWalletPositionRefreshAtMs < config.runtime.walletPositionRefreshMs
+    ) {
       return;
     }
 
@@ -2771,7 +2775,10 @@ export class MarketMakerRuntime {
     }
 
     const nowMs = Date.now();
-    if (!force && nowMs - this.lastWalletFundsRefreshAtMs < LIVE_WALLET_FUNDS_REFRESH_MS) {
+    if (
+      !force &&
+      nowMs - this.lastWalletFundsRefreshAtMs < config.runtime.walletFundsRefreshMs
+    ) {
       return;
     }
 
