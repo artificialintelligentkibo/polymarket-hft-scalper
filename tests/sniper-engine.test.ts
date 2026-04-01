@@ -330,6 +330,223 @@ test('sniper engine emits reversal stop when Binance flips and pnl is below stop
   assert.match(signals[0]?.reason ?? '', /reversal stop/i);
 });
 
+test('sniper engine uses cross urgency for losing time-stop exits', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_MAX_HOLD_MS: '60000',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.52,
+  });
+
+  engine.recordExecution({
+    market,
+    signal: {
+      marketId: market.marketId,
+      marketTitle: market.title,
+      signalType: 'SNIPER_BUY',
+      priority: 1200,
+      action: 'BUY',
+      outcome: 'YES',
+      outcomeIndex: 0,
+      shares: 6,
+      targetPrice: 0.52,
+      referencePrice: 0.6,
+      tokenPrice: 0.52,
+      midPrice: 0.51,
+      fairValue: 0.6,
+      edgeAmount: 0.04,
+      combinedBid: 0.96,
+      combinedAsk: 1.02,
+      combinedMid: 0.99,
+      combinedDiscount: -0.02,
+      combinedPremium: 0.02,
+      fillRatio: 1,
+      capitalClamp: 1,
+      priceMultiplier: 1,
+      urgency: 'cross',
+      reduceOnly: false,
+      reason: 'entry',
+    },
+    filledShares: 6,
+    fillPrice: 0.52,
+    executedAtMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+
+  const signals = engine.generateSignals({
+    market,
+    orderbook: createOrderbook({
+      yes: {
+        ...createOrderbook().yes,
+        bestBid: 0.41,
+        bestAsk: 0.43,
+        midPrice: 0.42,
+      },
+    }),
+    positionManager,
+    binanceAssessment: createAssessment(),
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:02:05.000Z'),
+  });
+
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0]?.signalType, 'SNIPER_SCALP_EXIT');
+  assert.equal(signals[0]?.urgency, 'cross');
+  assert.match(signals[0]?.reason ?? '', /time stop/i);
+});
+
+test('failed sniper exits re-enable HARD_STOP fallback without re-enabling other legacy exits', () => {
+  const runtimeConfig = createRuntimeConfig();
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+
+  engine.recordExecution({
+    market,
+    signal: {
+      marketId: market.marketId,
+      marketTitle: market.title,
+      signalType: 'SNIPER_BUY',
+      priority: 1200,
+      action: 'BUY',
+      outcome: 'YES',
+      outcomeIndex: 0,
+      shares: 6,
+      targetPrice: 0.52,
+      referencePrice: 0.6,
+      tokenPrice: 0.52,
+      midPrice: 0.51,
+      fairValue: 0.6,
+      edgeAmount: 0.04,
+      combinedBid: 0.96,
+      combinedAsk: 1.02,
+      combinedMid: 0.99,
+      combinedDiscount: -0.02,
+      combinedPremium: 0.02,
+      fillRatio: 1,
+      capitalClamp: 1,
+      priceMultiplier: 1,
+      urgency: 'cross',
+      reduceOnly: false,
+      reason: 'entry',
+    },
+    filledShares: 6,
+    fillPrice: 0.52,
+    executedAtMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+
+  assert.equal(
+    engine.shouldSuppressLegacyForcedSignal({
+      marketId: market.marketId,
+      outcome: 'YES',
+      signalType: 'HARD_STOP',
+    }),
+    true
+  );
+
+  engine.recordFailedExit({
+    marketId: market.marketId,
+    outcome: 'YES',
+  });
+
+  assert.equal(
+    engine.shouldSuppressLegacyForcedSignal({
+      marketId: market.marketId,
+      outcome: 'YES',
+      signalType: 'HARD_STOP',
+    }),
+    false
+  );
+  assert.equal(
+    engine.shouldSuppressLegacyForcedSignal({
+      marketId: market.marketId,
+      outcome: 'YES',
+      signalType: 'TRAILING_TAKE_PROFIT',
+    }),
+    true
+  );
+});
+
+test('dust-sized sniper entries are cleared when their mark value falls below one dollar', () => {
+  const runtimeConfig = createRuntimeConfig();
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.4,
+  });
+
+  engine.recordExecution({
+    market,
+    signal: {
+      marketId: market.marketId,
+      marketTitle: market.title,
+      signalType: 'SNIPER_BUY',
+      priority: 1200,
+      action: 'BUY',
+      outcome: 'YES',
+      outcomeIndex: 0,
+      shares: 6,
+      targetPrice: 0.4,
+      referencePrice: 0.55,
+      tokenPrice: 0.4,
+      midPrice: 0.395,
+      fairValue: 0.55,
+      edgeAmount: 0.03,
+      combinedBid: 0.96,
+      combinedAsk: 1.02,
+      combinedMid: 0.99,
+      combinedDiscount: -0.02,
+      combinedPremium: 0.02,
+      fillRatio: 1,
+      capitalClamp: 1,
+      priceMultiplier: 1,
+      urgency: 'cross',
+      reduceOnly: false,
+      reason: 'entry',
+    },
+    filledShares: 6,
+    fillPrice: 0.4,
+    executedAtMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+
+  const signals = engine.generateSignals({
+    market,
+    orderbook: createOrderbook({
+      yes: {
+        ...createOrderbook().yes,
+        bestBid: 0.1,
+        bestAsk: 0.11,
+        midPrice: 0.105,
+      },
+    }),
+    positionManager,
+    binanceAssessment: createAssessment(),
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:01:30.000Z'),
+  });
+
+  assert.ok(Array.isArray(signals));
+  assert.equal(engine.hasActiveEntryForMarket(market.marketId), false);
+  assert.equal(
+    engine.shouldSuppressLegacyForcedSignal({
+      marketId: market.marketId,
+      outcome: 'YES',
+      signalType: 'HARD_STOP',
+    }),
+    false
+  );
+});
+
 test('sniper rejection stats capture move_too_small and coin evaluation counts', () => {
   const runtimeConfig = createRuntimeConfig({
     SNIPER_MIN_BINANCE_MOVE_PCT: '0.20',

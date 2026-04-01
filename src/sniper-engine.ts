@@ -124,6 +124,7 @@ export function buildSniperEntryKey(marketId: string, outcome: Outcome): string 
 
 export class SniperEngine {
   private readonly activeEntries = new Map<string, SniperEntry>();
+  private readonly hardStopFallbackKeys = new Set<string>();
   private readonly lastEntryAt = new Map<string, number>();
   private readonly rejectionCounts = new Map<SniperRejection, number>();
   private readonly coinEvals = new Map<string, CoinEvalState>();
@@ -155,12 +156,42 @@ export class SniperEngine {
     return this.activeEntries.has(buildSniperEntryKey(marketId, outcome));
   }
 
+  clearActiveEntry(marketId: string, outcome: Outcome): void {
+    const key = buildSniperEntryKey(marketId, outcome);
+    this.activeEntries.delete(key);
+    this.hardStopFallbackKeys.delete(key);
+  }
+
+  recordFailedExit(params: {
+    marketId: string;
+    outcome: Outcome;
+  }): void {
+    if (!this.runtimeConfig.SNIPER_MODE_ENABLED) {
+      return;
+    }
+
+    const key = buildSniperEntryKey(params.marketId, params.outcome);
+    if (!this.activeEntries.has(key)) {
+      return;
+    }
+
+    this.hardStopFallbackKeys.add(key);
+  }
+
   shouldSuppressLegacyForcedSignal(
     signal: Pick<StrategySignal, 'marketId' | 'outcome' | 'signalType'>
   ): boolean {
+    const key = buildSniperEntryKey(signal.marketId, signal.outcome);
     if (
       !this.runtimeConfig.SNIPER_MODE_ENABLED ||
-      !this.hasActiveEntryFor(signal.marketId, signal.outcome)
+      !this.activeEntries.has(key)
+    ) {
+      return false;
+    }
+
+    if (
+      signal.signalType === 'HARD_STOP' &&
+      this.hardStopFallbackKeys.has(key)
     ) {
       return false;
     }
@@ -195,6 +226,7 @@ export class SniperEngine {
 
     const key = buildSniperEntryKey(params.market.marketId, params.signal.outcome);
     if (params.signal.signalType === 'SNIPER_BUY' && params.signal.action === 'BUY') {
+      this.hardStopFallbackKeys.delete(key);
       const nextPrice =
         params.fillPrice ??
         params.signal.targetPrice ??
@@ -230,6 +262,8 @@ export class SniperEngine {
       return;
     }
 
+    this.hardStopFallbackKeys.delete(key);
+
     const existing = this.activeEntries.get(key);
     if (!existing) {
       return;
@@ -237,7 +271,7 @@ export class SniperEngine {
 
     const remainingShares = roundTo(existing.shares - shares, 4);
     if (remainingShares <= 0.0001) {
-      this.activeEntries.delete(key);
+      this.clearActiveEntry(params.market.marketId, params.signal.outcome);
       return;
     }
 
@@ -636,7 +670,7 @@ export class SniperEngine {
     for (const entry of candidates) {
       const currentShares = params.positionManager.getShares(entry.outcome);
       if (currentShares <= 0.0001) {
-        this.activeEntries.delete(buildSniperEntryKey(entry.marketId, entry.outcome));
+        this.clearActiveEntry(entry.marketId, entry.outcome);
         continue;
       }
 
@@ -647,6 +681,10 @@ export class SniperEngine {
       }
 
       const exitShares = roundTo(Math.min(currentShares, entry.shares), 4);
+      if (roundTo(exitShares * bestBid, 6) < 1) {
+        this.clearActiveEntry(entry.marketId, entry.outcome);
+        continue;
+      }
       const pnlEdge = roundTo(bestBid - entry.entryPrice, 6);
       if (pnlEdge >= params.config.scalpExitEdge) {
         return [
@@ -694,7 +732,7 @@ export class SniperEngine {
             bestBid,
             edgeAmount: pnlEdge,
             signalType: 'SNIPER_SCALP_EXIT',
-            urgency: 'improve',
+            urgency: 'cross',
             reason: `Sniper time stop: held ${(params.nowMs - entry.enteredAtMs)}ms with pnl ${(pnlEdge * 100).toFixed(2)}%`,
             nowMs: params.nowMs,
           }),

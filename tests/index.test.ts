@@ -1080,6 +1080,146 @@ test('hard stops clamp to wallet balance and abandon sub-minimum live inventory'
   assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), true);
 });
 
+test('failed live sniper exits cancel the resting order and re-arm HARD_STOP fallback', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.45,
+  });
+
+  runtime.syncRuntimeStatus = () => {};
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.recordSkippedSignal = () => {};
+  runtime.settlementStartedAt.set('market-1:YES', Date.now() - 1_000);
+  runtime.settlementAttempts.set('market-1:YES', 0);
+  runtime.tradeLogger = {
+    logTrade: async () => {},
+  };
+  runtime.productTestMode = {
+    recordExecution: () => {},
+  };
+  runtime.quotingEngine = {
+    activateForMarket: () => {},
+  };
+  runtime.lotteryEngine = {
+    recordExecution: () => {},
+    recordExit: () => {},
+  };
+  runtime.syncBlockedExitRemainderFromInventory = () => {};
+  runtime.recordCostBasisFill = () => {};
+  runtime.updateLatencyPause = () => {};
+  runtime.recordRuntimeSignal = () => {};
+  runtime.getAverageLatencyMs = () => null;
+  runtime.getLatencyPauseAverageMs = () => null;
+
+  let cancelledOrderId: string | null = null;
+  let pendingOrderRegistered = false;
+  let fallbackRearmed: { marketId: string; outcome: StrategySignal['outcome'] } | null = null;
+  runtime.signalEngine = {
+    recordFailedSniperExit: (params: { marketId: string; outcome: StrategySignal['outcome'] }) => {
+      fallbackRearmed = params;
+    },
+  };
+  runtime.fillTracker = {
+    registerPendingOrder: () => {
+      pendingOrderRegistered = true;
+    },
+    forgetPendingOrder: () => {},
+    hasPendingOrderFor: () => false,
+  };
+  runtime.executor = {
+    getOutcomeTokenBalance: async () => 6,
+    executeSignal: async () =>
+      createExecutionReport({
+        simulation: false,
+        orderId: 'exit-order',
+        tokenId: 'yes-token',
+        outcome: 'YES',
+        side: 'SELL',
+        shares: 6,
+        filledShares: 0,
+        fillConfirmed: false,
+        price: 0.23,
+        fillPrice: null,
+        urgency: 'cross',
+      }),
+    cancelOrder: async (orderId: string) => {
+      cancelledOrderId = orderId;
+    },
+    invalidateOutcomeBalanceCache: () => {},
+    invalidateBalanceValidationCache: () => {},
+  };
+
+  const result = await runtime.executeSignal(
+    market,
+    orderbook,
+    positionManager,
+    createSignal({
+      signalType: 'SNIPER_SCALP_EXIT',
+      action: 'SELL',
+      reduceOnly: true,
+      outcome: 'YES',
+      outcomeIndex: 0,
+      shares: 6,
+      targetPrice: 0.23,
+      referencePrice: 0.45,
+      tokenPrice: 0.23,
+      midPrice: 0.23,
+      fairValue: 0.45,
+      urgency: 'cross',
+    }),
+    'slot-1'
+  );
+
+  assert.equal(result?.fillConfirmed, false);
+  assert.equal(cancelledOrderId, 'exit-order');
+  assert.deepEqual(fallbackRearmed, {
+    marketId: market.marketId,
+    outcome: 'YES',
+  });
+  assert.equal(pendingOrderRegistered, false);
+  assert.equal(runtime.pendingLiveOrders.size, 0);
+});
+
+test('abandoning a dust sniper position clears sniper ownership immediately', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  let cleared: { marketId: string; outcome: StrategySignal['outcome'] } | null = null;
+  runtime.signalEngine = {
+    clearSniperEntry: (marketId: string, outcome: StrategySignal['outcome']) => {
+      cleared = { marketId, outcome };
+    },
+  };
+
+  runtime.abandonPositionForRedeem({
+    market,
+    signal: createSignal({
+      signalType: 'SNIPER_SCALP_EXIT',
+      action: 'SELL',
+      reduceOnly: true,
+      outcome: 'YES',
+      outcomeIndex: 0,
+    }),
+    requestedShares: 6,
+    minimumShares: 10,
+    referencePrice: 0.1,
+  });
+
+  assert.deepEqual(cleared, {
+    marketId: market.marketId,
+    outcome: 'YES',
+  });
+  assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), true);
+});
+
 test('redeem-success clears local runtime positions for settled conditions', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const market = createMarket();

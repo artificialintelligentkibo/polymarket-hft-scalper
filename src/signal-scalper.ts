@@ -320,6 +320,17 @@ export class SignalScalper {
     return this.sniperEngine.hasActiveEntryForMarket(marketId);
   }
 
+  clearSniperEntry(marketId: string, outcome: Outcome): void {
+    this.sniperEngine.clearActiveEntry(marketId, outcome);
+  }
+
+  recordFailedSniperExit(params: {
+    marketId: string;
+    outcome: Outcome;
+  }): void {
+    this.sniperEngine.recordFailedExit(params);
+  }
+
   evaluateSniperCandidate(params: {
     market: MarketCandidate;
     orderbook: MarketOrderbookSnapshot;

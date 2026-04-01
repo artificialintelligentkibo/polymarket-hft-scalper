@@ -1199,6 +1199,64 @@ export class MarketMakerRuntime {
         slotStart: market.startTime,
         slotEnd: market.endTime,
       });
+    } else if (
+      !execution.simulation &&
+      executionSignal.signalType === 'SNIPER_SCALP_EXIT' &&
+      executionSignal.action === 'SELL'
+    ) {
+      let exitOrderCancelled = !execution.orderId;
+      if (execution.orderId) {
+        try {
+          await this.executor.cancelOrder(execution.orderId);
+          exitOrderCancelled = true;
+        } catch (error) {
+          logger.warn('Failed to cancel unfilled sniper exit order', {
+            marketId: market.marketId,
+            outcome: executionSignal.outcome,
+            orderId: execution.orderId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      if (exitOrderCancelled) {
+        if (execution.orderId) {
+          this.fillTracker.forgetPendingOrder(execution.orderId);
+        }
+        this.clearPendingLiveOrder(pendingOrderKey);
+        this.signalEngine.recordFailedSniperExit({
+          marketId: market.marketId,
+          outcome: executionSignal.outcome,
+        });
+        logger.warn('Sniper exit was not filled; HARD_STOP fallback re-armed', {
+          marketId: market.marketId,
+          outcome: executionSignal.outcome,
+          orderId: execution.orderId,
+          submittedShares: execution.shares,
+          submittedPrice: execution.price,
+        });
+      } else {
+        this.rememberPendingLiveOrder(pendingOrderKey);
+        this.fillTracker.registerPendingOrder({
+          orderId: execution.orderId,
+          marketId: market.marketId,
+          slotKey,
+          tokenId,
+          outcome: executionSignal.outcome,
+          side: executionSignal.action,
+          submittedShares: execution.shares,
+          submittedPrice: execution.price,
+          signalType: executionSignal.signalType,
+          strategyLayer:
+            executionSignal.strategyLayer ?? resolveStrategyLayer(executionSignal.signalType),
+          placedAt: startedAt,
+          slotEndTime:
+            market.endTime ??
+            new Date(startedAt + config.FILL_POLL_TIMEOUT_MS).toISOString(),
+          lastCheckedAt: 0,
+          filledSharesSoFar: 0,
+        });
+      }
     } else if (!execution.simulation) {
       this.rememberPendingLiveOrder(pendingOrderKey);
       this.fillTracker.registerPendingOrder({
@@ -2946,6 +3004,7 @@ export class MarketMakerRuntime {
     }
 
     this.dustAbandonedPositions.add(key);
+    this.signalEngine.clearSniperEntry(params.market.marketId, params.signal.outcome);
     logger.info('Position abandoned for redeem - below CLOB minimum sell size', {
       marketId: params.market.marketId,
       signalType: params.signal.signalType,
