@@ -3381,6 +3381,18 @@ export class MarketMakerRuntime {
 
     if (guardedSell.skip) {
       if (latestBalance > 0 && guardedSell.reason === 'below_minimum') {
+        if (params.signal.signalType === 'MM_QUOTE_ASK') {
+          logger.info('MM quote skipped', {
+            marketId: params.market.marketId,
+            reason: 'below_minimum_size',
+            details: {
+              outcome: params.signal.outcome,
+              walletShares: roundTo(Math.max(0, latestBalance), 4),
+              minimumShares: guardedSell.minimumShares,
+              referencePrice: params.referencePrice,
+            },
+          });
+        }
         this.skipReduceOnlySellForDust({
           market: params.market,
           signal: params.signal,
@@ -3477,15 +3489,29 @@ export class MarketMakerRuntime {
     const nextCheckAtMs = Date.now() + 1_000;
     this.settlementCooldowns.set(key, nextCheckAtMs);
     this.settlementAttempts.set(key, attempts);
-    logger.debug('SELL deferred: waiting for settled token balance after BUY fill', {
-      marketId: params.market.marketId,
-      signalType: params.signal.signalType,
-      outcome: params.signal.outcome,
-      requiredShares,
-      availableShares: roundTo(latestBalance, 4),
-      attempts,
-      nextCheckAt: new Date(nextCheckAtMs).toISOString(),
-    });
+    const nextCheckAt = new Date(nextCheckAtMs).toISOString();
+    if (params.signal.signalType === 'MM_QUOTE_ASK' && attempts <= 3) {
+      logger.info('MM quote skipped', {
+        marketId: params.market.marketId,
+        reason: 'waiting_for_settlement',
+        details: {
+          outcome: params.signal.outcome,
+          requiredShares,
+          availableShares: roundTo(latestBalance, 4),
+          nextCheckAt,
+        },
+      });
+    } else {
+      logger.debug('SELL deferred: waiting for settled token balance after BUY fill', {
+        marketId: params.market.marketId,
+        signalType: params.signal.signalType,
+        outcome: params.signal.outcome,
+        requiredShares,
+        availableShares: roundTo(latestBalance, 4),
+        attempts,
+        nextCheckAt,
+      });
+    }
     return {
       ready: false,
       requiredShares,

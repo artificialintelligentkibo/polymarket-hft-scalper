@@ -135,7 +135,7 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.strategy.latencyResumeThresholdMs, 400);
   assert.equal(candidate.strategy.latencyPauseWindowSize, 10);
   assert.equal(candidate.strategy.latencyPauseSampleTtlMs, 90000);
-  assert.equal(candidate.MM_QUOTE_SHARES, 5);
+  assert.equal(candidate.MM_QUOTE_SHARES, 6);
   assert.equal(candidate.MM_MAX_GROSS_EXPOSURE_USD, 15);
   assert.equal(candidate.MM_MAX_NET_DIRECTIONAL, 10);
   assert.equal(candidate.strategy.maxDrawdownUsdc, -15);

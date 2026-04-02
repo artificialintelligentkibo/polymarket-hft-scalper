@@ -625,7 +625,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     REBALANCE_ON_IMBALANCE: parseBoolean(env.REBALANCE_ON_IMBALANCE, true),
     MM_AUTONOMOUS_QUOTES: parseBoolean(env.MM_AUTONOMOUS_QUOTES, true),
     MM_ALWAYS_QUOTE: parseBoolean(env.MM_ALWAYS_QUOTE, false),
-    MM_QUOTE_SHARES: Math.max(1, parseIntOrDefault(env.MM_QUOTE_SHARES, '5')),
+    MM_QUOTE_SHARES: Math.max(1, parseIntOrDefault(env.MM_QUOTE_SHARES, '6')),
     MM_MAX_GROSS_EXPOSURE_USD: parseFloatOrDefault(env.MM_MAX_GROSS_EXPOSURE_USD, '15'),
     MM_MAX_NET_DIRECTIONAL: parseFloatOrDefault(env.MM_MAX_NET_DIRECTIONAL, '10'),
     MM_MIN_SPREAD_TICKS: Math.max(

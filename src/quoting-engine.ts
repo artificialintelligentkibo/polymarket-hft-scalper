@@ -18,6 +18,7 @@ import type {
 import { getTakerFee } from './ev-kelly.js';
 import { logger } from './logger.js';
 import { getSlotKey, type MarketCandidate } from './monitor.js';
+import { resolveMinimumTradableShares } from './paired-arbitrage.js';
 import type { PositionManager } from './position-manager.js';
 import type { RiskAssessment } from './risk-manager.js';
 import {
@@ -135,6 +136,14 @@ export function buildMarketMakerQuoteSignals(params: {
     runtimeConfig.MM_AUTONOMOUS_QUOTES &&
     (params.context.quoteSignals.length === 0 || runtimeConfig.MM_ALWAYS_QUOTE)
   ) {
+    builtSignals.push(
+      ...generatePostSniperAskSignals({
+        context: params.context,
+        runtimeConfig,
+        quoteSpreadTicks,
+        now,
+      })
+    );
     builtSignals.push(
       ...generateAutonomousQuoteSignals({
         context: params.context,
@@ -275,10 +284,15 @@ function generateAutonomousQuoteSignals(params: {
     context.binanceAssessment.direction !== 'FLAT' &&
     Math.abs(context.binanceAssessment.binanceMovePct) >= runtimeConfig.sniper.minBinanceMovePct
   ) {
-    logger.debug('MM quote suppressed - Binance directional signal active', {
-      marketId: context.market.marketId,
-      direction: context.binanceAssessment.direction,
-      movePct: context.binanceAssessment.binanceMovePct,
+    logMmQuoteSkip({
+      context,
+      runtimeConfig,
+      now,
+      reason: 'directional_signal_active',
+      details: {
+        direction: context.binanceAssessment.direction,
+        movePct: context.binanceAssessment.binanceMovePct,
+      },
     });
     return [];
   }
@@ -326,8 +340,10 @@ function generateAutonomousQuoteSignals(params: {
       book.depthNotionalBid < runtimeConfig.MM_MIN_BOOK_DEPTH_USD ||
       book.depthNotionalAsk < runtimeConfig.MM_MIN_BOOK_DEPTH_USD
     ) {
-      logger.debug('MM quote skipped', {
-        marketId: context.market.marketId,
+      logMmQuoteSkip({
+        context,
+        runtimeConfig,
+        now,
         reason: 'low_depth',
         details: {
           outcome,
@@ -347,8 +363,10 @@ function generateAutonomousQuoteSignals(params: {
       context.deepBinanceAssessment
     );
     if (runtimeConfig.MM_REQUIRE_FAIR_VALUE && fairValue === null) {
-      logger.debug('MM quote skipped', {
-        marketId: context.market.marketId,
+      logMmQuoteSkip({
+        context,
+        runtimeConfig,
+        now,
         reason: 'no_fair_value',
         details: { outcome },
       });
@@ -362,8 +380,10 @@ function generateAutonomousQuoteSignals(params: {
       book.bestBid ??
       book.bestAsk;
     if (pricingAnchor === null || !Number.isFinite(pricingAnchor)) {
-      logger.debug('MM quote skipped', {
-        marketId: context.market.marketId,
+      logMmQuoteSkip({
+        context,
+        runtimeConfig,
+        now,
         reason: 'no_fair_value',
         details: {
           outcome,
@@ -385,8 +405,10 @@ function generateAutonomousQuoteSignals(params: {
     const bidPrice = resolveBuyQuotePrice(book, skewedFairValue, perOutcomeSpreadTicks);
     const askPrice = resolveSellQuotePrice(book, skewedFairValue, perOutcomeSpreadTicks);
     if (bidPrice === null || askPrice === null) {
-      logger.debug('MM quote skipped', {
-        marketId: context.market.marketId,
+      logMmQuoteSkip({
+        context,
+        runtimeConfig,
+        now,
         reason: 'spread_too_thin',
         details: {
           outcome,
@@ -404,8 +426,10 @@ function generateAutonomousQuoteSignals(params: {
     );
     const actualSpread = roundTo(askPrice - bidPrice, 6);
     if (actualSpread < minProfitableSpread) {
-      logger.debug('MM quote skipped', {
-        marketId: context.market.marketId,
+      logMmQuoteSkip({
+        context,
+        runtimeConfig,
+        now,
         reason: 'spread_too_thin',
         details: {
           outcome,
@@ -439,8 +463,10 @@ function generateAutonomousQuoteSignals(params: {
       increasesDirectionalRisk ||
       projectedExposureUsd + bidNotionalUsd > runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
     ) {
-      logger.debug('MM quote skipped', {
-        marketId: context.market.marketId,
+      logMmQuoteSkip({
+        context,
+        runtimeConfig,
+        now,
         reason:
           context.allowEntryQuotes === false
             ? 'concurrent_limit'
@@ -529,6 +555,102 @@ function generateAutonomousQuoteSignals(params: {
   return builtSignals;
 }
 
+function generatePostSniperAskSignals(params: {
+  context: QuoteContext;
+  runtimeConfig: AppConfig;
+  quoteSpreadTicks: number;
+  now: Date;
+}): StrategySignal[] {
+  const { context, runtimeConfig, now } = params;
+  if (
+    !isPostSniperMmGraceWindowActive({
+      activationTrigger: context.activationTrigger,
+      runtimeConfig,
+      now,
+    }) ||
+    context.activationTrigger?.triggerLayer !== 'SNIPER'
+  ) {
+    return [];
+  }
+
+  const outcome = context.activationTrigger.entryOutcome;
+  const openShares = roundTo(Math.max(0, context.positionManager.getShares(outcome)), 4);
+  if (openShares <= 0) {
+    return [];
+  }
+
+  const book = getBookForOutcome(context.orderbook, outcome);
+  const fairValue = resolveQuoteFairValue(
+    context.orderbook,
+    outcome,
+    runtimeConfig,
+    context.binanceFairValueAdjustment,
+    context.deepBinanceAssessment
+  );
+  const askPrice = resolveSellQuotePrice(
+    book,
+    fairValue,
+    Math.max(1, params.quoteSpreadTicks - 1)
+  );
+  if (askPrice === null) {
+    logMmQuoteSkip({
+      context,
+      runtimeConfig,
+      now,
+      reason: 'spread_too_thin',
+      details: {
+        outcome,
+        mode: 'post_sniper_ask',
+      },
+    });
+    return [];
+  }
+
+  const askShares = Math.min(roundTo(runtimeConfig.MM_QUOTE_SHARES, 4), openShares);
+  const minimumShares = resolveMinimumTradableShares(askPrice, 0);
+  if (askShares < minimumShares) {
+    logMmQuoteSkip({
+      context,
+      runtimeConfig,
+      now,
+      reason: 'below_minimum_size',
+      details: {
+        outcome,
+        mode: 'post_sniper_ask',
+        askShares,
+        minimumShares,
+        askPrice,
+      },
+    });
+    return [];
+  }
+
+  const referencePrice =
+    fairValue ?? book.midPrice ?? book.bestAsk ?? book.bestBid ?? askPrice;
+  const actualSpread = roundTo(
+    Math.max(0, askPrice - (book.bestBid ?? askPrice)),
+    6
+  );
+
+  return [
+    buildAutonomousSignal({
+      market: context.market,
+      orderbook: context.orderbook,
+      runtimeConfig,
+      action: 'SELL',
+      outcome,
+      signalType: 'MM_QUOTE_ASK',
+      shares: askShares,
+      targetPrice: askPrice,
+      referencePrice,
+      fairValue: referencePrice,
+      actualSpread,
+      reason: 'Post-sniper MM ask',
+      now,
+    }),
+  ];
+}
+
 function isPostSniperMmGraceWindowActive(params: {
   activationTrigger?: QuoteActivationTrigger;
   runtimeConfig: AppConfig;
@@ -544,6 +666,38 @@ function isPostSniperMmGraceWindowActive(params: {
   }
 
   return now.getTime() - activationTrigger.activatedAtMs <= runtimeConfig.MM_POST_SNIPER_GRACE_WINDOW_MS;
+}
+
+function logMmQuoteSkip(params: {
+  context: QuoteContext;
+  runtimeConfig: AppConfig;
+  now: Date;
+  reason: string;
+  details: Record<string, unknown>;
+}): void {
+  const payload = {
+    marketId: params.context.market.marketId,
+    reason: params.reason,
+    details: params.details,
+  };
+
+  if (shouldPromoteMmSkipLog(params)) {
+    logger.info('MM quote skipped', payload);
+    return;
+  }
+
+  logger.debug('MM quote skipped', payload);
+}
+
+function shouldPromoteMmSkipLog(params: {
+  context: QuoteContext;
+  reason: string;
+}): boolean {
+  if (params.context.activationTrigger?.triggerLayer !== 'SNIPER') {
+    return false;
+  }
+
+  return params.reason === 'spread_too_thin' || params.reason === 'below_minimum_size';
 }
 
 function buildAutonomousSignal(params: {
