@@ -195,6 +195,7 @@ export class MarketMakerRuntime {
   >();
   private readonly dustAbandonedPositions = new Set<string>();
   private readonly pendingLiveOrders = new Map<string, number>();
+  private readonly postSniperMakerAskStartedAt = new Map<string, number>();
   private readonly settlementCooldowns = new Map<string, number>();
   private readonly settlementStartedAt = new Map<string, number>();
   private readonly settlementAttempts = new Map<string, number>();
@@ -1224,6 +1225,7 @@ export class MarketMakerRuntime {
           this.fillTracker.forgetPendingOrder(execution.orderId);
         }
         this.clearPendingLiveOrder(pendingOrderKey);
+        this.clearPostSniperMakerAskSignal(market.marketId, executionSignal.outcome);
         this.signalEngine.recordFailedSniperExit({
           marketId: market.marketId,
           outcome: executionSignal.outcome,
@@ -1306,12 +1308,26 @@ export class MarketMakerRuntime {
       );
     }
     const completedAt = executionCompletedAt;
+    if (
+      !execution.simulation &&
+      execution.orderId &&
+      !execution.fillConfirmed &&
+      executionSignal.signalType === 'MM_QUOTE_ASK' &&
+      executionSignal.reason.startsWith('Post-sniper MM ask')
+    ) {
+      this.notePostSniperMakerAskSignal(
+        market.marketId,
+        executionSignal.outcome,
+        completedAt
+      );
+    }
     if (!paperTradingEnabled && effectiveShares > 0 && executionSignal.action === 'BUY') {
       this.armSettlementConfirmation(market.marketId, executionSignal.outcome, completedAt);
       this.executor.invalidateOutcomeBalanceCache(tokenId);
       this.executor.invalidateBalanceValidationCache();
     } else if (!paperTradingEnabled && effectiveShares > 0 && executionSignal.action === 'SELL') {
       this.clearSettlementConfirmation(market.marketId, executionSignal.outcome);
+      this.clearPostSniperMakerAskSignal(market.marketId, executionSignal.outcome);
       this.executor.invalidateOutcomeBalanceCache(tokenId);
       this.executor.invalidateBalanceValidationCache();
     }
@@ -2066,6 +2082,20 @@ export class MarketMakerRuntime {
         continue;
       }
 
+      if (this.shouldDeferSniperScalpExitForMakerAsk(market, signal)) {
+        this.recordSkippedSignal({
+          signal,
+          filterReason: 'MM_MAKER_FIRST',
+          details: `Deferred sniper scalp exit for ${config.sniper.makerExitGraceMs}ms to give post-sniper MM ask a maker-first fill window.`,
+          context: {
+            marketId: market.marketId,
+            outcome: signal.outcome,
+            graceMs: config.sniper.makerExitGraceMs,
+          },
+        });
+        continue;
+      }
+
       if (!this.isEntrySignal(signal)) {
         allowed.push(signal);
         continue;
@@ -2115,6 +2145,64 @@ export class MarketMakerRuntime {
     }
 
     return allowed;
+  }
+
+  private shouldDeferSniperScalpExitForMakerAsk(
+    market: MarketCandidate,
+    signal: StrategySignal
+  ): boolean {
+    if (
+      config.sniper.makerExitGraceMs <= 0 ||
+      signal.signalType !== 'SNIPER_SCALP_EXIT' ||
+      signal.action !== 'SELL' ||
+      !signal.reduceOnly ||
+      !signal.reason.startsWith('Sniper scalp exit:')
+    ) {
+      return false;
+    }
+
+    const key = this.getPostSniperMakerAskKey(market.marketId, signal.outcome);
+    const startedAtMs = this.postSniperMakerAskStartedAt.get(key);
+    if (!startedAtMs) {
+      return false;
+    }
+
+    if (Date.now() - startedAtMs > config.sniper.makerExitGraceMs) {
+      this.postSniperMakerAskStartedAt.delete(key);
+      return false;
+    }
+
+    return true;
+  }
+
+  private notePostSniperMakerAskSignal(
+    marketId: string,
+    outcome: StrategySignal['outcome'],
+    nowMs: number
+  ): void {
+    const key = this.getPostSniperMakerAskKey(marketId, outcome);
+    const startedAtMs = this.postSniperMakerAskStartedAt.get(key);
+    if (startedAtMs && nowMs - startedAtMs <= config.sniper.makerExitGraceMs) {
+      return;
+    }
+
+    this.postSniperMakerAskStartedAt.set(key, nowMs);
+  }
+
+  private clearPostSniperMakerAskSignal(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): void {
+    this.postSniperMakerAskStartedAt.delete(
+      this.getPostSniperMakerAskKey(marketId, outcome)
+    );
+  }
+
+  private getPostSniperMakerAskKey(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): string {
+    return `${marketId}:${outcome}`;
   }
 
   private sortExecutionCandidatesByLayerPriority(
@@ -3381,6 +3469,7 @@ export class MarketMakerRuntime {
 
     if (guardedSell.skip) {
       if (latestBalance > 0 && guardedSell.reason === 'below_minimum') {
+        this.clearPostSniperMakerAskSignal(params.market.marketId, params.signal.outcome);
         if (params.signal.signalType === 'MM_QUOTE_ASK') {
           logger.info('MM quote skipped', {
             marketId: params.market.marketId,

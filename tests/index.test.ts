@@ -1637,6 +1637,106 @@ test('pending quote exposure counts only remaining BUY quote shares', () => {
   });
 });
 
+test('layer coordination gives post-sniper MM ask a maker-first window before scalp exit', () => {
+  const originalGraceMs = process.env.SNIPER_MAKER_EXIT_GRACE_MS;
+  process.env.SNIPER_MAKER_EXIT_GRACE_MS = '2500';
+  resetConfigCache();
+
+  try {
+    const runtime = new MarketMakerRuntime() as any;
+    const market = createMarket();
+    const positionManager = new PositionManager(market.marketId, market.endTime);
+    const skipped: Array<{ filterReason: string; details: string }> = [];
+
+    runtime.recordSkippedSignal = (params: { filterReason: string; details: string }) => {
+      skipped.push(params);
+    };
+    runtime.quotingEngine = {
+      hasActiveMMMarket: () => false,
+      getQuoteOrders: () => [],
+      getActiveMMMarketIds: () => [],
+    };
+    runtime.postSniperMakerAskStartedAt.set('market-1:YES', Date.now());
+
+    const filtered = runtime.applyLayerCoordinationFilters(
+      market,
+      positionManager,
+      [
+        createSignal({
+          signalType: 'SNIPER_SCALP_EXIT',
+          action: 'SELL',
+          reduceOnly: true,
+          outcome: 'YES',
+          outcomeIndex: 0,
+          shares: 6,
+          targetPrice: 0.42,
+          referencePrice: 0.35,
+          tokenPrice: 0.42,
+          midPrice: 0.415,
+          fairValue: 0.35,
+          urgency: 'cross',
+          reason: 'Sniper scalp exit: bid 0.420 repriced 7.00% above entry',
+        }),
+      ]
+    );
+
+    assert.equal(filtered.length, 0);
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0]?.filterReason, 'MM_MAKER_FIRST');
+  } finally {
+    process.env.SNIPER_MAKER_EXIT_GRACE_MS = originalGraceMs;
+    resetConfigCache();
+  }
+});
+
+test('maker-first coordination does not block sniper time stops', () => {
+  const originalGraceMs = process.env.SNIPER_MAKER_EXIT_GRACE_MS;
+  process.env.SNIPER_MAKER_EXIT_GRACE_MS = '2500';
+  resetConfigCache();
+
+  try {
+    const runtime = new MarketMakerRuntime() as any;
+    const market = createMarket();
+    const positionManager = new PositionManager(market.marketId, market.endTime);
+
+    runtime.recordSkippedSignal = () => {};
+    runtime.quotingEngine = {
+      hasActiveMMMarket: () => false,
+      getQuoteOrders: () => [],
+      getActiveMMMarketIds: () => [],
+    };
+    runtime.postSniperMakerAskStartedAt.set('market-1:YES', Date.now());
+
+    const filtered = runtime.applyLayerCoordinationFilters(
+      market,
+      positionManager,
+      [
+        createSignal({
+          signalType: 'SNIPER_SCALP_EXIT',
+          action: 'SELL',
+          reduceOnly: true,
+          outcome: 'YES',
+          outcomeIndex: 0,
+          shares: 6,
+          targetPrice: 0.3,
+          referencePrice: 0.4,
+          tokenPrice: 0.3,
+          midPrice: 0.305,
+          fairValue: 0.4,
+          urgency: 'cross',
+          reason: 'Sniper time stop: held 62000ms with pnl -10.00%',
+        }),
+      ]
+    );
+
+    assert.equal(filtered.length, 1);
+    assert.equal(filtered[0]?.reason, 'Sniper time stop: held 62000ms with pnl -10.00%');
+  } finally {
+    process.env.SNIPER_MAKER_EXIT_GRACE_MS = originalGraceMs;
+    resetConfigCache();
+  }
+});
+
 test('executePairedArbAtomic unwinds leg1 when leg2 does not fill', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const calls: StrategySignal[] = [];

@@ -63,6 +63,8 @@ export interface SniperConfig {
   readonly maxHoldMs: number;
   /** Profit target for fast repricing exits. */
   readonly scalpExitEdge: number;
+  /** Short maker-first delay before a profitable scalp exit crosses the spread. */
+  readonly makerExitGraceMs: number;
   /** Reversal loss threshold once Binance direction flips. */
   readonly stopLossPct: number;
   /** Lookback window for Binance velocity confirmation. */
@@ -892,6 +894,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ),
       maxHoldMs: Math.max(0, parseIntOrDefault(env.SNIPER_MAX_HOLD_MS, '0')),
       scalpExitEdge: parseFloatOrDefault(env.SNIPER_SCALP_EXIT_EDGE, '0.08'),
+      makerExitGraceMs: Math.max(
+        0,
+        parseIntOrDefault(env.SNIPER_MAKER_EXIT_GRACE_MS, '2500')
+      ),
       stopLossPct: parseFloatOrDefault(env.SNIPER_STOP_LOSS_PCT, '0.15'),
       velocityWindowMs: Math.max(
         1_000,
