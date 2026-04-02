@@ -199,3 +199,102 @@ test('lottery engine enforces one ticket per slot and tracks stats after executi
   assert.equal(stats.activeEntries, 1);
   assert.equal(stats.totalRiskUsdc > 0, true);
 });
+
+test('lottery engine generates a take-profit exit when the bid rallies above the configured threshold', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    LOTTERY_LAYER_ENABLED: 'true',
+    LOTTERY_TAKE_PROFIT_MIN_CENTS: '0.12',
+    LOTTERY_TAKE_PROFIT_MULTIPLIER: '1.5',
+  });
+  const engine = new LotteryEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  positionManager.applyFill({
+    outcome: 'NO',
+    side: 'BUY',
+    shares: 5.55,
+    price: 0.18,
+    strategyLayer: 'LOTTERY',
+  });
+  engine.recordExecution({
+    marketId: market.marketId,
+    outcome: 'NO',
+    filledShares: 5.55,
+    fillPrice: 0.18,
+    signalType: 'LOTTERY_BUY',
+    slotKey: 'slot-1',
+  });
+
+  const orderbook = createOrderbook();
+  orderbook.no.bestBid = 0.31;
+  orderbook.no.bestAsk = 0.32;
+  orderbook.no.midPrice = 0.315;
+
+  const exits = engine.generateExitSignals({
+    market,
+    orderbook,
+    positionManager,
+    nowMs: Date.parse('2026-03-31T16:03:30.000Z'),
+    config: runtimeConfig.lottery,
+  });
+
+  assert.equal(exits.length, 1);
+  assert.equal(exits[0].signalType, 'TRAILING_TAKE_PROFIT');
+  assert.equal(exits[0].strategyLayer, 'LOTTERY');
+  assert.equal(exits[0].action, 'SELL');
+  assert.equal(exits[0].reduceOnly, true);
+  assert.equal(exits[0].urgency, 'cross');
+  assert.equal(exits[0].targetPrice, 0.31);
+});
+
+test('lottery engine generates a forced slot-end exit before settlement', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    LOTTERY_LAYER_ENABLED: 'true',
+    LOTTERY_EXIT_BEFORE_END_MS: '45000',
+    LOTTERY_TAKE_PROFIT_MIN_CENTS: '0.20',
+    LOTTERY_TAKE_PROFIT_MULTIPLIER: '2.0',
+  });
+  const engine = new LotteryEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  positionManager.applyFill({
+    outcome: 'NO',
+    side: 'BUY',
+    shares: 5.55,
+    price: 0.18,
+    strategyLayer: 'LOTTERY',
+  });
+  engine.recordExecution({
+    marketId: market.marketId,
+    outcome: 'NO',
+    filledShares: 5.55,
+    fillPrice: 0.18,
+    signalType: 'LOTTERY_BUY',
+    slotKey: 'slot-1',
+  });
+
+  const orderbook = createOrderbook();
+  orderbook.no.bestBid = 0.19;
+  orderbook.no.bestAsk = 0.2;
+  orderbook.no.midPrice = 0.195;
+
+  const exits = engine.generateExitSignals({
+    market,
+    orderbook,
+    positionManager,
+    nowMs: Date.parse('2026-03-31T16:04:25.000Z'),
+    config: runtimeConfig.lottery,
+  });
+
+  assert.equal(exits.length, 1);
+  assert.equal(exits[0].signalType, 'SLOT_FLATTEN');
+  assert.equal(exits[0].strategyLayer, 'LOTTERY');
+  assert.equal(exits[0].action, 'SELL');
+  assert.equal(exits[0].reduceOnly, true);
+  assert.equal(exits[0].urgency, 'cross');
+  assert.equal(exits[0].targetPrice, 0.19);
+});

@@ -163,8 +163,8 @@ export class MarketMakerRuntime {
   private readonly deepBinance = new BinanceDeepIntegration();
   private readonly tradeLogger = new TradeLogger();
   private readonly riskManager = new RiskManager();
-  private readonly signalEngine = new SignalScalper();
   private readonly lotteryEngine = new LotteryEngine(config);
+  private readonly signalEngine = new SignalScalper(config, this.lotteryEngine);
   private readonly quotingEngine = new QuotingEngine();
   private readonly redeemer = new AutoRedeemer();
   private readonly resolutionChecker = new ResolutionChecker();

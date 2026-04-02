@@ -88,6 +88,12 @@ export interface LotteryConfig {
   readonly relativePriceFactor: number;
   /** Hard cap for relative lottery bids before order-executor post-only adjustment. */
   readonly relativeMaxCents: number;
+  /** Minimum absolute bid price required before taking profit on a filled lottery ticket. */
+  readonly takeProfitMinCents: number;
+  /** Relative profit multiple required before taking profit on a filled lottery ticket. */
+  readonly takeProfitMultiplier: number;
+  /** Start forced lottery flattening this long before the slot ends. */
+  readonly exitBeforeEndMs: number;
   /** Only trigger lottery entries after a confirmed sniper fill. */
   readonly onlyAfterSniper: boolean;
   /** Maximum number of lottery tickets allowed inside the same 5-minute slot. */
@@ -908,6 +914,12 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         env.LOTTERY_RELATIVE_MAX_CENTS ?? env.LOTTERY_MAX_CENTS,
         '0.07'
       ),
+      takeProfitMinCents: parseFloatOrDefault(env.LOTTERY_TAKE_PROFIT_MIN_CENTS, '0.12'),
+      takeProfitMultiplier: parseFloatOrDefault(env.LOTTERY_TAKE_PROFIT_MULTIPLIER, '1.5'),
+      exitBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.LOTTERY_EXIT_BEFORE_END_MS, '45000')
+      ),
       onlyAfterSniper: parseBoolean(env.LOTTERY_ONLY_AFTER_SNIPER, true),
       maxPerSlot: Math.max(0, parseIntOrDefault(env.LOTTERY_MAX_PER_SLOT, '1')),
     },
@@ -1299,6 +1311,17 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error(
       'LOTTERY_RELATIVE_MAX_CENTS must be greater than LOTTERY_MIN_CENTS.'
     );
+  }
+
+  if (
+    candidate.lottery.takeProfitMinCents <= 0 ||
+    candidate.lottery.takeProfitMinCents >= 1
+  ) {
+    throw new Error('LOTTERY_TAKE_PROFIT_MIN_CENTS must be in range (0, 1).');
+  }
+
+  if (candidate.lottery.takeProfitMultiplier <= 1) {
+    throw new Error('LOTTERY_TAKE_PROFIT_MULTIPLIER must be greater than 1.');
   }
 
   if (candidate.sniper.maxConcurrentSameDirection < 1) {

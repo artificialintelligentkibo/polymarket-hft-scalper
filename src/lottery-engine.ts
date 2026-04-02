@@ -26,6 +26,121 @@ export class LotteryEngine {
 
   constructor(private readonly runtimeConfig: AppConfig) {}
 
+  generateExitSignals(params: {
+    market: MarketCandidate;
+    orderbook: MarketOrderbookSnapshot;
+    positionManager: PositionManager;
+    nowMs: number;
+    config: LotteryConfig;
+  }): StrategySignal[] {
+    const { market, orderbook, positionManager, nowMs, config } = params;
+    const slotEndMs = market.endTime ? Date.parse(market.endTime) : Number.NaN;
+    const timeToEndMs = Number.isFinite(slotEndMs) ? slotEndMs - nowMs : Number.POSITIVE_INFINITY;
+    const signals: StrategySignal[] = [];
+
+    for (const outcome of ['YES', 'NO'] as const satisfies readonly Outcome[]) {
+      const entry = this.activeEntries.get(this.getEntryKey(market.marketId, outcome));
+      if (!entry) {
+        continue;
+      }
+
+      const availableShares = roundTo(
+        Math.min(positionManager.getShares(outcome), entry.shares),
+        4
+      );
+      if (availableShares <= 0) {
+        continue;
+      }
+
+      const book = outcome === 'YES' ? orderbook.yes : orderbook.no;
+      const bestBid =
+        book.bestBid !== null && Number.isFinite(book.bestBid) ? roundTo(book.bestBid, 6) : null;
+      const markPrice =
+        bestBid ??
+        (book.midPrice !== null && Number.isFinite(book.midPrice) ? roundTo(book.midPrice, 6) : null) ??
+        (book.bestAsk !== null && Number.isFinite(book.bestAsk) ? roundTo(book.bestAsk, 6) : null);
+      if (markPrice === null || markPrice <= 0) {
+        continue;
+      }
+
+      const takeProfitPrice = roundTo(
+        Math.max(config.takeProfitMinCents, entry.entryPrice * config.takeProfitMultiplier),
+        6
+      );
+
+      if (bestBid !== null && bestBid >= takeProfitPrice) {
+        signals.push({
+          marketId: market.marketId,
+          marketTitle: market.title,
+          signalType: 'TRAILING_TAKE_PROFIT',
+          priority: 985,
+          generatedAt: nowMs,
+          action: 'SELL',
+          outcome,
+          outcomeIndex: outcome === 'YES' ? 0 : 1,
+          shares: availableShares,
+          targetPrice: bestBid,
+          referencePrice: entry.entryPrice,
+          tokenPrice: bestBid,
+          midPrice: book.midPrice,
+          fairValue: null,
+          edgeAmount: roundTo(bestBid - entry.entryPrice, 6),
+          combinedBid: orderbook.combined.combinedBid,
+          combinedAsk: orderbook.combined.combinedAsk,
+          combinedMid: orderbook.combined.combinedMid,
+          combinedDiscount: orderbook.combined.combinedDiscount,
+          combinedPremium: orderbook.combined.combinedPremium,
+          fillRatio: 1,
+          capitalClamp: 1,
+          priceMultiplier: 1,
+          urgency: 'cross',
+          reduceOnly: true,
+          reason:
+            `Lottery take-profit: bid ${bestBid.toFixed(3)} reached target ${takeProfitPrice.toFixed(3)} ` +
+            `vs entry ${entry.entryPrice.toFixed(3)}`,
+          strategyLayer: 'LOTTERY',
+        });
+        continue;
+      }
+
+      if (timeToEndMs <= config.exitBeforeEndMs) {
+        signals.push({
+          marketId: market.marketId,
+          marketTitle: market.title,
+          signalType: 'SLOT_FLATTEN',
+          priority: 980,
+          generatedAt: nowMs,
+          action: 'SELL',
+          outcome,
+          outcomeIndex: outcome === 'YES' ? 0 : 1,
+          shares: availableShares,
+          targetPrice: markPrice,
+          referencePrice: entry.entryPrice,
+          tokenPrice: markPrice,
+          midPrice: book.midPrice,
+          fairValue: null,
+          edgeAmount: roundTo(markPrice - entry.entryPrice, 6),
+          combinedBid: orderbook.combined.combinedBid,
+          combinedAsk: orderbook.combined.combinedAsk,
+          combinedMid: orderbook.combined.combinedMid,
+          combinedDiscount: orderbook.combined.combinedDiscount,
+          combinedPremium: orderbook.combined.combinedPremium,
+          fillRatio: 1,
+          capitalClamp: 1,
+          priceMultiplier: 1,
+          urgency: 'cross',
+          reduceOnly: true,
+          reason:
+            `Lottery slot-end exit: ${Math.max(0, timeToEndMs)}ms before slot end ` +
+            `at ${markPrice.toFixed(3)} vs entry ${entry.entryPrice.toFixed(3)}`,
+          strategyLayer: 'LOTTERY',
+        });
+      }
+    }
+
+    return signals;
+  }
+
   generateLotterySignal(params: {
     market: MarketCandidate;
     orderbook: MarketOrderbookSnapshot;

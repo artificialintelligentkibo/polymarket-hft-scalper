@@ -4,6 +4,7 @@ import { applyEVKellyFilter } from './ev-kelly.js';
 import { LatencyMomentumEngine } from './latency-momentum.js';
 import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob-fetcher.js';
 import { logger } from './logger.js';
+import { LotteryEngine } from './lottery-engine.js';
 import type { MarketCandidate } from './monitor.js';
 import { PairedArbitrageEngine } from './paired-arbitrage.js';
 import type { PositionManager } from './position-manager.js';
@@ -57,13 +58,18 @@ export class SignalScalper {
   private readonly pairedArbEngine = new PairedArbitrageEngine();
   private readonly latencyMomentumEngine = new LatencyMomentumEngine();
   private readonly sniperEngine: SniperEngine;
+  private readonly lotteryEngine: LotteryEngine;
   private readonly recentSkippedSignals: SkippedSignalRecord[] = [];
   private readonly smoothedScalperFV = new Map<string, number>();
   private readonly smoothedScalperFvSeenAtMs = new Map<string, number>();
   private readonly currentTickFairValueCache = new Map<string, number | null>();
 
-  constructor(private readonly runtimeConfig: AppConfig = config) {
+  constructor(
+    private readonly runtimeConfig: AppConfig = config,
+    lotteryEngine?: LotteryEngine
+  ) {
     this.sniperEngine = new SniperEngine(runtimeConfig);
+    this.lotteryEngine = lotteryEngine ?? new LotteryEngine(runtimeConfig);
   }
 
   recordExecution(params: {
@@ -186,8 +192,18 @@ export class SignalScalper {
       return forcedSelection.selected;
     }
 
+    const lotteryExitSignals = this.runtimeConfig.lottery.enabled
+      ? this.lotteryEngine.generateExitSignals({
+          market,
+          orderbook,
+          positionManager,
+          nowMs: now.getTime(),
+          config: this.runtimeConfig.lottery,
+        })
+      : [];
+
     if (!this.runtimeConfig.ENABLE_SIGNAL) {
-      return [];
+      return lotteryExitSignals;
     }
 
     const sniperExitSignals = this.runtimeConfig.sniper.enabled
@@ -200,8 +216,8 @@ export class SignalScalper {
           nowMs: now.getTime(),
         })
       : [];
-    if (sniperExitSignals.length > 0) {
-      return sniperExitSignals;
+    if (sniperExitSignals.length > 0 || lotteryExitSignals.length > 0) {
+      return [...sniperExitSignals, ...lotteryExitSignals];
     }
 
     const sniperSignals: StrategySignal[] = this.runtimeConfig.sniper.enabled
