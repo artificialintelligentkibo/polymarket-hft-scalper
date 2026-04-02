@@ -135,6 +135,8 @@ export interface AppConfig {
    */
   readonly DYNAMIC_QUOTING_ENABLED: boolean;
   readonly MM_AUTO_ACTIVATE_AFTER_SNIPER: boolean;
+  /** Short post-sniper window where autonomous MM may quote despite directional Binance moves. */
+  readonly MM_POST_SNIPER_GRACE_WINDOW_MS: number;
   readonly LAYER_CONFLICT_RESOLUTION: LayerConflictResolution;
   readonly GLOBAL_MAX_EXPOSURE_USD: number;
   /**
@@ -598,6 +600,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     MARKET_MAKER_MODE: parseBoolean(env.MARKET_MAKER_MODE, false),
     DYNAMIC_QUOTING_ENABLED: parseBoolean(env.DYNAMIC_QUOTING_ENABLED, false),
     MM_AUTO_ACTIVATE_AFTER_SNIPER: parseBoolean(env.MM_AUTO_ACTIVATE_AFTER_SNIPER, true),
+    MM_POST_SNIPER_GRACE_WINDOW_MS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_POST_SNIPER_GRACE_WINDOW_MS, '15000')
+    ),
     LAYER_CONFLICT_RESOLUTION: parseLayerConflictResolution(env.LAYER_CONFLICT_RESOLUTION),
     GLOBAL_MAX_EXPOSURE_USD: parseFloatOrDefault(env.GLOBAL_MAX_EXPOSURE_USD, '50'),
     POST_ONLY_ONLY: parseBoolean(env.POST_ONLY_ONLY, true),

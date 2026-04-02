@@ -460,6 +460,57 @@ test('autonomous MM quotes are suppressed when sniper mode sees a directional Bi
   assert.equal(plan.signals.length, 0);
 });
 
+test('post-sniper MM grace window bypasses directional suppression for the activated market', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 8, 8);
+
+  const now = new Date('2026-03-24T10:01:00.000Z');
+  const runtimeConfig = createMmConfig({
+    SNIPER_MODE_ENABLED: 'true',
+    SNIPER_MIN_BINANCE_MOVE_PCT: '0.10',
+    MM_POST_SNIPER_GRACE_WINDOW_MS: '15000',
+  });
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+      binanceAssessment: {
+        available: true,
+        coin: 'BTC',
+        binancePrice: 84250,
+        slotOpenPrice: 84000,
+        binanceMovePct: 0.18,
+        direction: 'UP',
+        pmUpMid: 0.45,
+        pmImpliedDirection: 'FLAT',
+        directionalAgreement: true,
+        edgeStrength: 0.18,
+        sizeMultiplier: 1.2,
+        urgencyBoost: false,
+        contraSignal: false,
+      },
+      activationTrigger: {
+        triggerLayer: 'SNIPER',
+        entryOutcome: 'YES',
+        entryPrice: 0.33,
+        entryShares: 6,
+        activatedAtMs: now.getTime() - 5000,
+      },
+    },
+    runtimeConfig,
+    now,
+  });
+
+  assert.equal(plan.signals.filter((signal) => signal.signalType === 'MM_QUOTE_BID').length, 2);
+  assert.equal(plan.signals.filter((signal) => signal.signalType === 'MM_QUOTE_ASK').length, 2);
+});
+
 test('autonomous MM quotes stay disabled when MM_AUTONOMOUS_QUOTES=false', () => {
   const market = createMarket();
   const orderbook = createWideOrderbook();

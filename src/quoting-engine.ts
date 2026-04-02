@@ -263,7 +263,13 @@ function generateAutonomousQuoteSignals(params: {
   now: Date;
 }): StrategySignal[] {
   const { context, runtimeConfig, now } = params;
+  const postSniperGraceActive = isPostSniperMmGraceWindowActive({
+    activationTrigger: context.activationTrigger,
+    runtimeConfig,
+    now,
+  });
   if (
+    !postSniperGraceActive &&
     runtimeConfig.SNIPER_MODE_ENABLED &&
     context.binanceAssessment?.available &&
     context.binanceAssessment.direction !== 'FLAT' &&
@@ -521,6 +527,23 @@ function generateAutonomousQuoteSignals(params: {
   }
 
   return builtSignals;
+}
+
+function isPostSniperMmGraceWindowActive(params: {
+  activationTrigger?: QuoteActivationTrigger;
+  runtimeConfig: AppConfig;
+  now: Date;
+}): boolean {
+  const { activationTrigger, runtimeConfig, now } = params;
+  if (
+    !activationTrigger ||
+    activationTrigger.triggerLayer !== 'SNIPER' ||
+    runtimeConfig.MM_POST_SNIPER_GRACE_WINDOW_MS <= 0
+  ) {
+    return false;
+  }
+
+  return now.getTime() - activationTrigger.activatedAtMs <= runtimeConfig.MM_POST_SNIPER_GRACE_WINDOW_MS;
 }
 
 function buildAutonomousSignal(params: {

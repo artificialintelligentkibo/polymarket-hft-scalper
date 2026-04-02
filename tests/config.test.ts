@@ -59,6 +59,7 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.BALANCE_CACHE_TTL_MS, 10000);
   assert.equal(candidate.MARKET_MAKER_MODE, false);
   assert.equal(candidate.DYNAMIC_QUOTING_ENABLED, false);
+  assert.equal(candidate.MM_POST_SNIPER_GRACE_WINDOW_MS, 15000);
   assert.equal(candidate.POST_ONLY_ONLY, true);
   assert.equal(candidate.QUOTING_INTERVAL_MS, 150);
   assert.equal(candidate.MAX_IMBALANCE_PERCENT, 35);
