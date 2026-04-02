@@ -97,7 +97,12 @@ export class LotteryEngine {
       });
     }
 
-    const targetPrice = roundTo(clamp(book.bestBid ?? config.maxCents, config.minCents, config.maxCents), 6);
+    const pricing = this.resolveLotteryTargetPrice({
+      book,
+      triggerFillPrice: params.triggerFillPrice,
+      config,
+    });
+    const targetPrice = pricing.targetPrice;
     const shares = roundTo(
       Math.min(
         config.maxRiskUsdc / targetPrice,
@@ -123,6 +128,10 @@ export class LotteryEngine {
       triggerFilledShares: roundTo(params.triggerFilledShares, 4),
       currentBestBid: book.bestBid,
       currentBestAsk: book.bestAsk,
+      pricingMode: pricing.mode,
+      pricingAnchorSource: pricing.anchorSource,
+      pricingAnchorPrice: pricing.anchorPrice,
+      rawTargetPrice: pricing.rawTargetPrice,
       targetPrice,
       shares: roundTo(shares, 2),
       riskUsdc: roundTo(riskUsdc, 2),
@@ -194,6 +203,16 @@ export class LotteryEngine {
         entryPrice: nextEntryPrice,
       });
       this.totalRiskUsdc = roundTo(this.totalRiskUsdc + notionalUsd, 4);
+      logger.info('Lottery ticket filled', {
+        marketId: params.marketId,
+        outcome: params.outcome,
+        filledShares: roundTo(params.filledShares, 4),
+        fillPrice: roundTo(params.fillPrice, 6),
+        totalShares: nextShares,
+        avgEntryPrice: nextEntryPrice,
+        ticketCount: this.totalTickets,
+        activeEntries: this.activeEntries.size,
+      });
       return;
     }
 
@@ -211,6 +230,16 @@ export class LotteryEngine {
       triggerSignalType: params.signalType,
       enteredAtMs: Date.now(),
       maxRiskUsdc: notionalUsd,
+    });
+    logger.info('Lottery ticket filled', {
+      marketId: params.marketId,
+      outcome: params.outcome,
+      filledShares: roundTo(params.filledShares, 4),
+      fillPrice: roundTo(params.fillPrice, 6),
+      totalShares: roundTo(params.filledShares, 4),
+      avgEntryPrice: roundTo(params.fillPrice, 6),
+      ticketCount: this.totalTickets,
+      activeEntries: this.activeEntries.size,
     });
   }
 
@@ -264,5 +293,58 @@ export class LotteryEngine {
 
   private getEntryKey(marketId: string, outcome: Outcome): string {
     return `${marketId}:${outcome}`;
+  }
+
+  private resolveLotteryTargetPrice(params: {
+    book: MarketOrderbookSnapshot['yes'] | MarketOrderbookSnapshot['no'];
+    triggerFillPrice: number;
+    config: LotteryConfig;
+  }): {
+    targetPrice: number;
+    rawTargetPrice: number;
+    anchorPrice: number;
+    anchorSource: 'best_bid' | 'mid_price' | 'best_ask' | 'trigger_complement' | 'fixed_cap';
+    mode: 'relative' | 'fixed';
+  } {
+    const { book, triggerFillPrice, config } = params;
+    const triggerComplement = clamp(1 - triggerFillPrice, 0.01, 0.99);
+    const bestBid =
+      book.bestBid !== null && Number.isFinite(book.bestBid) ? Math.max(0.01, book.bestBid) : null;
+    const midPrice =
+      book.midPrice !== null && Number.isFinite(book.midPrice) ? Math.max(0.01, book.midPrice) : null;
+    const bestAsk =
+      book.bestAsk !== null && Number.isFinite(book.bestAsk) ? Math.max(0.01, book.bestAsk) : null;
+
+    if (config.relativePricingEnabled) {
+      const anchorPrice = bestBid ?? midPrice ?? bestAsk ?? triggerComplement;
+      const anchorSource =
+        bestBid !== null
+          ? 'best_bid'
+          : midPrice !== null
+            ? 'mid_price'
+            : bestAsk !== null
+              ? 'best_ask'
+              : 'trigger_complement';
+      const rawTargetPrice = roundTo(anchorPrice * config.relativePriceFactor, 6);
+      return {
+        targetPrice: roundTo(
+          clamp(rawTargetPrice, config.minCents, config.relativeMaxCents),
+          6
+        ),
+        rawTargetPrice,
+        anchorPrice: roundTo(anchorPrice, 6),
+        anchorSource,
+        mode: 'relative',
+      };
+    }
+
+    const anchorPrice = bestBid ?? config.maxCents;
+    return {
+      targetPrice: roundTo(clamp(anchorPrice, config.minCents, config.maxCents), 6),
+      rawTargetPrice: roundTo(anchorPrice, 6),
+      anchorPrice: roundTo(anchorPrice, 6),
+      anchorSource: bestBid !== null ? 'best_bid' : 'fixed_cap',
+      mode: 'fixed',
+    };
   }
 }

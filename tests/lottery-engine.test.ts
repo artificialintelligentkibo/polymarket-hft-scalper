@@ -106,6 +106,7 @@ test('lottery engine generates a passive opposite-side resting bid within the co
     LOTTERY_MAX_RISK_USDC: '12',
     LOTTERY_MIN_CENTS: '0.03',
     LOTTERY_MAX_CENTS: '0.07',
+    LOTTERY_RELATIVE_PRICING_ENABLED: 'false',
   });
   const engine = new LotteryEngine(runtimeConfig);
   const signal = engine.generateLotterySignal({
@@ -128,6 +129,35 @@ test('lottery engine generates a passive opposite-side resting bid within the co
   assert.equal(signal.reduceOnly, false);
   assert.equal(signal.targetPrice, 0.07);
   assert.equal(signal.shares <= 171.43, true);
+  assert.equal(signal.shares * (signal.targetPrice ?? 0) <= 12.01, true);
+});
+
+test('lottery engine can anchor bids relative to the live opposite-side best bid', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    LOTTERY_LAYER_ENABLED: 'true',
+    LOTTERY_MIN_CENTS: '0.03',
+    LOTTERY_MAX_CENTS: '0.07',
+    LOTTERY_RELATIVE_PRICING_ENABLED: 'true',
+    LOTTERY_RELATIVE_PRICE_FACTOR: '0.25',
+    LOTTERY_RELATIVE_MAX_CENTS: '0.20',
+  });
+  const engine = new LotteryEngine(runtimeConfig);
+  const signal = engine.generateLotterySignal({
+    market: createMarket(),
+    orderbook: createOrderbook(),
+    positionManager: new PositionManager('market-1'),
+    triggerSignalType: 'SNIPER_BUY',
+    triggerOutcome: 'YES',
+    triggerFillPrice: 0.31,
+    triggerFilledShares: 6,
+    config: runtimeConfig.lottery,
+    slotKey: 'slot-1',
+  });
+
+  assert.ok(signal);
+  assert.equal(signal.signalType, 'LOTTERY_BUY');
+  assert.equal(signal.targetPrice, 0.1325);
   assert.equal(signal.shares * (signal.targetPrice ?? 0) <= 12.01, true);
 });
 

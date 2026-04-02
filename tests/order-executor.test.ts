@@ -110,3 +110,33 @@ test('lottery passive buys respect the configured cheap target price', () => {
   assert.equal(plan.postOnly, true);
   assert.equal(plan.urgency, 'passive');
 });
+
+test('lottery passive buys preserve relative-priced targets without drifting to the live book', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+  });
+
+  const executor = new OrderExecutor(undefined, runtimeConfig) as any;
+  const plan = executor.buildExecutionPlan(
+    createSignal({
+      signalType: 'LOTTERY_BUY',
+      urgency: 'passive',
+      targetPrice: 0.1325,
+      referencePrice: 0.1325,
+      tokenPrice: 0.1325,
+      midPrice: 0.1325,
+    }),
+    {
+      bids: [{ price: 0.61, size: 100 }],
+      asks: [{ price: 0.62, size: 100 }],
+      bestBid: 0.61,
+      bestAsk: 0.62,
+    }
+  );
+
+  assert.equal(plan.price, 0.1325);
+  assert.equal(plan.postOnly, true);
+  assert.equal(plan.urgency, 'passive');
+});

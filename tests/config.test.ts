@@ -104,6 +104,9 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.lottery.maxRiskUsdc, 12);
   assert.equal(candidate.lottery.minCents, 0.03);
   assert.equal(candidate.lottery.maxCents, 0.07);
+  assert.equal(candidate.lottery.relativePricingEnabled, true);
+  assert.equal(candidate.lottery.relativePriceFactor, 0.25);
+  assert.equal(candidate.lottery.relativeMaxCents, 0.07);
   assert.equal(candidate.lottery.onlyAfterSniper, true);
   assert.equal(candidate.lottery.maxPerSlot, 1);
   assert.equal(candidate.strategy.minCombinedDiscount, 0.01);

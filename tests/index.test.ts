@@ -1423,6 +1423,30 @@ test('live wallet reconciliation clears zero-balance ghost positions', async () 
   assert.equal(runtime.positions.has(market.marketId), false);
 });
 
+test('live wallet reconciliation preserves fresh fills while settlement confirmation is active', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.5,
+  });
+
+  runtime.markets.set(market.marketId, market);
+  runtime.positions.set(market.marketId, positionManager);
+  runtime.settlementStartedAt.set(`${market.marketId}:YES`, Date.now());
+  runtime.executor = {
+    getOutcomeTokenBalance: async () => 0,
+    invalidateOutcomeBalanceCache: () => {},
+  };
+
+  await runtime.reconcileLivePositionsWithWallet(true);
+
+  assert.equal(runtime.positions.has(market.marketId), true);
+});
+
 test('live wallet reconciliation preserves positions with non-zero balances', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const market = createMarket();

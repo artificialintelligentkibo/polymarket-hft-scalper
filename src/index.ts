@@ -2764,6 +2764,21 @@ export class MarketMakerRuntime {
           normalizedYesBalance <= LIVE_POSITION_RECONCILIATION_EPSILON &&
           normalizedNoBalance <= LIVE_POSITION_RECONCILIATION_EPSILON
         ) {
+          if (this.hasPendingSettlementConfirmationForSnapshot(marketId, snapshot)) {
+            logger.debug(
+              'Skipped stale live position cleanup while token settlement confirmation is active',
+              {
+                marketId,
+                conditionId: market.conditionId,
+                localYesShares: snapshot.yesShares,
+                localNoShares: snapshot.noShares,
+                walletYesShares: normalizedYesBalance,
+                walletNoShares: normalizedNoBalance,
+              }
+            );
+            continue;
+          }
+
           logger.info('Cleared stale live position after wallet balance reconciliation', {
             marketId,
             conditionId: market.conditionId,
@@ -3297,6 +3312,25 @@ export class MarketMakerRuntime {
     this.settlementCooldowns.delete(key);
     this.settlementStartedAt.delete(key);
     this.settlementAttempts.delete(key);
+  }
+
+  private hasSettlementConfirmation(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): boolean {
+    return this.settlementStartedAt.has(getSettlementCooldownKey(marketId, outcome));
+  }
+
+  private hasPendingSettlementConfirmationForSnapshot(
+    marketId: string,
+    snapshot: ReturnType<PositionManager['getSnapshot']>
+  ): boolean {
+    return (
+      (snapshot.yesShares > LIVE_POSITION_RECONCILIATION_EPSILON &&
+        this.hasSettlementConfirmation(marketId, 'YES')) ||
+      (snapshot.noShares > LIVE_POSITION_RECONCILIATION_EPSILON &&
+        this.hasSettlementConfirmation(marketId, 'NO'))
+    );
   }
 
   private skipReduceOnlySellForDust(params: {

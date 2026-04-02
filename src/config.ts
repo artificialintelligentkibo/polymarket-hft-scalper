@@ -78,10 +78,16 @@ export interface LotteryConfig {
   readonly enabled: boolean;
   /** Maximum USDC risk per lottery ticket. */
   readonly maxRiskUsdc: number;
-  /** Cheapest ask considered valid for a lottery entry. */
+  /** Absolute floor for a lottery bid price. */
   readonly minCents: number;
-  /** Most expensive ask considered valid for a lottery entry. */
+  /** Legacy fixed-price ceiling for lottery bids. */
   readonly maxCents: number;
+  /** Whether lottery bids should be anchored to the live opposite-side book. */
+  readonly relativePricingEnabled: boolean;
+  /** Fraction of the opposite-side best bid used as the initial lottery anchor. */
+  readonly relativePriceFactor: number;
+  /** Hard cap for relative lottery bids before order-executor post-only adjustment. */
+  readonly relativeMaxCents: number;
   /** Only trigger lottery entries after a confirmed sniper fill. */
   readonly onlyAfterSniper: boolean;
   /** Maximum number of lottery tickets allowed inside the same 5-minute slot. */
@@ -890,6 +896,12 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxRiskUsdc: parseFloatOrDefault(env.LOTTERY_MAX_RISK_USDC, '12'),
       minCents: parseFloatOrDefault(env.LOTTERY_MIN_CENTS, '0.03'),
       maxCents: parseFloatOrDefault(env.LOTTERY_MAX_CENTS, '0.07'),
+      relativePricingEnabled: parseBoolean(env.LOTTERY_RELATIVE_PRICING_ENABLED, true),
+      relativePriceFactor: parseFloatOrDefault(env.LOTTERY_RELATIVE_PRICE_FACTOR, '0.25'),
+      relativeMaxCents: parseFloatOrDefault(
+        env.LOTTERY_RELATIVE_MAX_CENTS ?? env.LOTTERY_MAX_CENTS,
+        '0.07'
+      ),
       onlyAfterSniper: parseBoolean(env.LOTTERY_ONLY_AFTER_SNIPER, true),
       maxPerSlot: Math.max(0, parseIntOrDefault(env.LOTTERY_MAX_PER_SLOT, '1')),
     },
@@ -1268,6 +1280,19 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.lottery.maxCents <= candidate.lottery.minCents) {
     throw new Error('LOTTERY_MAX_CENTS must be greater than LOTTERY_MIN_CENTS.');
+  }
+
+  if (
+    candidate.lottery.relativePriceFactor <= 0 ||
+    candidate.lottery.relativePriceFactor > 1
+  ) {
+    throw new Error('LOTTERY_RELATIVE_PRICE_FACTOR must be in the range (0, 1].');
+  }
+
+  if (candidate.lottery.relativeMaxCents <= candidate.lottery.minCents) {
+    throw new Error(
+      'LOTTERY_RELATIVE_MAX_CENTS must be greater than LOTTERY_MIN_CENTS.'
+    );
   }
 
   if (candidate.sniper.maxConcurrentSameDirection < 1) {
