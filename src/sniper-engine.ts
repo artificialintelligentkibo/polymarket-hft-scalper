@@ -676,22 +676,54 @@ export class SniperEngine {
 
       const book = entry.outcome === 'YES' ? params.orderbook.yes : params.orderbook.no;
       const bestBid = book.bestBid;
-      if (bestBid === null) {
+      const slotEndMs = parseSlotBoundary(params.market.endTime);
+      const slotEndWindowOpen =
+        slotEndMs !== null &&
+        params.config.exitBeforeEndMs > 0 &&
+        slotEndMs - params.nowMs <= params.config.exitBeforeEndMs;
+      const slotEndExitPrice = bestBid ?? book.midPrice;
+
+      if (bestBid === null && !slotEndWindowOpen) {
         continue;
       }
 
       const exitShares = roundTo(Math.min(currentShares, entry.shares), 4);
-      if (roundTo(exitShares * bestBid, 6) < 1) {
+      const liquidationReferencePrice =
+        slotEndWindowOpen && slotEndExitPrice !== null ? slotEndExitPrice : bestBid;
+      if (
+        liquidationReferencePrice === null ||
+        roundTo(exitShares * liquidationReferencePrice, 6) < 1
+      ) {
         this.clearActiveEntry(entry.marketId, entry.outcome);
         continue;
       }
-      const pnlEdge = roundTo(bestBid - entry.entryPrice, 6);
+
+      const pnlEdge = roundTo(liquidationReferencePrice - entry.entryPrice, 6);
+      if (slotEndWindowOpen) {
+        return [
+          buildSniperExitSignal(params.market, params.orderbook, {
+            entry,
+            shares: exitShares,
+            exitPrice: liquidationReferencePrice,
+            edgeAmount: pnlEdge,
+            signalType: 'SNIPER_SCALP_EXIT',
+            urgency: 'cross',
+            reason: `Sniper slot-end exit: ${Math.max(0, slotEndMs - params.nowMs)}ms before slot end with pnl ${(pnlEdge * 100).toFixed(2)}%`,
+            nowMs: params.nowMs,
+          }),
+        ];
+      }
+
+      if (bestBid === null) {
+        continue;
+      }
+
       if (pnlEdge >= params.config.scalpExitEdge) {
         return [
           buildSniperExitSignal(params.market, params.orderbook, {
             entry,
             shares: exitShares,
-            bestBid,
+            exitPrice: bestBid,
             edgeAmount: pnlEdge,
             signalType: 'SNIPER_SCALP_EXIT',
             urgency: 'cross',
@@ -710,7 +742,7 @@ export class SniperEngine {
           buildSniperExitSignal(params.market, params.orderbook, {
             entry,
             shares: exitShares,
-            bestBid,
+            exitPrice: bestBid,
             edgeAmount: pnlEdge,
             signalType: 'SNIPER_SCALP_EXIT',
             urgency: 'cross',
@@ -729,7 +761,7 @@ export class SniperEngine {
           buildSniperExitSignal(params.market, params.orderbook, {
             entry,
             shares: exitShares,
-            bestBid,
+            exitPrice: bestBid,
             edgeAmount: pnlEdge,
             signalType: 'SNIPER_SCALP_EXIT',
             urgency: 'cross',
@@ -978,7 +1010,7 @@ function buildSniperExitSignal(
   params: {
     entry: SniperEntry;
     shares: number;
-    bestBid: number;
+    exitPrice: number;
     edgeAmount: number;
     signalType: 'SNIPER_SCALP_EXIT';
     urgency: StrategySignal['urgency'];
@@ -996,9 +1028,9 @@ function buildSniperExitSignal(
     outcome: params.entry.outcome,
     outcomeIndex: params.entry.outcome === 'YES' ? 0 : 1,
     shares: params.shares,
-    targetPrice: roundTo(params.bestBid, 6),
+    targetPrice: roundTo(params.exitPrice, 6),
     referencePrice: params.entry.entryPrice,
-    tokenPrice: params.bestBid,
+    tokenPrice: params.exitPrice,
     midPrice: params.entry.outcome === 'YES' ? orderbook.yes.midPrice : orderbook.no.midPrice,
     fairValue: params.entry.entryPrice,
     edgeAmount: params.edgeAmount,

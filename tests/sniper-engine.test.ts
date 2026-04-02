@@ -253,6 +253,79 @@ test('sniper engine emits scalp exit after entry reprices in our favor', () => {
   assert.equal(signals[0]?.urgency, 'cross');
 });
 
+test('sniper engine forces a cross exit inside the slot-end window even below the scalp target', () => {
+  const runtimeConfig = createRuntimeConfig({
+    SNIPER_EXIT_BEFORE_END_MS: '30000',
+    SNIPER_SCALP_EXIT_EDGE: '0.08',
+  });
+  const engine = new SniperEngine(runtimeConfig);
+  const market = createMarket();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 6,
+    price: 0.52,
+  });
+
+  engine.recordExecution({
+    market,
+    signal: {
+      marketId: market.marketId,
+      marketTitle: market.title,
+      signalType: 'SNIPER_BUY',
+      priority: 1200,
+      action: 'BUY',
+      outcome: 'YES',
+      outcomeIndex: 0,
+      shares: 6,
+      targetPrice: 0.52,
+      referencePrice: 0.6,
+      tokenPrice: 0.52,
+      midPrice: 0.51,
+      fairValue: 0.6,
+      edgeAmount: 0.04,
+      combinedBid: 0.96,
+      combinedAsk: 1.02,
+      combinedMid: 0.99,
+      combinedDiscount: -0.02,
+      combinedPremium: 0.02,
+      fillRatio: 1,
+      capitalClamp: 1,
+      priceMultiplier: 1,
+      urgency: 'cross',
+      reduceOnly: false,
+      reason: 'entry',
+    },
+    filledShares: 6,
+    fillPrice: 0.52,
+    executedAtMs: Date.parse('2026-03-31T10:01:00.000Z'),
+  });
+
+  const signals = engine.generateSignals({
+    market,
+    orderbook: createOrderbook({
+      yes: {
+        ...createOrderbook().yes,
+        bestBid: 0.54,
+        bestAsk: 0.55,
+        midPrice: 0.545,
+      },
+    }),
+    positionManager,
+    binanceAssessment: createAssessment(),
+    config: runtimeConfig.sniper,
+    nowMs: Date.parse('2026-03-31T10:04:40.000Z'),
+  });
+
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0]?.signalType, 'SNIPER_SCALP_EXIT');
+  assert.equal(signals[0]?.action, 'SELL');
+  assert.equal(signals[0]?.urgency, 'cross');
+  assert.match(signals[0]?.reason ?? '', /slot-end exit/i);
+});
+
 test('sniper engine emits reversal stop when Binance flips and pnl is below stop threshold', () => {
   const runtimeConfig = createRuntimeConfig({
     SNIPER_STOP_LOSS_PCT: '0.05',
