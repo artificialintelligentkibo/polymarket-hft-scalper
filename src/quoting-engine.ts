@@ -134,18 +134,19 @@ export function buildMarketMakerQuoteSignals(params: {
           : null
       : null;
 
+  builtSignals.push(
+    ...generatePostSniperAskSignals({
+      context: params.context,
+      runtimeConfig,
+      quoteSpreadTicks,
+      now,
+    })
+  );
+
   if (
     runtimeConfig.MM_AUTONOMOUS_QUOTES &&
     (params.context.quoteSignals.length === 0 || runtimeConfig.MM_ALWAYS_QUOTE)
   ) {
-    builtSignals.push(
-      ...generatePostSniperAskSignals({
-        context: params.context,
-        runtimeConfig,
-        quoteSpreadTicks,
-        now,
-      })
-    );
     builtSignals.push(
       ...generateAutonomousQuoteSignals({
         context: params.context,

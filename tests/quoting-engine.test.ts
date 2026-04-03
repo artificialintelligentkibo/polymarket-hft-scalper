@@ -713,6 +713,51 @@ test('post-sniper MM fast path still emits a reduce-only ask when the regular MM
   );
 });
 
+test('post-sniper MM fast path still emits when autonomous MM is disabled', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 0);
+
+  const now = new Date('2026-03-24T10:01:00.000Z');
+  const runtimeConfig = createMmConfig({
+    MM_AUTONOMOUS_QUOTES: 'false',
+    MM_POST_SNIPER_GRACE_WINDOW_MS: '15000',
+    MM_QUOTE_SHARES: '6',
+    POST_ONLY_ONLY: 'true',
+  });
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+      activationTrigger: {
+        triggerLayer: 'SNIPER',
+        entryOutcome: 'YES',
+        entryPrice: 0.35,
+        entryShares: 6,
+        activatedAtMs: now.getTime() - 5_000,
+      },
+    },
+    runtimeConfig,
+    now,
+  });
+
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_ASK' && signal.outcome === 'YES'
+    ),
+    true
+  );
+  assert.equal(
+    plan.signals.some((signal) => signal.signalType === 'MM_QUOTE_BID'),
+    false
+  );
+});
+
 test('post-sniper MM asks stay above entry with a passive maker floor', () => {
   const market = createMarket();
   const orderbook = createOrderbook();
