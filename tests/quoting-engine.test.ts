@@ -844,11 +844,11 @@ test('autonomous MM only emits asks after the gross exposure cap is reached', ()
   assert.equal(plan.signals.some((signal) => signal.action === 'SELL'), true);
 });
 
-test('autonomous MM skews YES quotes lower when YES inventory is heavy', () => {
+test('autonomous MM biases toward exits when YES inventory is heavy', () => {
   const market = createMarket();
   const orderbook = createWideOrderbook();
   const runtimeConfig = createMmConfig({
-    MM_QUOTE_SHARES: '4',
+    MM_QUOTE_SHARES: '6',
     MM_INVENTORY_SKEW_FACTOR: '0.5',
   });
 
@@ -866,7 +866,7 @@ test('autonomous MM skews YES quotes lower when YES inventory is heavy', () => {
   });
 
   const lightPositionManager = new PositionManager(market.marketId, market.endTime);
-  seedInventory(lightPositionManager, 1, 0);
+  seedInventory(lightPositionManager, 5, 0);
   const lightPlan = buildQuoteRefreshPlan({
     context: {
       market,
@@ -908,9 +908,9 @@ test('autonomous MM skews YES quotes lower when YES inventory is heavy', () => {
 
   assert.ok(neutralYesBid?.targetPrice !== null);
   assert.ok(lightYesAsk?.targetPrice !== null);
-  assert.ok(skewedYesBid?.targetPrice !== null);
   assert.ok(skewedYesAsk?.targetPrice !== null);
-  assert.ok((skewedYesBid?.targetPrice ?? 0) < (neutralYesBid?.targetPrice ?? 0));
+  assert.equal(skewedYesBid, undefined);
+  assert.ok((neutralYesBid?.targetPrice ?? 0) > 0);
   assert.ok((skewedYesAsk?.targetPrice ?? 0) < (lightYesAsk?.targetPrice ?? 0));
 });
 
@@ -1047,4 +1047,80 @@ test('autonomous MM allows YES bids again once pending YES exposure is gone', ()
     ),
     true
   );
+});
+
+test('autonomous MM blocks entry bids when the quoted price is outside the allowed band', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.yes = {
+    ...orderbook.yes,
+    bids: [{ price: 0.94, size: 100 }],
+    asks: [{ price: 0.96, size: 100 }],
+    bestBid: 0.94,
+    bestAsk: 0.96,
+    midPrice: 0.95,
+    spread: 0.02,
+    depthSharesBid: 100,
+    depthSharesAsk: 100,
+    depthNotionalBid: 94,
+    depthNotionalAsk: 96,
+    lastTradePrice: 0.95,
+  };
+  orderbook.no = {
+    ...orderbook.no,
+    bids: [{ price: 0.02, size: 100 }],
+    asks: [{ price: 0.04, size: 100 }],
+    bestBid: 0.02,
+    bestAsk: 0.04,
+    midPrice: 0.03,
+    spread: 0.02,
+    depthSharesBid: 100,
+    depthSharesAsk: 100,
+    depthNotionalBid: 2,
+    depthNotionalAsk: 4,
+    lastTradePrice: 0.03,
+  };
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_AUTONOMOUS_MIN_BID_PRICE: '0.10',
+      MM_AUTONOMOUS_MAX_BID_PRICE: '0.90',
+    }),
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(plan.signals.length, 0);
+});
+
+test('autonomous MM skips dust asks that do not meet the minimum tradable size', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 0.7, 0.7);
+  const runtimeConfig = createMmConfig({
+    MM_MAX_GROSS_EXPOSURE_USD: '30',
+  });
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    currentMMExposureUsd: runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD,
+    runtimeConfig,
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(plan.signals.length, 0);
 });

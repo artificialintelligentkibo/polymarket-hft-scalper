@@ -450,85 +450,121 @@ function generateAutonomousQuoteSignals(params: {
       continue;
     }
 
-    const bidShares = roundTo(runtimeConfig.MM_QUOTE_SHARES, 4);
-    const bidNotionalUsd = roundTo(bidShares * bidPrice, 4);
-    const entryCapacity = resolvePendingAwareEntryCapacity({
-      outcome,
-      snapshot,
-      pendingQuoteExposure,
-      maxNetYes: runtimeConfig.strategy.maxNetYes,
-      maxNetNo: runtimeConfig.strategy.maxNetNo,
-    });
-    const projectedDirectionalInventory =
-      netInventory + (outcome === 'YES' ? bidShares : -bidShares);
-    const increasesDirectionalRisk =
-      Math.abs(projectedDirectionalInventory) > runtimeConfig.MM_MAX_NET_DIRECTIONAL &&
-      Math.abs(projectedDirectionalInventory) >= Math.abs(netInventory);
-
     if (
-      context.allowEntryQuotes === false ||
-      context.riskAssessment.blockedOutcomes.has(outcome) ||
-      overweightOutcome === outcome ||
-      entryCapacity < bidShares ||
-      increasesDirectionalRisk ||
-      projectedExposureUsd + bidNotionalUsd > runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
+      bidPrice < runtimeConfig.MM_AUTONOMOUS_MIN_BID_PRICE ||
+      bidPrice > runtimeConfig.MM_AUTONOMOUS_MAX_BID_PRICE
     ) {
       logMmQuoteSkip({
         context,
         runtimeConfig,
         now,
-        reason:
-          context.allowEntryQuotes === false
-            ? 'concurrent_limit'
-            : projectedExposureUsd + bidNotionalUsd > runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
-              ? 'exposure_limit'
-              : 'inventory_limit',
+        reason: 'price_out_of_band',
         details: {
           outcome,
-          entryCapacity,
-          overweightOutcome,
-          projectedExposureUsd: roundTo(projectedExposureUsd + bidNotionalUsd, 4),
-          maxExposureUsd: runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD,
-          netInventory: roundTo(netInventory, 4),
-          projectedDirectionalInventory: roundTo(projectedDirectionalInventory, 4),
-          maxDirectionalInventory: runtimeConfig.MM_MAX_NET_DIRECTIONAL,
+          bidPrice,
+          minBidPrice: runtimeConfig.MM_AUTONOMOUS_MIN_BID_PRICE,
+          maxBidPrice: runtimeConfig.MM_AUTONOMOUS_MAX_BID_PRICE,
         },
       });
     } else {
-      builtSignals.push(
-        buildAutonomousSignal({
-          market: context.market,
-          orderbook: context.orderbook,
-          runtimeConfig,
-          action: 'BUY',
-          outcome,
-          signalType: 'MM_QUOTE_BID',
-          shares: bidShares,
-          targetPrice: bidPrice,
-          referencePrice: fairValue ?? pricingAnchor,
-          fairValue: skewedFairValue,
-          actualSpread,
-          reason: 'Autonomous MM bid',
-          now,
-        })
-      );
-      projectedExposureUsd += bidNotionalUsd;
-      logger.debug('MM autonomous quote generated', {
-        marketId: context.market.marketId,
+      const bidShares = roundTo(runtimeConfig.MM_QUOTE_SHARES, 4);
+      const bidNotionalUsd = roundTo(bidShares * bidPrice, 4);
+      const entryCapacity = resolvePendingAwareEntryCapacity({
         outcome,
-        action: 'BID',
-        price: bidPrice,
-        fairValue,
-        skewedFairValue,
-        spread: actualSpread,
-        inventorySkew: roundTo(skewAdjustment, 6),
-        grossExposure: roundTo(projectedExposureUsd, 4),
+        snapshot,
+        pendingQuoteExposure,
+        maxNetYes: runtimeConfig.strategy.maxNetYes,
+        maxNetNo: runtimeConfig.strategy.maxNetNo,
       });
+      const projectedDirectionalInventory =
+        netInventory + (outcome === 'YES' ? bidShares : -bidShares);
+      const increasesDirectionalRisk =
+        Math.abs(projectedDirectionalInventory) > runtimeConfig.MM_MAX_NET_DIRECTIONAL &&
+        Math.abs(projectedDirectionalInventory) >= Math.abs(netInventory);
+
+      if (
+        context.allowEntryQuotes === false ||
+        context.riskAssessment.blockedOutcomes.has(outcome) ||
+        overweightOutcome === outcome ||
+        entryCapacity < bidShares ||
+        increasesDirectionalRisk ||
+        projectedExposureUsd + bidNotionalUsd > runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
+      ) {
+        logMmQuoteSkip({
+          context,
+          runtimeConfig,
+          now,
+          reason:
+            context.allowEntryQuotes === false
+              ? 'concurrent_limit'
+              : projectedExposureUsd + bidNotionalUsd > runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
+                ? 'exposure_limit'
+                : 'inventory_limit',
+          details: {
+            outcome,
+            entryCapacity,
+            overweightOutcome,
+            projectedExposureUsd: roundTo(projectedExposureUsd + bidNotionalUsd, 4),
+            maxExposureUsd: runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD,
+            netInventory: roundTo(netInventory, 4),
+            projectedDirectionalInventory: roundTo(projectedDirectionalInventory, 4),
+            maxDirectionalInventory: runtimeConfig.MM_MAX_NET_DIRECTIONAL,
+          },
+        });
+      } else {
+        builtSignals.push(
+          buildAutonomousSignal({
+            market: context.market,
+            orderbook: context.orderbook,
+            runtimeConfig,
+            action: 'BUY',
+            outcome,
+            signalType: 'MM_QUOTE_BID',
+            shares: bidShares,
+            targetPrice: bidPrice,
+            referencePrice: fairValue ?? pricingAnchor,
+            fairValue: skewedFairValue,
+            actualSpread,
+            reason: 'Autonomous MM bid',
+            now,
+          })
+        );
+        projectedExposureUsd += bidNotionalUsd;
+        logger.debug('MM autonomous quote generated', {
+          marketId: context.market.marketId,
+          outcome,
+          action: 'BID',
+          price: bidPrice,
+          fairValue,
+          skewedFairValue,
+          spread: actualSpread,
+          inventorySkew: roundTo(skewAdjustment, 6),
+          grossExposure: roundTo(projectedExposureUsd, 4),
+        });
+      }
     }
 
     const openShares = context.positionManager.getShares(outcome);
     const askShares = Math.min(roundTo(runtimeConfig.MM_QUOTE_SHARES, 4), openShares);
     if (askShares <= 0) {
+      continue;
+    }
+
+    const minimumAskShares = resolveMinimumTradableShares(askPrice, 0);
+    if (askShares < minimumAskShares) {
+      logMmQuoteSkip({
+        context,
+        runtimeConfig,
+        now,
+        reason: 'below_minimum_size',
+        details: {
+          outcome,
+          mode: 'autonomous_ask',
+          askShares,
+          minimumShares: minimumAskShares,
+          askPrice,
+        },
+      });
       continue;
     }
 

@@ -195,6 +195,10 @@ export interface AppConfig {
   readonly MM_REQUIRE_FAIR_VALUE: boolean;
   /** Minimum visible depth on both sides of the book before quoting. */
   readonly MM_MIN_BOOK_DEPTH_USD: number;
+  /** Lowest autonomous MM bid price allowed for fresh entry quotes. */
+  readonly MM_AUTONOMOUS_MIN_BID_PRICE: number;
+  /** Highest autonomous MM bid price allowed for fresh entry quotes. */
+  readonly MM_AUTONOMOUS_MAX_BID_PRICE: number;
   /** Maximum number of markets allowed to carry active MM inventory/quotes. */
   readonly MM_MAX_CONCURRENT_MARKETS: number;
   /** Amount of inventory-based fair-value skew applied to autonomous quotes. */
@@ -642,6 +646,8 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ),
     MM_REQUIRE_FAIR_VALUE: parseBoolean(env.MM_REQUIRE_FAIR_VALUE, true),
     MM_MIN_BOOK_DEPTH_USD: parseFloatOrDefault(env.MM_MIN_BOOK_DEPTH_USD, '3'),
+    MM_AUTONOMOUS_MIN_BID_PRICE: parseFloatOrDefault(env.MM_AUTONOMOUS_MIN_BID_PRICE, '0.10'),
+    MM_AUTONOMOUS_MAX_BID_PRICE: parseFloatOrDefault(env.MM_AUTONOMOUS_MAX_BID_PRICE, '0.90'),
     MM_MAX_CONCURRENT_MARKETS: Math.max(
       1,
       parseIntOrDefault(env.MM_MAX_CONCURRENT_MARKETS, '4')
@@ -1494,6 +1500,26 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.MM_MAX_NET_DIRECTIONAL <= 0) {
     throw new Error('MM_MAX_NET_DIRECTIONAL must be positive.');
+  }
+
+  if (
+    candidate.MM_AUTONOMOUS_MIN_BID_PRICE < 0.01 ||
+    candidate.MM_AUTONOMOUS_MIN_BID_PRICE >= 0.99
+  ) {
+    throw new Error('MM_AUTONOMOUS_MIN_BID_PRICE must be in the range [0.01, 0.99).');
+  }
+
+  if (
+    candidate.MM_AUTONOMOUS_MAX_BID_PRICE <= 0.01 ||
+    candidate.MM_AUTONOMOUS_MAX_BID_PRICE > 0.99
+  ) {
+    throw new Error('MM_AUTONOMOUS_MAX_BID_PRICE must be in the range (0.01, 0.99].');
+  }
+
+  if (candidate.MM_AUTONOMOUS_MIN_BID_PRICE >= candidate.MM_AUTONOMOUS_MAX_BID_PRICE) {
+    throw new Error(
+      'MM_AUTONOMOUS_MIN_BID_PRICE must be lower than MM_AUTONOMOUS_MAX_BID_PRICE.'
+    );
   }
 
   if (candidate.MM_INVENTORY_SKEW_FACTOR < 0 || candidate.MM_INVENTORY_SKEW_FACTOR > 1) {
