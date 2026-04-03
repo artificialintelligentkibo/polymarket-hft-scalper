@@ -1758,6 +1758,103 @@ test('quote refresh retention replaces passive MM orders once they age past the 
   assert.equal(plan.newSignals.length, 1);
 });
 
+test('tracked resting MM asks block duplicate post-sniper sell placement', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.fillTracker = {
+    getPendingOrders: () => [],
+  };
+
+  assert.equal(
+    runtime.hasTrackedRestingMmAskOrder({
+      marketId: 'market-1',
+      outcome: 'YES',
+      quoteOrders: [
+        {
+          orderId: 'quote-1',
+          marketId: 'market-1',
+          outcome: 'YES',
+          action: 'SELL',
+          signalType: 'MM_QUOTE_ASK',
+          targetPrice: 0.42,
+          shares: 6,
+          urgency: 'passive',
+          placedAtMs: 10_000,
+        },
+      ],
+    }),
+    true
+  );
+
+  runtime.fillTracker = {
+    getPendingOrders: () => [
+      {
+        orderId: 'pending-1',
+        marketId: 'market-1',
+        slotKey: 'slot-1',
+        tokenId: 'yes-token',
+        outcome: 'YES',
+        side: 'SELL',
+        submittedShares: 6,
+        submittedPrice: 0.42,
+        signalType: 'MM_QUOTE_ASK',
+        strategyLayer: 'MM_QUOTE',
+        placedAt: Date.now(),
+        slotEndTime: new Date(Date.now() + 60_000).toISOString(),
+        lastCheckedAt: 0,
+        filledSharesSoFar: 0,
+      },
+    ],
+  };
+
+  assert.equal(
+    runtime.hasTrackedRestingMmAskOrder({
+      marketId: 'market-1',
+      outcome: 'YES',
+      quoteOrders: [],
+    }),
+    true
+  );
+});
+
+test('cancelQuoteOrder keeps tracking when quote cancellation fails', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  let forgotPending = 0;
+  let forgotQuote = 0;
+
+  runtime.executor = {
+    cancelOrder: async () => {
+      throw new Error('cancel failed');
+    },
+  };
+  runtime.fillTracker = {
+    forgetPendingOrder: () => {
+      forgotPending += 1;
+    },
+  };
+  runtime.quotingEngine = {
+    forgetQuoteOrder: () => {
+      forgotQuote += 1;
+    },
+  };
+
+  const cancelled = await runtime.cancelQuoteOrder({
+    orderId: 'quote-1',
+    marketId: 'market-1',
+    outcome: 'YES',
+    action: 'SELL',
+    signalType: 'MM_QUOTE_ASK',
+    targetPrice: 0.42,
+    shares: 6,
+    urgency: 'passive',
+    placedAtMs: 10_000,
+  });
+
+  assert.equal(cancelled, false);
+  assert.equal(forgotPending, 0);
+  assert.equal(forgotQuote, 0);
+  assert.equal(runtime.pendingLiveOrders.has('market-1:YES'), true);
+});
+
 test('layer coordination gives post-sniper MM ask a maker-first window before scalp exit', () => {
   const originalGraceMs = process.env.SNIPER_MAKER_EXIT_GRACE_MS;
   process.env.SNIPER_MAKER_EXIT_GRACE_MS = '2500';

@@ -596,11 +596,13 @@ function generatePostSniperAskSignals(params: {
     context.binanceFairValueAdjustment,
     context.deepBinanceAssessment
   );
-  const askPrice = resolveSellQuotePrice(
+  const askPrice = resolvePostSniperAskPrice({
     book,
     fairValue,
-    Math.max(1, params.quoteSpreadTicks - 1)
-  );
+    entryPrice: context.activationTrigger.entryPrice,
+    quoteSpreadTicks: Math.max(1, params.quoteSpreadTicks - 1),
+    runtimeConfig,
+  });
   if (askPrice === null) {
     logMmQuoteSkip({
       context,
@@ -655,6 +657,7 @@ function generatePostSniperAskSignals(params: {
       fairValue: referencePrice,
       actualSpread,
       reason: 'Post-sniper MM ask',
+      urgencyOverride: 'passive',
       now,
     }),
   ];
@@ -722,6 +725,7 @@ function buildAutonomousSignal(params: {
   fairValue: number;
   actualSpread: number;
   reason: string;
+  urgencyOverride?: StrategySignal['urgency'];
   now: Date;
 }): StrategySignal {
   const book = getBookForOutcome(params.orderbook, params.outcome);
@@ -754,7 +758,7 @@ function buildAutonomousSignal(params: {
     fillRatio: 1,
     capitalClamp: 1,
     priceMultiplier: 1,
-    urgency: resolveQuoteUrgency(params.runtimeConfig),
+    urgency: params.urgencyOverride ?? resolveQuoteUrgency(params.runtimeConfig),
     reduceOnly: params.action === 'SELL',
     reason: `${params.reason} | spread=${params.actualSpread.toFixed(4)}`,
   };
@@ -1210,6 +1214,46 @@ function resolveSellQuotePrice(
       : 0.99;
   const desired = Math.max(fallback, lowerBound) + tick * Math.max(0, quoteSpreadTicks - 1);
   return normalizeQuotePrice(desired, lowerBound, upperBound);
+}
+
+function resolvePostSniperAskPrice(params: {
+  book: TokenBookSnapshot;
+  fairValue: number | null;
+  entryPrice: number;
+  quoteSpreadTicks: number;
+  runtimeConfig: AppConfig;
+}): number | null {
+  const fallback =
+    params.fairValue ??
+    params.book.midPrice ??
+    params.book.bestAsk ??
+    params.book.bestBid ??
+    params.entryPrice;
+  if (fallback === null || !Number.isFinite(fallback) || fallback <= 0) {
+    return null;
+  }
+
+  const tick = inferQuoteTick(params.book, Math.max(fallback, params.entryPrice));
+  const lowerBound =
+    params.book.bestBid !== null && Number.isFinite(params.book.bestBid)
+      ? Math.min(0.99, params.book.bestBid + tick)
+      : Math.min(0.99, params.entryPrice + tick);
+  const desiredFromFairValue =
+    Math.max(fallback, lowerBound) + tick * Math.max(0, params.quoteSpreadTicks - 1);
+  const breakEvenFloor = roundTo(
+    clamp(
+      params.entryPrice + Math.max(tick, params.runtimeConfig.MM_MAKER_MIN_EDGE),
+      0.01,
+      0.99
+    ),
+    6
+  );
+
+  return normalizeQuotePrice(
+    Math.max(desiredFromFairValue, breakEvenFloor),
+    lowerBound,
+    0.99
+  );
 }
 
 function resolveQuoteFairValue(

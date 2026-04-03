@@ -713,6 +713,66 @@ test('post-sniper MM fast path still emits a reduce-only ask when the regular MM
   );
 });
 
+test('post-sniper MM asks stay above entry with a passive maker floor', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.yes = {
+    ...orderbook.yes,
+    bids: [
+      { price: 0.34, size: 100 },
+      { price: 0.33, size: 100 },
+    ],
+    asks: [
+      { price: 0.35, size: 100 },
+      { price: 0.36, size: 100 },
+    ],
+    bestBid: 0.34,
+    bestAsk: 0.35,
+    midPrice: 0.345,
+    spread: 0.01,
+    spreadBps: 289.86,
+    depthSharesBid: 100,
+    depthSharesAsk: 100,
+    depthNotionalBid: 34,
+    depthNotionalAsk: 35,
+    lastTradePrice: 0.35,
+  };
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 0);
+  const now = new Date('2026-03-24T10:01:00.000Z');
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+      activationTrigger: {
+        triggerLayer: 'SNIPER',
+        entryOutcome: 'YES',
+        entryPrice: 0.37,
+        entryShares: 6,
+        activatedAtMs: now.getTime() - 5_000,
+      },
+    },
+    runtimeConfig: createMmConfig({
+      MM_POST_SNIPER_GRACE_WINDOW_MS: '15000',
+      MM_QUOTE_SHARES: '6',
+      POST_ONLY_ONLY: 'false',
+    }),
+    now,
+  });
+
+  const askSignal = plan.signals.find(
+    (signal) => signal.signalType === 'MM_QUOTE_ASK' && signal.outcome === 'YES'
+  );
+
+  assert.ok(askSignal);
+  assert.equal(askSignal?.urgency, 'passive');
+  assert.ok((askSignal?.targetPrice ?? 0) >= 0.38);
+});
+
 test('autonomous MM only emits asks after the gross exposure cap is reached', () => {
   const market = createMarket();
   const orderbook = createWideOrderbook();

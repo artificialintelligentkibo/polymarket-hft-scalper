@@ -4464,6 +4464,7 @@ export class MarketMakerRuntime {
       const orderbook = await this.fetcher.getMarketSnapshot(market);
       this.latestBooks.set(plan.marketId, orderbook);
       const positionManager = this.getPositionManager(market);
+      const currentActiveQuoteOrders = this.quotingEngine.getQuoteOrders(plan.marketId);
       const riskAssessment = this.riskManager.checkRiskLimits({
         market,
         orderbook,
@@ -4480,7 +4481,7 @@ export class MarketMakerRuntime {
           pendingQuoteExposure: this.getPendingQuoteExposure(market.marketId),
           deepBinanceAssessment,
         },
-        activeQuoteOrders: plan.activeQuoteOrders,
+        activeQuoteOrders: currentActiveQuoteOrders,
         currentMMExposureUsd: roundTo(
           this.quotingEngine.getCurrentMMExposureUsd() +
             this.getPendingQuoteExposure().grossExposureUsd,
@@ -4497,7 +4498,7 @@ export class MarketMakerRuntime {
           .map((pending) => pending.orderId)
       );
       const retentionPlan = reconcileQuoteRefreshPlan({
-        activeQuoteOrders: plan.activeQuoteOrders,
+        activeQuoteOrders: currentActiveQuoteOrders,
         refreshedSignals: refreshedPlan.signals,
         trackedPendingQuoteOrderIds,
         nowMs: Date.now(),
@@ -4505,13 +4506,39 @@ export class MarketMakerRuntime {
         repriceDeadbandTicks: config.MM_REPRICE_DEADBAND_TICKS,
       });
 
+      const failedCancelOrders: ActiveQuoteOrder[] = [];
       for (const order of retentionPlan.staleOrders) {
-        await this.cancelQuoteOrder(order);
+        const cancelled = await this.cancelQuoteOrder(order);
+        if (!cancelled) {
+          failedCancelOrders.push(order);
+        }
       }
 
-      const nextActiveOrders: ActiveQuoteOrder[] = [...retentionPlan.keptOrders];
+      const nextActiveOrders: ActiveQuoteOrder[] = [
+        ...retentionPlan.keptOrders,
+        ...failedCancelOrders,
+      ];
 
       for (const signal of retentionPlan.newSignals) {
+        if (
+          signal.signalType === 'MM_QUOTE_ASK' &&
+          this.hasTrackedRestingMmAskOrder({
+            marketId: market.marketId,
+            outcome: signal.outcome,
+            quoteOrders: nextActiveOrders,
+          })
+        ) {
+          logger.info('MM quote skipped', {
+            marketId: market.marketId,
+            reason: 'resting_order_exists',
+            details: {
+              outcome: signal.outcome,
+              signalType: signal.signalType,
+            },
+          });
+          continue;
+        }
+
         const execution = await this.executeSignal(
           market,
           orderbook,
@@ -4558,20 +4585,50 @@ export class MarketMakerRuntime {
     });
   }
 
-  private async cancelQuoteOrder(order: ActiveQuoteOrder): Promise<void> {
+  private async cancelQuoteOrder(order: ActiveQuoteOrder): Promise<boolean> {
     try {
       await this.executor.cancelOrder(order.orderId);
+      this.fillTracker.forgetPendingOrder(order.orderId);
+      this.quotingEngine.forgetQuoteOrder(order.orderId);
+      this.clearPendingLiveOrder(this.getPendingOrderKey(order.marketId, order.outcome));
+      return true;
     } catch (error) {
-      logger.debug('Quote cancel failed', {
+      this.rememberPendingLiveOrder(this.getPendingOrderKey(order.marketId, order.outcome));
+      logger.warn('Quote cancel failed; retaining local tracking', {
         orderId: order.orderId,
         marketId: order.marketId,
         message: error instanceof Error ? error.message : String(error),
       });
-    } finally {
-      this.fillTracker.forgetPendingOrder(order.orderId);
-      this.quotingEngine.forgetQuoteOrder(order.orderId);
-      this.clearPendingLiveOrder(this.getPendingOrderKey(order.marketId, order.outcome));
+      return false;
     }
+  }
+
+  private hasTrackedRestingMmAskOrder(params: {
+    marketId: string;
+    outcome: StrategySignal['outcome'];
+    quoteOrders: readonly ActiveQuoteOrder[];
+  }): boolean {
+    if (
+      params.quoteOrders.some(
+        (order) =>
+          order.marketId === params.marketId &&
+          order.signalType === 'MM_QUOTE_ASK' &&
+          order.action === 'SELL' &&
+          order.outcome === params.outcome
+      )
+    ) {
+      return true;
+    }
+
+    return this.fillTracker
+      .getPendingOrders()
+      .some(
+        (pending) =>
+          pending.marketId === params.marketId &&
+          pending.signalType === 'MM_QUOTE_ASK' &&
+          pending.side === 'SELL' &&
+          pending.outcome === params.outcome
+      );
   }
 }
 
