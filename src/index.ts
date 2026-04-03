@@ -1761,6 +1761,15 @@ export class MarketMakerRuntime {
       this.executor.invalidateOutcomeBalanceCache(fill.tokenId);
       this.executor.invalidateBalanceValidationCache();
     }
+    const pendingOrderStillTracked = this.fillTracker
+      .getPendingOrders()
+      .some((pending) => pending.orderId === fill.orderId);
+    if (!pendingOrderStillTracked) {
+      this.quotingEngine.forgetQuoteOrder(fill.orderId);
+    }
+    if (fill.signalType === 'MM_QUOTE_ASK' && fill.side === 'SELL') {
+      this.clearPostSniperMakerAskSignal(fill.marketId, fill.outcome);
+    }
     if (
       fill.side === 'SELL' &&
       beforeOutcomeLayer === 'LOTTERY' &&
@@ -4481,13 +4490,28 @@ export class MarketMakerRuntime {
         now: new Date(),
       });
 
-      for (const order of plan.activeQuoteOrders) {
+      const trackedPendingQuoteOrderIds = new Set(
+        this.fillTracker
+          .getPendingOrders()
+          .filter((pending) => isQuotingSignalType(pending.signalType))
+          .map((pending) => pending.orderId)
+      );
+      const retentionPlan = reconcileQuoteRefreshPlan({
+        activeQuoteOrders: plan.activeQuoteOrders,
+        refreshedSignals: refreshedPlan.signals,
+        trackedPendingQuoteOrderIds,
+        nowMs: Date.now(),
+        minQuoteLifetimeMs: config.MM_MIN_QUOTE_LIFETIME_MS,
+        repriceDeadbandTicks: config.MM_REPRICE_DEADBAND_TICKS,
+      });
+
+      for (const order of retentionPlan.staleOrders) {
         await this.cancelQuoteOrder(order);
       }
 
-      const nextActiveOrders: ActiveQuoteOrder[] = [];
+      const nextActiveOrders: ActiveQuoteOrder[] = [...retentionPlan.keptOrders];
 
-      for (const signal of refreshedPlan.signals) {
+      for (const signal of retentionPlan.newSignals) {
         const execution = await this.executeSignal(
           market,
           orderbook,
@@ -4510,11 +4534,27 @@ export class MarketMakerRuntime {
             signalType: signal.signalType,
             targetPrice: signal.targetPrice,
             shares: signal.shares,
+            urgency: signal.urgency,
+            placedAtMs: Date.now(),
           });
         }
       }
 
       this.quotingEngine.replaceQuoteOrders(refreshedPlan.marketId, nextActiveOrders);
+      if (
+        retentionPlan.staleOrders.length > 0 ||
+        retentionPlan.newSignals.length > 0 ||
+        retentionPlan.deadbandRetainedCount > 0
+      ) {
+        logger.info('MM quote retention', {
+          marketId: refreshedPlan.marketId,
+          kept: retentionPlan.keptOrders.length,
+          canceled: retentionPlan.staleOrders.length,
+          new: retentionPlan.newSignals.length,
+          deadbandRetained: retentionPlan.deadbandRetainedCount,
+          oldestQueueMs: retentionPlan.oldestQueueAgeMs ?? 0,
+        });
+      }
     });
   }
 
@@ -4550,6 +4590,76 @@ export async function main(): Promise<void> {
 
   await runtime.initialize();
   await runtime.run();
+}
+
+const QUOTE_PRICE_EPSILON = 0.000001;
+const QUOTE_SHARES_EPSILON = 0.0001;
+
+export interface QuoteRefreshRetentionPlan {
+  readonly keptOrders: readonly ActiveQuoteOrder[];
+  readonly staleOrders: readonly ActiveQuoteOrder[];
+  readonly newSignals: readonly StrategySignal[];
+  readonly deadbandRetainedCount: number;
+  readonly oldestQueueAgeMs: number | null;
+}
+
+export function reconcileQuoteRefreshPlan(params: {
+  activeQuoteOrders: readonly ActiveQuoteOrder[];
+  refreshedSignals: readonly StrategySignal[];
+  trackedPendingQuoteOrderIds?: Iterable<string>;
+  nowMs: number;
+  minQuoteLifetimeMs: number;
+  repriceDeadbandTicks: number;
+}): QuoteRefreshRetentionPlan {
+  const trackedPendingQuoteOrderIds = params.trackedPendingQuoteOrderIds
+    ? new Set(params.trackedPendingQuoteOrderIds)
+    : null;
+  const matchedOrderIds = new Set<string>();
+  const keptOrders: ActiveQuoteOrder[] = [];
+  const newSignals: StrategySignal[] = [];
+  let deadbandRetainedCount = 0;
+
+  for (const signal of params.refreshedSignals) {
+    const retained = findRetainedQuoteOrder({
+      signal,
+      activeQuoteOrders: params.activeQuoteOrders,
+      matchedOrderIds,
+      trackedPendingQuoteOrderIds,
+      nowMs: params.nowMs,
+      minQuoteLifetimeMs: params.minQuoteLifetimeMs,
+      repriceDeadbandTicks: params.repriceDeadbandTicks,
+    });
+
+    if (!retained) {
+      newSignals.push(signal);
+      continue;
+    }
+
+    matchedOrderIds.add(retained.order.orderId);
+    keptOrders.push(retained.order);
+    if (retained.reason === 'deadband') {
+      deadbandRetainedCount += 1;
+    }
+  }
+
+  const staleOrders = params.activeQuoteOrders.filter(
+    (order) => !matchedOrderIds.has(order.orderId)
+  );
+  const oldestQueueAgeMs =
+    keptOrders.length > 0
+      ? Math.max(
+          0,
+          params.nowMs - Math.min(...keptOrders.map((order) => order.placedAtMs))
+        )
+      : null;
+
+  return {
+    keptOrders,
+    staleOrders,
+    newSignals,
+    deadbandRetainedCount,
+    oldestQueueAgeMs,
+  };
 }
 
 async function runWithConcurrency<T>(
@@ -4591,6 +4701,114 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
 
 function normalizeRuntimeNumber(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? roundTo(value, 4) : null;
+}
+
+function findRetainedQuoteOrder(params: {
+  signal: StrategySignal;
+  activeQuoteOrders: readonly ActiveQuoteOrder[];
+  matchedOrderIds: ReadonlySet<string>;
+  trackedPendingQuoteOrderIds: ReadonlySet<string> | null;
+  nowMs: number;
+  minQuoteLifetimeMs: number;
+  repriceDeadbandTicks: number;
+}): { order: ActiveQuoteOrder; reason: 'exact' | 'deadband' } | null {
+  for (const order of params.activeQuoteOrders) {
+    if (params.matchedOrderIds.has(order.orderId)) {
+      continue;
+    }
+    if (
+      params.trackedPendingQuoteOrderIds &&
+      !params.trackedPendingQuoteOrderIds.has(order.orderId)
+    ) {
+      continue;
+    }
+    if (!matchesQuoteRefreshIdentity(order, params.signal)) {
+      continue;
+    }
+    if (matchesQuoteRefreshExactly(order, params.signal)) {
+      return { order, reason: 'exact' };
+    }
+    if (
+      shouldRetainPassiveQuoteOrder({
+        order,
+        signal: params.signal,
+        nowMs: params.nowMs,
+        minQuoteLifetimeMs: params.minQuoteLifetimeMs,
+        repriceDeadbandTicks: params.repriceDeadbandTicks,
+      })
+    ) {
+      return { order, reason: 'deadband' };
+    }
+  }
+
+  return null;
+}
+
+function matchesQuoteRefreshIdentity(order: ActiveQuoteOrder, signal: StrategySignal): boolean {
+  return (
+    order.marketId === signal.marketId &&
+    order.signalType === signal.signalType &&
+    order.outcome === signal.outcome &&
+    order.action === signal.action &&
+    order.urgency === signal.urgency
+  );
+}
+
+function matchesQuoteRefreshExactly(order: ActiveQuoteOrder, signal: StrategySignal): boolean {
+  return (
+    nearlyEqualNullablePrice(order.targetPrice, signal.targetPrice) &&
+    nearlyEqualShares(order.shares, signal.shares)
+  );
+}
+
+function shouldRetainPassiveQuoteOrder(params: {
+  order: ActiveQuoteOrder;
+  signal: StrategySignal;
+  nowMs: number;
+  minQuoteLifetimeMs: number;
+  repriceDeadbandTicks: number;
+}): boolean {
+  if (
+    params.repriceDeadbandTicks <= 0 ||
+    params.minQuoteLifetimeMs <= 0 ||
+    params.signal.urgency !== 'passive' ||
+    params.order.urgency !== 'passive' ||
+    !isQuotingSignalType(params.signal.signalType) ||
+    params.signal.targetPrice === null ||
+    params.order.targetPrice === null ||
+    !nearlyEqualShares(params.order.shares, params.signal.shares)
+  ) {
+    return false;
+  }
+
+  const queueAgeMs = Math.max(0, params.nowMs - params.order.placedAtMs);
+  if (queueAgeMs >= params.minQuoteLifetimeMs) {
+    return false;
+  }
+
+  const tick = estimateQuoteDeadbandTick(params.order.targetPrice, params.signal.targetPrice);
+  const allowedDrift = tick * params.repriceDeadbandTicks + QUOTE_PRICE_EPSILON;
+  return Math.abs(params.order.targetPrice - params.signal.targetPrice) <= allowedDrift;
+}
+
+function estimateQuoteDeadbandTick(currentPrice: number, nextPrice: number): number {
+  return Math.max(currentPrice, nextPrice) >= 0.5 ? 0.01 : 0.005;
+}
+
+function nearlyEqualNullablePrice(
+  left: number | null,
+  right: number | null,
+  epsilon = QUOTE_PRICE_EPSILON
+): boolean {
+  if (left === null || right === null) {
+    return left === right;
+  }
+
+  return Math.abs(left - right) <= epsilon;
+}
+
+function nearlyEqualShares(left: number, right: number, epsilon = QUOTE_SHARES_EPSILON): boolean {
+  return Math.abs(left - right) <= epsilon;
 }
 
 function resolveQuoteOrderPrice(

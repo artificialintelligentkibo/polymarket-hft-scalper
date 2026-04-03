@@ -11,6 +11,7 @@ import {
   pruneLatencyPauseSamples,
   pruneExpiredSettlementCooldowns,
   resolveReduceOnlySellGuard,
+  reconcileQuoteRefreshPlan,
   resolveSettledOutcomeSellExecution,
   shouldBlockSniperSelectionForApiGate,
   shouldDeferSignalForSettlement,
@@ -1635,6 +1636,126 @@ test('pending quote exposure counts only remaining BUY quote shares', () => {
     noShares: 2,
     grossExposureUsd: 4.65,
   });
+});
+
+test('quote refresh retention keeps unchanged pending MM orders in the queue', () => {
+  const plan = reconcileQuoteRefreshPlan({
+    activeQuoteOrders: [
+      {
+        orderId: 'quote-1',
+        marketId: 'market-1',
+        outcome: 'YES',
+        action: 'SELL',
+        signalType: 'MM_QUOTE_ASK',
+        targetPrice: 0.42,
+        shares: 6,
+        urgency: 'passive',
+        placedAtMs: 10_000,
+      },
+    ],
+    refreshedSignals: [
+      createSignal({
+        signalType: 'MM_QUOTE_ASK',
+        action: 'SELL',
+        reduceOnly: true,
+        outcome: 'YES',
+        outcomeIndex: 0,
+        shares: 6,
+        targetPrice: 0.42,
+        urgency: 'passive',
+        reason: 'Post-sniper MM ask',
+      }),
+    ],
+    trackedPendingQuoteOrderIds: ['quote-1'],
+    nowMs: 12_000,
+    minQuoteLifetimeMs: 1500,
+    repriceDeadbandTicks: 1,
+  });
+
+  assert.equal(plan.keptOrders.length, 1);
+  assert.equal(plan.staleOrders.length, 0);
+  assert.equal(plan.newSignals.length, 0);
+  assert.equal(plan.deadbandRetainedCount, 0);
+  assert.equal(plan.oldestQueueAgeMs, 2000);
+});
+
+test('quote refresh retention preserves passive MM orders inside the deadband window', () => {
+  const plan = reconcileQuoteRefreshPlan({
+    activeQuoteOrders: [
+      {
+        orderId: 'quote-1',
+        marketId: 'market-1',
+        outcome: 'YES',
+        action: 'SELL',
+        signalType: 'MM_QUOTE_ASK',
+        targetPrice: 0.42,
+        shares: 6,
+        urgency: 'passive',
+        placedAtMs: 10_000,
+      },
+    ],
+    refreshedSignals: [
+      createSignal({
+        signalType: 'MM_QUOTE_ASK',
+        action: 'SELL',
+        reduceOnly: true,
+        outcome: 'YES',
+        outcomeIndex: 0,
+        shares: 6,
+        targetPrice: 0.425,
+        urgency: 'passive',
+        reason: 'Post-sniper MM ask',
+      }),
+    ],
+    trackedPendingQuoteOrderIds: ['quote-1'],
+    nowMs: 10_900,
+    minQuoteLifetimeMs: 1500,
+    repriceDeadbandTicks: 1,
+  });
+
+  assert.equal(plan.keptOrders.length, 1);
+  assert.equal(plan.staleOrders.length, 0);
+  assert.equal(plan.newSignals.length, 0);
+  assert.equal(plan.deadbandRetainedCount, 1);
+});
+
+test('quote refresh retention replaces passive MM orders once they age past the minimum lifetime', () => {
+  const plan = reconcileQuoteRefreshPlan({
+    activeQuoteOrders: [
+      {
+        orderId: 'quote-1',
+        marketId: 'market-1',
+        outcome: 'YES',
+        action: 'SELL',
+        signalType: 'MM_QUOTE_ASK',
+        targetPrice: 0.42,
+        shares: 6,
+        urgency: 'passive',
+        placedAtMs: 10_000,
+      },
+    ],
+    refreshedSignals: [
+      createSignal({
+        signalType: 'MM_QUOTE_ASK',
+        action: 'SELL',
+        reduceOnly: true,
+        outcome: 'YES',
+        outcomeIndex: 0,
+        shares: 6,
+        targetPrice: 0.425,
+        urgency: 'passive',
+        reason: 'Post-sniper MM ask',
+      }),
+    ],
+    trackedPendingQuoteOrderIds: ['quote-1'],
+    nowMs: 12_000,
+    minQuoteLifetimeMs: 1500,
+    repriceDeadbandTicks: 1,
+  });
+
+  assert.equal(plan.keptOrders.length, 0);
+  assert.equal(plan.staleOrders.length, 1);
+  assert.equal(plan.newSignals.length, 1);
 });
 
 test('layer coordination gives post-sniper MM ask a maker-first window before scalp exit', () => {

@@ -139,6 +139,9 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.MM_QUOTE_SHARES, 6);
   assert.equal(candidate.MM_MAX_GROSS_EXPOSURE_USD, 15);
   assert.equal(candidate.MM_MAX_NET_DIRECTIONAL, 10);
+  assert.equal(candidate.MM_MAKER_MIN_EDGE, 0.003);
+  assert.equal(candidate.MM_MIN_QUOTE_LIFETIME_MS, 1500);
+  assert.equal(candidate.MM_REPRICE_DEADBAND_TICKS, 1);
   assert.equal(candidate.strategy.maxDrawdownUsdc, -15);
   assert.equal(candidate.strategy.hardStopCooldownMs, 15000);
   assert.equal(candidate.binance.edgeEnabled, false);

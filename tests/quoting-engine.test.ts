@@ -548,7 +548,9 @@ test('autonomous MM generates dual-sided quotes when fair value and inventory ar
       riskAssessment: createRiskAssessment(positionManager),
       quoteSignals: [],
     },
-    runtimeConfig: createMmConfig(),
+    runtimeConfig: createMmConfig({
+      POST_ONLY_ONLY: 'false',
+    }),
     now: new Date('2026-03-24T10:01:00.000Z'),
   });
 
@@ -579,7 +581,86 @@ test('autonomous MM skips quotes when the captured spread does not clear fees', 
       riskAssessment: createRiskAssessment(positionManager),
       quoteSignals: [],
     },
-    runtimeConfig: createMmConfig(),
+    runtimeConfig: createMmConfig({
+      POST_ONLY_ONLY: 'false',
+    }),
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(plan.signals.length, 0);
+});
+
+test('autonomous MM uses maker-aware spread logic for passive quotes on thin markets', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.yes.bestBid = 0.47;
+  orderbook.yes.bestAsk = 0.48;
+  orderbook.yes.midPrice = 0.475;
+  orderbook.yes.spread = 0.01;
+  orderbook.yes.bids = [{ price: 0.47, size: 80 }];
+  orderbook.yes.asks = [{ price: 0.48, size: 80 }];
+  orderbook.no.bestBid = 0.52;
+  orderbook.no.bestAsk = 0.53;
+  orderbook.no.midPrice = 0.525;
+  orderbook.no.spread = 0.01;
+  orderbook.no.bids = [{ price: 0.52, size: 90 }];
+  orderbook.no.asks = [{ price: 0.53, size: 90 }];
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 8, 8);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_MIN_SPREAD_TICKS: '1',
+      MM_MAKER_MIN_EDGE: '0.003',
+      POST_ONLY_ONLY: 'true',
+    }),
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.ok(plan.signals.some((signal) => signal.signalType === 'MM_QUOTE_BID'));
+  assert.ok(plan.signals.some((signal) => signal.signalType === 'MM_QUOTE_ASK'));
+});
+
+test('thin spreads are still rejected when passive maker mode is disabled', () => {
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  orderbook.yes.bestBid = 0.47;
+  orderbook.yes.bestAsk = 0.48;
+  orderbook.yes.midPrice = 0.475;
+  orderbook.yes.spread = 0.01;
+  orderbook.yes.bids = [{ price: 0.47, size: 80 }];
+  orderbook.yes.asks = [{ price: 0.48, size: 80 }];
+  orderbook.no.bestBid = 0.52;
+  orderbook.no.bestAsk = 0.53;
+  orderbook.no.midPrice = 0.525;
+  orderbook.no.spread = 0.01;
+  orderbook.no.bids = [{ price: 0.52, size: 90 }];
+  orderbook.no.asks = [{ price: 0.53, size: 90 }];
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 8, 8);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_MIN_SPREAD_TICKS: '1',
+      MM_MAKER_MIN_EDGE: '0.003',
+      POST_ONLY_ONLY: 'false',
+    }),
     now: new Date('2026-03-24T10:01:00.000Z'),
   });
 
@@ -598,6 +679,7 @@ test('post-sniper MM fast path still emits a reduce-only ask when the regular MM
     SNIPER_MIN_BINANCE_MOVE_PCT: '0.10',
     MM_POST_SNIPER_GRACE_WINDOW_MS: '15000',
     MM_QUOTE_SHARES: '6',
+    POST_ONLY_ONLY: 'false',
   });
 
   const plan = buildQuoteRefreshPlan({

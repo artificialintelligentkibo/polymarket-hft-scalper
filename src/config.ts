@@ -201,6 +201,12 @@ export interface AppConfig {
   readonly MM_INVENTORY_SKEW_FACTOR: number;
   /** Minimum extra spread edge above fees for autonomous MM quotes. */
   readonly MM_MIN_EDGE_AFTER_FEE: number;
+  /** Minimum extra spread edge required for passive maker MM quotes. */
+  readonly MM_MAKER_MIN_EDGE: number;
+  /** Minimum time to leave a passive MM quote resting before repricing it. */
+  readonly MM_MIN_QUOTE_LIFETIME_MS: number;
+  /** Maximum passive reprice drift tolerated before a quote is canceled and replaced. */
+  readonly MM_REPRICE_DEADBAND_TICKS: number;
   /**
    * Enables the deeper Binance derivatives integration for the market-maker.
    * false = keep the existing lightweight Binance edge only.
@@ -646,6 +652,15 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       1
     ),
     MM_MIN_EDGE_AFTER_FEE: parseFloatOrDefault(env.MM_MIN_EDGE_AFTER_FEE, '0.005'),
+    MM_MAKER_MIN_EDGE: parseFloatOrDefault(env.MM_MAKER_MIN_EDGE, '0.003'),
+    MM_MIN_QUOTE_LIFETIME_MS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_MIN_QUOTE_LIFETIME_MS, '1500')
+    ),
+    MM_REPRICE_DEADBAND_TICKS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_REPRICE_DEADBAND_TICKS, '1')
+    ),
     DEEP_BINANCE_MODE: parseBoolean(env.DEEP_BINANCE_MODE, false),
     BINANCE_WS_ENABLED: parseBoolean(env.BINANCE_WS_ENABLED, true),
     BINANCE_DEPTH_LEVELS: Math.max(
@@ -1487,6 +1502,18 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.MM_MIN_EDGE_AFTER_FEE < 0) {
     throw new Error('MM_MIN_EDGE_AFTER_FEE must be zero or positive.');
+  }
+
+  if (candidate.MM_MAKER_MIN_EDGE < 0) {
+    throw new Error('MM_MAKER_MIN_EDGE must be zero or positive.');
+  }
+
+  if (candidate.MM_MIN_QUOTE_LIFETIME_MS < 0) {
+    throw new Error('MM_MIN_QUOTE_LIFETIME_MS must be zero or positive.');
+  }
+
+  if (candidate.MM_REPRICE_DEADBAND_TICKS < 0) {
+    throw new Error('MM_REPRICE_DEADBAND_TICKS must be zero or positive.');
   }
 
   if (candidate.MM_MIN_BOOK_DEPTH_USD < 0) {

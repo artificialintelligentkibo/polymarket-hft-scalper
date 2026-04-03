@@ -70,6 +70,8 @@ export interface ActiveQuoteOrder {
   readonly signalType: SignalType;
   readonly targetPrice: number | null;
   readonly shares: number;
+  readonly urgency: StrategySignal['urgency'];
+  readonly placedAtMs: number;
 }
 
 export interface QuoteRefreshPlan {
@@ -419,9 +421,14 @@ function generateAutonomousQuoteSignals(params: {
       continue;
     }
 
+    const isPassiveMakerQuote = resolveQuoteUrgency(runtimeConfig) === 'passive';
     const takerFee = getTakerFee(context.market.title, runtimeConfig.evKelly);
+    const effectiveFee = isPassiveMakerQuote ? 0 : takerFee;
+    const requiredEdge = isPassiveMakerQuote
+      ? runtimeConfig.MM_MAKER_MIN_EDGE
+      : runtimeConfig.MM_MIN_EDGE_AFTER_FEE;
     const minProfitableSpread = Math.max(
-      takerFee + runtimeConfig.MM_MIN_EDGE_AFTER_FEE,
+      effectiveFee + requiredEdge,
       tick * runtimeConfig.MM_MIN_SPREAD_TICKS
     );
     const actualSpread = roundTo(askPrice - bidPrice, 6);
@@ -435,6 +442,8 @@ function generateAutonomousQuoteSignals(params: {
           outcome,
           actualSpread,
           minProfitableSpread,
+          quoteMode: isPassiveMakerQuote ? 'maker' : 'aggressive',
+          effectiveFee,
         },
       });
       continue;
