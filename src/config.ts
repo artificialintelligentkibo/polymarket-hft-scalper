@@ -685,7 +685,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ),
     MM_STOP_NEW_ENTRIES_BEFORE_END_MS: Math.max(
       0,
-      parseIntOrDefault(env.MM_STOP_NEW_ENTRIES_BEFORE_END_MS, '60000')
+      parseIntOrDefault(env.MM_STOP_NEW_ENTRIES_BEFORE_END_MS, '90000')
     ),
     MM_CANCEL_ALL_QUOTES_BEFORE_END_MS: Math.max(
       0,
@@ -713,7 +713,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ),
     MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS: Math.max(
       0,
-      parseIntOrDefault(env.MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS, '10000')
+      parseIntOrDefault(env.MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS, '15000')
     ),
     MM_SAME_SIDE_REENTRY_COOLDOWN_MS: Math.max(
       0,

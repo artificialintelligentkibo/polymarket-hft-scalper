@@ -1612,3 +1612,74 @@ test('autonomous MM sellability cliff lifts passive asks before the position bec
   assert.match(askSignal.reason, /sellabilityCliff=true/);
   assert.deepEqual(plan.mmDiagnostics?.sellabilityCliffOutcomes, ['YES']);
 });
+
+test('autonomous MM blocks all bid reentries in the final minute when sellability cliff is active', () => {
+  const market = createMarket();
+  const orderbook = createLowPriceOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 0);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_QUOTE_SHARES: '6',
+      MM_STOP_NEW_ENTRIES_BEFORE_END_MS: '0',
+      MM_CANCEL_ALL_QUOTES_BEFORE_END_MS: '15000',
+    }),
+    now: new Date('2026-03-24T10:04:20.000Z'),
+  });
+
+  assert.equal(
+    plan.signals.some((signal) => signal.signalType === 'MM_QUOTE_BID'),
+    false
+  );
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_ASK' && signal.outcome === 'YES'
+    ),
+    true
+  );
+  assert.equal(plan.mmDiagnostics?.entryMode, 'ASK_ONLY');
+  assert.ok(plan.mmDiagnostics?.toxicityFlags.includes('sellability_cliff_final_minute'));
+  assert.deepEqual(plan.mmDiagnostics?.sellabilityCliffOutcomes, ['YES']);
+});
+
+test('autonomous MM still allows hedge bids before the final-minute sellability cliff window', () => {
+  const market = createMarket();
+  const orderbook = createLowPriceOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 0);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_QUOTE_SHARES: '6',
+      MM_STOP_NEW_ENTRIES_BEFORE_END_MS: '0',
+      MM_CANCEL_ALL_QUOTES_BEFORE_END_MS: '15000',
+    }),
+    now: new Date('2026-03-24T10:03:20.000Z'),
+  });
+
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'NO'
+    ),
+    true
+  );
+  assert.equal(
+    plan.mmDiagnostics?.toxicityFlags.includes('sellability_cliff_final_minute'),
+    false
+  );
+});

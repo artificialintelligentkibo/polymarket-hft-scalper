@@ -748,6 +748,24 @@ function resolveAutonomousBidShares(params: {
   return roundTo(clamp(size, baseShares, maxShares), 4);
 }
 
+const SELLABILITY_CLIFF_BID_BLOCK_WINDOW_MS = 60_000;
+
+function isSellabilityCliffAtRisk(params: {
+  openShares: number;
+  referencePrice: number | null;
+}): boolean {
+  if (
+    !Number.isFinite(params.openShares) ||
+    params.openShares <= 0 ||
+    params.referencePrice === null ||
+    !Number.isFinite(params.referencePrice)
+  ) {
+    return false;
+  }
+
+  return params.openShares < resolveMinimumTradableShares(params.referencePrice, 0);
+}
+
 function assessSellabilityCliff(params: {
   book: TokenBookSnapshot;
   openShares: number;
@@ -770,8 +788,12 @@ function assessSellabilityCliff(params: {
     params.book.bestBid ??
     params.book.bestAsk ??
     params.fallbackAskPrice;
-  const minimumSharesAtReference = resolveMinimumTradableShares(referencePrice, 0);
-  if (params.openShares >= minimumSharesAtReference) {
+  if (
+    !isSellabilityCliffAtRisk({
+      openShares: params.openShares,
+      referencePrice,
+    })
+  ) {
     return {
       atRisk: false,
       adjustedAskPrice: params.fallbackAskPrice,
@@ -854,6 +876,51 @@ function generateAutonomousQuoteSignals(params: {
   );
   const builtSignals: StrategySignal[] = [];
   let projectedExposureUsd = Math.max(0, roundTo(params.currentMMExposureUsd, 4));
+  const sellabilityCliffBidBlockOutcomes =
+    assessment.timeToSlotEndMs !== null &&
+    assessment.timeToSlotEndMs <= SELLABILITY_CLIFF_BID_BLOCK_WINDOW_MS
+      ? (['YES', 'NO'] as const satisfies readonly Outcome[]).filter((outcome) => {
+          const book = getBookForOutcome(context.orderbook, outcome);
+          const fairValue = resolveQuoteFairValue(
+            context.orderbook,
+            outcome,
+            runtimeConfig,
+            context.binanceFairValueAdjustment,
+            context.deepBinanceAssessment
+          );
+          const referencePrice =
+            fairValue ??
+            book.midPrice ??
+            book.lastTradePrice ??
+            book.bestBid ??
+            book.bestAsk;
+          const openShares = context.positionManager.getShares(outcome);
+          const askShares = Math.min(
+            roundTo(Math.max(6, runtimeConfig.MM_QUOTE_SHARES), 4),
+            openShares
+          );
+
+          return isSellabilityCliffAtRisk({
+            openShares: askShares,
+            referencePrice,
+          });
+        })
+      : [];
+  const sellabilityCliffBidBlockActive = sellabilityCliffBidBlockOutcomes.length > 0;
+  if (sellabilityCliffBidBlockActive) {
+    diagnostics.sellabilityCliffOutcomes = Array.from(
+      new Set([...diagnostics.sellabilityCliffOutcomes, ...sellabilityCliffBidBlockOutcomes])
+    );
+    if (!diagnostics.toxicityFlags.includes('sellability_cliff_final_minute')) {
+      diagnostics.toxicityFlags = [
+        ...diagnostics.toxicityFlags,
+        'sellability_cliff_final_minute',
+      ];
+    }
+    if (diagnostics.entryMode !== 'OFF') {
+      diagnostics.entryMode = 'ASK_ONLY';
+    }
+  }
 
   if (!assessment.allowBidQuotes && !assessment.allowAskQuotes) {
     logMmQuoteSkip({
@@ -993,7 +1060,10 @@ function generateAutonomousQuoteSignals(params: {
       continue;
     }
 
+    const bidBlockedBySellabilityCliff =
+      sellabilityCliffBidBlockActive && assessment.allowBidQuotes;
     const bidBlockedByMode =
+      bidBlockedBySellabilityCliff ||
       !assessment.allowBidQuotes ||
       (assessment.entryMode === 'ONE_SIDED' &&
         assessment.blockedBidOutcomes.includes(outcome));
@@ -1003,16 +1073,19 @@ function generateAutonomousQuoteSignals(params: {
         runtimeConfig,
         now,
         reason:
-          assessment.entryMode === 'ONE_SIDED' &&
-          assessment.blockedBidOutcomes.includes(outcome)
-            ? 'toxic_flow'
-            : resolvePhaseSkipReason(assessment.phase),
+          bidBlockedBySellabilityCliff
+            ? 'sellability_cliff_final_minute'
+            : assessment.entryMode === 'ONE_SIDED' &&
+           assessment.blockedBidOutcomes.includes(outcome)
+              ? 'toxic_flow'
+              : resolvePhaseSkipReason(assessment.phase),
         details: {
           outcome,
           phase: assessment.phase,
           entryMode: assessment.entryMode,
           blockedBidOutcomes: assessment.blockedBidOutcomes,
           toxicityFlags: assessment.toxicityFlags,
+          sellabilityCliffOutcomes: diagnostics.sellabilityCliffOutcomes,
           slotAgeMs: assessment.slotAgeMs,
           timeToSlotEndMs: assessment.timeToSlotEndMs,
         },
