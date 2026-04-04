@@ -147,7 +147,11 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.MM_STOP_NEW_ENTRIES_BEFORE_END_MS, 60000);
   assert.equal(candidate.MM_CANCEL_ALL_QUOTES_BEFORE_END_MS, 15000);
   assert.equal(candidate.MM_TOXIC_FLOW_BLOCK_MOVE_PCT, 0.08);
+  assert.equal(candidate.MM_TOXIC_FLOW_CLEAR_MOVE_PCT, 0.05);
   assert.equal(candidate.MM_TOXIC_FLOW_MICROPRICE_TICKS, 1.5);
+  assert.equal(candidate.MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS, 1);
+  assert.equal(candidate.MM_TOXIC_FLOW_HOLD_MS, 5000);
+  assert.equal(candidate.MM_SAME_SIDE_REENTRY_COOLDOWN_MS, 30000);
   assert.equal(candidate.MM_MAKER_MIN_EDGE, 0.003);
   assert.equal(candidate.MM_MIN_QUOTE_LIFETIME_MS, 1500);
   assert.equal(candidate.MM_REPRICE_DEADBAND_TICKS, 1);
@@ -329,6 +333,36 @@ test('validateConfig rejects cancel windows that outlive the late-entry cutoff',
   assert.throws(
     () => validateConfig(candidate),
     /MM_CANCEL_ALL_QUOTES_BEFORE_END_MS must be less than or equal to MM_STOP_NEW_ENTRIES_BEFORE_END_MS/
+  );
+});
+
+test('validateConfig rejects toxic-flow clear thresholds above their block thresholds', () => {
+  const candidate = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    MM_TOXIC_FLOW_BLOCK_MOVE_PCT: '0.08',
+    MM_TOXIC_FLOW_CLEAR_MOVE_PCT: '0.09',
+  });
+
+  assert.throws(
+    () => validateConfig(candidate),
+    /MM_TOXIC_FLOW_CLEAR_MOVE_PCT must be less than or equal to MM_TOXIC_FLOW_BLOCK_MOVE_PCT/
+  );
+});
+
+test('validateConfig rejects toxic-flow clear microprice above the block threshold', () => {
+  const candidate = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    MM_TOXIC_FLOW_MICROPRICE_TICKS: '1.5',
+    MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS: '2',
+  });
+
+  assert.throws(
+    () => validateConfig(candidate),
+    /MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS must be less than or equal to MM_TOXIC_FLOW_MICROPRICE_TICKS/
   );
 });
 

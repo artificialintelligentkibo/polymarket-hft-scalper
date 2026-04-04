@@ -515,6 +515,119 @@ test('autonomous MM quotes are suppressed when sniper mode sees a directional Bi
   assert.ok(plan.mmDiagnostics?.toxicityFlags.includes('binance_up_0.1800'));
 });
 
+test('autonomous MM keeps Binance bid suppression until the toxic-flow hold expires', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 8, 8);
+
+  const runtimeConfig = createMmConfig({
+    MM_TOXIC_FLOW_BLOCK_MOVE_PCT: '0.08',
+    MM_TOXIC_FLOW_CLEAR_MOVE_PCT: '0.05',
+    MM_TOXIC_FLOW_HOLD_MS: '5000',
+  });
+  const firstNow = new Date('2026-03-24T10:01:00.000Z');
+  const heldNow = new Date('2026-03-24T10:01:03.000Z');
+  const clearedNow = new Date('2026-03-24T10:01:06.500Z');
+
+  const firstPlan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+      binanceAssessment: {
+        available: true,
+        coin: 'BTC',
+        binancePrice: 84250,
+        slotOpenPrice: 84000,
+        binanceMovePct: 0.18,
+        direction: 'UP',
+        pmUpMid: 0.45,
+        pmImpliedDirection: 'FLAT',
+        directionalAgreement: true,
+        edgeStrength: 0.18,
+        sizeMultiplier: 1.2,
+        urgencyBoost: false,
+        contraSignal: false,
+      },
+    },
+    runtimeConfig,
+    now: firstNow,
+  });
+
+  const heldPlan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+      binanceAssessment: {
+        available: true,
+        coin: 'BTC',
+        binancePrice: 84035,
+        slotOpenPrice: 84000,
+        binanceMovePct: 0.04,
+        direction: 'UP',
+        pmUpMid: 0.45,
+        pmImpliedDirection: 'FLAT',
+        directionalAgreement: false,
+        edgeStrength: 0.04,
+        sizeMultiplier: 1,
+        urgencyBoost: false,
+        contraSignal: false,
+      },
+    },
+    behaviorState: firstPlan.mmBehaviorState ?? undefined,
+    runtimeConfig,
+    now: heldNow,
+  });
+
+  const clearedPlan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+      binanceAssessment: {
+        available: true,
+        coin: 'BTC',
+        binancePrice: 84035,
+        slotOpenPrice: 84000,
+        binanceMovePct: 0.04,
+        direction: 'UP',
+        pmUpMid: 0.45,
+        pmImpliedDirection: 'FLAT',
+        directionalAgreement: false,
+        edgeStrength: 0.04,
+        sizeMultiplier: 1,
+        urgencyBoost: false,
+        contraSignal: false,
+      },
+    },
+    behaviorState: heldPlan.mmBehaviorState ?? undefined,
+    runtimeConfig,
+    now: clearedNow,
+  });
+
+  assert.ok(
+    (firstPlan.mmBehaviorState?.globalBidBlockUntilMs ?? 0) >= firstNow.getTime() + 5000
+  );
+  assert.equal(
+    heldPlan.signals.some((signal) => signal.signalType === 'MM_QUOTE_BID'),
+    false
+  );
+  assert.equal(heldPlan.mmDiagnostics?.entryMode, 'ASK_ONLY');
+  assert.ok(heldPlan.mmDiagnostics?.toxicityFlags.includes('binance_hold'));
+  assert.equal(
+    clearedPlan.signals.some((signal) => signal.signalType === 'MM_QUOTE_BID'),
+    true
+  );
+});
+
 test('post-sniper MM grace window bypasses directional suppression for the activated market', () => {
   const market = createMarket();
   const orderbook = createWideOrderbook();
@@ -1159,6 +1272,90 @@ test('autonomous MM allows YES bids again once pending YES exposure is gone', ()
   assert.equal(
     clearedPlan.signals.some(
       (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'YES'
+    ),
+    true
+  );
+});
+
+test('autonomous MM blocks same-side rebids during the reentry cooldown window', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const now = new Date('2026-03-24T10:01:00.000Z');
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    behaviorState: {
+      globalBidBlockUntilMs: null,
+      toxicBidBlockUntilMs: {},
+      sameSideBidBlockUntilMs: {
+        NO: now.getTime() + 15_000,
+      },
+    },
+    runtimeConfig: createMmConfig({
+      MM_QUOTE_SHARES: '6',
+      MM_SAME_SIDE_REENTRY_COOLDOWN_MS: '30000',
+    }),
+    now,
+  });
+
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'NO'
+    ),
+    false
+  );
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'YES'
+    ),
+    true
+  );
+  assert.equal(plan.mmDiagnostics?.selectedBidSharesNo, null);
+  assert.notEqual(plan.mmDiagnostics?.selectedBidSharesYes, null);
+});
+
+test('autonomous MM blocks same-side rebids when directional inventory already equals the base clip', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 0, 6);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_QUOTE_SHARES: '6',
+    }),
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'NO'
+    ),
+    false
+  );
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'YES'
+    ),
+    true
+  );
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_ASK' && signal.outcome === 'NO'
     ),
     true
   );

@@ -211,8 +211,16 @@ export interface AppConfig {
   readonly MM_CANCEL_ALL_QUOTES_BEFORE_END_MS: number;
   /** Binance move threshold where autonomous MM degrades to ask-only. */
   readonly MM_TOXIC_FLOW_BLOCK_MOVE_PCT: number;
+  /** Binance move threshold below which autonomous MM clears directional toxic hold. */
+  readonly MM_TOXIC_FLOW_CLEAR_MOVE_PCT: number;
   /** Microprice imbalance threshold, measured in ticks, that blocks one-sided bids. */
   readonly MM_TOXIC_FLOW_MICROPRICE_TICKS: number;
+  /** Microprice imbalance threshold below which autonomous MM clears toxic hold. */
+  readonly MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS: number;
+  /** Minimum hold time for autonomous MM toxic-flow suppression. */
+  readonly MM_TOXIC_FLOW_HOLD_MS: number;
+  /** Cooldown after an autonomous MM fill before the same-side bid can re-enter. */
+  readonly MM_SAME_SIDE_REENTRY_COOLDOWN_MS: number;
   /** Maximum number of markets allowed to carry active MM inventory/quotes. */
   readonly MM_MAX_CONCURRENT_MARKETS: number;
   /** Amount of inventory-based fair-value skew applied to autonomous quotes. */
@@ -680,9 +688,25 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       env.MM_TOXIC_FLOW_BLOCK_MOVE_PCT,
       '0.08'
     ),
+    MM_TOXIC_FLOW_CLEAR_MOVE_PCT: parseFloatOrDefault(
+      env.MM_TOXIC_FLOW_CLEAR_MOVE_PCT,
+      '0.05'
+    ),
     MM_TOXIC_FLOW_MICROPRICE_TICKS: Math.max(
       0,
       parseFloatOrDefault(env.MM_TOXIC_FLOW_MICROPRICE_TICKS, '1.5')
+    ),
+    MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS: Math.max(
+      0,
+      parseFloatOrDefault(env.MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS, '1')
+    ),
+    MM_TOXIC_FLOW_HOLD_MS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_TOXIC_FLOW_HOLD_MS, '5000')
+    ),
+    MM_SAME_SIDE_REENTRY_COOLDOWN_MS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_SAME_SIDE_REENTRY_COOLDOWN_MS, '30000')
     ),
     MM_MAX_CONCURRENT_MARKETS: Math.max(
       1,
@@ -1600,8 +1624,38 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error('MM_TOXIC_FLOW_BLOCK_MOVE_PCT must be positive.');
   }
 
+  if (candidate.MM_TOXIC_FLOW_CLEAR_MOVE_PCT <= 0) {
+    throw new Error('MM_TOXIC_FLOW_CLEAR_MOVE_PCT must be positive.');
+  }
+
+  if (candidate.MM_TOXIC_FLOW_CLEAR_MOVE_PCT > candidate.MM_TOXIC_FLOW_BLOCK_MOVE_PCT) {
+    throw new Error(
+      'MM_TOXIC_FLOW_CLEAR_MOVE_PCT must be less than or equal to MM_TOXIC_FLOW_BLOCK_MOVE_PCT.'
+    );
+  }
+
   if (candidate.MM_TOXIC_FLOW_MICROPRICE_TICKS < 0) {
     throw new Error('MM_TOXIC_FLOW_MICROPRICE_TICKS must be zero or positive.');
+  }
+
+  if (candidate.MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS < 0) {
+    throw new Error('MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS must be zero or positive.');
+  }
+
+  if (
+    candidate.MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS > candidate.MM_TOXIC_FLOW_MICROPRICE_TICKS
+  ) {
+    throw new Error(
+      'MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS must be less than or equal to MM_TOXIC_FLOW_MICROPRICE_TICKS.'
+    );
+  }
+
+  if (candidate.MM_TOXIC_FLOW_HOLD_MS < 0) {
+    throw new Error('MM_TOXIC_FLOW_HOLD_MS must be zero or positive.');
+  }
+
+  if (candidate.MM_SAME_SIDE_REENTRY_COOLDOWN_MS < 0) {
+    throw new Error('MM_SAME_SIDE_REENTRY_COOLDOWN_MS must be zero or positive.');
   }
 
   if (candidate.BINANCE_DEPTH_LEVELS < 1) {

@@ -80,6 +80,7 @@ export interface QuoteRefreshPlan {
   readonly activeQuoteOrders: readonly ActiveQuoteOrder[];
   readonly signals: readonly StrategySignal[];
   readonly mmDiagnostics: MmMarketDiagnostics | null;
+  readonly mmBehaviorState: MmBehaviorState | null;
 }
 
 export type MmQuotePhase =
@@ -108,9 +109,16 @@ export interface MmMarketDiagnostics {
   readonly selectedBidSharesNo: number | null;
 }
 
+export interface MmBehaviorState {
+  readonly globalBidBlockUntilMs: number | null;
+  readonly toxicBidBlockUntilMs: Readonly<Partial<Record<Outcome, number>>>;
+  readonly sameSideBidBlockUntilMs: Readonly<Partial<Record<Outcome, number>>>;
+}
+
 interface MarketMakerQuoteBuildResult {
   readonly signals: readonly StrategySignal[];
   readonly mmDiagnostics: MmMarketDiagnostics | null;
+  readonly mmBehaviorState: MmBehaviorState | null;
 }
 
 interface AutonomousMmAssessment {
@@ -126,6 +134,7 @@ interface AutonomousMmAssessment {
   readonly allowAskQuotes: boolean;
   readonly entryMode: MmEntryMode;
   readonly postSniperGraceActive: boolean;
+  readonly mmBehaviorState: MmBehaviorState;
 }
 
 export function buildQuoteRefreshPlan(params: {
@@ -133,6 +142,7 @@ export function buildQuoteRefreshPlan(params: {
   activeQuoteOrders?: readonly ActiveQuoteOrder[];
   runtimeConfig?: AppConfig;
   currentMMExposureUsd?: number;
+  behaviorState?: MmBehaviorState;
   now?: Date;
 }): QuoteRefreshPlan {
   const runtimeConfig = params.runtimeConfig ?? config;
@@ -143,8 +153,9 @@ export function buildQuoteRefreshPlan(params: {
         runtimeConfig,
         activeQuoteOrders,
         currentMMExposureUsd: params.currentMMExposureUsd,
+        behaviorState: params.behaviorState,
       })
-    : { signals: [], mmDiagnostics: null };
+    : { signals: [], mmDiagnostics: null, mmBehaviorState: null };
 
   return {
     marketId: params.context.market.marketId,
@@ -152,6 +163,7 @@ export function buildQuoteRefreshPlan(params: {
     activeQuoteOrders,
     signals: quoteBuild.signals,
     mmDiagnostics: quoteBuild.mmDiagnostics,
+    mmBehaviorState: quoteBuild.mmBehaviorState,
   };
 }
 
@@ -160,6 +172,7 @@ export function buildMarketMakerQuoteSignals(params: {
   activeQuoteOrders?: readonly ActiveQuoteOrder[];
   runtimeConfig?: AppConfig;
   currentMMExposureUsd?: number;
+  behaviorState?: MmBehaviorState;
   now?: Date;
 }): MarketMakerQuoteBuildResult {
   const runtimeConfig = params.runtimeConfig ?? config;
@@ -167,6 +180,7 @@ export function buildMarketMakerQuoteSignals(params: {
     return {
       signals: [],
       mmDiagnostics: null,
+      mmBehaviorState: null,
     };
   }
 
@@ -189,6 +203,7 @@ export function buildMarketMakerQuoteSignals(params: {
   const autonomousAssessment = assessAutonomousMmContext({
     context: params.context,
     runtimeConfig,
+    behaviorState: params.behaviorState,
     now,
   });
   let mmDiagnostics = createMmDiagnosticsSnapshot(autonomousAssessment);
@@ -214,6 +229,7 @@ export function buildMarketMakerQuoteSignals(params: {
         quoteSpreadTicks,
         currentMMExposureUsd: params.currentMMExposureUsd ?? 0,
         assessment: autonomousAssessment,
+        behaviorState: autonomousAssessment.mmBehaviorState,
         diagnostics: mmDiagnostics,
         now,
       });
@@ -325,6 +341,7 @@ export function buildMarketMakerQuoteSignals(params: {
   return {
     signals: mergeQuoteSignals(builtSignals),
     mmDiagnostics,
+    mmBehaviorState: autonomousAssessment.mmBehaviorState,
   };
 }
 
@@ -352,9 +369,53 @@ function createMmDiagnosticsSnapshot(
   };
 }
 
+function normalizeMmBehaviorState(
+  state?: MmBehaviorState | null,
+  nowMs?: number
+): MmBehaviorState {
+  return {
+    globalBidBlockUntilMs:
+      state?.globalBidBlockUntilMs !== null &&
+      state?.globalBidBlockUntilMs !== undefined &&
+      (nowMs === undefined || state.globalBidBlockUntilMs > nowMs)
+        ? state.globalBidBlockUntilMs
+        : null,
+    toxicBidBlockUntilMs: pruneExpiredOutcomeBlockMap(state?.toxicBidBlockUntilMs, nowMs),
+    sameSideBidBlockUntilMs: pruneExpiredOutcomeBlockMap(
+      state?.sameSideBidBlockUntilMs,
+      nowMs
+    ),
+  };
+}
+
+function pruneExpiredOutcomeBlockMap(
+  map?: Readonly<Partial<Record<Outcome, number>>>,
+  nowMs?: number
+): Partial<Record<Outcome, number>> {
+  const next: Partial<Record<Outcome, number>> = {};
+  for (const outcome of ['YES', 'NO'] as const satisfies readonly Outcome[]) {
+    const untilMs = map?.[outcome];
+    if (
+      untilMs !== undefined &&
+      Number.isFinite(untilMs) &&
+      (nowMs === undefined || untilMs > nowMs)
+    ) {
+      next[outcome] = untilMs;
+    }
+  }
+  return next;
+}
+
+function resolveMicropriceToxicFlag(outcome: Outcome, biasTicks: number): string {
+  return `${outcome.toLowerCase()}_microprice_${biasTicks > 0 ? 'up' : 'down'}_${Math.abs(
+    biasTicks
+  ).toFixed(2)}t`;
+}
+
 function assessAutonomousMmContext(params: {
   context: QuoteContext;
   runtimeConfig: AppConfig;
+  behaviorState?: MmBehaviorState;
   now: Date;
 }): AutonomousMmAssessment {
   const slotState = resolveMmSlotState({
@@ -362,6 +423,8 @@ function assessAutonomousMmContext(params: {
     runtimeConfig: params.runtimeConfig,
     now: params.now,
   });
+  const nowMs = params.now.getTime();
+  const previousBehaviorState = normalizeMmBehaviorState(params.behaviorState, nowMs);
   const postSniperGraceActive = isPostSniperMmGraceWindowActive({
     activationTrigger: params.context.activationTrigger,
     runtimeConfig: params.runtimeConfig,
@@ -369,47 +432,85 @@ function assessAutonomousMmContext(params: {
   });
   const toxicityFlags: string[] = [];
   const blockedBidOutcomes = new Set<Outcome>();
+  let globalBidBlockUntilMs = previousBehaviorState.globalBidBlockUntilMs;
+  const toxicBidBlockUntilMs = {
+    ...previousBehaviorState.toxicBidBlockUntilMs,
+  };
   const binanceAssessment = params.context.binanceAssessment;
   const directionalMovePct =
     binanceAssessment?.available === true
       ? roundTo(Math.abs(binanceAssessment.binanceMovePct), 6)
       : null;
-  if (
+  const hasDirectionalBias =
+    directionalMovePct !== null && binanceAssessment?.direction !== 'FLAT';
+  const rawBinanceToxic =
     !postSniperGraceActive &&
-    directionalMovePct !== null &&
-    binanceAssessment?.direction !== 'FLAT' &&
-    directionalMovePct >= params.runtimeConfig.MM_TOXIC_FLOW_BLOCK_MOVE_PCT
-  ) {
+    hasDirectionalBias &&
+    directionalMovePct >= params.runtimeConfig.MM_TOXIC_FLOW_BLOCK_MOVE_PCT;
+  const directionalHoldShouldExtend =
+    !postSniperGraceActive &&
+    hasDirectionalBias &&
+    directionalMovePct > params.runtimeConfig.MM_TOXIC_FLOW_CLEAR_MOVE_PCT;
+
+  if (rawBinanceToxic) {
+    globalBidBlockUntilMs = Math.max(
+      globalBidBlockUntilMs ?? 0,
+      nowMs + params.runtimeConfig.MM_TOXIC_FLOW_HOLD_MS
+    );
     toxicityFlags.push(
       `binance_${String(binanceAssessment?.direction ?? 'flat').toLowerCase()}_${directionalMovePct.toFixed(4)}`
     );
   } else if (postSniperGraceActive) {
     toxicityFlags.push('post_sniper_grace');
+  } else if (globalBidBlockUntilMs !== null && globalBidBlockUntilMs > nowMs) {
+    if (directionalHoldShouldExtend) {
+      globalBidBlockUntilMs = Math.max(
+        globalBidBlockUntilMs,
+        nowMs + params.runtimeConfig.MM_TOXIC_FLOW_HOLD_MS
+      );
+    }
+    toxicityFlags.push('binance_hold');
+  } else {
+    globalBidBlockUntilMs = null;
   }
 
   const yesMicropriceBiasTicks = resolveMicropriceBiasTicks(params.context.orderbook.yes);
   const noMicropriceBiasTicks = resolveMicropriceBiasTicks(params.context.orderbook.no);
-  if (
-    yesMicropriceBiasTicks !== null &&
-    Math.abs(yesMicropriceBiasTicks) >= params.runtimeConfig.MM_TOXIC_FLOW_MICROPRICE_TICKS
-  ) {
-    blockedBidOutcomes.add('YES');
-    toxicityFlags.push(
-      `yes_microprice_${yesMicropriceBiasTicks > 0 ? 'up' : 'down'}_${Math.abs(
-        yesMicropriceBiasTicks
-      ).toFixed(2)}t`
-    );
-  }
-  if (
-    noMicropriceBiasTicks !== null &&
-    Math.abs(noMicropriceBiasTicks) >= params.runtimeConfig.MM_TOXIC_FLOW_MICROPRICE_TICKS
-  ) {
-    blockedBidOutcomes.add('NO');
-    toxicityFlags.push(
-      `no_microprice_${noMicropriceBiasTicks > 0 ? 'up' : 'down'}_${Math.abs(
-        noMicropriceBiasTicks
-      ).toFixed(2)}t`
-    );
+  for (const [outcome, biasTicks] of [
+    ['YES', yesMicropriceBiasTicks],
+    ['NO', noMicropriceBiasTicks],
+  ] as const) {
+    const previousHoldUntilMs = toxicBidBlockUntilMs[outcome];
+    const rawMicropriceToxic =
+      biasTicks !== null &&
+      Math.abs(biasTicks) >= params.runtimeConfig.MM_TOXIC_FLOW_MICROPRICE_TICKS;
+    const micropriceHoldShouldExtend =
+      biasTicks !== null &&
+      Math.abs(biasTicks) > params.runtimeConfig.MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS;
+
+    if (rawMicropriceToxic) {
+      toxicBidBlockUntilMs[outcome] = Math.max(
+        previousHoldUntilMs ?? 0,
+        nowMs + params.runtimeConfig.MM_TOXIC_FLOW_HOLD_MS
+      );
+      blockedBidOutcomes.add(outcome);
+      toxicityFlags.push(resolveMicropriceToxicFlag(outcome, biasTicks));
+      continue;
+    }
+
+    if (previousHoldUntilMs !== undefined && previousHoldUntilMs > nowMs) {
+      if (micropriceHoldShouldExtend) {
+        toxicBidBlockUntilMs[outcome] = Math.max(
+          previousHoldUntilMs,
+          nowMs + params.runtimeConfig.MM_TOXIC_FLOW_HOLD_MS
+        );
+      }
+      blockedBidOutcomes.add(outcome);
+      toxicityFlags.push(`${outcome.toLowerCase()}_microprice_hold`);
+      continue;
+    }
+
+    delete toxicBidBlockUntilMs[outcome];
   }
 
   let allowBidQuotes = true;
@@ -430,7 +531,8 @@ function assessAutonomousMmContext(params: {
 
   if (
     allowBidQuotes &&
-    toxicityFlags.some((flag) => flag.startsWith('binance_'))
+    globalBidBlockUntilMs !== null &&
+    globalBidBlockUntilMs > nowMs
   ) {
     allowBidQuotes = false;
     entryMode = 'ASK_ONLY';
@@ -454,6 +556,11 @@ function assessAutonomousMmContext(params: {
     allowAskQuotes,
     entryMode,
     postSniperGraceActive,
+    mmBehaviorState: {
+      globalBidBlockUntilMs,
+      toxicBidBlockUntilMs,
+      sameSideBidBlockUntilMs: previousBehaviorState.sameSideBidBlockUntilMs,
+    },
   };
 }
 
@@ -680,11 +787,13 @@ function generateAutonomousQuoteSignals(params: {
   quoteSpreadTicks: number;
   currentMMExposureUsd: number;
   assessment: AutonomousMmAssessment;
+  behaviorState: MmBehaviorState;
   diagnostics: MmMarketDiagnostics;
   now: Date;
 }): { signals: readonly StrategySignal[]; diagnostics: MmMarketDiagnostics } {
   const { context, runtimeConfig, now, assessment } = params;
   const diagnostics = { ...params.diagnostics };
+  const behaviorState = normalizeMmBehaviorState(params.behaviorState, now.getTime());
   const snapshot = context.positionManager.getSnapshot();
   const pendingQuoteExposure = normalizePendingQuoteExposure(
     context.pendingQuoteExposure
@@ -899,6 +1008,15 @@ function generateAutonomousQuoteSignals(params: {
         },
       });
     } else {
+      const sameSideBidBlockUntilMs = behaviorState.sameSideBidBlockUntilMs[outcome] ?? null;
+      const sameSideBidBlockActive =
+        sameSideBidBlockUntilMs !== null && sameSideBidBlockUntilMs > now.getTime();
+      const dominantDirectionalShares =
+        outcome === 'YES'
+          ? Math.max(0, effectiveSnapshot.yesShares - effectiveSnapshot.noShares)
+          : Math.max(0, effectiveSnapshot.noShares - effectiveSnapshot.yesShares);
+      const sameSideInventoryBlocked =
+        dominantDirectionalShares >= Math.max(6, runtimeConfig.MM_QUOTE_SHARES);
       const bidShares = resolveAutonomousBidShares({
         runtimeConfig,
         actualSpread,
@@ -924,6 +1042,8 @@ function generateAutonomousQuoteSignals(params: {
         Math.abs(projectedDirectionalInventory) >= Math.abs(netInventory);
 
       if (
+        sameSideBidBlockActive ||
+        sameSideInventoryBlocked ||
         bidShares < minimumBidShares ||
         context.allowEntryQuotes === false ||
         context.riskAssessment.blockedOutcomes.has(outcome) ||
@@ -937,7 +1057,9 @@ function generateAutonomousQuoteSignals(params: {
           runtimeConfig,
           now,
           reason:
-            bidShares < minimumBidShares
+            sameSideBidBlockActive || sameSideInventoryBlocked
+              ? 'same_side_reentry'
+              : bidShares < minimumBidShares
               ? 'below_minimum_size'
               : context.allowEntryQuotes === false
               ? 'concurrent_limit'
@@ -948,6 +1070,9 @@ function generateAutonomousQuoteSignals(params: {
             outcome,
             bidShares,
             minimumBidShares,
+            sameSideBidBlockActive,
+            sameSideBidBlockUntilMs,
+            dominantDirectionalShares: roundTo(dominantDirectionalShares, 4),
             entryCapacity,
             overweightOutcome,
             projectedExposureUsd: roundTo(projectedExposureUsd + bidNotionalUsd, 4),
@@ -1334,11 +1459,26 @@ function buildAutonomousSignal(params: {
   };
 }
 
+function isSameSideInventoryDominant(params: {
+  outcome: Outcome;
+  yesShares: number;
+  noShares: number;
+  baseShares: number;
+}): boolean {
+  const dominantDirectionalShares =
+    params.outcome === 'YES'
+      ? Math.max(0, params.yesShares - params.noShares)
+      : Math.max(0, params.noShares - params.yesShares);
+
+  return dominantDirectionalShares >= Math.max(6, params.baseShares);
+}
+
 export class QuotingEngine {
   private readonly contexts = new Map<string, QuoteContext>();
   private readonly activeQuoteOrders = new Map<string, ActiveQuoteOrder[]>();
   private readonly activationTriggers = new Map<string, QuoteActivationTrigger>();
   private readonly marketDiagnostics = new Map<string, MmMarketDiagnostics>();
+  private readonly mmBehaviorStates = new Map<string, MmBehaviorState>();
   private readonly marketLifecycleSignatures = new Map<string, string>();
   private refreshTimer: NodeJS.Timeout | null = null;
   private refreshInFlight = false;
@@ -1378,6 +1518,7 @@ export class QuotingEngine {
     this.activeQuoteOrders.clear();
     this.activationTriggers.clear();
     this.marketDiagnostics.clear();
+    this.mmBehaviorStates.clear();
     this.marketLifecycleSignatures.clear();
     this.onRefreshPlan = null;
   }
@@ -1418,6 +1559,11 @@ export class QuotingEngine {
     return diagnostics ? { ...diagnostics } : undefined;
   }
 
+  getMmBehaviorState(marketId: string): MmBehaviorState | undefined {
+    const behaviorState = this.mmBehaviorStates.get(marketId);
+    return behaviorState ? normalizeMmBehaviorState(behaviorState) : undefined;
+  }
+
   replaceMmDiagnostics(marketId: string, diagnostics: MmMarketDiagnostics | null): void {
     if (!diagnostics) {
       this.marketDiagnostics.delete(marketId);
@@ -1427,6 +1573,53 @@ export class QuotingEngine {
 
     this.marketDiagnostics.set(marketId, { ...diagnostics });
     this.maybeLogLifecycleTransition(marketId, diagnostics);
+  }
+
+  replaceMmBehaviorState(marketId: string, behaviorState: MmBehaviorState | null): void {
+    if (!behaviorState) {
+      this.mmBehaviorStates.delete(marketId);
+      return;
+    }
+
+    this.mmBehaviorStates.set(marketId, normalizeMmBehaviorState(behaviorState));
+  }
+
+  noteAutonomousQuoteFill(params: {
+    marketId: string;
+    outcome: Outcome;
+    side: StrategySignal['action'];
+    signalType: SignalType;
+    filledAtMs: number;
+    afterYesShares: number;
+    afterNoShares: number;
+  }): void {
+    const nextState = normalizeMmBehaviorState(
+      this.mmBehaviorStates.get(params.marketId),
+      params.filledAtMs
+    );
+    const sameSideBidBlockUntilMs = {
+      ...nextState.sameSideBidBlockUntilMs,
+    };
+
+    if (params.signalType === 'MM_QUOTE_BID' && params.side === 'BUY') {
+      sameSideBidBlockUntilMs[params.outcome] =
+        params.filledAtMs + this.runtimeConfig.MM_SAME_SIDE_REENTRY_COOLDOWN_MS;
+    } else if (
+      params.side === 'SELL' &&
+      !isSameSideInventoryDominant({
+        outcome: params.outcome,
+        yesShares: params.afterYesShares,
+        noShares: params.afterNoShares,
+        baseShares: this.runtimeConfig.MM_QUOTE_SHARES,
+      })
+    ) {
+      delete sameSideBidBlockUntilMs[params.outcome];
+    }
+
+    this.replaceMmBehaviorState(params.marketId, {
+      ...nextState,
+      sameSideBidBlockUntilMs,
+    });
   }
 
   /**
@@ -1507,6 +1700,7 @@ export class QuotingEngine {
         this.contexts.delete(marketId);
         this.activationTriggers.delete(marketId);
         this.marketDiagnostics.delete(marketId);
+        this.mmBehaviorStates.delete(marketId);
         this.marketLifecycleSignatures.delete(marketId);
       }
     }
@@ -1517,6 +1711,7 @@ export class QuotingEngine {
         this.activeQuoteOrders.delete(marketId);
         this.activationTriggers.delete(marketId);
         this.marketDiagnostics.delete(marketId);
+        this.mmBehaviorStates.delete(marketId);
         this.marketLifecycleSignatures.delete(marketId);
       }
     }
@@ -1536,10 +1731,12 @@ export class QuotingEngine {
           context,
           activeQuoteOrders: this.activeQuoteOrders.get(marketId) ?? [],
           currentMMExposureUsd: this.getCurrentMMExposureUsd(),
+          behaviorState: this.mmBehaviorStates.get(marketId),
           runtimeConfig: this.runtimeConfig,
           now: this.now(),
         });
         this.replaceMmDiagnostics(marketId, plan.mmDiagnostics);
+        this.replaceMmBehaviorState(marketId, plan.mmBehaviorState);
 
         if (plan.activeQuoteOrders.length === 0 && plan.signals.length === 0) {
           continue;

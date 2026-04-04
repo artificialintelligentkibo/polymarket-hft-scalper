@@ -140,3 +140,68 @@ test('lottery passive buys preserve relative-priced targets without drifting to 
   assert.equal(plan.postOnly, true);
   assert.equal(plan.urgency, 'passive');
 });
+
+test('passive MM bids respect the quote target instead of joining a richer live best bid', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    POST_ONLY_ONLY: 'true',
+  });
+
+  const executor = new OrderExecutor(undefined, runtimeConfig) as any;
+  const plan = executor.buildExecutionPlan(
+    createSignal({
+      signalType: 'MM_QUOTE_BID',
+      urgency: 'passive',
+      targetPrice: 0.29,
+      referencePrice: 0.29,
+      tokenPrice: 0.29,
+      midPrice: 0.29,
+    }),
+    {
+      bids: [{ price: 0.35, size: 100 }],
+      asks: [{ price: 0.36, size: 100 }],
+      bestBid: 0.35,
+      bestAsk: 0.36,
+    }
+  );
+
+  assert.equal(plan.price, 0.29);
+  assert.equal(plan.postOnly, true);
+  assert.equal(plan.urgency, 'passive');
+});
+
+test('passive MM asks respect the quote target instead of walking down to the live ask', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    POST_ONLY_ONLY: 'true',
+  });
+
+  const executor = new OrderExecutor(undefined, runtimeConfig) as any;
+  const plan = executor.buildExecutionPlan(
+    createSignal({
+      signalType: 'MM_QUOTE_ASK',
+      action: 'SELL',
+      outcome: 'NO',
+      outcomeIndex: 1,
+      urgency: 'passive',
+      targetPrice: 0.29,
+      referencePrice: 0.29,
+      tokenPrice: 0.29,
+      midPrice: 0.29,
+    }),
+    {
+      bids: [{ price: 0.21, size: 100 }],
+      asks: [{ price: 0.23, size: 100 }],
+      bestBid: 0.21,
+      bestAsk: 0.23,
+    }
+  );
+
+  assert.equal(plan.price, 0.29);
+  assert.equal(plan.postOnly, true);
+  assert.equal(plan.urgency, 'passive');
+});

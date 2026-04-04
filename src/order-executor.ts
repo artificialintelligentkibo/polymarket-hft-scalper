@@ -247,7 +247,10 @@ export class OrderExecutor {
           message: lastError.message,
         });
 
-        if (attempt < this.runtimeConfig.trading.retryAttempts) {
+        if (
+          attempt < this.runtimeConfig.trading.retryAttempts &&
+          shouldRetryOrderPlacement(lastError, executionPlan.postOnly)
+        ) {
           await sleep(Math.min(150 * 2 ** (attempt - 1), 2_000));
         }
       }
@@ -397,7 +400,7 @@ export class OrderExecutor {
       if (signal.signalType === 'LOTTERY_BUY' && effectiveUrgency !== 'cross') {
         const makerCap = bestAsk !== null ? Math.max(0.01, bestAsk - tick) : fallbackPrice;
         return {
-          price: roundTo(Math.min(fallbackPrice, makerCap), 6),
+          price: roundTo(Math.min(fallbackPrice, signal.targetPrice ?? fallbackPrice, makerCap), 6),
           postOnly: true,
           orderType: resolveOrderType(signal, this.runtimeConfig),
           urgency: effectiveUrgency,
@@ -417,14 +420,17 @@ export class OrderExecutor {
         const improvedBid = (bestBid ?? fallbackPrice) + tick * this.runtimeConfig.trading.improveTicks;
         const makerCap = bestAsk !== null ? Math.max(0.01, bestAsk - tick) : improvedBid;
         return {
-          price: roundTo(Math.min(improvedBid, makerCap), 6),
+          price: roundTo(Math.min(improvedBid, signal.targetPrice ?? improvedBid, makerCap), 6),
           postOnly: true,
           orderType: resolveOrderType(signal, this.runtimeConfig),
           urgency: effectiveUrgency,
         };
       }
 
-      const passiveBid = bestBid ?? Math.max(0.01, fallbackPrice - tick * this.runtimeConfig.trading.passiveTicks);
+      const passiveBid = Math.min(
+        bestBid ?? Math.max(0.01, fallbackPrice - tick * this.runtimeConfig.trading.passiveTicks),
+        signal.targetPrice ?? Number.POSITIVE_INFINITY
+      );
       const makerCap = bestAsk !== null ? Math.max(0.01, bestAsk - tick) : passiveBid;
       return {
         price: roundTo(Math.min(passiveBid, makerCap), 6),
@@ -447,14 +453,17 @@ export class OrderExecutor {
       const improvedAsk = (bestAsk ?? fallbackPrice) - tick * this.runtimeConfig.trading.improveTicks;
       const makerFloor = bestBid !== null ? bestBid + tick : improvedAsk;
       return {
-        price: roundTo(Math.max(improvedAsk, makerFloor), 6),
+        price: roundTo(Math.max(improvedAsk, signal.targetPrice ?? improvedAsk, makerFloor), 6),
         postOnly: true,
         orderType: resolveOrderType(signal, this.runtimeConfig),
         urgency: effectiveUrgency,
       };
     }
 
-    const passiveAsk = bestAsk ?? fallbackPrice + tick * this.runtimeConfig.trading.passiveTicks;
+    const passiveAsk = Math.max(
+      bestAsk ?? fallbackPrice + tick * this.runtimeConfig.trading.passiveTicks,
+      signal.targetPrice ?? 0
+    );
     const makerFloor = bestBid !== null ? bestBid + tick : passiveAsk;
     return {
       price: roundTo(Math.max(passiveAsk, makerFloor), 6),
@@ -519,6 +528,19 @@ export function resolveExecutionAttemptUrgencies(
   }
 
   return [signal.urgency];
+}
+
+function shouldRetryOrderPlacement(error: Error, postOnly: boolean): boolean {
+  if (!postOnly) {
+    return true;
+  }
+
+  const message = error.message.toLowerCase();
+  if (message.includes('post-only') && message.includes('cross')) {
+    return false;
+  }
+
+  return true;
 }
 
 function inferTickSize(book: TokenBookSnapshot, fallbackPrice: number): number {

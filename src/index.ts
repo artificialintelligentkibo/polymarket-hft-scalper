@@ -1167,6 +1167,21 @@ export class MarketMakerRuntime {
         : beforeSnapshot;
 
     if (effectiveShares > 0) {
+      if (
+        isDynamicQuotingEnabled(config) &&
+        (executionSignal.signalType === 'MM_QUOTE_BID' ||
+          executionSignal.signalType === 'MM_QUOTE_ASK')
+      ) {
+        this.quotingEngine.noteAutonomousQuoteFill({
+          marketId: market.marketId,
+          outcome: executionSignal.outcome,
+          side: executionSignal.action,
+          signalType: executionSignal.signalType,
+          filledAtMs: executionCompletedAt,
+          afterYesShares: afterSnapshot.yesShares,
+          afterNoShares: afterSnapshot.noShares,
+        });
+      }
       if (executionSignal.signalType === 'LOTTERY_BUY' && executionSignal.action === 'BUY') {
         this.lotteryEngine.recordExecution({
           marketId: market.marketId,
@@ -1694,6 +1709,20 @@ export class MarketMakerRuntime {
       orderId: fill.orderId,
       strategyLayer: fill.strategyLayer ?? resolveStrategyLayer(fill.signalType),
     });
+    if (
+      isDynamicQuotingEnabled(config) &&
+      (fill.signalType === 'MM_QUOTE_BID' || fill.signalType === 'MM_QUOTE_ASK')
+    ) {
+      this.quotingEngine.noteAutonomousQuoteFill({
+        marketId: fill.marketId,
+        outcome: fill.outcome,
+        side: fill.side,
+        signalType: fill.signalType,
+        filledAtMs: fill.filledAt,
+        afterYesShares: afterSnapshot.yesShares,
+        afterNoShares: afterSnapshot.noShares,
+      });
+    }
     if (fill.signalType === 'LOTTERY_BUY' && fill.side === 'BUY') {
       this.lotteryEngine.recordExecution({
         marketId: fill.marketId,
@@ -4502,10 +4531,12 @@ export class MarketMakerRuntime {
             this.getPendingQuoteExposure().grossExposureUsd,
           4
         ),
+        behaviorState: this.quotingEngine.getMmBehaviorState(plan.marketId),
         runtimeConfig: config,
         now: new Date(),
       });
       this.quotingEngine.replaceMmDiagnostics(plan.marketId, refreshedPlan.mmDiagnostics);
+      this.quotingEngine.replaceMmBehaviorState(plan.marketId, refreshedPlan.mmBehaviorState);
 
       const trackedPendingQuoteOrderIds = new Set(
         this.fillTracker
