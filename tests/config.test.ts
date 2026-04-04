@@ -151,7 +151,9 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.MM_TOXIC_FLOW_MICROPRICE_TICKS, 1.5);
   assert.equal(candidate.MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS, 1);
   assert.equal(candidate.MM_TOXIC_FLOW_HOLD_MS, 5000);
+  assert.equal(candidate.MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS, 10000);
   assert.equal(candidate.MM_SAME_SIDE_REENTRY_COOLDOWN_MS, 30000);
+  assert.equal(candidate.MM_GROSS_REENTRY_THRESHOLD_CLIPS, 2);
   assert.equal(candidate.MM_MAKER_MIN_EDGE, 0.003);
   assert.equal(candidate.MM_MIN_QUOTE_LIFETIME_MS, 1500);
   assert.equal(candidate.MM_REPRICE_DEADBAND_TICKS, 1);

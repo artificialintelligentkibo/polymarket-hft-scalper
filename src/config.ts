@@ -219,8 +219,15 @@ export interface AppConfig {
   readonly MM_TOXIC_FLOW_CLEAR_MICROPRICE_TICKS: number;
   /** Minimum hold time for autonomous MM toxic-flow suppression. */
   readonly MM_TOXIC_FLOW_HOLD_MS: number;
+  /** Cooldown after toxic ASK_ONLY clears before autonomous MM may bid again. */
+  readonly MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS: number;
   /** Cooldown after an autonomous MM fill before the same-side bid can re-enter. */
   readonly MM_SAME_SIDE_REENTRY_COOLDOWN_MS: number;
+  /**
+   * Gross inventory threshold, expressed in base MM quote clips, above which
+   * new autonomous bids are blocked unless they reduce the current imbalance.
+   */
+  readonly MM_GROSS_REENTRY_THRESHOLD_CLIPS: number;
   /** Maximum number of markets allowed to carry active MM inventory/quotes. */
   readonly MM_MAX_CONCURRENT_MARKETS: number;
   /** Amount of inventory-based fair-value skew applied to autonomous quotes. */
@@ -704,9 +711,17 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       0,
       parseIntOrDefault(env.MM_TOXIC_FLOW_HOLD_MS, '5000')
     ),
+    MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS, '10000')
+    ),
     MM_SAME_SIDE_REENTRY_COOLDOWN_MS: Math.max(
       0,
       parseIntOrDefault(env.MM_SAME_SIDE_REENTRY_COOLDOWN_MS, '30000')
+    ),
+    MM_GROSS_REENTRY_THRESHOLD_CLIPS: Math.max(
+      0,
+      parseFloatOrDefault(env.MM_GROSS_REENTRY_THRESHOLD_CLIPS, '2')
     ),
     MM_MAX_CONCURRENT_MARKETS: Math.max(
       1,
@@ -1654,8 +1669,16 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error('MM_TOXIC_FLOW_HOLD_MS must be zero or positive.');
   }
 
+  if (candidate.MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS < 0) {
+    throw new Error('MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS must be zero or positive.');
+  }
+
   if (candidate.MM_SAME_SIDE_REENTRY_COOLDOWN_MS < 0) {
     throw new Error('MM_SAME_SIDE_REENTRY_COOLDOWN_MS must be zero or positive.');
+  }
+
+  if (candidate.MM_GROSS_REENTRY_THRESHOLD_CLIPS < 0) {
+    throw new Error('MM_GROSS_REENTRY_THRESHOLD_CLIPS must be zero or positive.');
   }
 
   if (candidate.BINANCE_DEPTH_LEVELS < 1) {

@@ -113,6 +113,7 @@ export interface MmBehaviorState {
   readonly globalBidBlockUntilMs: number | null;
   readonly toxicBidBlockUntilMs: Readonly<Partial<Record<Outcome, number>>>;
   readonly sameSideBidBlockUntilMs: Readonly<Partial<Record<Outcome, number>>>;
+  readonly lastAskOnlyBidBlockAtMs: number | null;
 }
 
 interface MarketMakerQuoteBuildResult {
@@ -385,6 +386,12 @@ function normalizeMmBehaviorState(
       state?.sameSideBidBlockUntilMs,
       nowMs
     ),
+    lastAskOnlyBidBlockAtMs:
+      state?.lastAskOnlyBidBlockAtMs !== null &&
+      state?.lastAskOnlyBidBlockAtMs !== undefined &&
+      Number.isFinite(state.lastAskOnlyBidBlockAtMs)
+        ? state.lastAskOnlyBidBlockAtMs
+        : null,
   };
 }
 
@@ -433,6 +440,7 @@ function assessAutonomousMmContext(params: {
   const toxicityFlags: string[] = [];
   const blockedBidOutcomes = new Set<Outcome>();
   let globalBidBlockUntilMs = previousBehaviorState.globalBidBlockUntilMs;
+  let lastAskOnlyBidBlockAtMs = previousBehaviorState.lastAskOnlyBidBlockAtMs;
   const toxicBidBlockUntilMs = {
     ...previousBehaviorState.toxicBidBlockUntilMs,
   };
@@ -513,6 +521,22 @@ function assessAutonomousMmContext(params: {
     delete toxicBidBlockUntilMs[outcome];
   }
 
+  const toxicAskOnlyActive =
+    (globalBidBlockUntilMs !== null && globalBidBlockUntilMs > nowMs) ||
+    blockedBidOutcomes.size >= 2;
+  if (toxicAskOnlyActive) {
+    lastAskOnlyBidBlockAtMs = nowMs;
+  }
+  const postAskOnlyReentryCooldownActive =
+    !toxicAskOnlyActive &&
+    lastAskOnlyBidBlockAtMs !== null &&
+    params.runtimeConfig.MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS > 0 &&
+    nowMs - lastAskOnlyBidBlockAtMs <
+      params.runtimeConfig.MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS;
+  if (!toxicAskOnlyActive && !postAskOnlyReentryCooldownActive) {
+    lastAskOnlyBidBlockAtMs = null;
+  }
+
   let allowBidQuotes = true;
   let allowAskQuotes = true;
   let entryMode: MmEntryMode = 'NORMAL';
@@ -539,6 +563,10 @@ function assessAutonomousMmContext(params: {
   } else if (allowBidQuotes && blockedBidOutcomes.size >= 2) {
     allowBidQuotes = false;
     entryMode = 'ASK_ONLY';
+  } else if (allowBidQuotes && postAskOnlyReentryCooldownActive) {
+    allowBidQuotes = false;
+    entryMode = 'ASK_ONLY';
+    toxicityFlags.push('post_ask_only_cooldown');
   } else if (allowBidQuotes && blockedBidOutcomes.size === 1) {
     entryMode = 'ONE_SIDED';
   }
@@ -560,6 +588,7 @@ function assessAutonomousMmContext(params: {
       globalBidBlockUntilMs,
       toxicBidBlockUntilMs,
       sameSideBidBlockUntilMs: previousBehaviorState.sameSideBidBlockUntilMs,
+      lastAskOnlyBidBlockAtMs,
     },
   };
 }
@@ -1027,6 +1056,22 @@ function generateAutonomousQuoteSignals(params: {
         timeToSlotEndMs: assessment.timeToSlotEndMs,
       });
       const bidNotionalUsd = roundTo(bidShares * bidPrice, 4);
+      const projectedGrossExposureShares = roundTo(
+        effectiveSnapshot.grossExposureShares + bidShares,
+        4
+      );
+      const currentAbsoluteNetInventory = roundTo(Math.abs(netInventory), 4);
+      const projectedAbsoluteNetInventory = roundTo(
+        Math.abs(netInventory + (outcome === 'YES' ? bidShares : -bidShares)),
+        4
+      );
+      const grossReentryThresholdShares = resolveGrossReentryThresholdShares({
+        runtimeConfig,
+      });
+      const grossInventoryReentryBlocked =
+        grossReentryThresholdShares !== null &&
+        projectedGrossExposureShares >= grossReentryThresholdShares &&
+        projectedAbsoluteNetInventory > currentAbsoluteNetInventory + 0.0001;
       const minimumBidShares = resolveMinimumTradableShares(bidPrice, 6);
       const entryCapacity = resolvePendingAwareEntryCapacity({
         outcome,
@@ -1044,6 +1089,7 @@ function generateAutonomousQuoteSignals(params: {
       if (
         sameSideBidBlockActive ||
         sameSideInventoryBlocked ||
+        grossInventoryReentryBlocked ||
         bidShares < minimumBidShares ||
         context.allowEntryQuotes === false ||
         context.riskAssessment.blockedOutcomes.has(outcome) ||
@@ -1059,6 +1105,8 @@ function generateAutonomousQuoteSignals(params: {
           reason:
             sameSideBidBlockActive || sameSideInventoryBlocked
               ? 'same_side_reentry'
+              : grossInventoryReentryBlocked
+              ? 'gross_inventory_reentry'
               : bidShares < minimumBidShares
               ? 'below_minimum_size'
               : context.allowEntryQuotes === false
@@ -1073,6 +1121,11 @@ function generateAutonomousQuoteSignals(params: {
             sameSideBidBlockActive,
             sameSideBidBlockUntilMs,
             dominantDirectionalShares: roundTo(dominantDirectionalShares, 4),
+            currentGrossExposureShares: roundTo(effectiveSnapshot.grossExposureShares, 4),
+            projectedGrossExposureShares,
+            grossReentryThresholdShares,
+            currentAbsoluteNetInventory,
+            projectedAbsoluteNetInventory,
             entryCapacity,
             overweightOutcome,
             projectedExposureUsd: roundTo(projectedExposureUsd + bidNotionalUsd, 4),
@@ -1471,6 +1524,17 @@ function isSameSideInventoryDominant(params: {
       : Math.max(0, params.noShares - params.yesShares);
 
   return dominantDirectionalShares >= Math.max(6, params.baseShares);
+}
+
+function resolveGrossReentryThresholdShares(params: {
+  runtimeConfig: AppConfig;
+}): number | null {
+  if (params.runtimeConfig.MM_GROSS_REENTRY_THRESHOLD_CLIPS <= 0) {
+    return null;
+  }
+
+  const baseShares = Math.max(6, params.runtimeConfig.MM_QUOTE_SHARES);
+  return roundTo(baseShares * params.runtimeConfig.MM_GROSS_REENTRY_THRESHOLD_CLIPS, 4);
 }
 
 export class QuotingEngine {

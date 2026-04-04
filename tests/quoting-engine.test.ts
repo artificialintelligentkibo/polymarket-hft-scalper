@@ -207,6 +207,8 @@ function createMmConfig(
     MM_MIN_SPREAD_TICKS: '2',
     MM_REQUIRE_FAIR_VALUE: 'true',
     MM_MIN_BOOK_DEPTH_USD: '3',
+    MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS: '0',
+    MM_GROSS_REENTRY_THRESHOLD_CLIPS: '0',
     MM_MAX_CONCURRENT_MARKETS: '4',
     MM_INVENTORY_SKEW_FACTOR: '0.3',
     MM_MIN_EDGE_AFTER_FEE: '0.005',
@@ -1297,6 +1299,7 @@ test('autonomous MM blocks same-side rebids during the reentry cooldown window',
       sameSideBidBlockUntilMs: {
         NO: now.getTime() + 15_000,
       },
+      lastAskOnlyBidBlockAtMs: null,
     },
     runtimeConfig: createMmConfig({
       MM_QUOTE_SHARES: '6',
@@ -1359,6 +1362,147 @@ test('autonomous MM blocks same-side rebids when directional inventory already e
     ),
     true
   );
+});
+
+test('autonomous MM blocks fresh bids that would grow gross inventory beyond two clips without reducing imbalance', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 5.9916);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_QUOTE_SHARES: '6',
+      MM_GROSS_REENTRY_THRESHOLD_CLIPS: '2',
+    }),
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(
+    plan.signals.some((signal) => signal.signalType === 'MM_QUOTE_BID'),
+    false
+  );
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_ASK' && signal.outcome === 'YES'
+    ),
+    true
+  );
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_ASK' && signal.outcome === 'NO'
+    ),
+    true
+  );
+});
+
+test('autonomous MM still allows hedging bids above the gross reentry threshold when they reduce imbalance', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 0);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_QUOTE_SHARES: '6',
+      MM_GROSS_REENTRY_THRESHOLD_CLIPS: '2',
+    }),
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'NO'
+    ),
+    true
+  );
+  assert.equal(
+    plan.signals.some(
+      (signal) => signal.signalType === 'MM_QUOTE_BID' && signal.outcome === 'YES'
+    ),
+    false
+  );
+});
+
+test('autonomous MM keeps bids suppressed briefly after toxic ask-only clears', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const now = new Date('2026-03-24T10:01:00.000Z');
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    behaviorState: {
+      globalBidBlockUntilMs: null,
+      toxicBidBlockUntilMs: {},
+      sameSideBidBlockUntilMs: {},
+      lastAskOnlyBidBlockAtMs: now.getTime() - 3_000,
+    },
+    runtimeConfig: createMmConfig({
+      MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS: '5000',
+    }),
+    now,
+  });
+
+  assert.equal(
+    plan.signals.some((signal) => signal.signalType === 'MM_QUOTE_BID'),
+    false
+  );
+  assert.equal(plan.mmDiagnostics?.entryMode, 'ASK_ONLY');
+  assert.ok(plan.mmDiagnostics?.toxicityFlags.includes('post_ask_only_cooldown'));
+});
+
+test('autonomous MM resumes bidding once the post ask-only cooldown expires', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  const now = new Date('2026-03-24T10:01:00.000Z');
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    behaviorState: {
+      globalBidBlockUntilMs: null,
+      toxicBidBlockUntilMs: {},
+      sameSideBidBlockUntilMs: {},
+      lastAskOnlyBidBlockAtMs: now.getTime() - 6_000,
+    },
+    runtimeConfig: createMmConfig({
+      MM_POST_ASK_ONLY_REENTRY_COOLDOWN_MS: '5000',
+    }),
+    now,
+  });
+
+  assert.equal(
+    plan.signals.some((signal) => signal.signalType === 'MM_QUOTE_BID'),
+    true
+  );
+  assert.notEqual(plan.mmDiagnostics?.entryMode, 'ASK_ONLY');
 });
 
 test('autonomous MM blocks entry bids when the quoted price is outside the allowed band', () => {
