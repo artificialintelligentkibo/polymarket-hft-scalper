@@ -137,10 +137,17 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   assert.equal(candidate.strategy.latencyPauseWindowSize, 10);
   assert.equal(candidate.strategy.latencyPauseSampleTtlMs, 90000);
   assert.equal(candidate.MM_QUOTE_SHARES, 6);
+  assert.equal(candidate.MM_MAX_QUOTE_SHARES, 18);
   assert.equal(candidate.MM_MAX_GROSS_EXPOSURE_USD, 15);
   assert.equal(candidate.MM_MAX_NET_DIRECTIONAL, 10);
   assert.equal(candidate.MM_AUTONOMOUS_MIN_BID_PRICE, 0.1);
   assert.equal(candidate.MM_AUTONOMOUS_MAX_BID_PRICE, 0.9);
+  assert.equal(candidate.MM_SLOT_WARMUP_MS, 2000);
+  assert.equal(candidate.MM_OPENING_SEED_WINDOW_MS, 10000);
+  assert.equal(candidate.MM_STOP_NEW_ENTRIES_BEFORE_END_MS, 60000);
+  assert.equal(candidate.MM_CANCEL_ALL_QUOTES_BEFORE_END_MS, 15000);
+  assert.equal(candidate.MM_TOXIC_FLOW_BLOCK_MOVE_PCT, 0.08);
+  assert.equal(candidate.MM_TOXIC_FLOW_MICROPRICE_TICKS, 1.5);
   assert.equal(candidate.MM_MAKER_MIN_EDGE, 0.003);
   assert.equal(candidate.MM_MIN_QUOTE_LIFETIME_MS, 1500);
   assert.equal(candidate.MM_REPRICE_DEADBAND_TICKS, 1);
@@ -292,6 +299,36 @@ test('validateConfig rejects BAYESIAN_FV_ALPHA outside [0, 1]', () => {
   assert.throws(
     () => validateConfig(candidate),
     /BAYESIAN_FV_ALPHA must be in the range \[0, 1\]/
+  );
+});
+
+test('validateConfig rejects MM_MAX_QUOTE_SHARES below the 6-share floor', () => {
+  const candidate = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    MM_QUOTE_SHARES: '8',
+    MM_MAX_QUOTE_SHARES: '7',
+  });
+
+  assert.throws(
+    () => validateConfig(candidate),
+    /MM_MAX_QUOTE_SHARES must be greater than or equal to MM_QUOTE_SHARES/
+  );
+});
+
+test('validateConfig rejects cancel windows that outlive the late-entry cutoff', () => {
+  const candidate = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+    MM_STOP_NEW_ENTRIES_BEFORE_END_MS: '15000',
+    MM_CANCEL_ALL_QUOTES_BEFORE_END_MS: '30000',
+  });
+
+  assert.throws(
+    () => validateConfig(candidate),
+    /MM_CANCEL_ALL_QUOTES_BEFORE_END_MS must be less than or equal to MM_STOP_NEW_ENTRIES_BEFORE_END_MS/
   );
 });
 

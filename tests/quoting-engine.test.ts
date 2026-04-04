@@ -141,6 +141,58 @@ function createNoFairValueOrderbook(): MarketOrderbookSnapshot {
   return orderbook;
 }
 
+function createLowPriceOrderbook(): MarketOrderbookSnapshot {
+  return {
+    marketId: 'market-1',
+    title: 'BTC Up or Down - 10:00-10:05',
+    timestamp: new Date().toISOString(),
+    yes: {
+      tokenId: 'yes-token',
+      bids: [{ price: 0.14, size: 60 }],
+      asks: [{ price: 0.18, size: 60 }],
+      bestBid: 0.14,
+      bestAsk: 0.18,
+      midPrice: 0.16,
+      spread: 0.04,
+      spreadBps: 2500,
+      depthSharesBid: 60,
+      depthSharesAsk: 60,
+      depthNotionalBid: 8.4,
+      depthNotionalAsk: 10.8,
+      lastTradePrice: 0.16,
+      lastTradeSize: 8,
+      source: 'rest',
+      updatedAt: new Date().toISOString(),
+    },
+    no: {
+      tokenId: 'no-token',
+      bids: [{ price: 0.82, size: 60 }],
+      asks: [{ price: 0.86, size: 60 }],
+      bestBid: 0.82,
+      bestAsk: 0.86,
+      midPrice: 0.84,
+      spread: 0.04,
+      spreadBps: 476.19,
+      depthSharesBid: 60,
+      depthSharesAsk: 60,
+      depthNotionalBid: 49.2,
+      depthNotionalAsk: 51.6,
+      lastTradePrice: 0.84,
+      lastTradeSize: 8,
+      source: 'rest',
+      updatedAt: new Date().toISOString(),
+    },
+    combined: {
+      combinedBid: 0.96,
+      combinedAsk: 1.04,
+      combinedMid: 1,
+      combinedDiscount: -0.04,
+      combinedPremium: 0.04,
+      pairSpread: 0.08,
+    },
+  };
+}
+
 function createMmConfig(
   overrides: Record<string, string> = {}
 ) {
@@ -457,7 +509,10 @@ test('autonomous MM quotes are suppressed when sniper mode sees a directional Bi
     now: new Date('2026-03-24T10:01:00.000Z'),
   });
 
-  assert.equal(plan.signals.length, 0);
+  assert.equal(plan.signals.filter((signal) => signal.signalType === 'MM_QUOTE_BID').length, 0);
+  assert.equal(plan.signals.filter((signal) => signal.signalType === 'MM_QUOTE_ASK').length, 2);
+  assert.equal(plan.mmDiagnostics?.entryMode, 'ASK_ONLY');
+  assert.ok(plan.mmDiagnostics?.toxicityFlags.includes('binance_up_0.1800'));
 });
 
 test('post-sniper MM grace window bypasses directional suppression for the activated market', () => {
@@ -565,6 +620,66 @@ test('autonomous MM generates dual-sided quotes when fair value and inventory ar
       'MM_QUOTE_BID:YES',
     ]
   );
+});
+
+test('autonomous MM warmup keeps asks live but blocks new bids right after slot open', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 10, 10);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_QUOTE_SHARES: '6',
+      POST_ONLY_ONLY: 'false',
+    }),
+    now: new Date('2026-03-24T10:00:01.000Z'),
+  });
+
+  assert.equal(plan.mmDiagnostics?.phase, 'WARMUP');
+  assert.equal(plan.mmDiagnostics?.entryMode, 'OFF');
+  assert.equal(plan.signals.filter((signal) => signal.signalType === 'MM_QUOTE_BID').length, 0);
+  assert.equal(plan.signals.filter((signal) => signal.signalType === 'MM_QUOTE_ASK').length, 2);
+});
+
+test('autonomous MM scales bids above the 6-share floor when spread and depth are strong', () => {
+  const market = createMarket();
+  const orderbook = createWideOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 10, 10);
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    runtimeConfig: createMmConfig({
+      MM_QUOTE_SHARES: '6',
+      MM_MAX_QUOTE_SHARES: '18',
+      MM_MIN_SPREAD_TICKS: '1',
+      POST_ONLY_ONLY: 'false',
+    }),
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  const bidSignals = plan.signals.filter((signal) => signal.signalType === 'MM_QUOTE_BID');
+  assert.equal(bidSignals.length, 2);
+  assert.deepEqual(
+    bidSignals.map((signal) => signal.shares).sort((left, right) => left - right),
+    [12, 12]
+  );
+  assert.equal(plan.mmDiagnostics?.selectedBidSharesYes, 12);
+  assert.equal(plan.mmDiagnostics?.selectedBidSharesNo, 12);
 });
 
 test('autonomous MM skips quotes when the captured spread does not clear fees', () => {
@@ -1123,4 +1238,36 @@ test('autonomous MM skips dust asks that do not meet the minimum tradable size',
   });
 
   assert.equal(plan.signals.length, 0);
+});
+
+test('autonomous MM sellability cliff lifts passive asks before the position becomes unsellable', () => {
+  const market = createMarket();
+  const orderbook = createLowPriceOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  seedInventory(positionManager, 6, 0);
+  const runtimeConfig = createMmConfig({
+    MM_QUOTE_SHARES: '6',
+    POST_ONLY_ONLY: 'true',
+  });
+
+  const plan = buildQuoteRefreshPlan({
+    context: {
+      market,
+      orderbook,
+      positionManager,
+      riskAssessment: createRiskAssessment(positionManager),
+      quoteSignals: [],
+    },
+    currentMMExposureUsd: runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD,
+    runtimeConfig,
+    now: new Date('2026-03-24T10:01:00.000Z'),
+  });
+
+  const askSignal = plan.signals.find(
+    (signal) => signal.signalType === 'MM_QUOTE_ASK' && signal.outcome === 'YES'
+  );
+  assert.ok(askSignal);
+  assert.equal(askSignal.targetPrice, 0.166667);
+  assert.match(askSignal.reason, /sellabilityCliff=true/);
+  assert.deepEqual(plan.mmDiagnostics?.sellabilityCliffOutcomes, ['YES']);
 });

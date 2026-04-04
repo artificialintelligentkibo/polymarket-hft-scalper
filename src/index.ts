@@ -2671,6 +2671,7 @@ export class MarketMakerRuntime {
         mmEnabled: isDynamicQuotingEnabled(config),
         mmAutonomousQuotes: config.MM_AUTONOMOUS_QUOTES,
         mmQuoteShares: config.MM_QUOTE_SHARES,
+        mmMaxQuoteShares: config.MM_MAX_QUOTE_SHARES,
         mmMaxGrossExposure: config.MM_MAX_GROSS_EXPOSURE_USD,
         mmCurrentExposure: this.quotingEngine.getCurrentMMExposureUsd(),
         mmPendingExposure: pendingQuoteExposure.grossExposureUsd,
@@ -2678,6 +2679,10 @@ export class MarketMakerRuntime {
         mmPendingNoShares: pendingQuoteExposure.noShares,
         mmActiveMarkets: countActiveMMMarkets(this.quotingEngine),
         mmMaxConcurrentMarkets: config.MM_MAX_CONCURRENT_MARKETS,
+        mmSlotWarmupMs: config.MM_SLOT_WARMUP_MS,
+        mmOpeningSeedWindowMs: config.MM_OPENING_SEED_WINDOW_MS,
+        mmStopNewEntriesBeforeEndMs: config.MM_STOP_NEW_ENTRIES_BEFORE_END_MS,
+        mmCancelAllQuotesBeforeEndMs: config.MM_CANCEL_ALL_QUOTES_BEFORE_END_MS,
         mmInventorySkew: config.MM_INVENTORY_SKEW_FACTOR,
         mmMaxNetDirectional: config.MM_MAX_NET_DIRECTIONAL,
         mmQuotes: this.buildRuntimeMmQuoteSnapshots(),
@@ -4336,7 +4341,7 @@ export class MarketMakerRuntime {
   private buildRuntimeMmQuoteSnapshots(): RuntimeMmQuoteSnapshot[] {
     return this.quotingEngine
       .getActiveMMMarketIds()
-      .map((marketId) => {
+      .map<RuntimeMmQuoteSnapshot | null>((marketId) => {
         const market = this.markets.get(marketId) ?? this.quotingEngine.getContext(marketId)?.market;
         const context = this.quotingEngine.getContext(marketId);
         if (!market || !context) {
@@ -4352,6 +4357,7 @@ export class MarketMakerRuntime {
             : null;
         const snapshot = context.positionManager.getSnapshot();
         const orderbook = this.latestBooks.get(marketId) ?? context.orderbook;
+        const diagnostics = this.quotingEngine.getMmDiagnostics(marketId);
 
         return {
           marketId,
@@ -4360,6 +4366,15 @@ export class MarketMakerRuntime {
           bidPrice,
           askPrice,
           spread,
+          phase: diagnostics?.phase ?? 'UNKNOWN',
+          entryMode: diagnostics?.entryMode ?? 'OFF',
+          slotAgeMs: diagnostics?.slotAgeMs ?? null,
+          timeToSlotEndMs: diagnostics?.timeToSlotEndMs ?? null,
+          blockedBidOutcomes: diagnostics?.blockedBidOutcomes ?? [],
+          toxicityFlags: diagnostics?.toxicityFlags ?? [],
+          sellabilityCliffOutcomes: diagnostics?.sellabilityCliffOutcomes ?? [],
+          selectedBidSharesYes: diagnostics?.selectedBidSharesYes ?? null,
+          selectedBidSharesNo: diagnostics?.selectedBidSharesNo ?? null,
           yesShares: roundTo(snapshot.yesShares, 4),
           noShares: roundTo(snapshot.noShares, 4),
           grossExposureUsd: roundTo(
@@ -4368,7 +4383,7 @@ export class MarketMakerRuntime {
             4
           ),
           netDirectionalShares: roundTo(snapshot.yesShares - snapshot.noShares, 4),
-        } satisfies RuntimeMmQuoteSnapshot;
+        };
       })
       .filter((entry): entry is RuntimeMmQuoteSnapshot => entry !== null)
       .sort((left, right) => right.grossExposureUsd - left.grossExposureUsd)
@@ -4490,6 +4505,7 @@ export class MarketMakerRuntime {
         runtimeConfig: config,
         now: new Date(),
       });
+      this.quotingEngine.replaceMmDiagnostics(plan.marketId, refreshedPlan.mmDiagnostics);
 
       const trackedPendingQuoteOrderIds = new Set(
         this.fillTracker
@@ -4580,6 +4596,10 @@ export class MarketMakerRuntime {
           new: retentionPlan.newSignals.length,
           deadbandRetained: retentionPlan.deadbandRetainedCount,
           oldestQueueMs: retentionPlan.oldestQueueAgeMs ?? 0,
+          phase: refreshedPlan.mmDiagnostics?.phase ?? 'UNKNOWN',
+          entryMode: refreshedPlan.mmDiagnostics?.entryMode ?? 'OFF',
+          slotAgeMs: refreshedPlan.mmDiagnostics?.slotAgeMs ?? null,
+          timeToSlotEndMs: refreshedPlan.mmDiagnostics?.timeToSlotEndMs ?? null,
         });
       }
     });

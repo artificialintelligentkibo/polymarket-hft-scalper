@@ -79,6 +79,53 @@ export interface QuoteRefreshPlan {
   readonly slotKey: string;
   readonly activeQuoteOrders: readonly ActiveQuoteOrder[];
   readonly signals: readonly StrategySignal[];
+  readonly mmDiagnostics: MmMarketDiagnostics | null;
+}
+
+export type MmQuotePhase =
+  | 'PRE_OPEN'
+  | 'WARMUP'
+  | 'OPENING_SEED'
+  | 'NORMAL'
+  | 'LATE_ASK_ONLY'
+  | 'FINAL_CANCEL'
+  | 'UNKNOWN';
+
+export type MmEntryMode = 'OFF' | 'ASK_ONLY' | 'ONE_SIDED' | 'NORMAL';
+
+export interface MmMarketDiagnostics {
+  readonly phase: MmQuotePhase;
+  readonly entryMode: MmEntryMode;
+  readonly slotAgeMs: number | null;
+  readonly timeToSlotEndMs: number | null;
+  readonly directionalMovePct: number | null;
+  readonly yesMicropriceBiasTicks: number | null;
+  readonly noMicropriceBiasTicks: number | null;
+  readonly blockedBidOutcomes: readonly Outcome[];
+  readonly toxicityFlags: readonly string[];
+  readonly sellabilityCliffOutcomes: readonly Outcome[];
+  readonly selectedBidSharesYes: number | null;
+  readonly selectedBidSharesNo: number | null;
+}
+
+interface MarketMakerQuoteBuildResult {
+  readonly signals: readonly StrategySignal[];
+  readonly mmDiagnostics: MmMarketDiagnostics | null;
+}
+
+interface AutonomousMmAssessment {
+  readonly phase: MmQuotePhase;
+  readonly slotAgeMs: number | null;
+  readonly timeToSlotEndMs: number | null;
+  readonly directionalMovePct: number | null;
+  readonly yesMicropriceBiasTicks: number | null;
+  readonly noMicropriceBiasTicks: number | null;
+  readonly blockedBidOutcomes: readonly Outcome[];
+  readonly toxicityFlags: readonly string[];
+  readonly allowBidQuotes: boolean;
+  readonly allowAskQuotes: boolean;
+  readonly entryMode: MmEntryMode;
+  readonly postSniperGraceActive: boolean;
 }
 
 export function buildQuoteRefreshPlan(params: {
@@ -90,31 +137,37 @@ export function buildQuoteRefreshPlan(params: {
 }): QuoteRefreshPlan {
   const runtimeConfig = params.runtimeConfig ?? config;
   const activeQuoteOrders = [...(params.activeQuoteOrders ?? [])];
-  const signals = isDynamicQuotingEnabled(runtimeConfig)
+  const quoteBuild = isDynamicQuotingEnabled(runtimeConfig)
     ? buildMarketMakerQuoteSignals({
         ...params,
         runtimeConfig,
+        activeQuoteOrders,
         currentMMExposureUsd: params.currentMMExposureUsd,
       })
-    : [];
+    : { signals: [], mmDiagnostics: null };
 
   return {
     marketId: params.context.market.marketId,
     slotKey: getSlotKey(params.context.market),
     activeQuoteOrders,
-    signals,
+    signals: quoteBuild.signals,
+    mmDiagnostics: quoteBuild.mmDiagnostics,
   };
 }
 
 export function buildMarketMakerQuoteSignals(params: {
   context: QuoteContext;
+  activeQuoteOrders?: readonly ActiveQuoteOrder[];
   runtimeConfig?: AppConfig;
   currentMMExposureUsd?: number;
   now?: Date;
-}): StrategySignal[] {
+}): MarketMakerQuoteBuildResult {
   const runtimeConfig = params.runtimeConfig ?? config;
   if (!isDynamicQuotingEnabled(runtimeConfig)) {
-    return [];
+    return {
+      signals: [],
+      mmDiagnostics: null,
+    };
   }
 
   const now = params.now ?? new Date();
@@ -133,29 +186,39 @@ export function buildMarketMakerQuoteSignals(params: {
           ? 'NO'
           : null
       : null;
+  const autonomousAssessment = assessAutonomousMmContext({
+    context: params.context,
+    runtimeConfig,
+    now,
+  });
+  let mmDiagnostics = createMmDiagnosticsSnapshot(autonomousAssessment);
 
-  builtSignals.push(
-    ...generatePostSniperAskSignals({
+  const postSniperResult = generatePostSniperAskSignals({
       context: params.context,
       runtimeConfig,
       quoteSpreadTicks,
+      mmDiagnostics,
       now,
-    })
-  );
+    });
+  mmDiagnostics = postSniperResult.diagnostics;
+  builtSignals.push(...postSniperResult.signals);
 
   if (
     runtimeConfig.MM_AUTONOMOUS_QUOTES &&
     (params.context.quoteSignals.length === 0 || runtimeConfig.MM_ALWAYS_QUOTE)
   ) {
-    builtSignals.push(
-      ...generateAutonomousQuoteSignals({
+    const autonomousResult = generateAutonomousQuoteSignals({
         context: params.context,
+        activeQuoteOrders: params.activeQuoteOrders ?? [],
         runtimeConfig,
         quoteSpreadTicks,
         currentMMExposureUsd: params.currentMMExposureUsd ?? 0,
+        assessment: autonomousAssessment,
+        diagnostics: mmDiagnostics,
         now,
-      })
-    );
+      });
+    mmDiagnostics = autonomousResult.diagnostics;
+    builtSignals.push(...autonomousResult.signals);
   }
 
   for (const signal of params.context.quoteSignals) {
@@ -259,7 +322,10 @@ export function buildMarketMakerQuoteSignals(params: {
     }
   }
 
-  return mergeQuoteSignals(builtSignals);
+  return {
+    signals: mergeQuoteSignals(builtSignals),
+    mmDiagnostics,
+  };
 }
 
 /**
@@ -267,39 +333,358 @@ export function buildMarketMakerQuoteSignals(params: {
  * Bids can be suppressed by inventory, gross exposure, or concurrent-market
  * limits, while asks remain available to reduce existing inventory.
  */
+function createMmDiagnosticsSnapshot(
+  assessment: AutonomousMmAssessment
+): MmMarketDiagnostics {
+  return {
+    phase: assessment.phase,
+    entryMode: assessment.entryMode,
+    slotAgeMs: assessment.slotAgeMs,
+    timeToSlotEndMs: assessment.timeToSlotEndMs,
+    directionalMovePct: assessment.directionalMovePct,
+    yesMicropriceBiasTicks: assessment.yesMicropriceBiasTicks,
+    noMicropriceBiasTicks: assessment.noMicropriceBiasTicks,
+    blockedBidOutcomes: [...assessment.blockedBidOutcomes],
+    toxicityFlags: [...assessment.toxicityFlags],
+    sellabilityCliffOutcomes: [],
+    selectedBidSharesYes: null,
+    selectedBidSharesNo: null,
+  };
+}
+
+function assessAutonomousMmContext(params: {
+  context: QuoteContext;
+  runtimeConfig: AppConfig;
+  now: Date;
+}): AutonomousMmAssessment {
+  const slotState = resolveMmSlotState({
+    market: params.context.market,
+    runtimeConfig: params.runtimeConfig,
+    now: params.now,
+  });
+  const postSniperGraceActive = isPostSniperMmGraceWindowActive({
+    activationTrigger: params.context.activationTrigger,
+    runtimeConfig: params.runtimeConfig,
+    now: params.now,
+  });
+  const toxicityFlags: string[] = [];
+  const blockedBidOutcomes = new Set<Outcome>();
+  const binanceAssessment = params.context.binanceAssessment;
+  const directionalMovePct =
+    binanceAssessment?.available === true
+      ? roundTo(Math.abs(binanceAssessment.binanceMovePct), 6)
+      : null;
+  if (
+    !postSniperGraceActive &&
+    directionalMovePct !== null &&
+    binanceAssessment?.direction !== 'FLAT' &&
+    directionalMovePct >= params.runtimeConfig.MM_TOXIC_FLOW_BLOCK_MOVE_PCT
+  ) {
+    toxicityFlags.push(
+      `binance_${String(binanceAssessment?.direction ?? 'flat').toLowerCase()}_${directionalMovePct.toFixed(4)}`
+    );
+  } else if (postSniperGraceActive) {
+    toxicityFlags.push('post_sniper_grace');
+  }
+
+  const yesMicropriceBiasTicks = resolveMicropriceBiasTicks(params.context.orderbook.yes);
+  const noMicropriceBiasTicks = resolveMicropriceBiasTicks(params.context.orderbook.no);
+  if (
+    yesMicropriceBiasTicks !== null &&
+    Math.abs(yesMicropriceBiasTicks) >= params.runtimeConfig.MM_TOXIC_FLOW_MICROPRICE_TICKS
+  ) {
+    blockedBidOutcomes.add('YES');
+    toxicityFlags.push(
+      `yes_microprice_${yesMicropriceBiasTicks > 0 ? 'up' : 'down'}_${Math.abs(
+        yesMicropriceBiasTicks
+      ).toFixed(2)}t`
+    );
+  }
+  if (
+    noMicropriceBiasTicks !== null &&
+    Math.abs(noMicropriceBiasTicks) >= params.runtimeConfig.MM_TOXIC_FLOW_MICROPRICE_TICKS
+  ) {
+    blockedBidOutcomes.add('NO');
+    toxicityFlags.push(
+      `no_microprice_${noMicropriceBiasTicks > 0 ? 'up' : 'down'}_${Math.abs(
+        noMicropriceBiasTicks
+      ).toFixed(2)}t`
+    );
+  }
+
+  let allowBidQuotes = true;
+  let allowAskQuotes = true;
+  let entryMode: MmEntryMode = 'NORMAL';
+
+  if (slotState.phase === 'PRE_OPEN' || slotState.phase === 'WARMUP') {
+    allowBidQuotes = false;
+    entryMode = 'OFF';
+  } else if (slotState.phase === 'LATE_ASK_ONLY') {
+    allowBidQuotes = false;
+    entryMode = 'ASK_ONLY';
+  } else if (slotState.phase === 'FINAL_CANCEL') {
+    allowBidQuotes = false;
+    allowAskQuotes = false;
+    entryMode = 'OFF';
+  }
+
+  if (
+    allowBidQuotes &&
+    toxicityFlags.some((flag) => flag.startsWith('binance_'))
+  ) {
+    allowBidQuotes = false;
+    entryMode = 'ASK_ONLY';
+  } else if (allowBidQuotes && blockedBidOutcomes.size >= 2) {
+    allowBidQuotes = false;
+    entryMode = 'ASK_ONLY';
+  } else if (allowBidQuotes && blockedBidOutcomes.size === 1) {
+    entryMode = 'ONE_SIDED';
+  }
+
+  return {
+    phase: slotState.phase,
+    slotAgeMs: slotState.slotAgeMs,
+    timeToSlotEndMs: slotState.timeToSlotEndMs,
+    directionalMovePct,
+    yesMicropriceBiasTicks,
+    noMicropriceBiasTicks,
+    blockedBidOutcomes: Array.from(blockedBidOutcomes),
+    toxicityFlags,
+    allowBidQuotes,
+    allowAskQuotes,
+    entryMode,
+    postSniperGraceActive,
+  };
+}
+
+function resolveMmSlotState(params: {
+  market: MarketCandidate;
+  runtimeConfig: AppConfig;
+  now: Date;
+}): {
+  phase: MmQuotePhase;
+  slotAgeMs: number | null;
+  timeToSlotEndMs: number | null;
+} {
+  const startMs = params.market.startTime ? Date.parse(params.market.startTime) : Number.NaN;
+  const endMs = params.market.endTime ? Date.parse(params.market.endTime) : Number.NaN;
+  const slotAgeMs = Number.isFinite(startMs)
+    ? Math.max(0, params.now.getTime() - startMs)
+    : null;
+  const timeToSlotEndMs = Number.isFinite(endMs)
+    ? Math.max(0, endMs - params.now.getTime())
+    : null;
+
+  if (Number.isFinite(startMs) && params.now.getTime() < startMs) {
+    return {
+      phase: 'PRE_OPEN',
+      slotAgeMs: roundTo(params.now.getTime() - startMs, 0),
+      timeToSlotEndMs,
+    };
+  }
+
+  if (
+    timeToSlotEndMs !== null &&
+    timeToSlotEndMs <= params.runtimeConfig.MM_CANCEL_ALL_QUOTES_BEFORE_END_MS
+  ) {
+    return {
+      phase: 'FINAL_CANCEL',
+      slotAgeMs,
+      timeToSlotEndMs,
+    };
+  }
+
+  if (
+    timeToSlotEndMs !== null &&
+    timeToSlotEndMs <= params.runtimeConfig.MM_STOP_NEW_ENTRIES_BEFORE_END_MS
+  ) {
+    return {
+      phase: 'LATE_ASK_ONLY',
+      slotAgeMs,
+      timeToSlotEndMs,
+    };
+  }
+
+  if (slotAgeMs !== null && slotAgeMs < params.runtimeConfig.MM_SLOT_WARMUP_MS) {
+    return {
+      phase: 'WARMUP',
+      slotAgeMs,
+      timeToSlotEndMs,
+    };
+  }
+
+  if (
+    slotAgeMs !== null &&
+    slotAgeMs <
+      params.runtimeConfig.MM_SLOT_WARMUP_MS + params.runtimeConfig.MM_OPENING_SEED_WINDOW_MS
+  ) {
+    return {
+      phase: 'OPENING_SEED',
+      slotAgeMs,
+      timeToSlotEndMs,
+    };
+  }
+
+  if (slotAgeMs === null && timeToSlotEndMs === null) {
+    return {
+      phase: 'UNKNOWN',
+      slotAgeMs: null,
+      timeToSlotEndMs: null,
+    };
+  }
+
+  return {
+    phase: 'NORMAL',
+    slotAgeMs,
+    timeToSlotEndMs,
+  };
+}
+
+function resolveMicropriceBiasTicks(book: TokenBookSnapshot): number | null {
+  if (
+    book.bestBid === null ||
+    book.bestAsk === null ||
+    !Number.isFinite(book.bestBid) ||
+    !Number.isFinite(book.bestAsk)
+  ) {
+    return null;
+  }
+
+  const totalDepth = Math.max(0, book.depthSharesBid) + Math.max(0, book.depthSharesAsk);
+  if (totalDepth <= 0) {
+    return null;
+  }
+
+  const midPrice = roundTo((book.bestBid + book.bestAsk) / 2, 6);
+  const tick = inferQuoteTick(book, midPrice);
+  if (!Number.isFinite(tick) || tick <= 0) {
+    return null;
+  }
+
+  const microprice =
+    (book.bestBid * Math.max(0, book.depthSharesAsk) +
+      book.bestAsk * Math.max(0, book.depthSharesBid)) /
+    totalDepth;
+
+  return roundTo((microprice - midPrice) / tick, 4);
+}
+
+function resolveAutonomousBidShares(params: {
+  runtimeConfig: AppConfig;
+  actualSpread: number;
+  minProfitableSpread: number;
+  bidDepthUsd: number;
+  askDepthUsd: number;
+  phase: MmQuotePhase;
+  timeToSlotEndMs: number | null;
+}): number {
+  const baseShares = roundTo(Math.max(6, params.runtimeConfig.MM_QUOTE_SHARES), 4);
+  const maxShares = roundTo(
+    Math.max(baseShares, params.runtimeConfig.MM_MAX_QUOTE_SHARES),
+    4
+  );
+  if (params.phase === 'OPENING_SEED') {
+    return baseShares;
+  }
+
+  let size = baseShares;
+  const spreadMultiple =
+    params.minProfitableSpread > 0
+      ? params.actualSpread / params.minProfitableSpread
+      : 1;
+  const depthMultiple =
+    Math.min(params.bidDepthUsd, params.askDepthUsd) /
+    Math.max(0.0001, params.runtimeConfig.MM_MIN_BOOK_DEPTH_USD);
+
+  if (params.phase === 'NORMAL' && spreadMultiple >= 1.5) {
+    size += baseShares;
+  }
+  if (params.phase === 'NORMAL' && spreadMultiple >= 2.25 && depthMultiple >= 3) {
+    size += baseShares;
+  }
+  if (
+    params.timeToSlotEndMs !== null &&
+    params.timeToSlotEndMs <= params.runtimeConfig.MM_STOP_NEW_ENTRIES_BEFORE_END_MS * 2
+  ) {
+    size = Math.min(size, baseShares * 2);
+  }
+
+  return roundTo(clamp(size, baseShares, maxShares), 4);
+}
+
+function assessSellabilityCliff(params: {
+  book: TokenBookSnapshot;
+  openShares: number;
+  fallbackAskPrice: number;
+  fairValue: number | null;
+}): {
+  atRisk: boolean;
+  adjustedAskPrice: number | null;
+} {
+  if (!Number.isFinite(params.openShares) || params.openShares <= 0) {
+    return {
+      atRisk: false,
+      adjustedAskPrice: params.fallbackAskPrice,
+    };
+  }
+
+  const referencePrice =
+    params.fairValue ??
+    params.book.midPrice ??
+    params.book.bestBid ??
+    params.book.bestAsk ??
+    params.fallbackAskPrice;
+  const minimumSharesAtReference = resolveMinimumTradableShares(referencePrice, 0);
+  if (params.openShares >= minimumSharesAtReference) {
+    return {
+      atRisk: false,
+      adjustedAskPrice: params.fallbackAskPrice,
+    };
+  }
+
+  const tick = inferQuoteTick(params.book, Math.max(params.fallbackAskPrice, referencePrice));
+  const bestPassiveExit =
+    params.book.bestBid !== null && Number.isFinite(params.book.bestBid)
+      ? roundTo(clamp(params.book.bestBid + tick, 0.01, 0.99), 6)
+      : params.fallbackAskPrice;
+  const notionalFloorPrice = roundTo(clamp(1 / params.openShares, 0.01, 0.99), 6);
+
+  return {
+    atRisk: true,
+    adjustedAskPrice: roundTo(
+      clamp(Math.max(bestPassiveExit, notionalFloorPrice), 0.01, 0.99),
+      6
+    ),
+  };
+}
+
+function resolvePhaseSkipReason(phase: MmQuotePhase): string {
+  switch (phase) {
+    case 'PRE_OPEN':
+      return 'slot_not_open';
+    case 'WARMUP':
+      return 'slot_warmup';
+    case 'LATE_ASK_ONLY':
+      return 'late_slot';
+    case 'FINAL_CANCEL':
+      return 'final_cancel_window';
+    default:
+      return 'entry_mode_blocked';
+  }
+}
+
 function generateAutonomousQuoteSignals(params: {
   context: QuoteContext;
+  activeQuoteOrders: readonly ActiveQuoteOrder[];
   runtimeConfig: AppConfig;
   quoteSpreadTicks: number;
   currentMMExposureUsd: number;
+  assessment: AutonomousMmAssessment;
+  diagnostics: MmMarketDiagnostics;
   now: Date;
-}): StrategySignal[] {
-  const { context, runtimeConfig, now } = params;
-  const postSniperGraceActive = isPostSniperMmGraceWindowActive({
-    activationTrigger: context.activationTrigger,
-    runtimeConfig,
-    now,
-  });
-  if (
-    !postSniperGraceActive &&
-    runtimeConfig.SNIPER_MODE_ENABLED &&
-    context.binanceAssessment?.available &&
-    context.binanceAssessment.direction !== 'FLAT' &&
-    Math.abs(context.binanceAssessment.binanceMovePct) >= runtimeConfig.sniper.minBinanceMovePct
-  ) {
-    logMmQuoteSkip({
-      context,
-      runtimeConfig,
-      now,
-      reason: 'directional_signal_active',
-      details: {
-        direction: context.binanceAssessment.direction,
-        movePct: context.binanceAssessment.binanceMovePct,
-      },
-    });
-    return [];
-  }
-
+}): { signals: readonly StrategySignal[]; diagnostics: MmMarketDiagnostics } {
+  const { context, runtimeConfig, now, assessment } = params;
+  const diagnostics = { ...params.diagnostics };
   const snapshot = context.positionManager.getSnapshot();
   const pendingQuoteExposure = normalizePendingQuoteExposure(
     context.pendingQuoteExposure
@@ -331,6 +716,26 @@ function generateAutonomousQuoteSignals(params: {
   );
   const builtSignals: StrategySignal[] = [];
   let projectedExposureUsd = Math.max(0, roundTo(params.currentMMExposureUsd, 4));
+
+  if (!assessment.allowBidQuotes && !assessment.allowAskQuotes) {
+    logMmQuoteSkip({
+      context,
+      runtimeConfig,
+      now,
+      reason: resolvePhaseSkipReason(assessment.phase),
+      details: {
+        phase: assessment.phase,
+        entryMode: assessment.entryMode,
+        slotAgeMs: assessment.slotAgeMs,
+        timeToSlotEndMs: assessment.timeToSlotEndMs,
+        toxicityFlags: assessment.toxicityFlags,
+      },
+    });
+    return {
+      signals: [],
+      diagnostics,
+    };
+  }
 
   for (const outcome of ['YES', 'NO'] as const satisfies readonly Outcome[]) {
     const perOutcomeSpreadTicks =
@@ -450,7 +855,31 @@ function generateAutonomousQuoteSignals(params: {
       continue;
     }
 
-    if (
+    const bidBlockedByMode =
+      !assessment.allowBidQuotes ||
+      (assessment.entryMode === 'ONE_SIDED' &&
+        assessment.blockedBidOutcomes.includes(outcome));
+    if (bidBlockedByMode) {
+      logMmQuoteSkip({
+        context,
+        runtimeConfig,
+        now,
+        reason:
+          assessment.entryMode === 'ONE_SIDED' &&
+          assessment.blockedBidOutcomes.includes(outcome)
+            ? 'toxic_flow'
+            : resolvePhaseSkipReason(assessment.phase),
+        details: {
+          outcome,
+          phase: assessment.phase,
+          entryMode: assessment.entryMode,
+          blockedBidOutcomes: assessment.blockedBidOutcomes,
+          toxicityFlags: assessment.toxicityFlags,
+          slotAgeMs: assessment.slotAgeMs,
+          timeToSlotEndMs: assessment.timeToSlotEndMs,
+        },
+      });
+    } else if (
       bidPrice < runtimeConfig.MM_AUTONOMOUS_MIN_BID_PRICE ||
       bidPrice > runtimeConfig.MM_AUTONOMOUS_MAX_BID_PRICE
     ) {
@@ -464,11 +893,23 @@ function generateAutonomousQuoteSignals(params: {
           bidPrice,
           minBidPrice: runtimeConfig.MM_AUTONOMOUS_MIN_BID_PRICE,
           maxBidPrice: runtimeConfig.MM_AUTONOMOUS_MAX_BID_PRICE,
+          phase: assessment.phase,
+          slotAgeMs: assessment.slotAgeMs,
+          timeToSlotEndMs: assessment.timeToSlotEndMs,
         },
       });
     } else {
-      const bidShares = roundTo(runtimeConfig.MM_QUOTE_SHARES, 4);
+      const bidShares = resolveAutonomousBidShares({
+        runtimeConfig,
+        actualSpread,
+        minProfitableSpread,
+        bidDepthUsd: book.depthNotionalBid,
+        askDepthUsd: book.depthNotionalAsk,
+        phase: assessment.phase,
+        timeToSlotEndMs: assessment.timeToSlotEndMs,
+      });
       const bidNotionalUsd = roundTo(bidShares * bidPrice, 4);
+      const minimumBidShares = resolveMinimumTradableShares(bidPrice, 6);
       const entryCapacity = resolvePendingAwareEntryCapacity({
         outcome,
         snapshot,
@@ -483,6 +924,7 @@ function generateAutonomousQuoteSignals(params: {
         Math.abs(projectedDirectionalInventory) >= Math.abs(netInventory);
 
       if (
+        bidShares < minimumBidShares ||
         context.allowEntryQuotes === false ||
         context.riskAssessment.blockedOutcomes.has(outcome) ||
         overweightOutcome === outcome ||
@@ -495,13 +937,17 @@ function generateAutonomousQuoteSignals(params: {
           runtimeConfig,
           now,
           reason:
-            context.allowEntryQuotes === false
+            bidShares < minimumBidShares
+              ? 'below_minimum_size'
+              : context.allowEntryQuotes === false
               ? 'concurrent_limit'
               : projectedExposureUsd + bidNotionalUsd > runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
                 ? 'exposure_limit'
                 : 'inventory_limit',
           details: {
             outcome,
+            bidShares,
+            minimumBidShares,
             entryCapacity,
             overweightOutcome,
             projectedExposureUsd: roundTo(projectedExposureUsd + bidNotionalUsd, 4),
@@ -509,9 +955,17 @@ function generateAutonomousQuoteSignals(params: {
             netInventory: roundTo(netInventory, 4),
             projectedDirectionalInventory: roundTo(projectedDirectionalInventory, 4),
             maxDirectionalInventory: runtimeConfig.MM_MAX_NET_DIRECTIONAL,
+            phase: assessment.phase,
+            entryMode: assessment.entryMode,
+            toxicityFlags: assessment.toxicityFlags,
           },
         });
       } else {
+        if (outcome === 'YES') {
+          diagnostics.selectedBidSharesYes = bidShares;
+        } else {
+          diagnostics.selectedBidSharesNo = bidShares;
+        }
         builtSignals.push(
           buildAutonomousSignal({
             market: context.market,
@@ -526,6 +980,7 @@ function generateAutonomousQuoteSignals(params: {
             fairValue: skewedFairValue,
             actualSpread,
             reason: 'Autonomous MM bid',
+            diagnostics,
             now,
           })
         );
@@ -540,17 +995,34 @@ function generateAutonomousQuoteSignals(params: {
           spread: actualSpread,
           inventorySkew: roundTo(skewAdjustment, 6),
           grossExposure: roundTo(projectedExposureUsd, 4),
+          phase: assessment.phase,
+          bidShares,
+          toxicityFlags: assessment.toxicityFlags,
         });
       }
     }
 
+    if (!assessment.allowAskQuotes) {
+      continue;
+    }
+
     const openShares = context.positionManager.getShares(outcome);
-    const askShares = Math.min(roundTo(runtimeConfig.MM_QUOTE_SHARES, 4), openShares);
+    const askShares = Math.min(roundTo(Math.max(6, runtimeConfig.MM_QUOTE_SHARES), 4), openShares);
     if (askShares <= 0) {
       continue;
     }
 
-    const minimumAskShares = resolveMinimumTradableShares(askPrice, 0);
+    const sellabilityCliff = assessSellabilityCliff({
+      book,
+      openShares: askShares,
+      fallbackAskPrice: askPrice,
+      fairValue: fairValue ?? pricingAnchor,
+    });
+    if (sellabilityCliff.atRisk && !diagnostics.sellabilityCliffOutcomes.includes(outcome)) {
+      diagnostics.sellabilityCliffOutcomes = [...diagnostics.sellabilityCliffOutcomes, outcome];
+    }
+    const autonomousAskPrice = sellabilityCliff.adjustedAskPrice ?? askPrice;
+    const minimumAskShares = resolveMinimumTradableShares(autonomousAskPrice, 0);
     if (askShares < minimumAskShares) {
       logMmQuoteSkip({
         context,
@@ -562,7 +1034,9 @@ function generateAutonomousQuoteSignals(params: {
           mode: 'autonomous_ask',
           askShares,
           minimumShares: minimumAskShares,
-          askPrice,
+          askPrice: autonomousAskPrice,
+          phase: assessment.phase,
+          sellabilityCliff: sellabilityCliff.atRisk,
         },
       });
       continue;
@@ -577,11 +1051,13 @@ function generateAutonomousQuoteSignals(params: {
         outcome,
         signalType: 'MM_QUOTE_ASK',
         shares: askShares,
-        targetPrice: askPrice,
+        targetPrice: autonomousAskPrice,
         referencePrice: fairValue ?? pricingAnchor,
         fairValue: skewedFairValue,
         actualSpread,
         reason: 'Autonomous MM ask',
+        diagnostics,
+        cliffAdjusted: sellabilityCliff.atRisk,
         now,
       })
     );
@@ -589,25 +1065,32 @@ function generateAutonomousQuoteSignals(params: {
       marketId: context.market.marketId,
       outcome,
       action: 'ASK',
-      price: askPrice,
+      price: autonomousAskPrice,
       fairValue,
       skewedFairValue,
       spread: actualSpread,
       inventorySkew: roundTo(skewAdjustment, 6),
       grossExposure: roundTo(projectedExposureUsd, 4),
+      phase: assessment.phase,
+      sellabilityCliff: sellabilityCliff.atRisk,
     });
   }
 
-  return builtSignals;
+  return {
+    signals: builtSignals,
+    diagnostics,
+  };
 }
 
 function generatePostSniperAskSignals(params: {
   context: QuoteContext;
   runtimeConfig: AppConfig;
   quoteSpreadTicks: number;
+  mmDiagnostics: MmMarketDiagnostics;
   now: Date;
-}): StrategySignal[] {
+}): { signals: readonly StrategySignal[]; diagnostics: MmMarketDiagnostics } {
   const { context, runtimeConfig, now } = params;
+  const diagnostics = { ...params.mmDiagnostics };
   if (
     !isPostSniperMmGraceWindowActive({
       activationTrigger: context.activationTrigger,
@@ -616,13 +1099,19 @@ function generatePostSniperAskSignals(params: {
     }) ||
     context.activationTrigger?.triggerLayer !== 'SNIPER'
   ) {
-    return [];
+    return {
+      signals: [],
+      diagnostics,
+    };
   }
 
   const outcome = context.activationTrigger.entryOutcome;
   const openShares = roundTo(Math.max(0, context.positionManager.getShares(outcome)), 4);
   if (openShares <= 0) {
-    return [];
+    return {
+      signals: [],
+      diagnostics,
+    };
   }
 
   const book = getBookForOutcome(context.orderbook, outcome);
@@ -651,11 +1140,24 @@ function generatePostSniperAskSignals(params: {
         mode: 'post_sniper_ask',
       },
     });
-    return [];
+    return {
+      signals: [],
+      diagnostics,
+    };
   }
 
   const askShares = Math.min(roundTo(runtimeConfig.MM_QUOTE_SHARES, 4), openShares);
-  const minimumShares = resolveMinimumTradableShares(askPrice, 0);
+  const sellabilityCliff = assessSellabilityCliff({
+    book,
+    openShares: askShares,
+    fallbackAskPrice: askPrice,
+    fairValue: fairValue ?? context.activationTrigger.entryPrice,
+  });
+  if (sellabilityCliff.atRisk && !diagnostics.sellabilityCliffOutcomes.includes(outcome)) {
+    diagnostics.sellabilityCliffOutcomes = [...diagnostics.sellabilityCliffOutcomes, outcome];
+  }
+  const postSniperAskPrice = sellabilityCliff.adjustedAskPrice ?? askPrice;
+  const minimumShares = resolveMinimumTradableShares(postSniperAskPrice, 0);
   if (askShares < minimumShares) {
     logMmQuoteSkip({
       context,
@@ -667,10 +1169,14 @@ function generatePostSniperAskSignals(params: {
         mode: 'post_sniper_ask',
         askShares,
         minimumShares,
-        askPrice,
+        askPrice: postSniperAskPrice,
+        sellabilityCliff: sellabilityCliff.atRisk,
       },
     });
-    return [];
+    return {
+      signals: [],
+      diagnostics,
+    };
   }
 
   const referencePrice =
@@ -680,24 +1186,29 @@ function generatePostSniperAskSignals(params: {
     6
   );
 
-  return [
-    buildAutonomousSignal({
-      market: context.market,
-      orderbook: context.orderbook,
-      runtimeConfig,
-      action: 'SELL',
-      outcome,
-      signalType: 'MM_QUOTE_ASK',
-      shares: askShares,
-      targetPrice: askPrice,
-      referencePrice,
-      fairValue: referencePrice,
-      actualSpread,
-      reason: 'Post-sniper MM ask',
-      urgencyOverride: 'passive',
-      now,
-    }),
-  ];
+  return {
+    signals: [
+      buildAutonomousSignal({
+        market: context.market,
+        orderbook: context.orderbook,
+        runtimeConfig,
+        action: 'SELL',
+        outcome,
+        signalType: 'MM_QUOTE_ASK',
+        shares: askShares,
+        targetPrice: postSniperAskPrice,
+        referencePrice,
+        fairValue: referencePrice,
+        actualSpread,
+        reason: 'Post-sniper MM ask',
+        urgencyOverride: 'passive',
+        diagnostics,
+        cliffAdjusted: sellabilityCliff.atRisk,
+        now,
+      }),
+    ],
+    diagnostics,
+  };
 }
 
 function isPostSniperMmGraceWindowActive(params: {
@@ -762,6 +1273,8 @@ function buildAutonomousSignal(params: {
   fairValue: number;
   actualSpread: number;
   reason: string;
+  diagnostics: MmMarketDiagnostics;
+  cliffAdjusted?: boolean;
   urgencyOverride?: StrategySignal['urgency'];
   now: Date;
 }): StrategySignal {
@@ -770,6 +1283,26 @@ function buildAutonomousSignal(params: {
     params.action === 'BUY'
       ? roundTo(Math.max(0, params.referencePrice - params.targetPrice), 6)
       : roundTo(Math.max(0, params.targetPrice - params.referencePrice), 6);
+  const reasonDetails = [
+    `spread=${params.actualSpread.toFixed(4)}`,
+    `phase=${params.diagnostics.phase.toLowerCase()}`,
+    `mode=${params.diagnostics.entryMode.toLowerCase()}`,
+    `size=${roundTo(params.shares, 4).toFixed(4)}`,
+  ];
+  if (params.diagnostics.slotAgeMs !== null) {
+    reasonDetails.push(`slotAgeMs=${Math.max(0, Math.round(params.diagnostics.slotAgeMs))}`);
+  }
+  if (params.diagnostics.timeToSlotEndMs !== null) {
+    reasonDetails.push(
+      `timeLeftMs=${Math.max(0, Math.round(params.diagnostics.timeToSlotEndMs))}`
+    );
+  }
+  if (params.diagnostics.toxicityFlags.length > 0) {
+    reasonDetails.push(`tox=${params.diagnostics.toxicityFlags.join(',')}`);
+  }
+  if (params.cliffAdjusted) {
+    reasonDetails.push('sellabilityCliff=true');
+  }
 
   return {
     marketId: params.market.marketId,
@@ -797,7 +1330,7 @@ function buildAutonomousSignal(params: {
     priceMultiplier: 1,
     urgency: params.urgencyOverride ?? resolveQuoteUrgency(params.runtimeConfig),
     reduceOnly: params.action === 'SELL',
-    reason: `${params.reason} | spread=${params.actualSpread.toFixed(4)}`,
+    reason: `${params.reason} | ${reasonDetails.join(' | ')}`,
   };
 }
 
@@ -805,6 +1338,8 @@ export class QuotingEngine {
   private readonly contexts = new Map<string, QuoteContext>();
   private readonly activeQuoteOrders = new Map<string, ActiveQuoteOrder[]>();
   private readonly activationTriggers = new Map<string, QuoteActivationTrigger>();
+  private readonly marketDiagnostics = new Map<string, MmMarketDiagnostics>();
+  private readonly marketLifecycleSignatures = new Map<string, string>();
   private refreshTimer: NodeJS.Timeout | null = null;
   private refreshInFlight = false;
   private onRefreshPlan: ((plan: QuoteRefreshPlan) => Promise<void>) | null = null;
@@ -842,6 +1377,8 @@ export class QuotingEngine {
     this.contexts.clear();
     this.activeQuoteOrders.clear();
     this.activationTriggers.clear();
+    this.marketDiagnostics.clear();
+    this.marketLifecycleSignatures.clear();
     this.onRefreshPlan = null;
   }
 
@@ -874,6 +1411,22 @@ export class QuotingEngine {
 
   getContext(marketId: string): QuoteContext | undefined {
     return this.contexts.get(marketId);
+  }
+
+  getMmDiagnostics(marketId: string): MmMarketDiagnostics | undefined {
+    const diagnostics = this.marketDiagnostics.get(marketId);
+    return diagnostics ? { ...diagnostics } : undefined;
+  }
+
+  replaceMmDiagnostics(marketId: string, diagnostics: MmMarketDiagnostics | null): void {
+    if (!diagnostics) {
+      this.marketDiagnostics.delete(marketId);
+      this.marketLifecycleSignatures.delete(marketId);
+      return;
+    }
+
+    this.marketDiagnostics.set(marketId, { ...diagnostics });
+    this.maybeLogLifecycleTransition(marketId, diagnostics);
   }
 
   /**
@@ -953,6 +1506,8 @@ export class QuotingEngine {
       if (!active.has(marketId)) {
         this.contexts.delete(marketId);
         this.activationTriggers.delete(marketId);
+        this.marketDiagnostics.delete(marketId);
+        this.marketLifecycleSignatures.delete(marketId);
       }
     }
 
@@ -961,6 +1516,8 @@ export class QuotingEngine {
         staleOrders.push(...orders);
         this.activeQuoteOrders.delete(marketId);
         this.activationTriggers.delete(marketId);
+        this.marketDiagnostics.delete(marketId);
+        this.marketLifecycleSignatures.delete(marketId);
       }
     }
 
@@ -982,6 +1539,7 @@ export class QuotingEngine {
           runtimeConfig: this.runtimeConfig,
           now: this.now(),
         });
+        this.replaceMmDiagnostics(marketId, plan.mmDiagnostics);
 
         if (plan.activeQuoteOrders.length === 0 && plan.signals.length === 0) {
           continue;
@@ -996,6 +1554,34 @@ export class QuotingEngine {
     } finally {
       this.refreshInFlight = false;
     }
+  }
+
+  private maybeLogLifecycleTransition(
+    marketId: string,
+    diagnostics: MmMarketDiagnostics
+  ): void {
+    const signature = [
+      diagnostics.phase,
+      diagnostics.entryMode,
+      diagnostics.blockedBidOutcomes.join(','),
+      diagnostics.toxicityFlags.join(','),
+    ].join('|');
+    if (this.marketLifecycleSignatures.get(marketId) === signature) {
+      return;
+    }
+
+    this.marketLifecycleSignatures.set(marketId, signature);
+    logger.info('MM lifecycle state changed', {
+      marketId,
+      phase: diagnostics.phase,
+      entryMode: diagnostics.entryMode,
+      slotAgeMs: diagnostics.slotAgeMs,
+      timeToSlotEndMs: diagnostics.timeToSlotEndMs,
+      blockedBidOutcomes: diagnostics.blockedBidOutcomes,
+      toxicityFlags: diagnostics.toxicityFlags,
+      selectedBidSharesYes: diagnostics.selectedBidSharesYes,
+      selectedBidSharesNo: diagnostics.selectedBidSharesNo,
+    });
   }
 }
 

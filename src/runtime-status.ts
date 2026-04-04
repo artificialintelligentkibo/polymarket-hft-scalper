@@ -99,6 +99,15 @@ export interface RuntimeMmQuoteSnapshot {
   readonly bidPrice: number | null;
   readonly askPrice: number | null;
   readonly spread: number | null;
+  readonly phase: string;
+  readonly entryMode: string;
+  readonly slotAgeMs: number | null;
+  readonly timeToSlotEndMs: number | null;
+  readonly blockedBidOutcomes: readonly ('YES' | 'NO')[];
+  readonly toxicityFlags: readonly string[];
+  readonly sellabilityCliffOutcomes: readonly ('YES' | 'NO')[];
+  readonly selectedBidSharesYes: number | null;
+  readonly selectedBidSharesNo: number | null;
   readonly yesShares: number;
   readonly noShares: number;
   readonly grossExposureUsd: number;
@@ -183,6 +192,7 @@ export interface RuntimeStatusSnapshot {
   readonly mmEnabled: boolean;
   readonly mmAutonomousQuotes: boolean;
   readonly mmQuoteShares: number;
+  readonly mmMaxQuoteShares: number;
   readonly mmMaxGrossExposure: number;
   readonly mmCurrentExposure: number;
   readonly mmPendingExposure: number;
@@ -190,6 +200,10 @@ export interface RuntimeStatusSnapshot {
   readonly mmPendingNoShares: number;
   readonly mmActiveMarkets: number;
   readonly mmMaxConcurrentMarkets: number;
+  readonly mmSlotWarmupMs: number;
+  readonly mmOpeningSeedWindowMs: number;
+  readonly mmStopNewEntriesBeforeEndMs: number;
+  readonly mmCancelAllQuotesBeforeEndMs: number;
   readonly mmInventorySkew: number;
   readonly mmMaxNetDirectional: number;
   readonly mmQuotes: readonly RuntimeMmQuoteSnapshot[];
@@ -259,6 +273,7 @@ export function createRuntimeStatusSnapshot(
     mmEnabled: isDynamicQuotingEnabled(runtimeConfig),
     mmAutonomousQuotes: runtimeConfig.MM_AUTONOMOUS_QUOTES,
     mmQuoteShares: runtimeConfig.MM_QUOTE_SHARES,
+    mmMaxQuoteShares: runtimeConfig.MM_MAX_QUOTE_SHARES,
     mmMaxGrossExposure: runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD,
     mmCurrentExposure: 0,
     mmPendingExposure: 0,
@@ -266,6 +281,10 @@ export function createRuntimeStatusSnapshot(
     mmPendingNoShares: 0,
     mmActiveMarkets: 0,
     mmMaxConcurrentMarkets: runtimeConfig.MM_MAX_CONCURRENT_MARKETS,
+    mmSlotWarmupMs: runtimeConfig.MM_SLOT_WARMUP_MS,
+    mmOpeningSeedWindowMs: runtimeConfig.MM_OPENING_SEED_WINDOW_MS,
+    mmStopNewEntriesBeforeEndMs: runtimeConfig.MM_STOP_NEW_ENTRIES_BEFORE_END_MS,
+    mmCancelAllQuotesBeforeEndMs: runtimeConfig.MM_CANCEL_ALL_QUOTES_BEFORE_END_MS,
     mmInventorySkew: runtimeConfig.MM_INVENTORY_SKEW_FACTOR,
     mmMaxNetDirectional: runtimeConfig.MM_MAX_NET_DIRECTIONAL,
     mmQuotes: [],
@@ -413,6 +432,7 @@ function normalizeRuntimeStatus(
         ? value.mmAutonomousQuotes
         : runtimeConfig.MM_AUTONOMOUS_QUOTES,
     mmQuoteShares: normalizeNumber(value.mmQuoteShares, runtimeConfig.MM_QUOTE_SHARES),
+    mmMaxQuoteShares: normalizeNumber(value.mmMaxQuoteShares, runtimeConfig.MM_MAX_QUOTE_SHARES),
     mmMaxGrossExposure: normalizeNumber(
       value.mmMaxGrossExposure,
       runtimeConfig.MM_MAX_GROSS_EXPOSURE_USD
@@ -426,6 +446,15 @@ function normalizeRuntimeStatus(
       1,
       normalizeCount(value.mmMaxConcurrentMarkets) || runtimeConfig.MM_MAX_CONCURRENT_MARKETS
     ),
+    mmSlotWarmupMs: normalizeCount(value.mmSlotWarmupMs) || runtimeConfig.MM_SLOT_WARMUP_MS,
+    mmOpeningSeedWindowMs:
+      normalizeCount(value.mmOpeningSeedWindowMs) || runtimeConfig.MM_OPENING_SEED_WINDOW_MS,
+    mmStopNewEntriesBeforeEndMs:
+      normalizeCount(value.mmStopNewEntriesBeforeEndMs) ||
+      runtimeConfig.MM_STOP_NEW_ENTRIES_BEFORE_END_MS,
+    mmCancelAllQuotesBeforeEndMs:
+      normalizeCount(value.mmCancelAllQuotesBeforeEndMs) ||
+      runtimeConfig.MM_CANCEL_ALL_QUOTES_BEFORE_END_MS,
     mmInventorySkew: normalizeNumber(
       value.mmInventorySkew,
       runtimeConfig.MM_INVENTORY_SKEW_FACTOR
@@ -943,6 +972,31 @@ function normalizeRuntimeMmQuote(value: unknown): RuntimeMmQuoteSnapshot | null 
     bidPrice: normalizeNullablePrice(record.bidPrice),
     askPrice: normalizeNullablePrice(record.askPrice),
     spread: normalizeNullablePrice(record.spread),
+    phase: typeof record.phase === 'string' && record.phase.trim() ? record.phase : 'UNKNOWN',
+    entryMode:
+      typeof record.entryMode === 'string' && record.entryMode.trim() ? record.entryMode : 'OFF',
+    slotAgeMs: normalizeNullableNumber(record.slotAgeMs),
+    timeToSlotEndMs: normalizeNullableNumber(record.timeToSlotEndMs),
+    blockedBidOutcomes: Array.isArray(record.blockedBidOutcomes)
+      ? record.blockedBidOutcomes
+          .map((entry) => (entry === 'YES' || entry === 'NO' ? entry : null))
+          .filter((entry): entry is 'YES' | 'NO' => entry !== null)
+          .slice(0, 2)
+      : [],
+    toxicityFlags: Array.isArray(record.toxicityFlags)
+      ? record.toxicityFlags
+          .map((entry) => String(entry ?? '').trim())
+          .filter((entry) => entry.length > 0)
+          .slice(0, 6)
+      : [],
+    sellabilityCliffOutcomes: Array.isArray(record.sellabilityCliffOutcomes)
+      ? record.sellabilityCliffOutcomes
+          .map((entry) => (entry === 'YES' || entry === 'NO' ? entry : null))
+          .filter((entry): entry is 'YES' | 'NO' => entry !== null)
+          .slice(0, 2)
+      : [],
+    selectedBidSharesYes: normalizeNullableNumber(record.selectedBidSharesYes),
+    selectedBidSharesNo: normalizeNullableNumber(record.selectedBidSharesNo),
     yesShares: normalizeNumber(record.yesShares, 0),
     noShares: normalizeNumber(record.noShares, 0),
     grossExposureUsd: normalizeNumber(record.grossExposureUsd, 0),

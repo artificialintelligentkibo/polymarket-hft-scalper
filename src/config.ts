@@ -183,8 +183,10 @@ export interface AppConfig {
   readonly MM_AUTONOMOUS_QUOTES: boolean;
   /** Keep autonomous quoting on even when scalper-driven quote signals are present. */
   readonly MM_ALWAYS_QUOTE: boolean;
-  /** Fixed share size used by autonomous market-making quotes. */
+  /** Base autonomous MM share size floor. Runtime sizing may scale above this, never below six. */
   readonly MM_QUOTE_SHARES: number;
+  /** Maximum autonomous MM share size after dynamic scaling. */
+  readonly MM_MAX_QUOTE_SHARES: number;
   /** Maximum total MM notional exposure across tracked markets in USDC. */
   readonly MM_MAX_GROSS_EXPOSURE_USD: number;
   /** Maximum allowed YES-minus-NO directional inventory in shares. */
@@ -199,6 +201,18 @@ export interface AppConfig {
   readonly MM_AUTONOMOUS_MIN_BID_PRICE: number;
   /** Highest autonomous MM bid price allowed for fresh entry quotes. */
   readonly MM_AUTONOMOUS_MAX_BID_PRICE: number;
+  /** Delay after slot open before autonomous MM starts new entries. */
+  readonly MM_SLOT_WARMUP_MS: number;
+  /** Early slot window where autonomous MM only seeds the queue with base size. */
+  readonly MM_OPENING_SEED_WINDOW_MS: number;
+  /** Stop opening new autonomous MM inventory this far before slot end. */
+  readonly MM_STOP_NEW_ENTRIES_BEFORE_END_MS: number;
+  /** Cancel all autonomous MM quotes this far before slot end. */
+  readonly MM_CANCEL_ALL_QUOTES_BEFORE_END_MS: number;
+  /** Binance move threshold where autonomous MM degrades to ask-only. */
+  readonly MM_TOXIC_FLOW_BLOCK_MOVE_PCT: number;
+  /** Microprice imbalance threshold, measured in ticks, that blocks one-sided bids. */
+  readonly MM_TOXIC_FLOW_MICROPRICE_TICKS: number;
   /** Maximum number of markets allowed to carry active MM inventory/quotes. */
   readonly MM_MAX_CONCURRENT_MARKETS: number;
   /** Amount of inventory-based fair-value skew applied to autonomous quotes. */
@@ -637,7 +651,8 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     REBALANCE_ON_IMBALANCE: parseBoolean(env.REBALANCE_ON_IMBALANCE, true),
     MM_AUTONOMOUS_QUOTES: parseBoolean(env.MM_AUTONOMOUS_QUOTES, true),
     MM_ALWAYS_QUOTE: parseBoolean(env.MM_ALWAYS_QUOTE, false),
-    MM_QUOTE_SHARES: Math.max(1, parseIntOrDefault(env.MM_QUOTE_SHARES, '6')),
+    MM_QUOTE_SHARES: Math.max(6, parseIntOrDefault(env.MM_QUOTE_SHARES, '6')),
+    MM_MAX_QUOTE_SHARES: Math.max(6, parseIntOrDefault(env.MM_MAX_QUOTE_SHARES, '18')),
     MM_MAX_GROSS_EXPOSURE_USD: parseFloatOrDefault(env.MM_MAX_GROSS_EXPOSURE_USD, '15'),
     MM_MAX_NET_DIRECTIONAL: parseFloatOrDefault(env.MM_MAX_NET_DIRECTIONAL, '10'),
     MM_MIN_SPREAD_TICKS: Math.max(
@@ -648,6 +663,27 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     MM_MIN_BOOK_DEPTH_USD: parseFloatOrDefault(env.MM_MIN_BOOK_DEPTH_USD, '3'),
     MM_AUTONOMOUS_MIN_BID_PRICE: parseFloatOrDefault(env.MM_AUTONOMOUS_MIN_BID_PRICE, '0.10'),
     MM_AUTONOMOUS_MAX_BID_PRICE: parseFloatOrDefault(env.MM_AUTONOMOUS_MAX_BID_PRICE, '0.90'),
+    MM_SLOT_WARMUP_MS: Math.max(0, parseIntOrDefault(env.MM_SLOT_WARMUP_MS, '2000')),
+    MM_OPENING_SEED_WINDOW_MS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_OPENING_SEED_WINDOW_MS, '10000')
+    ),
+    MM_STOP_NEW_ENTRIES_BEFORE_END_MS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_STOP_NEW_ENTRIES_BEFORE_END_MS, '60000')
+    ),
+    MM_CANCEL_ALL_QUOTES_BEFORE_END_MS: Math.max(
+      0,
+      parseIntOrDefault(env.MM_CANCEL_ALL_QUOTES_BEFORE_END_MS, '15000')
+    ),
+    MM_TOXIC_FLOW_BLOCK_MOVE_PCT: parseFloatOrDefault(
+      env.MM_TOXIC_FLOW_BLOCK_MOVE_PCT,
+      '0.08'
+    ),
+    MM_TOXIC_FLOW_MICROPRICE_TICKS: Math.max(
+      0,
+      parseFloatOrDefault(env.MM_TOXIC_FLOW_MICROPRICE_TICKS, '1.5')
+    ),
     MM_MAX_CONCURRENT_MARKETS: Math.max(
       1,
       parseIntOrDefault(env.MM_MAX_CONCURRENT_MARKETS, '4')
@@ -1502,6 +1538,14 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error('MM_MAX_NET_DIRECTIONAL must be positive.');
   }
 
+  if (candidate.MM_QUOTE_SHARES < 6) {
+    throw new Error('MM_QUOTE_SHARES must be at least 6.');
+  }
+
+  if (candidate.MM_MAX_QUOTE_SHARES < candidate.MM_QUOTE_SHARES) {
+    throw new Error('MM_MAX_QUOTE_SHARES must be greater than or equal to MM_QUOTE_SHARES.');
+  }
+
   if (
     candidate.MM_AUTONOMOUS_MIN_BID_PRICE < 0.01 ||
     candidate.MM_AUTONOMOUS_MIN_BID_PRICE >= 0.99
@@ -1519,6 +1563,12 @@ export function validateConfig(candidate: AppConfig = config): void {
   if (candidate.MM_AUTONOMOUS_MIN_BID_PRICE >= candidate.MM_AUTONOMOUS_MAX_BID_PRICE) {
     throw new Error(
       'MM_AUTONOMOUS_MIN_BID_PRICE must be lower than MM_AUTONOMOUS_MAX_BID_PRICE.'
+    );
+  }
+
+  if (candidate.MM_CANCEL_ALL_QUOTES_BEFORE_END_MS > candidate.MM_STOP_NEW_ENTRIES_BEFORE_END_MS) {
+    throw new Error(
+      'MM_CANCEL_ALL_QUOTES_BEFORE_END_MS must be less than or equal to MM_STOP_NEW_ENTRIES_BEFORE_END_MS.'
     );
   }
 
@@ -1544,6 +1594,14 @@ export function validateConfig(candidate: AppConfig = config): void {
 
   if (candidate.MM_MIN_BOOK_DEPTH_USD < 0) {
     throw new Error('MM_MIN_BOOK_DEPTH_USD must be zero or positive.');
+  }
+
+  if (candidate.MM_TOXIC_FLOW_BLOCK_MOVE_PCT <= 0) {
+    throw new Error('MM_TOXIC_FLOW_BLOCK_MOVE_PCT must be positive.');
+  }
+
+  if (candidate.MM_TOXIC_FLOW_MICROPRICE_TICKS < 0) {
+    throw new Error('MM_TOXIC_FLOW_MICROPRICE_TICKS must be zero or positive.');
   }
 
   if (candidate.BINANCE_DEPTH_LEVELS < 1) {
