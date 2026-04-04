@@ -63,13 +63,23 @@ test('normalizeTrackedOrderStatus parses order fill fields from multiple respons
 });
 
 test('FillTracker confirms fills immediately from realtime WS events', () => {
+  const detectedFills: { orderId: string; filledShares: number; fillPrice: number }[] = [];
   const tracker = new FillTracker(
     {
       getOrderStatus: async () => ({ status: 'open', sizeMatched: '0' }),
       cancelOrder: async () => undefined,
     },
     createFillTrackerConfig(),
-    { now: () => 20_000 }
+    {
+      now: () => 20_000,
+      onTrackedFillDetected: (fill) => {
+        detectedFills.push({
+          orderId: fill.orderId,
+          filledShares: fill.filledShares,
+          fillPrice: fill.fillPrice,
+        });
+      },
+    }
   );
 
   tracker.setRealtimeFeedConnected(true);
@@ -93,6 +103,13 @@ test('FillTracker confirms fills immediately from realtime WS events', () => {
   assert.equal(fills.length, 1);
   assert.equal(fills[0].filledShares, 2.5);
   assert.equal(fills[0].fillPrice, 0.44);
+  assert.deepEqual(detectedFills, [
+    {
+      orderId: 'order-1',
+      filledShares: 2.5,
+      fillPrice: 0.44,
+    },
+  ]);
   assert.equal(tracker.hasPendingOrderFor('market-1', 'YES'), true);
 });
 

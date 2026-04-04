@@ -46,6 +46,7 @@ export interface FillTrackerClient {
 
 export interface FillTrackerOptions {
   readonly now?: () => number;
+  readonly onTrackedFillDetected?: (fill: ConfirmedFill) => void;
 }
 
 interface NormalizedOrderStatus {
@@ -118,6 +119,7 @@ export class FillTracker {
   private readonly orphanRealtimeFills = new Map<string, UserTradeFillEvent[]>();
   private readonly processedRealtimeFillKeys = new Map<string, number>();
   private readonly now: () => number;
+  private readonly onTrackedFillDetected?: (fill: ConfirmedFill) => void;
   private pollIntervalId: NodeJS.Timeout | null = null;
   private pollInFlight = false;
   private realtimeFeedConnected = false;
@@ -129,6 +131,7 @@ export class FillTracker {
     options: FillTrackerOptions = {}
   ) {
     this.now = options.now ?? (() => Date.now());
+    this.onTrackedFillDetected = options.onTrackedFillDetected;
   }
 
   registerPendingOrder(order: PendingOrder): void {
@@ -301,7 +304,7 @@ export class FillTracker {
       const deltaShares = roundTo(nextFilledShares - pending.filledSharesSoFar, 4);
 
       if (deltaShares > 0) {
-        this.queueConfirmedFill({
+        const detectedFill = {
           orderId,
           marketId: pending.marketId,
           slotKey: pending.slotKey,
@@ -313,7 +316,9 @@ export class FillTracker {
           signalType: pending.signalType,
           strategyLayer: pending.strategyLayer,
           filledAt: nowMs,
-        });
+        } satisfies ConfirmedFill;
+        this.queueConfirmedFill(detectedFill);
+        this.emitTrackedFillDetected(detectedFill);
 
         logger.info('REST fill detected for pending order', {
           orderId,
@@ -366,7 +371,7 @@ export class FillTracker {
       return;
     }
 
-    this.queueConfirmedFill({
+    const detectedFill = {
       orderId: pending.orderId,
       marketId: pending.marketId,
       slotKey: pending.slotKey,
@@ -378,7 +383,9 @@ export class FillTracker {
       signalType: pending.signalType,
       strategyLayer: pending.strategyLayer,
       filledAt: event.matchedAtMs,
-    });
+    } satisfies ConfirmedFill;
+    this.queueConfirmedFill(detectedFill);
+    this.emitTrackedFillDetected(detectedFill);
 
     const totalFilled = roundTo(pending.filledSharesSoFar + cappedDelta, 4);
     logger.info('Realtime fill detected for pending order', {
@@ -422,6 +429,23 @@ export class FillTracker {
 
   private queueConfirmedFill(fill: ConfirmedFill): void {
     this.confirmedFills.push(fill);
+  }
+
+  private emitTrackedFillDetected(fill: ConfirmedFill): void {
+    if (!this.onTrackedFillDetected) {
+      return;
+    }
+
+    try {
+      this.onTrackedFillDetected(fill);
+    } catch (error) {
+      logger.warn('Tracked fill callback failed', {
+        orderId: fill.orderId,
+        marketId: fill.marketId,
+        signalType: fill.signalType,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async cancelAndRemove(orderId: string): Promise<void> {

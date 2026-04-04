@@ -173,7 +173,12 @@ export class MarketMakerRuntime {
       getOrderStatus: (orderId) => this.executor.getOrderStatus(orderId),
       cancelOrder: (orderId) => this.executor.cancelOrder(orderId),
     },
-    config
+    config,
+    {
+      onTrackedFillDetected: (fill) => {
+        this.handleTrackedFillDetected(fill);
+      },
+    }
   );
   private readonly productTestMode = new ProductTestModeController();
   private readonly positions = new Map<string, PositionManager>();
@@ -712,6 +717,21 @@ export class MarketMakerRuntime {
     return prepared;
   }
 
+  private handleTrackedFillDetected(fill: ConfirmedFill): void {
+    if (
+      isDynamicQuotingEnabled(config) &&
+      (fill.signalType === 'MM_QUOTE_BID' || fill.signalType === 'MM_QUOTE_ASK')
+    ) {
+      this.quotingEngine.noteAutonomousQuoteDetectedFill({
+        marketId: fill.marketId,
+        outcome: fill.outcome,
+        side: fill.side,
+        signalType: fill.signalType,
+        filledAtMs: fill.filledAt,
+      });
+    }
+  }
+
   private buildSniperEntryOverrides(
     preparedTicks: readonly PreparedMarketTick[],
     now: Date
@@ -1030,10 +1050,6 @@ export class MarketMakerRuntime {
         market.marketId,
         executionSignal.outcome
       );
-      if (!trackerPending) {
-        this.clearPendingLiveOrder(pendingOrderKey);
-      }
-
       if (this.hasPendingLiveOrder(pendingOrderKey) || trackerPending) {
         logger.debug('Skipping signal because live resting order is still pending', {
           marketId: market.marketId,

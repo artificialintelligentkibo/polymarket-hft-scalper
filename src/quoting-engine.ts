@@ -1584,6 +1584,33 @@ export class QuotingEngine {
     this.mmBehaviorStates.set(marketId, normalizeMmBehaviorState(behaviorState));
   }
 
+  noteAutonomousQuoteDetectedFill(params: {
+    marketId: string;
+    outcome: Outcome;
+    side: StrategySignal['action'];
+    signalType: SignalType;
+    filledAtMs: number;
+  }): void {
+    if (params.signalType !== 'MM_QUOTE_BID' || params.side !== 'BUY') {
+      return;
+    }
+
+    const nextState = normalizeMmBehaviorState(
+      this.mmBehaviorStates.get(params.marketId),
+      params.filledAtMs
+    );
+    const sameSideBidBlockUntilMs = {
+      ...nextState.sameSideBidBlockUntilMs,
+      [params.outcome]:
+        params.filledAtMs + this.runtimeConfig.MM_SAME_SIDE_REENTRY_COOLDOWN_MS,
+    };
+
+    this.replaceMmBehaviorState(params.marketId, {
+      ...nextState,
+      sameSideBidBlockUntilMs,
+    });
+  }
+
   noteAutonomousQuoteFill(params: {
     marketId: string;
     outcome: Outcome;

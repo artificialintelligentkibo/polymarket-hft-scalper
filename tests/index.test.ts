@@ -638,6 +638,63 @@ test('dust-abandoned positions are pruned when inventory disappears', () => {
   assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), false);
 });
 
+test('executeSignal keeps the live pending-order cooldown until fill confirmation arrives', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.recordSkippedSignal = () => {};
+  runtime.pendingLiveOrders.set(`${market.marketId}:YES`, Date.now() + 15_000);
+  runtime.fillTracker = {
+    hasPendingOrderFor: () => false,
+  };
+
+  let executorCalls = 0;
+  runtime.executor = {
+    executeSignal: async () => {
+      executorCalls += 1;
+      return createExecutionReport({
+        simulation: false,
+        fillConfirmed: false,
+        orderId: 'resting-order',
+        tokenId: 'yes-token',
+      });
+    },
+    invalidateOutcomeBalanceCache: () => {},
+    invalidateBalanceValidationCache: () => {},
+  };
+
+  const result = await runtime.executeSignal(
+    market,
+    orderbook,
+    positionManager,
+    createSignal({
+      signalType: 'MM_QUOTE_BID',
+      strategyLayer: 'MM_QUOTE',
+      action: 'BUY',
+      outcome: 'YES',
+      outcomeIndex: 0,
+      shares: 6,
+      targetPrice: 0.44,
+      referencePrice: 0.45,
+      tokenPrice: 0.44,
+      midPrice: 0.445,
+      fairValue: 0.45,
+      urgency: 'passive',
+    }),
+    'slot-1'
+  );
+
+  assert.equal(result, null);
+  assert.equal(executorCalls, 0);
+  assert.equal(runtime.hasPendingLiveOrder(`${market.marketId}:YES`), true);
+});
+
 test('valid SLOT_FLATTEN orders still execute normally above the minimum size', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const market = createMarket();
