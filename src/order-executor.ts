@@ -531,11 +531,17 @@ export function resolveExecutionAttemptUrgencies(
 }
 
 function shouldRetryOrderPlacement(error: Error, postOnly: boolean): boolean {
+  const message = error.message.toLowerCase();
+
+  // Never retry — these errors are deterministic, condition won't change between attempts
+  if (message.includes('not enough balance') || message.includes('invalid amounts')) {
+    return false;
+  }
+
   if (!postOnly) {
     return true;
   }
 
-  const message = error.message.toLowerCase();
   if (message.includes('post-only') && message.includes('cross')) {
     return false;
   }
