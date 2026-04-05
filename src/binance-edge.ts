@@ -91,6 +91,17 @@ export class BinanceEdgeProvider {
     return this.lastPrices.size > 0;
   }
 
+  /**
+   * Returns raw price history samples for a coin.
+   * Used by RegimeFilter for market regime classification.
+   */
+  getPriceHistory(coin: string): ReadonlyArray<{ readonly price: number; readonly recordedAtMs: number }> {
+    const symbol = COIN_TO_BINANCE[coin.toUpperCase()];
+    if (!symbol) return [];
+    this.prunePriceHistory();
+    return this.priceHistory.get(symbol) ?? [];
+  }
+
   getLatestPrice(coin: string): number | null {
     const symbol = COIN_TO_BINANCE[coin.toUpperCase()];
     if (!symbol) {

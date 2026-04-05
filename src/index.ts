@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url';
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import { BinanceEdgeProvider, extractCoinFromTitle } from './binance-edge.js';
 import { DynamicCompounder } from './dynamic-compounder.js';
+import { RegimeFilter } from './regime-filter.js';
 import {
   BinanceDeepIntegration,
   type DeepBinanceAssessment,
@@ -168,6 +169,7 @@ export class MarketMakerRuntime {
   private readonly signalEngine = new SignalScalper(config, this.lotteryEngine);
   private readonly quotingEngine = new QuotingEngine();
   private readonly compounder = new DynamicCompounder(config.compounding);
+  private readonly regimeFilter = new RegimeFilter(config.regimeFilter);
   private readonly redeemer = new AutoRedeemer();
   private readonly resolutionChecker = new ResolutionChecker();
   private readonly fillTracker = new FillTracker(
@@ -461,6 +463,17 @@ export class MarketMakerRuntime {
           logger.warn('Compounding: failed to seed initial balance, will retry on next refresh');
         }
       }
+    }
+
+    // Wire up regime filter (no-op when REGIME_FILTER_ENABLED=false)
+    if (this.regimeFilter.enabled) {
+      this.signalEngine.setRegimeFilter(this.regimeFilter, this.binanceEdge);
+      logger.info('Market regime filter enabled', {
+        lookbackWindowMs: config.regimeFilter.lookbackWindowMs,
+        barIntervalMs: config.regimeFilter.barIntervalMs,
+        efficiencyThreshold: config.regimeFilter.efficiencyThreshold,
+        atrThreshold: config.regimeFilter.atrThreshold,
+      });
     }
 
     const discoveryMode = describeDiscoveryMode(config);

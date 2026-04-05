@@ -1,6 +1,7 @@
-import type { BinanceEdgeAssessment } from './binance-edge.js';
+import type { BinanceEdgeAssessment, BinanceEdgeProvider } from './binance-edge.js';
 import { config, isDynamicQuotingEnabled, type AppConfig } from './config.js';
 import type { DynamicCompounder } from './dynamic-compounder.js';
+import type { RegimeFilter } from './regime-filter.js';
 import { applyEVKellyFilter } from './ev-kelly.js';
 import { LatencyMomentumEngine } from './latency-momentum.js';
 import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob-fetcher.js';
@@ -78,6 +79,11 @@ export class SignalScalper {
   setCompounder(compounder: DynamicCompounder): void {
     this.compounder = compounder;
     this.sniperEngine.setCompounder(compounder);
+  }
+
+  /** Attach a RegimeFilter for market regime-based entry filtering (optional). */
+  setRegimeFilter(filter: RegimeFilter, binanceEdge: BinanceEdgeProvider): void {
+    this.sniperEngine.setRegimeFilter(filter, binanceEdge);
   }
 
   /**

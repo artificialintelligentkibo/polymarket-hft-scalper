@@ -96,6 +96,26 @@ export interface CompoundingConfig {
   readonly drawdownGuardPct: number;
 }
 
+/**
+ * Market regime filter configuration.
+ * Classifies Binance price action as TRENDING or RANGING to filter
+ * sniper entries during choppy conditions.
+ */
+export interface RegimeFilterConfig {
+  /** Master switch. When false, sniper entries are never blocked by regime. */
+  readonly enabled: boolean;
+  /** Lookback window in milliseconds for regime calculation (default 300000 = 5 min). */
+  readonly lookbackWindowMs: number;
+  /** Micro-bar aggregation interval in milliseconds (default 10000 = 10 sec). */
+  readonly barIntervalMs: number;
+  /** Minimum raw price samples required before assessment (default 20). */
+  readonly minSamplesRequired: number;
+  /** Directional efficiency threshold (0..1). Below = ranging. Default 0.4. */
+  readonly efficiencyThreshold: number;
+  /** Normalized ATR threshold. Below = low volatility / ranging. Default 0.0003. */
+  readonly atrThreshold: number;
+}
+
 export interface LotteryConfig {
   /** Master switch for convex opposite-side tickets. */
   readonly enabled: boolean;
@@ -400,6 +420,8 @@ export interface AppConfig {
   readonly latencyMomentum: LatencyMomentumConfig;
   /** Runtime sniper-engine configuration for Binance-led aggressive entries. */
   readonly sniper: SniperConfig;
+  /** Market regime filter for sniper entry quality filtering. */
+  readonly regimeFilter: RegimeFilterConfig;
   /** Runtime lottery-layer configuration for convex opposite-side tickets. */
   readonly lottery: LotteryConfig;
   readonly paperTrading: PaperTraderConfig;
@@ -1027,6 +1049,28 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         '0.005'
       ),
       volatilityScale: parseFloatOrDefault(env.SNIPER_VOLATILITY_SCALE, '0.003'),
+    },
+    regimeFilter: {
+      enabled: parseBoolean(env.REGIME_FILTER_ENABLED, false),
+      lookbackWindowMs: Math.max(
+        10_000,
+        parseIntOrDefault(env.REGIME_FILTER_LOOKBACK_MS, '300000')
+      ),
+      barIntervalMs: Math.max(
+        1_000,
+        parseIntOrDefault(env.REGIME_FILTER_BAR_INTERVAL_MS, '10000')
+      ),
+      minSamplesRequired: Math.max(5, parseIntOrDefault(env.REGIME_FILTER_MIN_SAMPLES, '20')),
+      efficiencyThreshold: clamp(
+        parseFloatOrDefault(env.REGIME_FILTER_EFFICIENCY_THRESHOLD, '0.4'),
+        0.1,
+        0.9
+      ),
+      atrThreshold: clamp(
+        parseFloatOrDefault(env.REGIME_FILTER_ATR_THRESHOLD, '0.0003'),
+        0.00001,
+        0.01
+      ),
     },
     lottery: {
       enabled: parseBoolean(env.LOTTERY_LAYER_ENABLED, false),

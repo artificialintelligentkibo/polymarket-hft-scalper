@@ -1,8 +1,9 @@
-import type { BinanceEdgeAssessment } from './binance-edge.js';
+import type { BinanceEdgeAssessment, BinanceEdgeProvider } from './binance-edge.js';
 import type { MarketOrderbookSnapshot, Outcome } from './clob-fetcher.js';
 import type { AppConfig, SniperConfig } from './config.js';
 import type { DynamicCompounder } from './dynamic-compounder.js';
 import { logger } from './logger.js';
+import { RegimeFilter, type RegimeAssessment } from './regime-filter.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
 import type { SniperStatsSnapshot } from './runtime-status.js';
@@ -36,6 +37,7 @@ export type SniperRejection =
   | 'max_position_reached'
   | 'velocity_too_low'
   | 'correlated_risk_limit'
+  | 'regime_ranging'
   | 'signal_generated';
 
 interface SniperEvaluation {
@@ -142,12 +144,26 @@ export class SniperEngine {
   private static readonly MAX_COIN_MOVE_SAMPLES = 500;
 
   private compounder: DynamicCompounder | null = null;
+  private regimeFilter: RegimeFilter | null = null;
+  private binanceEdgeProvider: BinanceEdgeProvider | null = null;
+  private lastRegimeAssessments = new Map<string, RegimeAssessment>();
 
   constructor(private readonly runtimeConfig: AppConfig) {}
 
   /** Attach a DynamicCompounder for balance-aware sizing (optional). */
   setCompounder(compounder: DynamicCompounder): void {
     this.compounder = compounder;
+  }
+
+  /** Attach a RegimeFilter + BinanceEdgeProvider for market regime filtering (optional). */
+  setRegimeFilter(filter: RegimeFilter, binanceEdge: BinanceEdgeProvider): void {
+    this.regimeFilter = filter;
+    this.binanceEdgeProvider = binanceEdge;
+  }
+
+  /** Get the latest regime assessment for a coin (for external logging). */
+  getLastRegimeAssessment(coin: string): RegimeAssessment | undefined {
+    return this.lastRegimeAssessments.get(coin.toUpperCase());
   }
 
   hasActiveEntryForMarket(marketId: string): boolean {
@@ -508,6 +524,25 @@ export class SniperEngine {
         rejection: 'pm_already_repriced',
       });
       return null;
+    }
+
+    // Regime filter: block entries during ranging/choppy conditions
+    if (this.regimeFilter?.enabled && this.binanceEdgeProvider) {
+      const priceHistory = this.binanceEdgeProvider.getPriceHistory(coin);
+      const regimeAssessment = this.regimeFilter.assess(coin, priceHistory, nowMs);
+      this.lastRegimeAssessments.set(coin.toUpperCase(), regimeAssessment);
+
+      if (!regimeAssessment.allowEntry) {
+        this.reject({
+          ...evaluationBase,
+          bestAsk,
+          edge,
+          pmLag,
+          impliedFV,
+          rejection: 'regime_ranging',
+        });
+        return null;
+      }
     }
 
     const isStrongMove = movePct >= params.config.strongBinanceMovePct;
