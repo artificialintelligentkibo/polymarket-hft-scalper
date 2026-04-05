@@ -2,6 +2,7 @@ import { AutoRedeemer } from './auto-redeemer.js';
 import { pathToFileURL } from 'node:url';
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import { BinanceEdgeProvider, extractCoinFromTitle } from './binance-edge.js';
+import { DynamicCompounder } from './dynamic-compounder.js';
 import {
   BinanceDeepIntegration,
   type DeepBinanceAssessment,
@@ -166,6 +167,7 @@ export class MarketMakerRuntime {
   private readonly lotteryEngine = new LotteryEngine(config);
   private readonly signalEngine = new SignalScalper(config, this.lotteryEngine);
   private readonly quotingEngine = new QuotingEngine();
+  private readonly compounder = new DynamicCompounder(config.compounding);
   private readonly redeemer = new AutoRedeemer();
   private readonly resolutionChecker = new ResolutionChecker();
   private readonly fillTracker = new FillTracker(
@@ -431,6 +433,20 @@ export class MarketMakerRuntime {
     validateConfig();
     await this.tradeLogger.ensureReady();
     await this.executor.initialize();
+
+    // Wire up dynamic compounding engine (no-op when COMPOUNDING_ENABLED=false)
+    if (this.compounder.enabled) {
+      this.signalEngine.setCompounder(this.compounder);
+      this.quotingEngine.setCompounder(this.compounder);
+      logger.info('Dynamic compounding engine enabled', {
+        baseRiskPct: config.compounding.baseRiskPct,
+        maxSlotExposurePct: config.compounding.maxSlotExposurePct,
+        globalExposurePct: config.compounding.globalExposurePct,
+        layers: config.compounding.layerMultipliers.length,
+        drawdownGuardPct: config.compounding.drawdownGuardPct,
+      });
+    }
+
     const discoveryMode = describeDiscoveryMode(config);
 
     logger.info('Polymarket dual-sided market-maker initialized', {
@@ -495,6 +511,18 @@ export class MarketMakerRuntime {
     if (!isPaperTradingEnabled(config)) {
       this.redeemer.start();
     }
+  }
+
+  /**
+   * Returns the effective global max exposure USD, using dynamic compounding
+   * override when enabled, or the static config value otherwise.
+   */
+  private getEffectiveGlobalMaxExposure(): number {
+    if (this.compounder.enabled) {
+      const dynamic = this.compounder.getDynamicGlobalMaxExposure();
+      if (dynamic !== null && dynamic > 0) return dynamic;
+    }
+    return config.GLOBAL_MAX_EXPOSURE_USD;
   }
 
   async run(): Promise<void> {
@@ -2093,8 +2121,9 @@ export class MarketMakerRuntime {
           ),
           4
         );
+        const effectivePairMaxExposure = this.getEffectiveGlobalMaxExposure();
         const exceedsGlobalLimit =
-          simulatedExposure.totalUsd + pairExposureUsd > config.GLOBAL_MAX_EXPOSURE_USD;
+          simulatedExposure.totalUsd + pairExposureUsd > effectivePairMaxExposure;
 
         if (conflictingLayers.length > 0) {
           for (const signal of atomicPairedSignals) {
@@ -2114,12 +2143,12 @@ export class MarketMakerRuntime {
             this.recordSkippedSignal({
               signal,
               filterReason: 'global_exposure_limit',
-              details: `Global exposure cap ${config.GLOBAL_MAX_EXPOSURE_USD.toFixed(2)} would be exceeded by paired arbitrage entry.`,
+              details: `Global exposure cap ${effectivePairMaxExposure.toFixed(2)} would be exceeded by paired arbitrage entry.`,
               context: {
                 marketId: market.marketId,
                 totalExposureUsd: simulatedExposure.totalUsd,
                 requestedExposureUsd: pairExposureUsd,
-                maxExposureUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+                maxExposureUsd: effectivePairMaxExposure,
               },
             });
           }
@@ -2175,19 +2204,20 @@ export class MarketMakerRuntime {
       }
 
       const requestedExposureUsd = this.estimateSignalExposureUsd(signal);
+      const effectiveMaxExposure = this.getEffectiveGlobalMaxExposure();
       if (
         simulatedExposure.totalUsd + requestedExposureUsd >
-        config.GLOBAL_MAX_EXPOSURE_USD
+        effectiveMaxExposure
       ) {
         this.recordSkippedSignal({
           signal,
           filterReason: 'global_exposure_limit',
-          details: `Global exposure cap ${config.GLOBAL_MAX_EXPOSURE_USD.toFixed(2)} would be exceeded by this entry.`,
+          details: `Global exposure cap ${effectiveMaxExposure.toFixed(2)} would be exceeded by this entry.`,
           context: {
             marketId: market.marketId,
             totalExposureUsd: simulatedExposure.totalUsd,
             requestedExposureUsd,
-            maxExposureUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+            maxExposureUsd: effectiveMaxExposure,
           },
         });
         continue;
@@ -3004,14 +3034,20 @@ export class MarketMakerRuntime {
 
     try {
       const walletCashUsd = await this.executor.getUsdcBalance(false);
+      const validBalance =
+        typeof walletCashUsd === 'number' && Number.isFinite(walletCashUsd)
+          ? roundTo(walletCashUsd, 2)
+          : null;
       this.walletFundsSnapshot = {
-        walletCashUsd:
-          typeof walletCashUsd === 'number' && Number.isFinite(walletCashUsd)
-            ? roundTo(walletCashUsd, 2)
-            : null,
+        walletCashUsd: validBalance,
         updatedAt: new Date(nowMs).toISOString(),
       };
       this.lastWalletFundsRefreshAtMs = nowMs;
+
+      // Recalculate compounding sizes on every balance refresh
+      if (this.compounder.enabled && validBalance !== null && validBalance > 0) {
+        this.compounder.recalculate(validBalance);
+      }
     } catch (error) {
       logger.debug('Wallet funds snapshot refresh failed', {
         message: error instanceof Error ? error.message : String(error),
@@ -3293,13 +3329,14 @@ export class MarketMakerRuntime {
     positionManager: PositionManager
   ): boolean {
     const globalExposure = this.getGlobalExposure();
-    if (globalExposure.totalUsd >= config.GLOBAL_MAX_EXPOSURE_USD) {
+    const effectiveMaxExposure = this.getEffectiveGlobalMaxExposure();
+    if (globalExposure.totalUsd >= effectiveMaxExposure) {
       logger.debug('MM quote skipped', {
         marketId,
         reason: 'global_exposure_limit',
         details: {
           totalExposureUsd: globalExposure.totalUsd,
-          maxExposureUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+          maxExposureUsd: effectiveMaxExposure,
         },
       });
       return false;
@@ -3375,7 +3412,8 @@ export class MarketMakerRuntime {
 
     const globalExposure = this.getGlobalExposure();
     const requestedExposureUsd = this.estimateSignalExposureUsd(signal);
-    if (globalExposure.totalUsd + requestedExposureUsd > config.GLOBAL_MAX_EXPOSURE_USD) {
+    const effectiveMaxExposureForLayer = this.getEffectiveGlobalMaxExposure();
+    if (globalExposure.totalUsd + requestedExposureUsd > effectiveMaxExposureForLayer) {
       logger.debug('Follow-on layer entry skipped', {
         marketId,
         signalType: signal.signalType,
@@ -3383,7 +3421,7 @@ export class MarketMakerRuntime {
         details: {
           totalExposureUsd: globalExposure.totalUsd,
           requestedExposureUsd,
-          maxExposureUsd: config.GLOBAL_MAX_EXPOSURE_USD,
+          maxExposureUsd: effectiveMaxExposureForLayer,
         },
       });
       return false;

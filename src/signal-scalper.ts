@@ -1,5 +1,6 @@
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import { config, isDynamicQuotingEnabled, type AppConfig } from './config.js';
+import type { DynamicCompounder } from './dynamic-compounder.js';
 import { applyEVKellyFilter } from './ev-kelly.js';
 import { LatencyMomentumEngine } from './latency-momentum.js';
 import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from './clob-fetcher.js';
@@ -63,6 +64,7 @@ export class SignalScalper {
   private readonly smoothedScalperFV = new Map<string, number>();
   private readonly smoothedScalperFvSeenAtMs = new Map<string, number>();
   private readonly currentTickFairValueCache = new Map<string, number | null>();
+  private compounder: DynamicCompounder | null = null;
 
   constructor(
     private readonly runtimeConfig: AppConfig = config,
@@ -70,6 +72,22 @@ export class SignalScalper {
   ) {
     this.sniperEngine = new SniperEngine(runtimeConfig);
     this.lotteryEngine = lotteryEngine ?? new LotteryEngine(runtimeConfig);
+  }
+
+  /** Attach a DynamicCompounder for balance-aware sizing (optional). */
+  setCompounder(compounder: DynamicCompounder): void {
+    this.compounder = compounder;
+    this.sniperEngine.setCompounder(compounder);
+  }
+
+  /**
+   * Returns the compounding multiplier for legacy scalper calculateTradeSize() calls.
+   * Returns 1.0 when compounding is disabled (no-op).
+   */
+  private getCompoundingMultiplier(referencePrice: number): number {
+    if (!this.compounder?.enabled) return 1.0;
+    const strategy = getEffectiveStrategyConfig(this.runtimeConfig);
+    return this.compounder.getScalperSizeMultiplier(strategy.baseOrderShares, referencePrice);
   }
 
   recordExecution(params: {
@@ -502,6 +520,7 @@ export class SignalScalper {
         referenceEdge: strategy.minCombinedDiscount,
         runtimeConfig: this.runtimeConfig,
         entryGuardMultiplier: entryGuard.multiplier,
+        compoundingMultiplier: this.getCompoundingMultiplier(bestAsk),
       });
 
       if (size.shares < strategy.minShares) {
@@ -574,6 +593,7 @@ export class SignalScalper {
             referenceEdge: strategy.extremeBuyThreshold,
             runtimeConfig: this.runtimeConfig,
             entryGuardMultiplier: entryGuard.multiplier,
+            compoundingMultiplier: this.getCompoundingMultiplier(bestAsk),
           });
 
           if (size.shares >= strategy.minShares) {
@@ -732,6 +752,7 @@ export class SignalScalper {
             referenceEdge: adaptedBuyThreshold,
             runtimeConfig: this.runtimeConfig,
             entryGuardMultiplier: entryGuard.multiplier,
+            compoundingMultiplier: this.getCompoundingMultiplier(bestAsk),
           });
 
           if (size.shares >= strategy.minShares) {
@@ -1081,6 +1102,8 @@ export function calculateTradeSize(params: {
   runtimeConfig?: AppConfig;
   allowBelowMin?: boolean;
   entryGuardMultiplier?: number;
+  /** Optional multiplier from DynamicCompounder (balance-aware scaling). */
+  compoundingMultiplier?: number;
 }): SizeCalculationResult {
   const runtimeConfig = params.runtimeConfig ?? config;
   const strategy = getEffectiveStrategyConfig(runtimeConfig);
@@ -1100,13 +1123,15 @@ export function calculateTradeSize(params: {
     0.35,
     1
   );
+  const compounding = clamp(params.compoundingMultiplier ?? 1, 0.1, 5.0);
   const rawShares =
     strategy.baseOrderShares *
     priceMultiplier *
     fillRatio *
     capitalClamp *
     liquidityClamp *
-    clamp(params.entryGuardMultiplier ?? 1, 0, 1);
+    clamp(params.entryGuardMultiplier ?? 1, 0, 1) *
+    compounding;
   const minShares = params.allowBelowMin ? 0.01 : strategy.minShares;
   const preliminaryShares = roundTo(
     clamp(rawShares, minShares, Math.min(strategy.maxShares, params.availableCapacity)),

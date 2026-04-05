@@ -3,6 +3,7 @@ import type { EVKellyConfig } from './ev-kelly.js';
 import type { LatencyMomentumConfig } from './latency-momentum.js';
 import type { PairedArbConfig } from './paired-arbitrage.js';
 import type { PaperTraderConfig } from './paper-trader.js';
+import { parseLayerMultipliers } from './dynamic-compounder.js';
 import { clamp, parseBooleanLoose, sanitizeConditionIds } from './utils.js';
 
 export type AuthMode = 'EOA' | 'PROXY';
@@ -73,6 +74,26 @@ export interface SniperConfig {
   readonly minVelocityPctPerSec: number;
   /** Move-to-probability calibration scale for Binance fair value estimation. */
   readonly volatilityScale: number;
+}
+
+/**
+ * Dynamic compounding configuration for balance-aware position sizing.
+ * When enabled, all layer sizes (sniper, MM, scalper) are recalculated
+ * from current USDC balance on every cycle.
+ */
+export interface CompoundingConfig {
+  /** Master switch. When false, the bot uses static sizing (unchanged behaviour). */
+  readonly enabled: boolean;
+  /** Fraction of bankroll for Layer 1 base size (default 0.008 = 0.8%). */
+  readonly baseRiskPct: number;
+  /** Maximum total exposure per market slot as fraction of bankroll (default 0.15 = 15%). */
+  readonly maxSlotExposurePct: number;
+  /** Dynamic global max exposure as fraction of bankroll (default 0.35 = 35%). */
+  readonly globalExposurePct: number;
+  /** Layer scaling multipliers, e.g. [1.0, 1.5, 2.0, 2.5, 3.0, 3.5]. */
+  readonly layerMultipliers: readonly number[];
+  /** If daily drawdown exceeds this fraction, reduce sizes by 50% (default 0.08 = 8%). */
+  readonly drawdownGuardPct: number;
 }
 
 export interface LotteryConfig {
@@ -383,6 +404,8 @@ export interface AppConfig {
   readonly lottery: LotteryConfig;
   readonly paperTrading: PaperTraderConfig;
   readonly evKelly: EVKellyConfig;
+  /** Dynamic balance-aware compounding engine configuration. */
+  readonly compounding: CompoundingConfig;
   readonly trading: {
     readonly slippageTolerance: number;
     readonly orderType: OrderMode;
@@ -1066,6 +1089,26 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       preferMakerOrders: parseBoolean(env.PREFER_MAKER_ORDERS, true),
       defaultTakerFee: parseFloatOrDefault(env.DEFAULT_TAKER_FEE, '0.02'),
       highFeeTakerFee: parseFloatOrDefault(env.HIGH_FEE_TAKER_FEE, '0.0315'),
+    },
+    compounding: {
+      enabled: parseBoolean(env.COMPOUNDING_ENABLED, false),
+      baseRiskPct: clamp(parseFloatOrDefault(env.COMPOUNDING_BASE_RISK_PCT, '0.008'), 0.001, 0.05),
+      maxSlotExposurePct: clamp(
+        parseFloatOrDefault(env.COMPOUNDING_MAX_SLOT_EXPOSURE_PCT, '0.15'),
+        0.05,
+        0.30
+      ),
+      globalExposurePct: clamp(
+        parseFloatOrDefault(env.COMPOUNDING_GLOBAL_EXPOSURE_PCT, '0.35'),
+        0.10,
+        0.60
+      ),
+      layerMultipliers: parseLayerMultipliers(env.COMPOUNDING_LAYER_MULTIPLIERS),
+      drawdownGuardPct: clamp(
+        parseFloatOrDefault(env.COMPOUNDING_DRAWDOWN_GUARD_PCT, '0.08'),
+        0.02,
+        0.25
+      ),
     },
     trading: {
       slippageTolerance: parseFloatOrDefault(env.SLIPPAGE_TOLERANCE, '0.02'),

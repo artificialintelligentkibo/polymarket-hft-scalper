@@ -1,6 +1,7 @@
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import type { MarketOrderbookSnapshot, Outcome } from './clob-fetcher.js';
 import type { AppConfig, SniperConfig } from './config.js';
+import type { DynamicCompounder } from './dynamic-compounder.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
@@ -140,7 +141,14 @@ export class SniperEngine {
   private static readonly REJECTION_SUMMARY_INTERVAL_MS = 30_000;
   private static readonly MAX_COIN_MOVE_SAMPLES = 500;
 
+  private compounder: DynamicCompounder | null = null;
+
   constructor(private readonly runtimeConfig: AppConfig) {}
+
+  /** Attach a DynamicCompounder for balance-aware sizing (optional). */
+  setCompounder(compounder: DynamicCompounder): void {
+    this.compounder = compounder;
+  }
 
   hasActiveEntryForMarket(marketId: string): boolean {
     for (const entry of this.activeEntries.values()) {
@@ -502,10 +510,14 @@ export class SniperEngine {
       return null;
     }
 
-    const requestedShares =
-      movePct >= params.config.strongBinanceMovePct
-        ? params.config.strongShares
-        : params.config.baseShares;
+    const isStrongMove = movePct >= params.config.strongBinanceMovePct;
+    let requestedShares: number;
+    if (this.compounder?.enabled) {
+      const compounded = this.compounder.getSniperShares(isStrongMove, bestAsk);
+      requestedShares = isStrongMove ? compounded.strong : compounded.base;
+    } else {
+      requestedShares = isStrongMove ? params.config.strongShares : params.config.baseShares;
+    }
     const shares = roundTo(
       Math.min(requestedShares, Math.max(0, params.config.maxPositionShares - currentWinnerShares)),
       4

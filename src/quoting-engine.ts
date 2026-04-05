@@ -4,6 +4,7 @@ import {
   isDynamicQuotingEnabled,
   type AppConfig,
 } from './config.js';
+import type { DynamicCompounder } from './dynamic-compounder.js';
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import {
   getDynamicSpreadTicks,
@@ -1621,10 +1622,29 @@ export class QuotingEngine {
   private refreshInFlight = false;
   private onRefreshPlan: ((plan: QuoteRefreshPlan) => Promise<void>) | null = null;
 
+  private compounder: DynamicCompounder | null = null;
+
   constructor(
     private readonly runtimeConfig: AppConfig = config,
     private readonly now: () => Date = () => new Date()
   ) {}
+
+  /** Attach a DynamicCompounder for balance-aware MM sizing (optional). */
+  setCompounder(compounder: DynamicCompounder): void {
+    this.compounder = compounder;
+  }
+
+  /**
+   * Returns the effective MM quote shares, using compounding override when enabled.
+   * Falls back to static MM_QUOTE_SHARES config value when compounding is off.
+   */
+  getEffectiveMMQuoteShares(priceEstimate = 0.5): number {
+    if (this.compounder?.enabled) {
+      const compounded = this.compounder.getMMQuoteShares(priceEstimate);
+      if (compounded > 0) return compounded;
+    }
+    return this.runtimeConfig.MM_QUOTE_SHARES;
+  }
 
   isEnabled(): boolean {
     return isDynamicQuotingEnabled(this.runtimeConfig);
