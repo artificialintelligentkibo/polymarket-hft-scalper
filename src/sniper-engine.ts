@@ -522,6 +522,11 @@ export class SniperEngine {
     } else {
       requestedShares = staticShares;
     }
+    // Enforce CLOB $1 minimum order size — bump shares up if needed
+    const CLOB_MIN_ORDER_USD = 1.0;
+    if (bestAsk > 0 && requestedShares * bestAsk < CLOB_MIN_ORDER_USD) {
+      requestedShares = Math.ceil(CLOB_MIN_ORDER_USD / bestAsk);
+    }
     const shares = roundTo(
       Math.min(requestedShares, Math.max(0, params.config.maxPositionShares - currentWinnerShares)),
       4
