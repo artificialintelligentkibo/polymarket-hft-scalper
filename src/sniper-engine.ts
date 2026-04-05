@@ -511,12 +511,15 @@ export class SniperEngine {
     }
 
     const isStrongMove = movePct >= params.config.strongBinanceMovePct;
+    const staticShares = isStrongMove ? params.config.strongShares : params.config.baseShares;
     let requestedShares: number;
     if (this.compounder?.enabled) {
       const compounded = this.compounder.getSniperShares(isStrongMove, bestAsk);
-      requestedShares = isStrongMove ? compounded.strong : compounded.base;
+      const compoundedShares = isStrongMove ? compounded.strong : compounded.base;
+      // Fallback to static config when compounded shares are too small (low balance or no snapshot yet)
+      requestedShares = compoundedShares >= 1 ? compoundedShares : staticShares;
     } else {
-      requestedShares = isStrongMove ? params.config.strongShares : params.config.baseShares;
+      requestedShares = staticShares;
     }
     const shares = roundTo(
       Math.min(requestedShares, Math.max(0, params.config.maxPositionShares - currentWinnerShares)),

@@ -445,6 +445,22 @@ export class MarketMakerRuntime {
         layers: config.compounding.layerMultipliers.length,
         drawdownGuardPct: config.compounding.drawdownGuardPct,
       });
+
+      // Seed initial balance so compounding sizes are ready before first signal
+      if (!isDryRunMode(config) && !isPaperTradingEnabled(config)) {
+        try {
+          const initialBalance = await this.executor.getUsdcBalance(true);
+          if (typeof initialBalance === 'number' && Number.isFinite(initialBalance) && initialBalance > 0) {
+            this.compounder.recalculate(initialBalance);
+            logger.info('Compounding: initial balance seeded', {
+              balance: roundTo(initialBalance, 2),
+              snapshot: this.compounder.getSnapshot(),
+            });
+          }
+        } catch {
+          logger.warn('Compounding: failed to seed initial balance, will retry on next refresh');
+        }
+      }
     }
 
     const discoveryMode = describeDiscoveryMode(config);
@@ -515,12 +531,13 @@ export class MarketMakerRuntime {
 
   /**
    * Returns the effective global max exposure USD, using dynamic compounding
-   * override when enabled, or the static config value otherwise.
+   * override when enabled. Never goes below the static config value —
+   * compounding only scales UP exposure limits as balance grows.
    */
   private getEffectiveGlobalMaxExposure(): number {
     if (this.compounder.enabled) {
       const dynamic = this.compounder.getDynamicGlobalMaxExposure();
-      if (dynamic !== null && dynamic > 0) return dynamic;
+      if (dynamic !== null && dynamic > config.GLOBAL_MAX_EXPOSURE_USD) return dynamic;
     }
     return config.GLOBAL_MAX_EXPOSURE_USD;
   }

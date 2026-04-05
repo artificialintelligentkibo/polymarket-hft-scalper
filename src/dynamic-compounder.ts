@@ -157,8 +157,8 @@ export class DynamicCompounder {
   }
 
   /**
-   * Get the sniper (Layer 1) share count, optionally split into base/strong.
-   * When compounding is enabled, this replaces the static SNIPER_BASE_SHARES / SNIPER_STRONG_SHARES.
+   * Get the sniper (Layer 1) share count, split into base/strong.
+   * Returns 0 when no snapshot is available (caller should fallback to static config).
    */
   getSniperShares(
     isStrongMove: boolean,
@@ -228,7 +228,8 @@ export class DynamicCompounder {
    * the existing fill-ratio / capital-clamp / liquidity-clamp logic intact.
    *
    * Multiplier = (balance × BASE_RISK_PCT) / (staticBaseOrderShares × referencePrice)
-   * Clamped to [0.1, 5.0] to prevent extreme swings.
+   * Clamped to [1.0, 5.0] — compounding only scales UP, never reduces below static sizes.
+   * This ensures small balances still trade at their configured static sizes.
    */
   getScalperSizeMultiplier(staticBaseOrderShares: number, referencePrice: number): number {
     const snap = this.latestSnapshot;
@@ -239,7 +240,7 @@ export class DynamicCompounder {
     const staticNotional = staticBaseOrderShares * referencePrice;
     if (staticNotional <= 0) return 1.0;
 
-    return clamp(snap.baseSizeUsd / staticNotional, 0.1, 5.0);
+    return clamp(snap.baseSizeUsd / staticNotional, 1.0, 5.0);
   }
 
   /**
