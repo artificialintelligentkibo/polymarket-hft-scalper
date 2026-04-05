@@ -516,8 +516,9 @@ export class SniperEngine {
     if (this.compounder?.enabled) {
       const compounded = this.compounder.getSniperShares(isStrongMove, bestAsk);
       const compoundedShares = isStrongMove ? compounded.strong : compounded.base;
-      // Fallback to static config when compounded shares are too small (low balance or no snapshot yet)
-      requestedShares = compoundedShares >= 1 ? compoundedShares : staticShares;
+      // Fallback to static config when compounded order value < $1 CLOB minimum
+      const compoundedNotional = compoundedShares * bestAsk;
+      requestedShares = compoundedNotional >= 1.0 ? compoundedShares : staticShares;
     } else {
       requestedShares = staticShares;
     }

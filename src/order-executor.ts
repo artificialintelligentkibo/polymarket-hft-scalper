@@ -534,7 +534,12 @@ function shouldRetryOrderPlacement(error: Error, postOnly: boolean): boolean {
   const message = error.message.toLowerCase();
 
   // Never retry — these errors are deterministic, condition won't change between attempts
-  if (message.includes('not enough balance') || message.includes('invalid amounts')) {
+  if (
+    message.includes('not enough balance') ||
+    message.includes('invalid amounts') ||
+    message.includes('invalid amount') ||
+    message.includes('min size')
+  ) {
     return false;
   }
 
