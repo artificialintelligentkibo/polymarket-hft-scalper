@@ -1,5 +1,6 @@
 import { AutoRedeemer } from './auto-redeemer.js';
 import { pathToFileURL } from 'node:url';
+import { TradeNarrator } from './trade-narrator.js';
 import type { BinanceEdgeAssessment } from './binance-edge.js';
 import { BinanceEdgeProvider, extractCoinFromTitle } from './binance-edge.js';
 import { DynamicCompounder } from './dynamic-compounder.js';
@@ -171,6 +172,7 @@ export class MarketMakerRuntime {
   private readonly compounder = new DynamicCompounder(config.compounding);
   private readonly regimeFilter = new RegimeFilter(config.regimeFilter);
   private readonly redeemer = new AutoRedeemer();
+  private readonly narrator = new TradeNarrator(config.REPORTS_DIR);
   private readonly resolutionChecker = new ResolutionChecker();
   private readonly fillTracker = new FillTracker(
     {
@@ -391,6 +393,18 @@ export class MarketMakerRuntime {
             totalDayPnl: dayState.dayPnl,
             dayDrawdown: dayState.drawdown,
           };
+
+          // Narrator: log redemption
+          try {
+            this.narrator.logRedemption({
+              marketTitle: String((payload as { title?: unknown })?.title ?? entry.marketTitle ?? 'Unknown'),
+              conditionId,
+              winningOutcome: resolution.winningOutcome,
+              payoutUsd: actualPayoutUsd,
+              costBasisUsd: entry.totalCostUsd,
+              pnlUsd: result.pnl,
+            });
+          } catch { /* best-effort */ }
         }
       } else {
         logger.warn('Redeem PnL deferred - market resolution unavailable', {
@@ -540,6 +554,18 @@ export class MarketMakerRuntime {
     if (!isPaperTradingEnabled(config)) {
       this.redeemer.start();
     }
+
+    // Narrator: log startup
+    try {
+      const startupBalance = this.walletFundsSnapshot.walletCashUsd;
+      this.narrator.logStartup({
+        balanceUsd: startupBalance,
+        mode: isDryRunMode(config) ? 'DRY RUN' : isPaperTradingEnabled(config) ? 'PAPER' : 'LIVE',
+        sniperEnabled: config.SNIPER_MODE_ENABLED,
+        lotteryEnabled: config.lottery.enabled,
+        mmEnabled: isDynamicQuotingEnabled(config),
+      });
+    } catch { /* narrator is best-effort */ }
   }
 
   /**
@@ -593,6 +619,7 @@ export class MarketMakerRuntime {
     this.running = false;
 
     logger.info('Graceful shutdown started', { reason });
+    try { this.narrator.logShutdown(reason); } catch { /* best-effort */ }
     this.fillTracker.stop();
     this.userStream.stop();
 
@@ -641,6 +668,99 @@ export class MarketMakerRuntime {
       this.binanceEdge.stop();
       this.deepBinance.stop();
       this.fetcher.close();
+    }
+  }
+
+  /**
+   * Narrator helper — routes an execution to the appropriate narrator method.
+   */
+  private narrateExecution(params: {
+    market: MarketCandidate;
+    signal: StrategySignal;
+    shares: number;
+    price: number;
+    realizedDelta: number;
+    beforeOutcomeLayer: StrategyLayer | null;
+    binanceAssessment?: BinanceEdgeAssessment;
+  }): void {
+    const { market, signal, shares, price, realizedDelta, beforeOutcomeLayer, binanceAssessment } = params;
+
+    // --- Sniper BUY entry ---
+    if (signal.signalType === 'SNIPER_BUY' && signal.action === 'BUY') {
+      this.narrator.logSniperEntry({
+        marketId: market.marketId,
+        marketTitle: market.title,
+        outcome: signal.outcome,
+        shares,
+        price,
+        binanceDirection: binanceAssessment?.available ? binanceAssessment.direction : 'UNKNOWN',
+        binanceMovePct: binanceAssessment?.available ? binanceAssessment.binanceMovePct : 0,
+        edge: signal.edgeAmount ?? 0,
+        reason: signal.reason ?? '',
+      });
+      return;
+    }
+
+    // --- Lottery EXIT (when layer is LOTTERY) ---
+    if (signal.action === 'SELL' && beforeOutcomeLayer === 'LOTTERY') {
+      this.narrator.logLotteryExit({
+        marketId: market.marketId,
+        outcome: signal.outcome,
+        exitPrice: price,
+        shares,
+        signalType: signal.signalType,
+        reason: signal.reason ?? '',
+        pnlUsd: realizedDelta,
+      });
+      return;
+    }
+
+    // --- Sniper EXIT (scalp, trailing TP, hard stop, slot flatten) ---
+    if (
+      signal.action === 'SELL' &&
+      (signal.signalType === 'SNIPER_SCALP_EXIT' ||
+        signal.signalType === 'TRAILING_TAKE_PROFIT' ||
+        signal.signalType === 'HARD_STOP' ||
+        signal.signalType === 'SLOT_FLATTEN')
+    ) {
+      this.narrator.logSniperExit({
+        marketId: market.marketId,
+        outcome: signal.outcome,
+        shares,
+        exitPrice: price,
+        entryPrice: signal.referencePrice ?? price,
+        signalType: signal.signalType,
+        reason: signal.reason ?? '',
+        pnlUsd: realizedDelta,
+      });
+      return;
+    }
+
+    // --- Lottery BUY entry ---
+    if (signal.signalType === 'LOTTERY_BUY' && signal.action === 'BUY') {
+      this.narrator.logLotteryEntry({
+        marketId: market.marketId,
+        marketTitle: market.title,
+        outcome: signal.outcome,
+        shares,
+        price,
+        riskUsd: roundTo(shares * price, 2),
+      });
+      return;
+    }
+
+    // --- MM quote fills ---
+    if (signal.signalType === 'MM_QUOTE_BID' || signal.signalType === 'MM_QUOTE_ASK') {
+      this.narrator.logMMFill({
+        marketId: market.marketId,
+        marketTitle: market.title,
+        outcome: signal.outcome,
+        side: signal.action,
+        shares,
+        price,
+        pnlUsd: realizedDelta,
+      });
+      return;
     }
   }
 
@@ -1487,6 +1607,21 @@ export class MarketMakerRuntime {
       });
     }
 
+    // Narrator: log trade events
+    if (effectiveShares > 0) {
+      try {
+        this.narrateExecution({
+          market,
+          signal: executionSignal,
+          shares: effectiveShares,
+          price: effectivePrice,
+          realizedDelta,
+          beforeOutcomeLayer,
+          binanceAssessment,
+        });
+      } catch { /* narrator is best-effort */ }
+    }
+
     const slotMetrics = getSlotMetrics(slotKey);
     const dayState = getDayPnlState(new Date(completedAt));
     const latencyRoundTripMs =
@@ -1925,6 +2060,19 @@ export class MarketMakerRuntime {
       fillPrice: fill.fillPrice,
       executedAtMs: fill.filledAt,
     });
+
+    // Narrator: log delayed confirmed fill
+    try {
+      const trackedSignal = createTrackedSignal(market, fill);
+      this.narrateExecution({
+        market,
+        signal: trackedSignal,
+        shares: fill.filledShares,
+        price: fill.fillPrice,
+        realizedDelta,
+        beforeOutcomeLayer,
+      });
+    } catch { /* narrator is best-effort */ }
 
     const dayState = getDayPnlState(new Date(fill.filledAt));
     logger.info('Applied confirmed fill from fill tracker', {
