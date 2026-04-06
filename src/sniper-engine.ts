@@ -127,6 +127,7 @@ export function buildSniperEntryKey(marketId: string, outcome: Outcome): string 
 
 export class SniperEngine {
   private readonly activeEntries = new Map<string, SniperEntry>();
+  private readonly peakEdges = new Map<string, number>();
   private readonly hardStopFallbackKeys = new Set<string>();
   private readonly lastEntryAt = new Map<string, number>();
   private readonly rejectionCounts = new Map<SniperRejection, number>();
@@ -183,6 +184,7 @@ export class SniperEngine {
   clearActiveEntry(marketId: string, outcome: Outcome): void {
     const key = buildSniperEntryKey(marketId, outcome);
     this.activeEntries.delete(key);
+    this.peakEdges.delete(key);
     this.hardStopFallbackKeys.delete(key);
   }
 
@@ -755,6 +757,12 @@ export class SniperEngine {
       }
 
       const pnlEdge = roundTo(liquidationReferencePrice - entry.entryPrice, 6);
+      const entryKey = buildSniperEntryKey(entry.marketId, entry.outcome);
+      const prevPeak = this.peakEdges.get(entryKey) ?? 0;
+      if (pnlEdge > prevPeak) {
+        this.peakEdges.set(entryKey, pnlEdge);
+      }
+
       if (slotEndWindowOpen) {
         return [
           buildSniperExitSignal(params.market, params.orderbook, {
@@ -803,6 +811,26 @@ export class SniperEngine {
             signalType: 'SNIPER_SCALP_EXIT',
             urgency: 'cross',
             reason: `Sniper reversal stop: Binance flipped against ${entry.binanceDirectionAtEntry} and pnl ${(pnlEdge * 100).toFixed(2)}%`,
+            nowMs: params.nowMs,
+          }),
+        ];
+      }
+
+      const peakEdge = this.peakEdges.get(entryKey) ?? 0;
+      if (
+        params.config.breakEvenEdge > 0 &&
+        peakEdge >= params.config.breakEvenEdge &&
+        pnlEdge <= 0
+      ) {
+        return [
+          buildSniperExitSignal(params.market, params.orderbook, {
+            entry,
+            shares: exitShares,
+            exitPrice: bestBid,
+            edgeAmount: pnlEdge,
+            signalType: 'SNIPER_SCALP_EXIT',
+            urgency: 'cross',
+            reason: `Sniper break-even trail: peak edge was ${(peakEdge * 100).toFixed(2)}% but fell to ${(pnlEdge * 100).toFixed(2)}%`,
             nowMs: params.nowMs,
           }),
         ];

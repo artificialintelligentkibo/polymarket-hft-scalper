@@ -69,72 +69,56 @@ export class LotteryEngine {
       );
 
       if (bestBid !== null && bestBid >= takeProfitPrice) {
-        signals.push({
-          marketId: market.marketId,
-          marketTitle: market.title,
+        signals.push(this.buildLotteryExitSignal({
+          market, orderbook, book, outcome, entry,
+          availableShares, exitPrice: bestBid, nowMs,
           signalType: 'TRAILING_TAKE_PROFIT',
           priority: 985,
-          generatedAt: nowMs,
-          action: 'SELL',
-          outcome,
-          outcomeIndex: outcome === 'YES' ? 0 : 1,
-          shares: availableShares,
-          targetPrice: bestBid,
-          referencePrice: entry.entryPrice,
-          tokenPrice: bestBid,
-          midPrice: book.midPrice,
-          fairValue: null,
-          edgeAmount: roundTo(bestBid - entry.entryPrice, 6),
-          combinedBid: orderbook.combined.combinedBid,
-          combinedAsk: orderbook.combined.combinedAsk,
-          combinedMid: orderbook.combined.combinedMid,
-          combinedDiscount: orderbook.combined.combinedDiscount,
-          combinedPremium: orderbook.combined.combinedPremium,
-          fillRatio: 1,
-          capitalClamp: 1,
-          priceMultiplier: 1,
-          urgency: 'cross',
-          reduceOnly: true,
           reason:
             `Lottery take-profit: bid ${bestBid.toFixed(3)} reached target ${takeProfitPrice.toFixed(3)} ` +
             `vs entry ${entry.entryPrice.toFixed(3)}`,
-          strategyLayer: 'LOTTERY',
-        });
+        }));
+        continue;
+      }
+
+      const priceDrop = entry.entryPrice > 0 ? (entry.entryPrice - markPrice) / entry.entryPrice : 0;
+      if (config.stopLossPct > 0 && priceDrop >= config.stopLossPct) {
+        signals.push(this.buildLotteryExitSignal({
+          market, orderbook, book, outcome, entry,
+          availableShares, exitPrice: markPrice, nowMs,
+          signalType: 'HARD_STOP',
+          priority: 990,
+          reason:
+            `Lottery stop-loss: mark ${markPrice.toFixed(3)} dropped ${(priceDrop * 100).toFixed(1)}% ` +
+            `from entry ${entry.entryPrice.toFixed(3)}`,
+        }));
+        continue;
+      }
+
+      const holdMs = nowMs - entry.enteredAtMs;
+      if (config.maxHoldMs > 0 && holdMs > config.maxHoldMs && markPrice <= entry.entryPrice) {
+        signals.push(this.buildLotteryExitSignal({
+          market, orderbook, book, outcome, entry,
+          availableShares, exitPrice: markPrice, nowMs,
+          signalType: 'SLOT_FLATTEN',
+          priority: 985,
+          reason:
+            `Lottery time-stop: held ${(holdMs / 1000).toFixed(0)}s > max ${(config.maxHoldMs / 1000).toFixed(0)}s ` +
+            `at ${markPrice.toFixed(3)} vs entry ${entry.entryPrice.toFixed(3)}`,
+        }));
         continue;
       }
 
       if (timeToEndMs <= config.exitBeforeEndMs) {
-        signals.push({
-          marketId: market.marketId,
-          marketTitle: market.title,
+        signals.push(this.buildLotteryExitSignal({
+          market, orderbook, book, outcome, entry,
+          availableShares, exitPrice: markPrice, nowMs,
           signalType: 'SLOT_FLATTEN',
           priority: 980,
-          generatedAt: nowMs,
-          action: 'SELL',
-          outcome,
-          outcomeIndex: outcome === 'YES' ? 0 : 1,
-          shares: availableShares,
-          targetPrice: markPrice,
-          referencePrice: entry.entryPrice,
-          tokenPrice: markPrice,
-          midPrice: book.midPrice,
-          fairValue: null,
-          edgeAmount: roundTo(markPrice - entry.entryPrice, 6),
-          combinedBid: orderbook.combined.combinedBid,
-          combinedAsk: orderbook.combined.combinedAsk,
-          combinedMid: orderbook.combined.combinedMid,
-          combinedDiscount: orderbook.combined.combinedDiscount,
-          combinedPremium: orderbook.combined.combinedPremium,
-          fillRatio: 1,
-          capitalClamp: 1,
-          priceMultiplier: 1,
-          urgency: 'cross',
-          reduceOnly: true,
           reason:
             `Lottery slot-end exit: ${Math.max(0, timeToEndMs)}ms before slot end ` +
             `at ${markPrice.toFixed(3)} vs entry ${entry.entryPrice.toFixed(3)}`,
-          strategyLayer: 'LOTTERY',
-        });
+        }));
       }
     }
 
@@ -403,6 +387,50 @@ export class LotteryEngine {
           : '0.0%',
       totalRiskUsdc: roundTo(this.totalRiskUsdc, 2),
       totalPayoutUsdc: roundTo(this.totalPayoutUsdc, 2),
+    };
+  }
+
+  private buildLotteryExitSignal(params: {
+    market: MarketCandidate;
+    orderbook: MarketOrderbookSnapshot;
+    book: MarketOrderbookSnapshot['yes'] | MarketOrderbookSnapshot['no'];
+    outcome: Outcome;
+    entry: LotteryEntry;
+    availableShares: number;
+    exitPrice: number;
+    nowMs: number;
+    signalType: 'TRAILING_TAKE_PROFIT' | 'SLOT_FLATTEN' | 'HARD_STOP';
+    priority: number;
+    reason: string;
+  }): StrategySignal {
+    return {
+      marketId: params.market.marketId,
+      marketTitle: params.market.title,
+      signalType: params.signalType,
+      priority: params.priority,
+      generatedAt: params.nowMs,
+      action: 'SELL',
+      outcome: params.outcome,
+      outcomeIndex: params.outcome === 'YES' ? 0 : 1,
+      shares: params.availableShares,
+      targetPrice: params.exitPrice,
+      referencePrice: params.entry.entryPrice,
+      tokenPrice: params.exitPrice,
+      midPrice: params.book.midPrice,
+      fairValue: null,
+      edgeAmount: roundTo(params.exitPrice - params.entry.entryPrice, 6),
+      combinedBid: params.orderbook.combined.combinedBid,
+      combinedAsk: params.orderbook.combined.combinedAsk,
+      combinedMid: params.orderbook.combined.combinedMid,
+      combinedDiscount: params.orderbook.combined.combinedDiscount,
+      combinedPremium: params.orderbook.combined.combinedPremium,
+      fillRatio: 1,
+      capitalClamp: 1,
+      priceMultiplier: 1,
+      urgency: 'cross',
+      reduceOnly: true,
+      reason: params.reason,
+      strategyLayer: 'LOTTERY',
     };
   }
 

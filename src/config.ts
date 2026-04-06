@@ -68,6 +68,8 @@ export interface SniperConfig {
   readonly makerExitGraceMs: number;
   /** Reversal loss threshold once Binance direction flips. */
   readonly stopLossPct: number;
+  /** Once edge reaches this level, stop tightens to breakeven (0 = disabled). */
+  readonly breakEvenEdge: number;
   /** Lookback window for Binance velocity confirmation. */
   readonly velocityWindowMs: number;
   /** Minimum signed velocity required to confirm the move is real. */
@@ -141,6 +143,10 @@ export interface LotteryConfig {
   readonly onlyAfterSniper: boolean;
   /** Maximum number of lottery tickets allowed inside the same 5-minute slot. */
   readonly maxPerSlot: number;
+  /** Stop-loss as fraction of entry price drop (0.5 = exit when mark ≤ 50% of entry). */
+  readonly stopLossPct: number;
+  /** Maximum hold time for lottery positions (ms); 0 = disabled. */
+  readonly maxHoldMs: number;
 }
 
 export interface AppConfig {
@@ -1040,6 +1046,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseIntOrDefault(env.SNIPER_MAKER_EXIT_GRACE_MS, '2500')
       ),
       stopLossPct: parseFloatOrDefault(env.SNIPER_STOP_LOSS_PCT, '0.15'),
+      breakEvenEdge: parseFloatOrDefault(env.SNIPER_BREAK_EVEN_EDGE, '0.04'),
       velocityWindowMs: Math.max(
         1_000,
         parseIntOrDefault(env.SNIPER_VELOCITY_WINDOW_MS, '5000')
@@ -1091,6 +1098,8 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ),
       onlyAfterSniper: parseBoolean(env.LOTTERY_ONLY_AFTER_SNIPER, true),
       maxPerSlot: Math.max(0, parseIntOrDefault(env.LOTTERY_MAX_PER_SLOT, '1')),
+      stopLossPct: clamp(parseFloatOrDefault(env.LOTTERY_STOP_LOSS_PCT, '0.50'), 0.1, 0.9),
+      maxHoldMs: Math.max(0, parseIntOrDefault(env.LOTTERY_MAX_HOLD_MS, '150000')),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
