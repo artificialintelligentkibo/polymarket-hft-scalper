@@ -39,6 +39,7 @@ import {
   type MarketCandidate,
 } from './monitor.js';
 import { OrderBookImbalanceFilter } from './order-book-imbalance.js';
+import { ObiEngine } from './obi-engine.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
 import { meetsClobMinimums, resolveMinimumTradableShares } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
@@ -173,6 +174,7 @@ export class MarketMakerRuntime {
   private readonly compounder = new DynamicCompounder(config.compounding);
   private readonly regimeFilter = new RegimeFilter(config.regimeFilter);
   private readonly orderBookImbalance = new OrderBookImbalanceFilter(config.orderBookImbalance);
+  private readonly obiEngine = new ObiEngine();
   private readonly redeemer = new AutoRedeemer();
   private readonly narrator = new TradeNarrator(config.REPORTS_DIR);
   private readonly resolutionChecker = new ResolutionChecker();
@@ -1017,6 +1019,23 @@ export class MarketMakerRuntime {
       sniperEntryOverride,
     });
     this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
+
+    if (config.obiEngine.enabled) {
+      const obiEntrySignals = this.obiEngine.generateSignals({
+        market,
+        orderbook,
+        positionManager,
+        config: config.obiEngine,
+      });
+      const obiExitSignals = this.obiEngine.generateExitSignals({
+        market,
+        orderbook,
+        positionManager,
+        config: config.obiEngine,
+      });
+      for (const sig of obiEntrySignals) signals.push(sig);
+      for (const sig of obiExitSignals) signals.push(sig);
+    }
     const sniperFilteredSignals = this.applySniperCorrelationFilter(
       market,
       signals,
@@ -2004,6 +2023,43 @@ export class MarketMakerRuntime {
             price: roundTo(fill.fillPrice, 4),
             shares: roundTo(fill.filledShares, 4),
           });
+        }
+      }
+      if (fill.signalType === 'OBI_ENTRY_BUY' && config.obiEngine.enabled) {
+        const obiBook =
+          this.latestBooks.get(fill.marketId) ??
+          this.quotingEngine.getContext(fill.marketId)?.orderbook;
+        if (obiBook) {
+          const mmSignals = this.obiEngine.onEntryFill({
+            marketId: fill.marketId,
+            marketTitle: market.title,
+            outcome: fill.outcome,
+            fillPrice: fill.fillPrice,
+            filledShares: fill.filledShares,
+            orderbook: obiBook,
+            config: config.obiEngine,
+          });
+          for (const obiSignal of mmSignals) {
+            const obiOrderbook = obiBook;
+            this.scheduleBackgroundTask(async () => {
+              try {
+                await this.executeSignal(
+                  market,
+                  obiOrderbook,
+                  positionManager,
+                  obiSignal,
+                  fill.slotKey
+                );
+              } catch (error) {
+                logger.debug('OBI follow-on quote execution failed', {
+                  marketId: fill.marketId,
+                  signalType: obiSignal.signalType,
+                  outcome: obiSignal.outcome,
+                  message: error instanceof Error ? error.message : String(error),
+                });
+              }
+            });
+          }
         }
       }
       if (fill.signalType === 'SNIPER_BUY' && config.lottery.enabled) {
@@ -3072,6 +3128,7 @@ export class MarketMakerRuntime {
     this.positions.delete(marketId);
     this.latestBooks.delete(marketId);
     this.orderBookImbalance.clearState(marketId);
+    this.obiEngine.clearState(marketId);
     this.marketActions.delete(marketId);
     this.clearDustAbandonmentForMarket(marketId);
     this.clearSettlementConfirmation(marketId, 'YES');

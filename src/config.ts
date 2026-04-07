@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 import type { EVKellyConfig } from './ev-kelly.js';
 import type { LatencyMomentumConfig } from './latency-momentum.js';
 import type { OrderBookImbalanceConfig } from './order-book-imbalance.js';
+import type { ObiEngineConfig } from './obi-engine.js';
 import type { PairedArbConfig } from './paired-arbitrage.js';
 import type { PaperTraderConfig } from './paper-trader.js';
 import { parseLayerMultipliers } from './dynamic-compounder.js';
@@ -448,6 +449,7 @@ export interface AppConfig {
   /** Runtime lottery-layer configuration for convex opposite-side tickets. */
   readonly lottery: LotteryConfig;
   readonly orderBookImbalance: OrderBookImbalanceConfig;
+  readonly obiEngine: ObiEngineConfig;
   readonly paperTrading: PaperTraderConfig;
   readonly evKelly: EVKellyConfig;
   /** Dynamic balance-aware compounding engine configuration. */
@@ -648,10 +650,25 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
   }
 
   if (preset === 'ORDER_BOOK_IMBALANCE') {
-    console.warn(
-      '[strategy] ACTIVE_STRATEGY=ORDER_BOOK_IMBALANCE is not implemented yet — falling back to CURRENT_SNIPER behaviour.'
+    console.log(
+      '[strategy] ACTIVE_STRATEGY=ORDER_BOOK_IMBALANCE — vague-sourdough OBI mode (standalone Layer 1, Binance disabled)'
     );
-    return { ...input, ACTIVE_STRATEGY: 'CURRENT_SNIPER' };
+    return {
+      ...input,
+      SNIPER_MODE_ENABLED: false,
+      sniper: { ...input.sniper, enabled: false },
+      LATENCY_MOMENTUM_ENABLED: false,
+      latencyMomentum: { ...input.latencyMomentum, enabled: false },
+      PAIRED_ARB_ENABLED: false,
+      pairedArbitrage: { ...input.pairedArbitrage, enabled: false },
+      binance: { ...input.binance, edgeEnabled: false },
+      BINANCE_WS_ENABLED: false,
+      obiEngine: { ...input.obiEngine, enabled: true },
+      MARKET_MAKER_MODE: true,
+      DYNAMIC_QUOTING_ENABLED: true,
+      MM_AUTO_ACTIVATE_AFTER_SNIPER: false,
+      POST_ONLY_ONLY: true,
+    };
   }
 
   // PAIRED_ARBITRAGE: enable paired arb, disable sniper / MM / lottery / latency.
@@ -1207,6 +1224,72 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         1
       ),
       shadowMode: parseBoolean(env.OBI_SHADOW_MODE, false),
+    },
+    obiEngine: {
+      enabled: parseBoolean(env.OBI_ENGINE_ENABLED, false),
+      thinThresholdUsd: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_THIN_THRESHOLD_USD, '8')
+      ),
+      minLiquidityUsd: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_MIN_LIQUIDITY_USD, '500')
+      ),
+      entryImbalanceRatio: clamp(
+        parseFloatOrDefault(env.OBI_ENTRY_IMBALANCE_RATIO, '0.35'),
+        0.05,
+        0.95
+      ),
+      exitRebalanceRatio: clamp(
+        parseFloatOrDefault(env.OBI_EXIT_REBALANCE_RATIO, '0.65'),
+        0.10,
+        1.0
+      ),
+      entryShares: Math.max(6, parseIntOrDefault(env.OBI_ENTRY_SHARES, '8')),
+      maxPositionShares: Math.max(
+        6,
+        parseIntOrDefault(env.OBI_MAX_POSITION_SHARES, '20')
+      ),
+      cooldownMs: Math.max(0, parseIntOrDefault(env.OBI_COOLDOWN_MS, '15000')),
+      slotWarmupMs: Math.max(
+        0,
+        parseIntOrDefault(env.OBI_SLOT_WARMUP_MS, '5000')
+      ),
+      stopEntryBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.OBI_STOP_ENTRY_BEFORE_END_MS, '90000')
+      ),
+      cancelAllBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.OBI_CANCEL_ALL_BEFORE_END_MS, '20000')
+      ),
+      minEntryPrice: clamp(
+        parseFloatOrDefault(env.OBI_MIN_ENTRY_PRICE, '0.04'),
+        0,
+        1
+      ),
+      maxEntryPrice: clamp(
+        parseFloatOrDefault(env.OBI_MAX_ENTRY_PRICE, '0.50'),
+        0,
+        1
+      ),
+      scalpExitEdge: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_SCALP_EXIT_EDGE, '0.08')
+      ),
+      mmAskEnabled: parseBoolean(env.OBI_MM_ASK_ENABLED, true),
+      mmBidOppositeEnabled: parseBoolean(env.OBI_MM_BID_OPPOSITE_ENABLED, false),
+      mmAskSpreadTicks: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_MM_ASK_SPREAD_TICKS, '0.015')
+      ),
+      mmBidOppositeFactor: clamp(
+        parseFloatOrDefault(env.OBI_MM_BID_OPPOSITE_FACTOR, '0.25'),
+        0,
+        1
+      ),
+      shadowMode: parseBoolean(env.OBI_SHADOW_MODE, false),
+      aggressiveEntry: parseBoolean(env.OBI_AGGRESSIVE_ENTRY, false),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),

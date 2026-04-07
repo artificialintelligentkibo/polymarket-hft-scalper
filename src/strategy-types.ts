@@ -2,7 +2,7 @@ import type { Outcome } from './clob-fetcher.js';
 
 export type SignalAction = 'BUY' | 'SELL';
 export type SignalUrgency = 'passive' | 'improve' | 'cross';
-export type StrategyLayer = 'SNIPER' | 'MM_QUOTE' | 'PAIRED_ARB' | 'LOTTERY';
+export type StrategyLayer = 'SNIPER' | 'MM_QUOTE' | 'PAIRED_ARB' | 'LOTTERY' | 'OBI';
 export type SignalType =
   | 'COMBINED_DISCOUNT_BUY_BOTH'
   | 'DEEP_BINANCE_SIGNAL'
@@ -17,6 +17,11 @@ export type SignalType =
   | 'MM_QUOTE_BID'
   | 'INVENTORY_REBALANCE'
   | 'INVENTORY_REBALANCE_QUOTE'
+  | 'OBI_ENTRY_BUY'
+  | 'OBI_SCALP_EXIT'
+  | 'OBI_REBALANCE_EXIT'
+  | 'OBI_MM_QUOTE_ASK'
+  | 'OBI_MM_QUOTE_BID'
   | 'PAIRED_ARB_BUY_YES'
   | 'PAIRED_ARB_BUY_NO'
   | 'PAIRED_ARB_REBALANCE'
@@ -33,6 +38,8 @@ export const QUOTING_SIGNAL_TYPES = [
   'INVENTORY_REBALANCE_QUOTE',
   'MM_QUOTE_BID',
   'MM_QUOTE_ASK',
+  'OBI_MM_QUOTE_ASK',
+  'OBI_MM_QUOTE_BID',
 ] as const satisfies readonly SignalType[];
 
 export function isQuotingSignalType(signalType: SignalType): boolean {
@@ -51,7 +58,12 @@ export function bypassesBinanceEdge(signalType: SignalType): boolean {
     signalType === 'PAIRED_ARB_BUY_NO' ||
     signalType === 'PAIRED_ARB_REBALANCE' ||
     signalType === 'SNIPER_BUY' ||
-    signalType === 'SNIPER_SCALP_EXIT'
+    signalType === 'SNIPER_SCALP_EXIT' ||
+    signalType === 'OBI_ENTRY_BUY' ||
+    signalType === 'OBI_SCALP_EXIT' ||
+    signalType === 'OBI_REBALANCE_EXIT' ||
+    signalType === 'OBI_MM_QUOTE_ASK' ||
+    signalType === 'OBI_MM_QUOTE_BID'
   );
 }
 
@@ -83,6 +95,12 @@ export function resolveStrategyLayer(signalType: SignalType): StrategyLayer {
       return 'PAIRED_ARB';
     case 'LOTTERY_BUY':
       return 'LOTTERY';
+    case 'OBI_ENTRY_BUY':
+    case 'OBI_SCALP_EXIT':
+    case 'OBI_REBALANCE_EXIT':
+    case 'OBI_MM_QUOTE_ASK':
+    case 'OBI_MM_QUOTE_BID':
+      return 'OBI';
     default:
       return 'SNIPER';
   }
@@ -102,7 +120,9 @@ export function isLayerConflict(
     (existingLayer === 'SNIPER' && newLayer === 'LOTTERY') ||
     (existingLayer === 'LOTTERY' && newLayer === 'SNIPER') ||
     (existingLayer === 'MM_QUOTE' && newLayer === 'LOTTERY') ||
-    (existingLayer === 'LOTTERY' && newLayer === 'MM_QUOTE')
+    (existingLayer === 'LOTTERY' && newLayer === 'MM_QUOTE') ||
+    (existingLayer === 'OBI' && newLayer === 'LOTTERY') ||
+    (existingLayer === 'LOTTERY' && newLayer === 'OBI')
   );
 }
 
