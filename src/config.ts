@@ -664,8 +664,12 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
       binance: { ...input.binance, edgeEnabled: false },
       BINANCE_WS_ENABLED: false,
       obiEngine: { ...input.obiEngine, enabled: true },
-      MARKET_MAKER_MODE: true,
-      DYNAMIC_QUOTING_ENABLED: true,
+      // OBI is a standalone Layer 1 engine with its own Layer 2 quoting
+      // (OBI_MM_QUOTE_ASK). Running the regular MM_QUOTE engine in parallel
+      // causes layer_conflict errors that block every OBI_ENTRY_BUY because
+      // MM already owns the market. Disable the regular market maker here.
+      MARKET_MAKER_MODE: false,
+      DYNAMIC_QUOTING_ENABLED: false,
       MM_AUTO_ACTIVATE_AFTER_SNIPER: false,
       POST_ONLY_ONLY: true,
     };
