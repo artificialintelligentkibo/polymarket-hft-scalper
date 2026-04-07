@@ -449,6 +449,8 @@ export class TradeNarrator {
       case 'TRAILING_TAKE_PROFIT': return 'TAKE PROFIT';
       case 'HARD_STOP': return 'STOP-LOSS';
       case 'SLOT_FLATTEN': return 'SLOT-END EXIT';
+      case 'OBI_SCALP_EXIT': return 'OBI SCALP EXIT';
+      case 'OBI_REBALANCE_EXIT': return 'OBI REBALANCE EXIT';
       default: return 'EXIT';
     }
   }
@@ -476,6 +478,12 @@ export class TradeNarrator {
     }
     if (signalType === 'TRAILING_TAKE_PROFIT') {
       return 'Price reached target — took profit.';
+    }
+    if (signalType === 'OBI_SCALP_EXIT' && pnlUsd > 0) {
+      return 'Order book imbalance — scalp exit took profit.';
+    }
+    if (signalType === 'OBI_REBALANCE_EXIT') {
+      return 'Order book rebalanced — exiting OBI position.';
     }
     return '';
   }

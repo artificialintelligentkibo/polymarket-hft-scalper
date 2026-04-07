@@ -143,6 +143,7 @@ interface LayerExposureAccumulator {
   mmUsd: number;
   pairedArbUsd: number;
   lotteryUsd: number;
+  obiUsd: number;
   totalUsd: number;
   maxUsd: number;
 }
@@ -2632,10 +2633,17 @@ export class MarketMakerRuntime {
       case 'LOTTERY':
         exposure.lotteryUsd = roundTo(exposure.lotteryUsd + amountUsd, 4);
         break;
+      case 'OBI':
+        exposure.obiUsd = roundTo(exposure.obiUsd + amountUsd, 4);
+        break;
     }
 
     exposure.totalUsd = roundTo(
-      exposure.sniperUsd + exposure.mmUsd + exposure.pairedArbUsd + exposure.lotteryUsd,
+      exposure.sniperUsd +
+        exposure.mmUsd +
+        exposure.pairedArbUsd +
+        exposure.lotteryUsd +
+        exposure.obiUsd,
       4
     );
   }
@@ -2707,12 +2715,29 @@ export class MarketMakerRuntime {
           pnlUsd: 0,
         },
       ],
+      [
+        'OBI',
+        {
+          layer: 'OBI',
+          enabled: config.obiEngine.enabled,
+          status: config.obiEngine.enabled
+            ? config.obiEngine.shadowMode
+              ? 'WATCHING'
+              : 'ACTIVE'
+            : 'OFF',
+          positionCount: 0,
+          marketCount: 0,
+          exposureUsd: 0,
+          pnlUsd: 0,
+        },
+      ],
     ]);
     const layerMarkets = new Map<StrategyLayer, Set<string>>([
       ['SNIPER', new Set<string>()],
       ['MM_QUOTE', new Set<string>()],
       ['PAIRED_ARB', new Set<string>()],
       ['LOTTERY', new Set<string>()],
+      ['OBI', new Set<string>()],
     ]);
 
     for (const [marketId, positionManager] of this.positions.entries()) {
@@ -2771,7 +2796,9 @@ export class MarketMakerRuntime {
       });
     }
 
-    const strategyLayers = (['SNIPER', 'MM_QUOTE', 'PAIRED_ARB', 'LOTTERY'] as const).map((layer) => {
+    const strategyLayers = (
+      ['SNIPER', 'MM_QUOTE', 'PAIRED_ARB', 'LOTTERY', 'OBI'] as const
+    ).map((layer) => {
       const snapshot = base.get(layer)!;
       return {
         ...snapshot,
@@ -2788,6 +2815,7 @@ export class MarketMakerRuntime {
           strategyLayers.find((entry) => entry.layer === 'PAIRED_ARB')?.exposureUsd ?? 0,
         lotteryUsd:
           strategyLayers.find((entry) => entry.layer === 'LOTTERY')?.exposureUsd ?? 0,
+        obiUsd: strategyLayers.find((entry) => entry.layer === 'OBI')?.exposureUsd ?? 0,
         totalUsd: roundTo(
           strategyLayers.reduce((sum, entry) => sum + entry.exposureUsd, 0),
           4

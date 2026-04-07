@@ -33,6 +33,7 @@ export interface RuntimeGlobalExposureSnapshot {
   readonly mmUsd: number;
   readonly pairedArbUsd: number;
   readonly lotteryUsd: number;
+  readonly obiUsd: number;
   readonly totalUsd: number;
   readonly maxUsd: number;
 }
@@ -597,6 +598,19 @@ function createDefaultStrategyLayersSnapshot(
       exposureUsd: 0,
       pnlUsd: 0,
     },
+    {
+      layer: 'OBI',
+      enabled: runtimeConfig.obiEngine.enabled,
+      status: runtimeConfig.obiEngine.enabled
+        ? runtimeConfig.obiEngine.shadowMode
+          ? 'WATCHING'
+          : 'ACTIVE'
+        : 'OFF',
+      positionCount: 0,
+      marketCount: 0,
+      exposureUsd: 0,
+      pnlUsd: 0,
+    },
   ];
 }
 
@@ -608,6 +622,7 @@ function createDefaultGlobalExposureSnapshot(
     mmUsd: 0,
     pairedArbUsd: 0,
     lotteryUsd: 0,
+    obiUsd: 0,
     totalUsd: 0,
     maxUsd: runtimeConfig.GLOBAL_MAX_EXPOSURE_USD,
   };
@@ -825,6 +840,7 @@ function normalizeGlobalExposure(
     mmUsd: normalizeNumber(record.mmUsd, 0),
     pairedArbUsd: normalizeNumber(record.pairedArbUsd, 0),
     lotteryUsd: normalizeNumber(record.lotteryUsd, 0),
+    obiUsd: normalizeNumber(record.obiUsd, 0),
     totalUsd: normalizeNumber(record.totalUsd, 0),
     maxUsd: normalizeNumber(record.maxUsd, runtimeConfig.GLOBAL_MAX_EXPOSURE_USD),
   };
