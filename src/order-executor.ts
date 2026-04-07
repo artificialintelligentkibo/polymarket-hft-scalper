@@ -515,7 +515,9 @@ function resolveExecutionUrgency(
     signal.reduceOnly === true &&
     (signal.signalType === 'HARD_STOP' ||
       signal.signalType === 'SLOT_FLATTEN' ||
-      signal.signalType === 'TRAILING_TAKE_PROFIT')
+      signal.signalType === 'TRAILING_TAKE_PROFIT' ||
+      signal.signalType === 'OBI_REBALANCE_EXIT' ||
+      signal.signalType === 'OBI_SCALP_EXIT')
   ) {
     return urgency;
   }
