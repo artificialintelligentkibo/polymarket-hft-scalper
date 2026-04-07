@@ -57,6 +57,21 @@ export interface ObiEngineConfig {
   readonly mmBidOppositeFactor: number;
   readonly shadowMode: boolean;
   readonly aggressiveEntry: boolean;
+  // === Safety nets (added after $10 live loss audit) ===
+  /** Hard $ stop: exit immediately when position PnL drops below -hardStopUsd. */
+  readonly hardStopUsd: number;
+  /** Min entry notional in USD. Entry is rejected if shares*price < this. */
+  readonly minEntryNotionalUsd: number;
+  /** CLOB minimum sell notional. Used to prevent dust positions at entry. */
+  readonly clobMinNotionalUsd: number;
+  /** CLOB minimum sell shares. Used to prevent dust positions at entry. */
+  readonly clobMinShares: number;
+  /** After a losing exit, refuse new entries on the same market for this long. */
+  readonly losingExitCooldownMs: number;
+  /** Catastrophic flip ratio: exit immediately when currentRatio >= this (book fully reversed). */
+  readonly imbalanceCollapseRatio: number;
+  /** When set, generateSignals returns no entries if available USDC < required notional. */
+  readonly preflightBalanceCheck: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -71,6 +86,12 @@ interface ObiPosition {
   readonly enteredAtMs: number;
   readonly initialRatio: number;
   readonly thinSide: 'bid' | 'ask';
+  /** Slot end time in ms (parsed at entry). Used by orphan slot-end heartbeat. */
+  readonly slotEndMs: number | null;
+  /** Last orderbook snapshot for this market (refreshed from exit ticks). */
+  lastOrderbook?: MarketOrderbookSnapshot;
+  /** Cached title for orphan flatten signals. */
+  readonly marketTitle: string;
 }
 
 export interface ObiStatsSnapshot {
@@ -120,9 +141,23 @@ interface ObiCandidate {
 export class ObiEngine {
   private readonly positions = new Map<string, ObiPosition>();
   private readonly lastEntryMs = new Map<string, number>();
+  /** Markets where we recently exited at a loss — extra cooldown applies. */
+  private readonly lastLosingExitMs = new Map<string, number>();
+  /** Last available USDC balance reported by host. Used for pre-flight check. */
+  private availableUsdcBalance: number | null = null;
   private totalEntries = 0;
   private totalExits = 0;
   private totalShadowDecisions = 0;
+
+  /**
+   * Update the cached USDC balance. Host should call this each cycle from
+   * the same source the order executor uses, so generateSignals can pre-flight
+   * filter entries that the executor would just reject anyway.
+   */
+  setAvailableUsdcBalance(usdc: number | null): void {
+    this.availableUsdcBalance =
+      usdc !== null && Number.isFinite(usdc) ? usdc : null;
+  }
 
   /** Generate entry signals for the given market tick. */
   generateSignals(params: {
@@ -149,9 +184,25 @@ export class ObiEngine {
       return [];
     }
 
-    // Cooldown gate.
+    // Cooldown gate (normal).
     const lastEntry = this.lastEntryMs.get(market.marketId);
     if (lastEntry !== undefined && nowMs - lastEntry < config.cooldownMs) {
+      return [];
+    }
+
+    // Re-entry guard: after a losing exit, refuse new entries on same market
+    // for an extended cooldown. Prevents averaging into collapsed imbalances.
+    const lastLosingExit = this.lastLosingExitMs.get(market.marketId);
+    if (
+      lastLosingExit !== undefined &&
+      nowMs - lastLosingExit < config.losingExitCooldownMs
+    ) {
+      return [];
+    }
+
+    // Already holding an OBI position on this market — do not stack a second
+    // entry from the same engine. Existing position is managed via exits.
+    if (this.positions.has(market.marketId)) {
       return [];
     }
 
@@ -199,6 +250,45 @@ export class ObiEngine {
     candidates.sort((a, b) => a.ratio - b.ratio);
     const chosen = candidates[0]!;
 
+    // === Dust-trap prevention ===
+    // CLOB requires 5 shares min AND $1 min notional. If the entry leaves the
+    // position too small to be SOLD at any reasonable exit price, we'd get
+    // stuck and the position would redeem at $0.
+    //
+    // Compute auto-sized shares: enough so that even at half the entry price,
+    // the position is still above CLOB minimums with a safety buffer.
+    const safetyBuffer = 1.5; // require 1.5x CLOB notional minimum at exit.
+    const minSharesForExitNotional = Math.ceil(
+      (config.clobMinNotionalUsd * safetyBuffer) / Math.max(0.05, chosen.bestAsk * 0.5)
+    );
+    const sizedShares = Math.max(
+      config.entryShares,
+      config.clobMinShares,
+      minSharesForExitNotional
+    );
+
+    // Cap at maxPositionShares to respect risk limits.
+    const finalShares = Math.min(sizedShares, config.maxPositionShares);
+    if (finalShares < config.clobMinShares) {
+      // Cannot satisfy CLOB minimums even at max position size — skip entry.
+      return [];
+    }
+
+    const entryNotional = roundTo(finalShares * chosen.bestAsk, 4);
+    if (entryNotional < config.minEntryNotionalUsd) {
+      return [];
+    }
+
+    // === Pre-flight USDC balance check ===
+    // Avoid generating signals the executor will just reject. Reserve a 5%
+    // buffer for fees and price drift.
+    if (config.preflightBalanceCheck && this.availableUsdcBalance !== null) {
+      const requiredUsdc = entryNotional * 1.05;
+      if (this.availableUsdcBalance < requiredUsdc) {
+        return [];
+      }
+    }
+
     if (config.shadowMode) {
       this.totalShadowDecisions += 1;
       logger.info('OBI engine (shadow) would enter', {
@@ -232,7 +322,7 @@ export class ObiEngine {
       action: 'BUY',
       outcome: chosen.outcome,
       outcomeIndex: outcomeIndex(chosen.outcome),
-      shares: config.entryShares,
+      shares: finalShares,
       targetPrice,
       referencePrice: chosen.midPrice,
       tokenPrice: chosen.midPrice ?? chosen.bestAsk,
@@ -269,10 +359,13 @@ export class ObiEngine {
     orderbook: MarketOrderbookSnapshot;
     config: ObiEngineConfig;
     nowMs?: number;
+    /** Slot end time (ISO string from MarketCandidate.endTime). */
+    slotEndTime?: string | null;
   }): StrategySignal[] {
     const { marketId, outcome, fillPrice, filledShares, orderbook, config } = params;
     const nowMs = params.nowMs ?? Date.now();
     const title = params.marketTitle ?? marketId;
+    const slotEndMs = parseTimeMs(params.slotEndTime ?? null);
 
     const book = outcome === 'YES' ? orderbook.yes : orderbook.no;
     const bidDepth = roundTo(book.depthNotionalBid, 4);
@@ -290,7 +383,13 @@ export class ObiEngine {
       enteredAtMs: nowMs,
       initialRatio,
       thinSide,
+      slotEndMs,
+      lastOrderbook: orderbook,
+      marketTitle: title,
     });
+    // Lock cooldown on confirmed fill so even if generateSignals re-runs we
+    // don't re-enter immediately.
+    this.lastEntryMs.set(marketId, nowMs);
     this.totalEntries += 1;
 
     if (config.shadowMode) {
@@ -400,6 +499,10 @@ export class ObiEngine {
     const position = this.positions.get(market.marketId);
     if (!position) return [];
 
+    // Refresh stored orderbook so the orphan slot-end heartbeat has fresh
+    // data even if the host stops calling generateExitSignals on this market.
+    position.lastOrderbook = orderbook;
+
     // If position has been fully sold off elsewhere, drop state and stop.
     const liveShares = positionManager.getShares(position.outcome);
     if (liveShares <= 0) {
@@ -407,7 +510,7 @@ export class ObiEngine {
     }
 
     const nowMs = params.nowMs ?? Date.now();
-    const slotEndMs = parseTimeMs(market.endTime);
+    const slotEndMs = parseTimeMs(market.endTime) ?? position.slotEndMs;
     const book = position.outcome === 'YES' ? orderbook.yes : orderbook.no;
     const bestBid = book.bestBid;
     const bidDepth = roundTo(book.depthNotionalBid, 4);
@@ -415,6 +518,12 @@ export class ObiEngine {
     const thinDepth = position.thinSide === 'bid' ? bidDepth : askDepth;
     const thickDepth = position.thinSide === 'bid' ? askDepth : bidDepth;
     const currentRatio = safeRatio(thinDepth, thickDepth);
+
+    // Compute live PnL for hard-stop and tracking.
+    const livePnlUsd =
+      bestBid !== null
+        ? roundTo((bestBid - position.entryPrice) * liveShares, 4)
+        : 0;
 
     const buildExit = (
       signalType: 'OBI_REBALANCE_EXIT' | 'OBI_SCALP_EXIT',
@@ -450,6 +559,58 @@ export class ObiEngine {
       strategyLayer: resolveStrategyLayer(signalType),
     });
 
+    // === Hard PnL stop ===
+    // Exit immediately when the position is more than `hardStopUsd` underwater.
+    // This is the safety net that prevents -$5 redemptions.
+    if (livePnlUsd <= -config.hardStopUsd && bestBid !== null) {
+      if (config.shadowMode) {
+        this.totalShadowDecisions += 1;
+        logger.info('OBI engine (shadow) would hard-stop', {
+          marketId: market.marketId,
+          entryPrice: position.entryPrice,
+          bestBid,
+          livePnlUsd,
+          hardStopUsd: config.hardStopUsd,
+        });
+        return [];
+      }
+      this.totalExits += 1;
+      this.lastLosingExitMs.set(market.marketId, nowMs);
+      return [
+        buildExit(
+          'OBI_REBALANCE_EXIT',
+          `OBI hard stop: pnl $${livePnlUsd.toFixed(2)} <= -$${config.hardStopUsd.toFixed(2)}`,
+          bestBid
+        ),
+      ];
+    }
+
+    // === Imbalance collapse: book fully reversed against us ===
+    // Originally we entered the thin side (low ratio). If currentRatio has
+    // exploded past `imbalanceCollapseRatio` (e.g. 2.0 = 2x heavier on our side
+    // now), the imbalance reversed; exit now before it gets worse.
+    if (currentRatio >= config.imbalanceCollapseRatio) {
+      if (config.shadowMode) {
+        this.totalShadowDecisions += 1;
+        logger.info('OBI engine (shadow) would collapse-exit', {
+          marketId: market.marketId,
+          initialRatio: position.initialRatio,
+          currentRatio,
+          collapseRatio: config.imbalanceCollapseRatio,
+        });
+        return [];
+      }
+      this.totalExits += 1;
+      if (livePnlUsd < 0) this.lastLosingExitMs.set(market.marketId, nowMs);
+      return [
+        buildExit(
+          'OBI_REBALANCE_EXIT',
+          `OBI collapse: ratio ${currentRatio.toFixed(3)} >= ${config.imbalanceCollapseRatio.toFixed(3)}`,
+          bestBid
+        ),
+      ];
+    }
+
     // Cancel-all / forced flatten window before slot end.
     if (
       slotEndMs !== null &&
@@ -465,6 +626,7 @@ export class ObiEngine {
         return [];
       }
       this.totalExits += 1;
+      if (livePnlUsd < 0) this.lastLosingExitMs.set(market.marketId, nowMs);
       return [
         buildExit(
           'OBI_REBALANCE_EXIT',
@@ -486,6 +648,7 @@ export class ObiEngine {
         return [];
       }
       this.totalExits += 1;
+      if (livePnlUsd < 0) this.lastLosingExitMs.set(market.marketId, nowMs);
       return [
         buildExit(
           'OBI_REBALANCE_EXIT',
@@ -522,10 +685,130 @@ export class ObiEngine {
     return [];
   }
 
+  /**
+   * Independent slot-end safety net. Walks ALL tracked OBI positions and
+   * returns flatten signals for any whose slot end is within
+   * `cancelAllBeforeEndMs`, regardless of whether the host is currently
+   * processing them. This is the fix for positions that fall out of the
+   * candidate list right before slot end and never get a normal exit tick.
+   *
+   * Host should call this once per processing cycle, AFTER it has processed
+   * all the per-market ticks. Excluded markets are those for which a normal
+   * exit was already emitted in this cycle.
+   *
+   * The signals use the position's stored lastOrderbook (refreshed on the
+   * latest tick this market was processed). If no orderbook is stored, the
+   * signal still goes out with a defensive low targetPrice so the executor
+   * can cross the spread.
+   */
+  getOrphanFlattenSignals(params: {
+    positionManager: (marketId: string) => PositionManager | null;
+    config: ObiEngineConfig;
+    excludeMarketIds?: Set<string>;
+    nowMs?: number;
+  }): StrategySignal[] {
+    const { positionManager, config, excludeMarketIds } = params;
+    if (!config.enabled) return [];
+    const nowMs = params.nowMs ?? Date.now();
+    const out: StrategySignal[] = [];
+
+    for (const [marketId, position] of this.positions.entries()) {
+      if (excludeMarketIds?.has(marketId)) continue;
+      if (position.slotEndMs === null) continue;
+      const remainingMs = position.slotEndMs - nowMs;
+      if (remainingMs > config.cancelAllBeforeEndMs) continue;
+
+      const pm = positionManager(marketId);
+      if (!pm) continue;
+      const liveShares = pm.getShares(position.outcome);
+      if (liveShares <= 0) continue;
+
+      // Defensive target price: use stored book best bid if available,
+      // otherwise drop to a guaranteed-cross price (1 cent above 0).
+      let targetPrice: number | null = null;
+      let combinedBid = 0;
+      let combinedAsk = 0;
+      let combinedMid = 0;
+      if (position.lastOrderbook) {
+        const book =
+          position.outcome === 'YES'
+            ? position.lastOrderbook.yes
+            : position.lastOrderbook.no;
+        targetPrice = book.bestBid;
+        combinedBid = position.lastOrderbook.combined.combinedBid ?? 0;
+        combinedAsk = position.lastOrderbook.combined.combinedAsk ?? 0;
+        combinedMid = position.lastOrderbook.combined.combinedMid ?? 0;
+      }
+      if (targetPrice === null || targetPrice <= 0) {
+        targetPrice = 0.01;
+      }
+
+      if (config.shadowMode) {
+        this.totalShadowDecisions += 1;
+        logger.info('OBI engine (shadow) orphan slot-end flatten', {
+          marketId,
+          outcome: position.outcome,
+          shares: liveShares,
+          remainingMs,
+          targetPrice,
+        });
+        continue;
+      }
+
+      this.totalExits += 1;
+      this.lastLosingExitMs.set(marketId, nowMs);
+      logger.warn('OBI orphan slot-end flatten emitted', {
+        marketId,
+        outcome: position.outcome,
+        shares: liveShares,
+        remainingMs,
+        targetPrice,
+      });
+
+      out.push({
+        marketId,
+        marketTitle: position.marketTitle,
+        signalType: 'OBI_REBALANCE_EXIT',
+        priority: 999,
+        generatedAt: nowMs,
+        action: 'SELL',
+        outcome: position.outcome,
+        outcomeIndex: outcomeIndex(position.outcome),
+        shares: liveShares,
+        targetPrice,
+        referencePrice: position.entryPrice,
+        tokenPrice: targetPrice,
+        midPrice: targetPrice,
+        fairValue: position.entryPrice,
+        edgeAmount: 0,
+        combinedBid,
+        combinedAsk,
+        combinedMid,
+        combinedDiscount: 0,
+        combinedPremium: 0,
+        fillRatio: 1,
+        capitalClamp: 1,
+        priceMultiplier: 1,
+        urgency: 'cross',
+        reduceOnly: true,
+        reason: `OBI orphan flatten: ${remainingMs}ms to slot end (market not in candidate list)`,
+        strategyLayer: resolveStrategyLayer('OBI_REBALANCE_EXIT'),
+      });
+    }
+
+    return out;
+  }
+
+  /** Snapshot of currently tracked OBI positions (for diagnostics / dashboard). */
+  getActivePositions(): readonly Readonly<ObiPosition>[] {
+    return Array.from(this.positions.values());
+  }
+
   /** Drop per-market state. Called by host on market cleanup. */
   clearState(marketId: string): void {
     this.positions.delete(marketId);
     this.lastEntryMs.delete(marketId);
+    this.lastLosingExitMs.delete(marketId);
   }
 
   /** Operational counters for the dashboard. */

@@ -848,6 +848,19 @@ export class MarketMakerRuntime {
           suppressedMarkets: new Set<string>(),
         };
 
+    // Feed the OBI engine the latest USDC balance so its pre-flight check
+    // can refuse entries when we cannot afford them, instead of generating
+    // signals the executor will reject.
+    if (config.obiEngine.enabled) {
+      this.obiEngine.setAvailableUsdcBalance(
+        this.walletFundsSnapshot.walletCashUsd ?? null
+      );
+    }
+
+    const preparedMarketIds = new Set<string>(
+      preparedTicks.map((p) => p.market.marketId)
+    );
+
     await runWithConcurrency(
       preparedTicks,
       config.runtime.maxConcurrentMarkets,
@@ -861,6 +874,57 @@ export class MarketMakerRuntime {
         });
       }
     );
+
+    // === OBI orphan slot-end safety net ===
+    // After the normal per-market cycle, check if any OBI position is held on
+    // a market that just dropped from the candidate list and is approaching
+    // slot end. Without this, the position would silently redeem at $0.
+    if (config.obiEngine.enabled) {
+      try {
+        const orphanFlattens = this.obiEngine.getOrphanFlattenSignals({
+          positionManager: (marketId) => this.positions.get(marketId) ?? null,
+          config: config.obiEngine,
+          excludeMarketIds: preparedMarketIds,
+        });
+        for (const sig of orphanFlattens) {
+          // Best-effort lookup of a stale market candidate / orderbook so we
+          // can route through the normal executor. Use the most recent prepared
+          // tick if any, otherwise reconstruct minimal context.
+          const orphanBook = this.latestBooks.get(sig.marketId);
+          const orphanPosManager = this.positions.get(sig.marketId);
+          const orphanMarket = this.markets.get(sig.marketId);
+          if (!orphanBook || !orphanPosManager || !orphanMarket) {
+            logger.warn('OBI orphan flatten skipped: missing context', {
+              marketId: sig.marketId,
+              hasBook: !!orphanBook,
+              hasPosManager: !!orphanPosManager,
+              hasMarket: !!orphanMarket,
+            });
+            continue;
+          }
+          this.scheduleBackgroundTask(async () => {
+            try {
+              await this.executeSignal(
+                orphanMarket,
+                orphanBook,
+                orphanPosManager,
+                sig,
+                getSlotKey(orphanMarket)
+              );
+            } catch (error) {
+              logger.warn('OBI orphan flatten execution failed', {
+                marketId: sig.marketId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          });
+        }
+      } catch (error) {
+        logger.warn('OBI orphan flatten check failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
 
     this.syncRuntimeStatus({
       activeSlotsCount: markets.length,
@@ -2039,6 +2103,7 @@ export class MarketMakerRuntime {
             filledShares: fill.filledShares,
             orderbook: obiBook,
             config: config.obiEngine,
+            slotEndTime: market.endTime,
           });
           for (const obiSignal of mmSignals) {
             const obiOrderbook = obiBook;

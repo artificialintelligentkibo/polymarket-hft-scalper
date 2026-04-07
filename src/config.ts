@@ -1294,6 +1294,36 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ),
       shadowMode: parseBoolean(env.OBI_SHADOW_MODE, false),
       aggressiveEntry: parseBoolean(env.OBI_AGGRESSIVE_ENTRY, false),
+      // === Safety nets (after $10 live loss audit) ===
+      hardStopUsd: Math.max(
+        0.5,
+        parseFloatOrDefault(env.OBI_HARD_STOP_USD, '2.0')
+      ),
+      minEntryNotionalUsd: Math.max(
+        1,
+        parseFloatOrDefault(env.OBI_MIN_ENTRY_NOTIONAL_USD, '3.0')
+      ),
+      clobMinNotionalUsd: Math.max(
+        1,
+        parseFloatOrDefault(env.OBI_CLOB_MIN_NOTIONAL_USD, '1.0')
+      ),
+      clobMinShares: Math.max(
+        1,
+        parseIntOrDefault(env.OBI_CLOB_MIN_SHARES, '5')
+      ),
+      losingExitCooldownMs: Math.max(
+        0,
+        parseIntOrDefault(env.OBI_LOSING_EXIT_COOLDOWN_MS, '300000')
+      ),
+      imbalanceCollapseRatio: clamp(
+        parseFloatOrDefault(env.OBI_IMBALANCE_COLLAPSE_RATIO, '1.5'),
+        0.5,
+        10
+      ),
+      preflightBalanceCheck: parseBoolean(
+        env.OBI_PREFLIGHT_BALANCE_CHECK,
+        true
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),

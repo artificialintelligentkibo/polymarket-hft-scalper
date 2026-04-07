@@ -31,6 +31,13 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     mmBidOppositeFactor: 0.25,
     shadowMode: false,
     aggressiveEntry: false,
+    hardStopUsd: 2.0,
+    minEntryNotionalUsd: 0,
+    clobMinNotionalUsd: 1.0,
+    clobMinShares: 5,
+    losingExitCooldownMs: 0,
+    imbalanceCollapseRatio: 1.5,
+    preflightBalanceCheck: false,
     ...overrides,
   };
 }
