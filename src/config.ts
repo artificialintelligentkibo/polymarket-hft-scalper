@@ -654,8 +654,9 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
 
   // PAIRED_ARBITRAGE: enable paired arb, disable sniper / MM / lottery / latency.
   console.log(
-    '[strategy] ACTIVE_STRATEGY=PAIRED_ARBITRAGE — enabling paired arb engine, disabling sniper / MM / lottery / latency-momentum'
+    '[strategy] ACTIVE_STRATEGY=PAIRED_ARBITRAGE — enabling paired arb engine, disabling sniper / MM / lottery / latency-momentum / binance-edge'
   );
+  console.log('[strategy] Binance edge disabled for current strategy');
   return {
     ...input,
     ENTRY_STRATEGY: 'PAIRED_ARBITRAGE',
@@ -669,6 +670,11 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
     lottery: { ...input.lottery, enabled: false },
     latencyMomentum: { ...input.latencyMomentum, enabled: false },
     pairedArbitrage: { ...input.pairedArbitrage, enabled: true },
+    // Paired arb does not need Binance fair-value lookups; turning the feed
+    // off here also prevents `BinanceEdgeProvider` from connecting to the WS
+    // (shouldRunFeed() reads this flag) and silences "Binance edge
+    // unavailable" debug spam in BinanceEdgeProvider.assess().
+    binance: { ...input.binance, edgeEnabled: false },
   };
 }
 

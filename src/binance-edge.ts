@@ -178,6 +178,15 @@ export class BinanceEdgeProvider {
     signalOutcome: 'YES' | 'NO';
   }): BinanceEdgeAssessment {
     const coin = params.coin.toUpperCase();
+
+    // Hard guard: when Binance edge is disabled (e.g. PAIRED_ARBITRAGE preset
+    // or BINANCE_EDGE_ENABLED=false), short-circuit silently without any
+    // "Binance edge unavailable" debug spam. Sniper / latency-momentum that
+    // need this assessment should never be reached in those modes anyway.
+    if (!this.runtimeConfig.binance.edgeEnabled) {
+      return createUnavailableAssessment(coin, params.pmUpMid);
+    }
+
     const symbol = COIN_TO_BINANCE[coin];
     const binancePrice = symbol ? this.lastPrices.get(symbol) ?? null : null;
     const slotOpenPrice = this.getSlotOpenPrice(coin, params.slotStartTime);
