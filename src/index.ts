@@ -555,9 +555,15 @@ export class MarketMakerRuntime {
       this.redeemer.start();
     }
 
-    // Narrator: log startup
+    // Narrator: log startup with fresh balance
     try {
-      const startupBalance = this.walletFundsSnapshot.walletCashUsd;
+      let startupBalance: number | null = null;
+      if (!isDryRunMode(config) && !isPaperTradingEnabled(config)) {
+        try {
+          const bal = await this.executor.getUsdcBalance(false);
+          if (typeof bal === 'number' && Number.isFinite(bal)) startupBalance = roundTo(bal, 2);
+        } catch { /* fallback to null */ }
+      }
       this.narrator.logStartup({
         balanceUsd: startupBalance,
         mode: isDryRunMode(config) ? 'DRY RUN' : isPaperTradingEnabled(config) ? 'PAPER' : 'LIVE',

@@ -8,6 +8,20 @@ import { clamp, parseBooleanLoose, sanitizeConditionIds } from './utils.js';
 
 export type AuthMode = 'EOA' | 'PROXY';
 export type EntryStrategy = 'LEGACY' | 'PAIRED_ARBITRAGE' | 'LATENCY_MOMENTUM' | 'ALL';
+/**
+ * High-level strategy preset switcher applied on top of the existing config.
+ * - CURRENT_SNIPER: zero changes; preserves the historical Binance-led
+ *   sniper + lottery + MM behaviour. This is the default for backward compat.
+ * - PAIRED_ARBITRAGE: forces ENTRY_STRATEGY=PAIRED_ARBITRAGE, enables
+ *   PAIRED_ARB_ENABLED, and disables sniper / MM / lottery layers so the bot
+ *   trades only googoogaga23-style YES+NO arbitrage with limit orders.
+ * - ORDER_BOOK_IMBALANCE: placeholder for the vague-sourdough-style strategy.
+ *   Not implemented yet — logs a warning and falls back to CURRENT_SNIPER.
+ */
+export type ActiveStrategy =
+  | 'CURRENT_SNIPER'
+  | 'PAIRED_ARBITRAGE'
+  | 'ORDER_BOOK_IMBALANCE';
 export type SignatureType = 0 | 1 | 2;
 export type OrderMode = 'GTC' | 'FOK' | 'FAK';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -158,6 +172,8 @@ export interface AppConfig {
   readonly TEST_MAX_SLOTS: number;
   readonly ENABLE_SIGNAL: boolean;
   readonly ENTRY_STRATEGY: EntryStrategy;
+  /** High-level strategy preset (overrides several flags at startup). */
+  readonly ACTIVE_STRATEGY: ActiveStrategy;
   readonly PAIRED_ARB_ENABLED: boolean;
   readonly LATENCY_MOMENTUM_ENABLED: boolean;
   readonly PAPER_TRADING_ENABLED: boolean;
@@ -601,6 +617,61 @@ function parseEntryStrategy(value?: string): EntryStrategy {
   );
 }
 
+function parseActiveStrategy(value?: string): ActiveStrategy {
+  const normalized = value?.trim().toUpperCase();
+  if (!normalized || normalized === 'CURRENT_SNIPER') {
+    return 'CURRENT_SNIPER';
+  }
+  if (normalized === 'PAIRED_ARBITRAGE' || normalized === 'ORDER_BOOK_IMBALANCE') {
+    return normalized;
+  }
+  throw new Error(
+    `Invalid ACTIVE_STRATEGY: ${value}. Expected CURRENT_SNIPER, PAIRED_ARBITRAGE, or ORDER_BOOK_IMBALANCE.`
+  );
+}
+
+/**
+ * Apply high-level strategy preset overrides on top of an env-built config.
+ *
+ * Backwards compatible: when ACTIVE_STRATEGY=CURRENT_SNIPER (default), the
+ * input config is returned unchanged. Other presets clone the config and
+ * mutate flags / nested layer toggles to match the requested mode so the
+ * existing engines, signal-scalper, and quoting paths remain untouched.
+ */
+function applyStrategyPreset(input: AppConfig): AppConfig {
+  const preset = input.ACTIVE_STRATEGY;
+  if (preset === 'CURRENT_SNIPER') {
+    console.log('[strategy] ACTIVE_STRATEGY=CURRENT_SNIPER (legacy sniper + lottery + MM)');
+    return input;
+  }
+
+  if (preset === 'ORDER_BOOK_IMBALANCE') {
+    console.warn(
+      '[strategy] ACTIVE_STRATEGY=ORDER_BOOK_IMBALANCE is not implemented yet — falling back to CURRENT_SNIPER behaviour.'
+    );
+    return { ...input, ACTIVE_STRATEGY: 'CURRENT_SNIPER' };
+  }
+
+  // PAIRED_ARBITRAGE: enable paired arb, disable sniper / MM / lottery / latency.
+  console.log(
+    '[strategy] ACTIVE_STRATEGY=PAIRED_ARBITRAGE — enabling paired arb engine, disabling sniper / MM / lottery / latency-momentum'
+  );
+  return {
+    ...input,
+    ENTRY_STRATEGY: 'PAIRED_ARBITRAGE',
+    PAIRED_ARB_ENABLED: true,
+    SNIPER_MODE_ENABLED: false,
+    MARKET_MAKER_MODE: false,
+    DYNAMIC_QUOTING_ENABLED: false,
+    LATENCY_MOMENTUM_ENABLED: false,
+    POST_ONLY_ONLY: true,
+    sniper: { ...input.sniper, enabled: false },
+    lottery: { ...input.lottery, enabled: false },
+    latencyMomentum: { ...input.latencyMomentum, enabled: false },
+    pairedArbitrage: { ...input.pairedArbitrage, enabled: true },
+  };
+}
+
 function parsePriceMultiplierLevels(value?: string): PriceMultiplierLevel[] {
   const raw =
     value?.trim() ||
@@ -648,7 +719,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const reportsDir = (env.REPORTS_DIR || env.REPORTS_FOLDER || './reports').trim() || './reports';
   const reportsFilePrefix = (env.REPORTS_FILE_PREFIX || 'slot-reports').trim() || 'slot-reports';
 
-  return {
+  const baseConfig: AppConfig = {
     PRODUCT_TEST_MODE: parseBoolean(env.PRODUCT_TEST_MODE, false),
     SIMULATION_MODE: parseBoolean(env.SIMULATION_MODE, true),
     TEST_MODE: parseBoolean(env.TEST_MODE, false),
@@ -657,6 +728,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     TEST_MAX_SLOTS: Math.max(1, parseIntOrDefault(env.TEST_MAX_SLOTS, '1')),
     ENABLE_SIGNAL: parseBoolean(env.ENABLE_SIGNAL, true),
     ENTRY_STRATEGY: parseEntryStrategy(env.ENTRY_STRATEGY),
+    ACTIVE_STRATEGY: parseActiveStrategy(env.ACTIVE_STRATEGY),
     PAIRED_ARB_ENABLED: parseBoolean(env.PAIRED_ARB_ENABLED, false),
     LATENCY_MOMENTUM_ENABLED: parseBoolean(env.LATENCY_MOMENTUM_ENABLED, false),
     PAPER_TRADING_ENABLED: parseBoolean(env.PAPER_TRADING_ENABLED, false),
@@ -1220,6 +1292,8 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxReconnectAttempts: Math.max(1, parseIntOrDefault(env.BINANCE_MAX_RECONNECT, '10')),
     },
   };
+
+  return applyStrategyPreset(baseConfig);
 }
 
 export function getConfig(): AppConfig {
