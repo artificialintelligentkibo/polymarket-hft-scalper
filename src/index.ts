@@ -38,6 +38,7 @@ import {
   getSlotKey,
   type MarketCandidate,
 } from './monitor.js';
+import { OrderBookImbalanceFilter } from './order-book-imbalance.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
 import { meetsClobMinimums, resolveMinimumTradableShares } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
@@ -171,6 +172,7 @@ export class MarketMakerRuntime {
   private readonly quotingEngine = new QuotingEngine();
   private readonly compounder = new DynamicCompounder(config.compounding);
   private readonly regimeFilter = new RegimeFilter(config.regimeFilter);
+  private readonly orderBookImbalance = new OrderBookImbalanceFilter(config.orderBookImbalance);
   private readonly redeemer = new AutoRedeemer();
   private readonly narrator = new TradeNarrator(config.REPORTS_DIR);
   private readonly resolutionChecker = new ResolutionChecker();
@@ -1553,18 +1555,26 @@ export class MarketMakerRuntime {
       isDynamicQuotingEnabled(config) &&
       config.MM_AUTO_ACTIVATE_AFTER_SNIPER
     ) {
-      this.quotingEngine.activateForMarket(market.marketId, {
-        triggerLayer: 'SNIPER',
-        entryOutcome: executionSignal.outcome,
-        entryPrice: effectivePrice,
-        entryShares: effectiveShares,
-      });
-      logger.info('MM_QUOTE activated after sniper entry', {
+      const obiAllowsMM = this.orderBookImbalance.shouldAllowMMActivation({
         marketId: market.marketId,
-        outcome: executionSignal.outcome,
-        price: roundTo(effectivePrice, 4),
-        shares: roundTo(effectiveShares, 4),
+        orderbook,
+        entryOutcome: executionSignal.outcome,
+        coin: extractCoinFromTitle(market.title) ?? undefined,
       });
+      if (obiAllowsMM) {
+        this.quotingEngine.activateForMarket(market.marketId, {
+          triggerLayer: 'SNIPER',
+          entryOutcome: executionSignal.outcome,
+          entryPrice: effectivePrice,
+          entryShares: effectiveShares,
+        });
+        logger.info('MM_QUOTE activated after sniper entry', {
+          marketId: market.marketId,
+          outcome: executionSignal.outcome,
+          price: roundTo(effectivePrice, 4),
+          shares: roundTo(effectiveShares, 4),
+        });
+      }
     }
     if (
       effectiveShares > 0 &&
@@ -1970,18 +1980,31 @@ export class MarketMakerRuntime {
         isDynamicQuotingEnabled(config) &&
         config.MM_AUTO_ACTIVATE_AFTER_SNIPER
       ) {
-        this.quotingEngine.activateForMarket(fill.marketId, {
-          triggerLayer: 'SNIPER',
-          entryOutcome: fill.outcome,
-          entryPrice: fill.fillPrice,
-          entryShares: fill.filledShares,
-        });
-        logger.info('MM_QUOTE activated after delayed sniper fill', {
-          marketId: fill.marketId,
-          outcome: fill.outcome,
-          price: roundTo(fill.fillPrice, 4),
-          shares: roundTo(fill.filledShares, 4),
-        });
+        const obiOrderbook =
+          this.latestBooks.get(fill.marketId) ??
+          this.quotingEngine.getContext(fill.marketId)?.orderbook;
+        const obiAllowsMM = obiOrderbook
+          ? this.orderBookImbalance.shouldAllowMMActivation({
+              marketId: fill.marketId,
+              orderbook: obiOrderbook,
+              entryOutcome: fill.outcome,
+              coin: extractCoinFromTitle(market.title) ?? undefined,
+            })
+          : !this.orderBookImbalance.enabled;
+        if (obiAllowsMM) {
+          this.quotingEngine.activateForMarket(fill.marketId, {
+            triggerLayer: 'SNIPER',
+            entryOutcome: fill.outcome,
+            entryPrice: fill.fillPrice,
+            entryShares: fill.filledShares,
+          });
+          logger.info('MM_QUOTE activated after delayed sniper fill', {
+            marketId: fill.marketId,
+            outcome: fill.outcome,
+            price: roundTo(fill.fillPrice, 4),
+            shares: roundTo(fill.filledShares, 4),
+          });
+        }
       }
       if (fill.signalType === 'SNIPER_BUY' && config.lottery.enabled) {
         const orderbook =
@@ -3048,6 +3071,7 @@ export class MarketMakerRuntime {
     this.lotteryEngine.recordExit(marketId, 'NO');
     this.positions.delete(marketId);
     this.latestBooks.delete(marketId);
+    this.orderBookImbalance.clearState(marketId);
     this.marketActions.delete(marketId);
     this.clearDustAbandonmentForMarket(marketId);
     this.clearSettlementConfirmation(marketId, 'YES');

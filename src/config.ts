@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import type { EVKellyConfig } from './ev-kelly.js';
 import type { LatencyMomentumConfig } from './latency-momentum.js';
+import type { OrderBookImbalanceConfig } from './order-book-imbalance.js';
 import type { PairedArbConfig } from './paired-arbitrage.js';
 import type { PaperTraderConfig } from './paper-trader.js';
 import { parseLayerMultipliers } from './dynamic-compounder.js';
@@ -446,6 +447,7 @@ export interface AppConfig {
   readonly regimeFilter: RegimeFilterConfig;
   /** Runtime lottery-layer configuration for convex opposite-side tickets. */
   readonly lottery: LotteryConfig;
+  readonly orderBookImbalance: OrderBookImbalanceConfig;
   readonly paperTrading: PaperTraderConfig;
   readonly evKelly: EVKellyConfig;
   /** Dynamic balance-aware compounding engine configuration. */
@@ -1178,6 +1180,33 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxPerSlot: Math.max(0, parseIntOrDefault(env.LOTTERY_MAX_PER_SLOT, '1')),
       stopLossPct: clamp(parseFloatOrDefault(env.LOTTERY_STOP_LOSS_PCT, '0.50'), 0.1, 0.9),
       maxHoldMs: Math.max(0, parseIntOrDefault(env.LOTTERY_MAX_HOLD_MS, '150000')),
+    },
+    orderBookImbalance: {
+      enabled: parseBoolean(env.ORDER_BOOK_IMBALANCE_ENABLED, false),
+      thinThresholdUsd: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_THIN_THRESHOLD_USD, '8')
+      ),
+      minLiquidityUsd: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_MIN_LIQUIDITY_USD, '500')
+      ),
+      entryImbalanceRatio: clamp(
+        parseFloatOrDefault(env.OBI_ENTRY_IMBALANCE_RATIO, '0.35'),
+        0.05,
+        0.95
+      ),
+      exitRebalanceRatio: clamp(
+        parseFloatOrDefault(env.OBI_EXIT_REBALANCE_RATIO, '0.65'),
+        0.10,
+        1.0
+      ),
+      keepStrongerLegPct: clamp(
+        parseFloatOrDefault(env.OBI_KEEP_STRONGER_LEG_PCT, '0.50'),
+        0,
+        1
+      ),
+      shadowMode: parseBoolean(env.OBI_SHADOW_MODE, false),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
