@@ -507,6 +507,19 @@ function resolveExecutionUrgency(
     return urgency;
   }
 
+  // CRITICAL: emergency exits MUST be able to cross the spread, otherwise
+  // they sit as post-only and the position resolves at 0 on slot end.
+  // Without this bypass, POST_ONLY_ONLY=true silently turns every stop-loss
+  // / time-stop / slot-flatten into "hold to expiration → 100% loss".
+  if (
+    signal.reduceOnly === true &&
+    (signal.signalType === 'HARD_STOP' ||
+      signal.signalType === 'SLOT_FLATTEN' ||
+      signal.signalType === 'TRAILING_TAKE_PROFIT')
+  ) {
+    return urgency;
+  }
+
   if (urgency !== 'cross') {
     return urgency;
   }
