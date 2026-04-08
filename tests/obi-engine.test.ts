@@ -402,32 +402,68 @@ test('obi engine shadow mode logs but emits no signals', () => {
   assert.equal(after.totalShadowDecisions, before.totalShadowDecisions + 1);
 });
 
-test('obi engine clearState removes per-market state', () => {
+test('obi engine clearState removes per-market state but preserves losing-exit cooldown', () => {
+  // 2026-04-08 whipsaw re-entry regression: market 0x3ff0a5a cycled
+  // entry → exit (loss) → wallet reconcile → clearState → re-entry
+  // → hard stop within ~60 seconds on the same marketId because the
+  // losing-exit cooldown marker was wiped by clearState. Now clearState
+  // must preserve lastLosingExitMs so the cooldown survives the
+  // post-exit position cleanup.
   const engine = new ObiEngine();
   const market = createMarket();
+  const ob = createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 });
+  const cfg = baseConfig();
+  const losingCooldownCfg = { ...cfg, losingExitCooldownMs: 300_000 };
+
   engine.onEntryFill({
     marketId: market.marketId,
     outcome: 'YES',
     fillPrice: 0.21,
     filledShares: 8,
     totalLiveShares: 8,
-    orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
-    config: baseConfig(),
+    orderbook: ob,
+    config: losingCooldownCfg,
     nowMs: FIXED_NOW,
   });
   assert.equal(engine.getStats().activePositions, 1);
+
+  // Trigger a losing exit so lastLosingExitMs is recorded.
+  const pm = new PositionManager(market.marketId);
+  pm.applyFill({ outcome: 'YES', side: 'BUY', shares: 8, price: 0.21 });
+  // Force an imbalance collapse so the engine emits a losing exit.
+  const collapseBook = createOrderbook({
+    yesBid: 0.18,
+    yesAsk: 0.19,
+    yesBidDepth: 800,
+    yesAskDepth: 4,
+  });
+  const exitSignals = engine.generateExitSignals({
+    market,
+    orderbook: collapseBook,
+    positionManager: pm,
+    config: losingCooldownCfg,
+    nowMs: FIXED_NOW + 1_000,
+  });
+  assert.equal(exitSignals.length, 1, 'losing exit must be emitted');
+
+  // Wallet reconcile-style cleanup: clearState after position closes.
   engine.clearState(market.marketId);
   assert.equal(engine.getStats().activePositions, 0);
 
-  // After clearing, the cooldown is also gone, so a new entry is allowed.
-  const signals = engine.generateSignals({
+  // Re-entry on the SAME marketId within the cooldown window must be
+  // blocked, even though clearState was called.
+  const reentrySignals = engine.generateSignals({
     market,
-    orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
+    orderbook: ob,
     positionManager: new PositionManager(market.marketId),
-    config: baseConfig(),
-    nowMs: FIXED_NOW + 1_000,
+    config: losingCooldownCfg,
+    nowMs: FIXED_NOW + 60_000, // 1 min later, well inside 5 min cooldown
   });
-  assert.equal(signals.length, 1);
+  assert.equal(
+    reentrySignals.length,
+    0,
+    'losing-exit cooldown must persist across clearState'
+  );
 });
 
 // Regression: 2026-04-08 XRP $5.28 incident.

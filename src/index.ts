@@ -2181,6 +2181,31 @@ export class MarketMakerRuntime {
                   obiSignal.signalType === 'OBI_MM_QUOTE_ASK' ||
                   obiSignal.signalType === 'OBI_MM_QUOTE_BID'
                 ) {
+                  // Variant A3 (2026-04-08 stale-quote guard): onEntryFill
+                  // schedules maker-quote signals as background tasks. By the
+                  // time the task runs, an exit may already have closed the
+                  // position (e.g. fast OBI_REBALANCE_EXIT immediately after
+                  // the entry fill). Posting an OBI_MM_QUOTE_ASK for a
+                  // position that no longer exists wastes a round-trip and
+                  // can collide with residual CLOB state ("sum of active
+                  // orders" ≥ balance). Re-check PositionManager just before
+                  // dispatch and skip the signal if the position is gone or
+                  // below CLOB minimum.
+                  const currentShares = positionManager.getShares(obiSignal.outcome);
+                  const minShares = resolveMinimumTradableShares(
+                    obiSignal.targetPrice ?? obiSignal.referencePrice ?? Number.NaN,
+                    0
+                  );
+                  if (currentShares < minShares) {
+                    logger.info('OBI maker quote skipped - position closed or dust before dispatch', {
+                      marketId: fill.marketId,
+                      outcome: obiSignal.outcome,
+                      signalType: obiSignal.signalType,
+                      currentShares: roundTo(currentShares, 4),
+                      minShares: roundTo(minShares, 4),
+                    });
+                    return;
+                  }
                   await this.cancelPendingObiMakerQuotes({
                     marketId: fill.marketId,
                     outcome: obiSignal.outcome,

@@ -892,11 +892,22 @@ export class ObiEngine {
     return Array.from(this.positions.values());
   }
 
-  /** Drop per-market state. Called by host on market cleanup. */
+  /**
+   * Drop per-market state. Called by host on market cleanup.
+   *
+   * NOTE (2026-04-08 whipsaw re-entry fix): we intentionally do NOT clear
+   * `lastLosingExitMs` here. The wallet reconcile path calls clearState as
+   * soon as PositionManager gross exposure drops to 0 after an exit fill,
+   * which used to wipe the re-entry cooldown marker and allow the engine
+   * to re-enter the same cascading market within seconds. The 08:02-08:03
+   * session on market 0x3ff0a5a cycled entry → abandon → lucky ask fill
+   * → re-entry → hard stop all on the same marketId in ~60s because the
+   * losing-exit cooldown was cleared mid-cascade. Each 5-minute slot has
+   * a unique marketId so the map entry is bounded by slot lifecycle.
+   */
   clearState(marketId: string): void {
     this.positions.delete(marketId);
     this.lastEntryMs.delete(marketId);
-    this.lastLosingExitMs.delete(marketId);
     this.lastOrphanEmitMs.delete(marketId);
   }
 
