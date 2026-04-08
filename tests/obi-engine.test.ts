@@ -226,7 +226,10 @@ test('obi engine emits OBI_ENTRY_BUY for YES when YES has thin bid', () => {
   assert.equal(sig.outcome, 'YES');
   assert.equal(sig.action, 'BUY');
   assert.equal(sig.targetPrice, 0.21);
-  assert.equal(sig.urgency, 'passive');
+  // Phase 9 (2026-04-08): OBI entries are now TAKER (cross) — grabbing thin
+  // resting liquidity is by definition a book-crossing trade. Post-only was
+  // silently rejected by CLOB ("order crosses book") causing 0 fills.
+  assert.equal(sig.urgency, 'cross');
   assert.equal(sig.strategyLayer, 'OBI');
 });
 

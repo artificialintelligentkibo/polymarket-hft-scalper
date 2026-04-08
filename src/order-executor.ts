@@ -530,7 +530,12 @@ function resolveExecutionUrgency(
 
   if (
     signal.signalType === 'SNIPER_BUY' ||
-    signal.signalType === 'SNIPER_SCALP_EXIT'
+    signal.signalType === 'SNIPER_SCALP_EXIT' ||
+    // Phase 9 (2026-04-08): OBI entries need TAKER execution — they grab
+    // resting thin-side liquidity by design. Without this bypass, MM_MODE
+    // silently downgrades 'cross' → 'passive'/'improve', causing 100% of
+    // orders to be rejected by CLOB as "order crosses book".
+    signal.signalType === 'OBI_ENTRY_BUY'
   ) {
     return urgency;
   }

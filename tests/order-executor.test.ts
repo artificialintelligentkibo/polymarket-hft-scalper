@@ -238,9 +238,15 @@ test('OBI_ENTRY_BUY improve sits one tick BELOW the ask too', () => {
   assert.equal(plan.postOnly, true);
 });
 
-test('OBI_ENTRY_BUY in MM mode is forced top-of-book maker even when signal urgency is cross', () => {
-  // Live live mode forces post-only, so urgency=cross becomes improve, and the
-  // OBI special-case routes to top-of-bid maker (bestAsk - 1 tick).
+test('Phase 9: OBI_ENTRY_BUY stays taker (cross/IOC) even in MM mode', () => {
+  // Phase 9 (2026-04-08): OBI entries grab resting thin-side liquidity — by
+  // definition a book-crossing trade. The previous behaviour downgraded
+  // urgency 'cross' → 'improve' in MM mode and routed to bestAsk - 1 tick
+  // post-only, which caused 100% of OBI entries to be rejected by CLOB as
+  // "order crosses book" (observed live: 4/7 rejections, 0 fills on 2026-04-08).
+  //
+  // Fix: add OBI_ENTRY_BUY to resolveExecutionUrgency bypass list so urgency
+  // stays 'cross' → executor prices at bestAsk, postOnly=false, IOC fills.
   const runtimeConfig = createConfig({
     ...process.env,
     MARKET_MAKER_MODE: 'true',
@@ -263,8 +269,9 @@ test('OBI_ENTRY_BUY in MM mode is forced top-of-book maker even when signal urge
     }
   );
 
-  assert.equal(plan.price, 0.305);
-  assert.equal(plan.postOnly, true);
+  assert.equal(plan.price, 0.31);
+  assert.equal(plan.postOnly, false);
+  assert.equal(plan.urgency, 'cross');
 });
 
 test('passive MM asks respect the quote target instead of walking down to the live ask', () => {

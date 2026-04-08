@@ -553,9 +553,16 @@ export class ObiEngine {
       return [];
     }
 
-    const targetPrice = config.aggressiveEntry
-      ? roundTo(Math.min(1, chosen.bestAsk + 0.01), 6)
-      : roundTo(chosen.bestAsk, 6);
+    // Phase 9 (2026-04-08): OBI entry must be TAKER (IOC), not post-only maker.
+    // Thesis: "grab the thin side before book rebalances" = we buy resting ask
+    // liquidity → by definition this crosses the book. Previous behaviour
+    // (passive @ bestAsk, or improve @ bestAsk+tick) produced 4/7 "order
+    // crosses book" rejections and 0 fills. vague-sourdough uses limit orders
+    // on the OPPOSITE side for passive MM layer — not for initial entry.
+    //
+    // Price = bestAsk. `urgency: 'cross'` below signals executor to use IOC
+    // and NOT downgrade in MARKET_MAKER_MODE (see order-executor bypass list).
+    const targetPrice = roundTo(chosen.bestAsk, 6);
 
     const reason =
       `OBI thin ${chosen.thinSide} $${chosen.thinDepth.toFixed(2)} vs $${chosen.thickDepth.toFixed(2)}` +
@@ -587,7 +594,7 @@ export class ObiEngine {
       fillRatio: 1,
       capitalClamp: 1,
       priceMultiplier: 1,
-      urgency: config.aggressiveEntry ? 'improve' : 'passive',
+      urgency: 'cross',
       reduceOnly: false,
       reason,
       strategyLayer: resolveStrategyLayer('OBI_ENTRY_BUY'),
