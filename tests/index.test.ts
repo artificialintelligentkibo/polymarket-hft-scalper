@@ -713,6 +713,131 @@ test('recheckDustAbandonmentOnRecovery removes flag when shares are zero', () =>
   assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), false);
 });
 
+test('rememberRestingObiMakerOrder + cancelPendingObiMakerQuotes uses backup registry', async () => {
+  // Variant A4: orders that aged out of fillTracker.pendingOrders must still
+  // be cancelled via the resting-orders registry.
+  const runtime = new MarketMakerRuntime() as any;
+  const cancelledOrderIds: string[] = [];
+  runtime.executor = {
+    cancelOrder: async (orderId: string) => {
+      cancelledOrderIds.push(orderId);
+    },
+  };
+  // fillTracker has no record of this order — it's only in our registry.
+  runtime.fillTracker = {
+    getPendingOrders: () => [],
+    forgetPendingOrder: () => {},
+  };
+
+  runtime.rememberRestingObiMakerOrder({
+    marketId: 'market-1',
+    outcome: 'NO',
+    orderId: '0xRESTING_QUOTE_FROM_FIRST_FILL',
+  });
+
+  const cancelled = await runtime.cancelPendingObiMakerQuotes({
+    marketId: 'market-1',
+    outcome: 'NO',
+    triggeredBy: 'OBI_MM_QUOTE_ASK',
+  });
+
+  assert.equal(cancelled, 1);
+  assert.deepEqual(cancelledOrderIds, ['0xRESTING_QUOTE_FROM_FIRST_FILL']);
+  assert.equal(
+    runtime.getRestingObiMakerOrderIds('market-1', 'NO').length,
+    0,
+    'registry must be cleared after successful cancel',
+  );
+});
+
+test('cancelPendingObiMakerQuotes dedupes orders present in both fillTracker and resting registry', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const cancelledOrderIds: string[] = [];
+  runtime.executor = {
+    cancelOrder: async (orderId: string) => {
+      cancelledOrderIds.push(orderId);
+    },
+  };
+  runtime.fillTracker = {
+    getPendingOrders: () => [
+      {
+        orderId: '0xORDER_A',
+        marketId: 'market-1',
+        outcome: 'YES',
+        side: 'SELL',
+        signalType: 'OBI_MM_QUOTE_ASK',
+        submittedShares: 9,
+        submittedPrice: 0.37,
+      },
+    ],
+    forgetPendingOrder: () => {},
+  };
+
+  runtime.rememberRestingObiMakerOrder({
+    marketId: 'market-1',
+    outcome: 'YES',
+    orderId: '0xORDER_A', // duplicate of fillTracker entry
+  });
+  runtime.rememberRestingObiMakerOrder({
+    marketId: 'market-1',
+    outcome: 'YES',
+    orderId: '0xORDER_B', // additional entry only in registry
+  });
+
+  const cancelled = await runtime.cancelPendingObiMakerQuotes({
+    marketId: 'market-1',
+    outcome: 'YES',
+    triggeredBy: 'OBI_REBALANCE_EXIT',
+  });
+
+  assert.equal(cancelled, 2);
+  assert.deepEqual(cancelledOrderIds.sort(), ['0xORDER_A', '0xORDER_B']);
+});
+
+test('forgetRestingObiMakerOrder removes only the targeted orderId', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.rememberRestingObiMakerOrder({
+    marketId: 'market-1',
+    outcome: 'NO',
+    orderId: '0xA',
+  });
+  runtime.rememberRestingObiMakerOrder({
+    marketId: 'market-1',
+    outcome: 'NO',
+    orderId: '0xB',
+  });
+
+  runtime.forgetRestingObiMakerOrder({
+    marketId: 'market-1',
+    outcome: 'NO',
+    orderId: '0xA',
+  });
+
+  const remaining = runtime.getRestingObiMakerOrderIds('market-1', 'NO');
+  assert.deepEqual(remaining, ['0xB']);
+});
+
+test('cancelPendingObiMakerQuotes returns 0 when nothing pending', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.executor = {
+    cancelOrder: async () => {
+      throw new Error('should not be called');
+    },
+  };
+  runtime.fillTracker = {
+    getPendingOrders: () => [],
+    forgetPendingOrder: () => {},
+  };
+
+  const cancelled = await runtime.cancelPendingObiMakerQuotes({
+    marketId: 'market-1',
+    outcome: 'YES',
+    triggeredBy: 'OBI_REBALANCE_EXIT',
+  });
+
+  assert.equal(cancelled, 0);
+});
+
 test('recheckDustAbandonmentOnRecovery is no-op when not abandoned', () => {
   const runtime = new MarketMakerRuntime() as any;
   const market = createMarket();

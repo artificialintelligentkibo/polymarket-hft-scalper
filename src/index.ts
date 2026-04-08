@@ -211,6 +211,15 @@ export class MarketMakerRuntime {
     }
   >();
   private readonly dustAbandonedPositions = new Set<string>();
+  /**
+   * Per-(marketId+outcome) registry of OBI maker orderIds that are still
+   * resting on CLOB (submitted, not yet filled or cancelled). The fillTracker
+   * map is the primary source of truth, but it can drop entries on
+   * timeout/poll cycles before the order actually fills, leaving us blind
+   * to collateral that's still locked. This registry is the belt-and-braces
+   * backup for cancelPendingObiMakerQuotes (Variant A4 / 2026-04-08).
+   */
+  private readonly restingObiMakerOrders = new Map<string, Set<string>>();
   private readonly pendingLiveOrders = new Map<string, number>();
   private readonly postSniperMakerAskStartedAt = new Map<string, number>();
   private readonly settlementCooldowns = new Map<string, number>();
@@ -1640,6 +1649,19 @@ export class MarketMakerRuntime {
         lastCheckedAt: 0,
         filledSharesSoFar: 0,
       });
+      // Variant A4: also remember OBI maker quotes in our backup registry,
+      // so cancelPendingObiMakerQuotes can find them even if fillTracker
+      // drops them on a poll-timeout cycle before the order actually fills.
+      if (
+        executionSignal.signalType === 'OBI_MM_QUOTE_ASK' ||
+        executionSignal.signalType === 'OBI_MM_QUOTE_BID'
+      ) {
+        this.rememberRestingObiMakerOrder({
+          marketId: market.marketId,
+          outcome: executionSignal.outcome,
+          orderId: execution.orderId,
+        });
+      }
       logger.warn('Live order submitted without confirmed fill; skipped position mutation', {
         marketId: market.marketId,
         signalType: executionSignal.signalType,
@@ -2333,6 +2355,20 @@ export class MarketMakerRuntime {
         beforeOutcomeLayer,
       });
     } catch { /* narrator is best-effort */ }
+
+    // Variant A4: drop the orderId from the resting OBI registry once a
+    // fill is confirmed so cancelPendingObiMakerQuotes doesn't try to
+    // cancel an already-completed order on the next exit cycle.
+    if (
+      fill.signalType === 'OBI_MM_QUOTE_ASK' ||
+      fill.signalType === 'OBI_MM_QUOTE_BID'
+    ) {
+      this.forgetRestingObiMakerOrder({
+        marketId: fill.marketId,
+        outcome: fill.outcome,
+        orderId: fill.orderId,
+      });
+    }
 
     const dayState = getDayPnlState(new Date(fill.filledAt));
     logger.info('Applied confirmed fill from fill tracker', {
@@ -3333,6 +3369,9 @@ export class MarketMakerRuntime {
     this.obiEngine.clearState(marketId);
     this.marketActions.delete(marketId);
     this.clearDustAbandonmentForMarket(marketId);
+    // Variant A4: drop any tracked resting OBI maker orders for this market.
+    this.restingObiMakerOrders.delete(this.getRestingObiKey(marketId, 'YES'));
+    this.restingObiMakerOrders.delete(this.getRestingObiKey(marketId, 'NO'));
     this.clearSettlementConfirmation(marketId, 'YES');
     this.clearSettlementConfirmation(marketId, 'NO');
     if (market) {
@@ -3680,6 +3719,54 @@ export class MarketMakerRuntime {
    *
    * Returns the number of orders successfully cancelled.
    */
+  private getRestingObiKey(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): string {
+    return `${marketId}:${outcome}`;
+  }
+
+  /** Register an OBI maker orderId as resting on CLOB. */
+  private rememberRestingObiMakerOrder(params: {
+    marketId: string;
+    outcome: StrategySignal['outcome'];
+    orderId: string;
+  }): void {
+    const key = this.getRestingObiKey(params.marketId, params.outcome);
+    let set = this.restingObiMakerOrders.get(key);
+    if (!set) {
+      set = new Set<string>();
+      this.restingObiMakerOrders.set(key, set);
+    }
+    set.add(params.orderId);
+  }
+
+  /** Drop an OBI maker orderId from the resting registry (on fill or cancel). */
+  private forgetRestingObiMakerOrder(params: {
+    marketId: string;
+    outcome: StrategySignal['outcome'];
+    orderId: string;
+  }): void {
+    const key = this.getRestingObiKey(params.marketId, params.outcome);
+    const set = this.restingObiMakerOrders.get(key);
+    if (!set) return;
+    set.delete(params.orderId);
+    if (set.size === 0) {
+      this.restingObiMakerOrders.delete(key);
+    }
+  }
+
+  /** All resting OBI maker orderIds for a (marketId, outcome). */
+  private getRestingObiMakerOrderIds(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): string[] {
+    const set = this.restingObiMakerOrders.get(
+      this.getRestingObiKey(marketId, outcome)
+    );
+    return set ? Array.from(set) : [];
+  }
+
   private async cancelPendingObiMakerQuotes(params: {
     marketId: string;
     outcome: StrategySignal['outcome'];
@@ -3696,15 +3783,36 @@ export class MarketMakerRuntime {
             order.signalType === 'OBI_MM_QUOTE_BID')
       );
 
-    if (pending.length === 0) {
+    // Variant A4 (2026-04-08): also include orderIds we tracked in our own
+    // resting-orders registry that may have aged out of fillTracker.pendingOrders
+    // but are still locking collateral on CLOB. Build a deduped list of orderIds
+    // to cancel.
+    const orderIdsToCancel = new Set<string>(pending.map((p) => p.orderId));
+    for (const orderId of this.getRestingObiMakerOrderIds(
+      params.marketId,
+      params.outcome
+    )) {
+      orderIdsToCancel.add(orderId);
+    }
+
+    if (orderIdsToCancel.size === 0) {
       return 0;
     }
 
+    // For logging purposes, build a lookup of pending order metadata by ID.
+    const pendingById = new Map(pending.map((p) => [p.orderId, p]));
+
     let cancelledCount = 0;
-    for (const order of pending) {
+    for (const orderId of orderIdsToCancel) {
+      const order = pendingById.get(orderId);
       try {
-        await this.executor.cancelOrder(order.orderId);
-        this.fillTracker.forgetPendingOrder(order.orderId);
+        await this.executor.cancelOrder(orderId);
+        this.fillTracker.forgetPendingOrder(orderId);
+        this.forgetRestingObiMakerOrder({
+          marketId: params.marketId,
+          outcome: params.outcome,
+          orderId,
+        });
         this.clearPendingLiveOrder(
           this.getPendingOrderKey(params.marketId, params.outcome)
         );
@@ -3713,10 +3821,11 @@ export class MarketMakerRuntime {
           marketId: params.marketId,
           outcome: params.outcome,
           triggeredBy: params.triggeredBy,
-          cancelledOrderId: order.orderId,
-          cancelledSignalType: order.signalType,
-          cancelledShares: order.submittedShares,
-          cancelledPrice: order.submittedPrice,
+          cancelledOrderId: orderId,
+          cancelledSignalType: order?.signalType ?? 'OBI_MM_QUOTE_REGISTRY',
+          cancelledShares: order?.submittedShares,
+          cancelledPrice: order?.submittedPrice,
+          source: order ? 'fillTracker' : 'restingRegistry',
         });
       } catch (error) {
         // Don't block the exit on a cancel failure — the placeOrder will
@@ -3726,7 +3835,7 @@ export class MarketMakerRuntime {
           marketId: params.marketId,
           outcome: params.outcome,
           triggeredBy: params.triggeredBy,
-          orderId: order.orderId,
+          orderId,
           message: error instanceof Error ? error.message : String(error),
         });
       }
@@ -3736,9 +3845,11 @@ export class MarketMakerRuntime {
       // Brief pause to let CLOB release the collateral on the cancelled
       // orders. Empirically the existing maker→taker fallback path uses
       // 2000ms, but for time-critical exits (hard stop) we want to be much
-      // faster. 250ms is comfortably above the observed network round-trip
-      // (~50-100ms) and has been sufficient in similar engines.
-      await sleep(250);
+      // faster. 500ms is comfortably above the observed network round-trip
+      // (~50-100ms) and gives CLOB enough time to release collateral —
+      // bumped from 250ms after the 2026-04-08 BTC race that hit 3 retries
+      // with sum-of-active-orders still locked.
+      await sleep(500);
     }
 
     return cancelledCount;
