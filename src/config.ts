@@ -1323,6 +1323,14 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseIntOrDefault(env.OBI_LOSING_EXIT_COOLDOWN_MS, '300000')
       ),
+      // Phase 8 (2026-04-08): coin-wide cooldown after a losing exit. Default
+      // 600s = 10 minutes ≈ skip the next 1-2 5-min slots of the same coin.
+      // The 11:00 → 11:06 SOL cascade losses motivated this. Set to 0 to
+      // disable the gate entirely (e.g. for backtests).
+      losingExitCooldownByCoinMs: Math.max(
+        0,
+        parseIntOrDefault(env.OBI_LOSING_EXIT_COOLDOWN_BY_COIN_MS, '600000')
+      ),
       imbalanceCollapseRatio: clamp(
         parseFloatOrDefault(env.OBI_IMBALANCE_COLLAPSE_RATIO, '1.5'),
         0.5,

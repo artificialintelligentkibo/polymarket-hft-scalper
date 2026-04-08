@@ -37,6 +37,7 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     clobMinNotionalUsd: 1.0,
     clobMinShares: 5,
     losingExitCooldownMs: 0,
+    losingExitCooldownByCoinMs: 0,
     imbalanceCollapseRatio: 1.5,
     preflightBalanceCheck: false,
     binanceGateEnabled: false,
@@ -287,6 +288,188 @@ test('obi engine respects cooldown window', () => {
     nowMs: FIXED_NOW + 5_000,
   });
   assert.deepEqual(second, []);
+});
+
+test('Phase 8: extractCoinFromObiTitle normalises Polymarket binary slot titles', async () => {
+  const { extractCoinFromObiTitle } = await import('../src/obi-engine.js');
+  assert.equal(extractCoinFromObiTitle('Bitcoin Up or Down - April 8, 8:30AM-8:35AM ET'), 'BTC');
+  assert.equal(extractCoinFromObiTitle('BTC Up or Down - April 8, 8:30AM ET'), 'BTC');
+  assert.equal(extractCoinFromObiTitle('Ethereum Up or Down'), 'ETH');
+  assert.equal(extractCoinFromObiTitle('SOL Up or Down'), 'SOL');
+  assert.equal(extractCoinFromObiTitle('Solana Up or Down'), 'SOL');
+  assert.equal(extractCoinFromObiTitle('XRP Up or Down'), 'XRP');
+  assert.equal(extractCoinFromObiTitle('Will Trump win'), null);
+  assert.equal(extractCoinFromObiTitle(''), null);
+});
+
+test('Phase 8: coin-wide cooldown blocks entries on a different SOL slot after a SOL hard stop', () => {
+  // Reproduces the 11:00 → 11:06 cascade: hard stop on SOL slot A at T=0,
+  // then a fresh SOL slot B with the same imbalance condition at T+6min.
+  // Without coin cooldown the per-market cooldown wouldn't apply (different
+  // marketId). With Phase 8 the engine refuses entry until cooldown expires.
+  const engine = new ObiEngine();
+  const cfg = baseConfig({
+    losingExitCooldownByCoinMs: 600_000, // 10 min
+    losingExitCooldownMs: 0,             // disable per-market guard
+    cooldownMs: 0,                       // disable normal cooldown
+    hardStopUsd: 1.0,
+    slotWarmupMs: 0,
+    stopEntryBeforeEndMs: 0,
+  });
+
+  // Slot end set far in the future so 11+ min later we're still in-window.
+  const farFutureEnd = new Date(Date.parse(SLOT_START) + 60 * 60_000).toISOString();
+
+  // === Slot A: SOL, take a position and hard-stop it ===
+  const slotA = createMarket({
+    marketId: 'sol-slot-a',
+    title: 'SOL Up or Down - 11:00AM ET',
+    endTime: farFutureEnd,
+  });
+  const obA = createOrderbook({
+    noBid: 0.43,
+    noAsk: 0.44,
+    noBidDepth: 4,
+    noAskDepth: 800,
+  });
+  const sigsA = engine.generateSignals({
+    market: slotA,
+    orderbook: obA,
+    positionManager: new PositionManager(slotA.marketId),
+    config: cfg,
+    nowMs: FIXED_NOW,
+  });
+  assert.equal(sigsA.length, 1, 'should enter SOL slot A on imbalance');
+
+  // Simulate the fill + hard stop on slot A.
+  engine.onEntryFill({
+    marketId: slotA.marketId,
+    marketTitle: slotA.title,
+    outcome: 'NO',
+    fillPrice: 0.44,
+    filledShares: 7,
+    totalLiveShares: 7,
+    orderbook: obA,
+    config: cfg,
+    nowMs: FIXED_NOW + 1_000,
+  });
+  // Drive the price below hard stop to trigger losing exit.
+  const obAStopped = createOrderbook({
+    noBid: 0.20,
+    noAsk: 0.21,
+    noBidDepth: 600,
+    noAskDepth: 600,
+  });
+  const exitSignals = engine.generateExitSignals({
+    market: slotA,
+    orderbook: obAStopped,
+    positionManager: (() => {
+      const pm = new PositionManager(slotA.marketId);
+      pm.applyFill({ outcome: 'NO', side: 'BUY', shares: 7, price: 0.44 });
+      return pm;
+    })(),
+    config: cfg,
+    nowMs: FIXED_NOW + 5_000,
+  });
+  assert.ok(
+    exitSignals.some((s) => s.reason?.startsWith('OBI hard stop')),
+    'expected hard stop exit on slot A'
+  );
+
+  // === Slot B: a DIFFERENT SOL market 6 min later — must be blocked ===
+  const slotB = createMarket({
+    marketId: 'sol-slot-b',
+    title: 'SOL Up or Down - 11:05AM ET',
+    endTime: farFutureEnd,
+  });
+  const sigsB = engine.generateSignals({
+    market: slotB,
+    orderbook: obA, // same imbalance shape
+    positionManager: new PositionManager(slotB.marketId),
+    config: cfg,
+    nowMs: FIXED_NOW + 6 * 60_000, // 6 min later
+  });
+  assert.deepEqual(
+    sigsB,
+    [],
+    'coin cooldown must block SOL slot B 6 min after SOL slot A loss'
+  );
+
+  // === A different coin (BTC) at the same time should NOT be blocked ===
+  const btcSlot = createMarket({
+    marketId: 'btc-slot',
+    title: 'Bitcoin Up or Down - 11:05AM ET',
+    endTime: farFutureEnd,
+  });
+  const sigsBtc = engine.generateSignals({
+    market: btcSlot,
+    orderbook: obA,
+    positionManager: new PositionManager(btcSlot.marketId),
+    config: cfg,
+    nowMs: FIXED_NOW + 6 * 60_000,
+  });
+  assert.equal(sigsBtc.length, 1, 'BTC slot must be allowed (different coin)');
+
+  // === After cooldown elapses, SOL slot B is allowed again ===
+  const sigsBLater = engine.generateSignals({
+    market: createMarket({
+      marketId: 'sol-slot-c',
+      title: 'SOL Up or Down - 11:15AM ET',
+      endTime: farFutureEnd,
+    }),
+    orderbook: obA,
+    positionManager: new PositionManager('sol-slot-c'),
+    config: cfg,
+    nowMs: FIXED_NOW + 11 * 60_000, // 11 min later, past 10-min cooldown
+  });
+  assert.equal(sigsBLater.length, 1, 'SOL must be allowed again past cooldown');
+});
+
+test('Phase 8: coin cooldown set to 0 disables the gate entirely', () => {
+  const engine = new ObiEngine();
+  const cfg = baseConfig({
+    losingExitCooldownByCoinMs: 0, // disabled
+    losingExitCooldownMs: 0,
+    cooldownMs: 0,
+    hardStopUsd: 1.0,
+    slotWarmupMs: 0,
+  });
+
+  // Trigger a hard stop on SOL.
+  const slotA = createMarket({ marketId: 'sol-a', title: 'SOL Up or Down' });
+  engine.onEntryFill({
+    marketId: slotA.marketId,
+    marketTitle: slotA.title,
+    outcome: 'NO',
+    fillPrice: 0.44,
+    filledShares: 7,
+    totalLiveShares: 7,
+    orderbook: createOrderbook({ noBid: 0.43, noAsk: 0.44 }),
+    config: cfg,
+    nowMs: FIXED_NOW,
+  });
+  engine.generateExitSignals({
+    market: slotA,
+    orderbook: createOrderbook({ noBid: 0.20, noAsk: 0.21 }),
+    positionManager: (() => {
+      const pm = new PositionManager(slotA.marketId);
+      pm.applyFill({ outcome: 'NO', side: 'BUY', shares: 7, price: 0.44 });
+      return pm;
+    })(),
+    config: cfg,
+    nowMs: FIXED_NOW + 5_000,
+  });
+
+  // Different SOL slot 1 second later — must be allowed.
+  const slotB = createMarket({ marketId: 'sol-b', title: 'SOL Up or Down' });
+  const sigs = engine.generateSignals({
+    market: slotB,
+    orderbook: createOrderbook({ noBid: 0.43, noAsk: 0.44, noBidDepth: 4, noAskDepth: 800 }),
+    positionManager: new PositionManager(slotB.marketId),
+    config: cfg,
+    nowMs: FIXED_NOW + 6_000,
+  });
+  assert.equal(sigs.length, 1, 'with gate disabled, immediate re-entry allowed');
 });
 
 test('obi engine onEntryFill emits OBI_MM_QUOTE_ASK when enabled', () => {

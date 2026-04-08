@@ -73,6 +73,14 @@ export interface ObiEngineConfig {
   readonly clobMinShares: number;
   /** After a losing exit, refuse new entries on the same market for this long. */
   readonly losingExitCooldownMs: number;
+  /**
+   * Phase 8 (2026-04-08): after a losing exit on coin X, refuse new entries
+   * on ANY market that is also coin X for this long. The 11:00 → 11:06 SOL
+   * losses showed that consecutive 5-min slots of the same coin tend to
+   * collapse together (continued runaway). A coin-wide cooldown lets the
+   * volatility cool off before re-engaging. Set to 0 to disable.
+   */
+  readonly losingExitCooldownByCoinMs: number;
   /** Catastrophic flip ratio: exit immediately when currentRatio >= this (book fully reversed). */
   readonly imbalanceCollapseRatio: number;
   /** When set, generateSignals returns no entries if available USDC < required notional. */
@@ -283,13 +291,50 @@ export function checkObiBinanceGate(params: {
 /*  Engine                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Phase 8 (2026-04-08): extract the underlying coin name from a Polymarket
+ * binary slot title. Polymarket uses titles like "Bitcoin Up or Down - April
+ * 8, 8:30AM-8:35AM ET" or "SOL Up or Down - ...". We normalize to a stable
+ * uppercase ticker (BTC, ETH, SOL, XRP) so the coin-wide cooldown can match
+ * across naming variants. Returns null if no recognized coin appears.
+ */
+export function extractCoinFromObiTitle(title: string): string | null {
+  if (!title) return null;
+  const upper = title.toUpperCase();
+  if (/\bBITCOIN\b|\bBTC\b/.test(upper)) return 'BTC';
+  if (/\bETHEREUM\b|\bETH\b/.test(upper)) return 'ETH';
+  if (/\bSOLANA\b|\bSOL\b/.test(upper)) return 'SOL';
+  if (/\bRIPPLE\b|\bXRP\b/.test(upper)) return 'XRP';
+  return null;
+}
+
 export class ObiEngine {
   private readonly positions = new Map<string, ObiPosition>();
   private readonly lastEntryMs = new Map<string, number>();
   /** Markets where we recently exited at a loss — extra cooldown applies. */
   private readonly lastLosingExitMs = new Map<string, number>();
+  /**
+   * Phase 8: coin-wide cooldown after a losing exit. Map key is the
+   * normalized coin ticker (BTC/ETH/SOL/XRP); value is the timestamp of
+   * the most recent losing exit on that coin across ALL slots. Used to
+   * skip the next slot(s) of a coin that just collapsed.
+   */
+  private readonly lastLosingExitMsByCoin = new Map<string, number>();
   /** Last time getOrphanFlattenSignals emitted for a market — used to throttle. */
   private readonly lastOrphanEmitMs = new Map<string, number>();
+
+  /**
+   * Phase 8: record a losing exit on both per-market and per-coin maps.
+   * Centralised so adding new exit reasons doesn't require touching every
+   * call site.
+   */
+  private recordLosingExit(market: MarketCandidate, nowMs: number): void {
+    this.lastLosingExitMs.set(market.marketId, nowMs);
+    const coin = extractCoinFromObiTitle(market.title);
+    if (coin !== null) {
+      this.lastLosingExitMsByCoin.set(coin, nowMs);
+    }
+  }
   /** Last available USDC balance reported by host. Used for pre-flight check. */
   private availableUsdcBalance: number | null = null;
   private totalEntries = 0;
@@ -354,6 +399,31 @@ export class ObiEngine {
       nowMs - lastLosingExit < config.losingExitCooldownMs
     ) {
       return [];
+    }
+
+    // Phase 8: coin-wide cooldown. After a losing exit on (e.g.) SOL, refuse
+    // new entries on ANY SOL slot for `losingExitCooldownByCoinMs`. The 11:00
+    // → 11:06 SOL cascade losses showed that a coin's volatility tends to
+    // persist across consecutive 5-min slots. The per-market cooldown
+    // doesn't help because the next slot has a fresh marketId.
+    if (config.losingExitCooldownByCoinMs > 0) {
+      const coin = extractCoinFromObiTitle(market.title);
+      if (coin !== null) {
+        const lastCoinLoss = this.lastLosingExitMsByCoin.get(coin);
+        if (
+          lastCoinLoss !== undefined &&
+          nowMs - lastCoinLoss < config.losingExitCooldownByCoinMs
+        ) {
+          logger.info('OBI engine entry skipped — coin-wide cooldown active', {
+            marketId: market.marketId,
+            marketTitle: market.title,
+            coin,
+            sinceLastLossMs: nowMs - lastCoinLoss,
+            cooldownMs: config.losingExitCooldownByCoinMs,
+          });
+          return [];
+        }
+      }
     }
 
     // Already holding an OBI position on this market — do not stack a second
@@ -825,7 +895,7 @@ export class ObiEngine {
         return [];
       }
       this.totalExits += 1;
-      this.lastLosingExitMs.set(market.marketId, nowMs);
+      this.recordLosingExit(market, nowMs);
       return [
         buildExit(
           'OBI_REBALANCE_EXIT',
@@ -851,7 +921,7 @@ export class ObiEngine {
         return [];
       }
       this.totalExits += 1;
-      if (livePnlUsd < 0) this.lastLosingExitMs.set(market.marketId, nowMs);
+      if (livePnlUsd < 0) this.recordLosingExit(market, nowMs);
       return [
         buildExit(
           'OBI_REBALANCE_EXIT',
@@ -876,7 +946,7 @@ export class ObiEngine {
         return [];
       }
       this.totalExits += 1;
-      if (livePnlUsd < 0) this.lastLosingExitMs.set(market.marketId, nowMs);
+      if (livePnlUsd < 0) this.recordLosingExit(market, nowMs);
       return [
         buildExit(
           'OBI_REBALANCE_EXIT',
@@ -898,7 +968,7 @@ export class ObiEngine {
         return [];
       }
       this.totalExits += 1;
-      if (livePnlUsd < 0) this.lastLosingExitMs.set(market.marketId, nowMs);
+      if (livePnlUsd < 0) this.recordLosingExit(market, nowMs);
       return [
         buildExit(
           'OBI_REBALANCE_EXIT',
@@ -1037,6 +1107,12 @@ export class ObiEngine {
 
       this.totalExits += 1;
       this.lastLosingExitMs.set(marketId, nowMs);
+      // Phase 8: orphan flattens are usually losing — propagate to coin map
+      // so we don't immediately re-enter another slot of the same coin.
+      const orphanCoin = extractCoinFromObiTitle(position.marketTitle);
+      if (orphanCoin !== null) {
+        this.lastLosingExitMsByCoin.set(orphanCoin, nowMs);
+      }
       this.lastOrphanEmitMs.set(marketId, nowMs);
       logger.warn('OBI orphan slot-end flatten emitted', {
         marketId,
