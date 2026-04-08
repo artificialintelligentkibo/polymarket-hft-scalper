@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { MarketOrderbookSnapshot, Outcome, TokenBookSnapshot } from '../src/clob-fetcher.js';
 import type { MarketCandidate } from '../src/monitor.js';
-import { ObiEngine, type ObiEngineConfig } from '../src/obi-engine.js';
+import { ObiEngine, type ObiEngineConfig, checkObiBinanceGate } from '../src/obi-engine.js';
+import type { DeepBinanceAssessment } from '../src/binance-deep-integration.js';
 import { PositionManager } from '../src/position-manager.js';
 
 const FIXED_NOW = Date.parse('2026-04-07T16:01:00.000Z');
@@ -38,6 +39,9 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     losingExitCooldownMs: 0,
     imbalanceCollapseRatio: 1.5,
     preflightBalanceCheck: false,
+    binanceGateEnabled: false,
+    binanceRunawayAbsPct: 0.30,
+    binanceContraAbsPct: 0.15,
     ...overrides,
   };
 }
@@ -598,4 +602,250 @@ test('obi engine getOrphanFlattenSignals throttles and gives up after 120s', () 
     0,
     'position should be dropped from tracking after give-up'
   );
+});
+
+/* ------------------------------------------------------------------ */
+/*  Binance runaway gate                                               */
+/* ------------------------------------------------------------------ */
+
+function makeAssessment(overrides: Partial<DeepBinanceAssessment> = {}): DeepBinanceAssessment {
+  return {
+    available: true,
+    coin: 'BTC',
+    symbol: 'BTCUSDT',
+    reason: null,
+    binanceBid: 70_000,
+    binanceAsk: 70_001,
+    binanceMid: 70_000.5,
+    binanceSpreadRatio: 0.0001,
+    slotOpenMid: 70_000,
+    binanceMovePct: 0,
+    volatilityRatio: 1,
+    fundingRate: 0,
+    fundingBasis: 0,
+    polymarketMid: 0.5,
+    fairValue: 0.5,
+    direction: 'FLAT',
+    ...overrides,
+  };
+}
+
+test('checkObiBinanceGate: disabled gate always allows', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ binanceMovePct: 5, direction: 'UP' }),
+    outcome: 'NO',
+    config: {
+      binanceGateEnabled: false,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, false);
+});
+
+test('checkObiBinanceGate: missing assessment fail-open', () => {
+  const decision = checkObiBinanceGate({
+    assessment: null,
+    outcome: 'YES',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, false);
+});
+
+test('checkObiBinanceGate: unavailable assessment fail-open', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ available: false, binanceMovePct: 0.5 }),
+    outcome: 'YES',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, false);
+});
+
+test('checkObiBinanceGate: null movePct fail-open', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ binanceMovePct: null }),
+    outcome: 'YES',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, false);
+});
+
+test('checkObiBinanceGate: blocks runaway up regardless of outcome (YES)', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ binanceMovePct: 0.45, direction: 'UP' }),
+    outcome: 'YES',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, true);
+  if (decision.blocked) {
+    assert.equal(decision.reason, 'runaway_abs');
+    assert.equal(decision.outcome, 'YES');
+  }
+});
+
+test('checkObiBinanceGate: blocks runaway down regardless of outcome (NO)', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ binanceMovePct: -0.50, direction: 'DOWN' }),
+    outcome: 'NO',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, true);
+  if (decision.blocked) assert.equal(decision.reason, 'runaway_abs');
+});
+
+test('checkObiBinanceGate: blocks contra-direction (UP + buy NO)', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ binanceMovePct: 0.20, direction: 'UP' }),
+    outcome: 'NO',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, true);
+  if (decision.blocked) {
+    assert.equal(decision.reason, 'contra_direction');
+    assert.equal(decision.direction, 'UP');
+  }
+});
+
+test('checkObiBinanceGate: blocks contra-direction (DOWN + buy YES)', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ binanceMovePct: -0.18, direction: 'DOWN' }),
+    outcome: 'YES',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, true);
+  if (decision.blocked) assert.equal(decision.reason, 'contra_direction');
+});
+
+test('checkObiBinanceGate: allows with-flow (UP + buy YES)', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ binanceMovePct: 0.20, direction: 'UP' }),
+    outcome: 'YES',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, false);
+});
+
+test('checkObiBinanceGate: allows small move below contra threshold', () => {
+  const decision = checkObiBinanceGate({
+    assessment: makeAssessment({ binanceMovePct: 0.05, direction: 'UP' }),
+    outcome: 'NO',
+    config: {
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    },
+  });
+  assert.equal(decision.blocked, false);
+});
+
+test('obi engine: Binance runaway blocks entry signal', () => {
+  const engine = new ObiEngine();
+  const signals = engine.generateSignals({
+    market: createMarket(),
+    orderbook: createOrderbook({
+      yesBid: 0.20,
+      yesAsk: 0.21,
+      yesBidDepth: 4,
+      yesAskDepth: 800,
+      noBidDepth: 400,
+      noAskDepth: 400,
+    }),
+    positionManager: new PositionManager('market-1'),
+    config: baseConfig({
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    }),
+    nowMs: FIXED_NOW,
+    deepBinanceAssessment: makeAssessment({
+      binanceMovePct: 0.45,
+      direction: 'UP',
+    }),
+  });
+  assert.deepEqual(signals, [], 'runaway slot must produce no entries');
+});
+
+test('obi engine: Binance with-flow allows entry signal', () => {
+  const engine = new ObiEngine();
+  const signals = engine.generateSignals({
+    market: createMarket(),
+    orderbook: createOrderbook({
+      yesBid: 0.20,
+      yesAsk: 0.21,
+      yesBidDepth: 4,
+      yesAskDepth: 800,
+      noBidDepth: 400,
+      noAskDepth: 400,
+    }),
+    positionManager: new PositionManager('market-1'),
+    config: baseConfig({
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    }),
+    nowMs: FIXED_NOW,
+    // YES entry (Up), Binance moving UP moderately → with-flow, allowed.
+    deepBinanceAssessment: makeAssessment({
+      binanceMovePct: 0.20,
+      direction: 'UP',
+    }),
+  });
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0]!.outcome, 'YES');
+});
+
+test('obi engine: missing Binance assessment does not block (fail-open)', () => {
+  const engine = new ObiEngine();
+  const signals = engine.generateSignals({
+    market: createMarket(),
+    orderbook: createOrderbook({
+      yesBid: 0.20,
+      yesAsk: 0.21,
+      yesBidDepth: 4,
+      yesAskDepth: 800,
+      noBidDepth: 400,
+      noAskDepth: 400,
+    }),
+    positionManager: new PositionManager('market-1'),
+    config: baseConfig({
+      binanceGateEnabled: true,
+      binanceRunawayAbsPct: 0.30,
+      binanceContraAbsPct: 0.15,
+    }),
+    nowMs: FIXED_NOW,
+    // No assessment provided.
+  });
+  assert.equal(signals.length, 1);
 });

@@ -1324,6 +1324,16 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         env.OBI_PREFLIGHT_BALANCE_CHECK,
         true
       ),
+      // === Binance runaway gate (2026-04-08 binary runaway fix) ===
+      binanceGateEnabled: parseBoolean(env.OBI_BINANCE_GATE_ENABLED, true),
+      binanceRunawayAbsPct: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_BINANCE_RUNAWAY_ABS_PCT, '0.30')
+      ),
+      binanceContraAbsPct: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_BINANCE_CONTRA_ABS_PCT, '0.15')
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),

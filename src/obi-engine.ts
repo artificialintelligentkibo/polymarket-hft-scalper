@@ -24,6 +24,7 @@
  * processPreparedMarket / FillTracker pipeline.
  */
 
+import type { DeepBinanceAssessment } from './binance-deep-integration.js';
 import type { MarketOrderbookSnapshot, Outcome } from './clob-fetcher.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
@@ -72,6 +73,25 @@ export interface ObiEngineConfig {
   readonly imbalanceCollapseRatio: number;
   /** When set, generateSignals returns no entries if available USDC < required notional. */
   readonly preflightBalanceCheck: boolean;
+  // === Binance runaway gate (2026-04-08 binary runaway fix) ===
+  /** Master switch for the Binance-based runaway gate on OBI entries. */
+  readonly binanceGateEnabled: boolean;
+  /**
+   * Absolute |binanceMovePct| above which OBI entries are blocked on any
+   * outcome (%). A 5-min BTC/ETH/SOL/XRP slot that already moved this
+   * much is a runaway: the "winning" outcome is rapidly pricing to $1,
+   * the "losing" outcome is pricing to $0, and OBI mean-reversion edge
+   * evaporates. Typical sensible values: 0.25–0.40 for BTC/ETH, up to
+   * 0.60 for SOL/XRP (higher base vol).
+   */
+  readonly binanceRunawayAbsPct: number;
+  /**
+   * Absolute |binanceMovePct| above which OBI entries are blocked ONLY
+   * when the chosen outcome contradicts Binance direction. Allows
+   * with-flow OBI scalps on moderate moves (0.1–0.25%) while cutting
+   * contra-trend entries that historically ended in hard stops.
+   */
+  readonly binanceContraAbsPct: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -137,6 +157,99 @@ interface ObiCandidate {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Binance runaway gate                                               */
+/* ------------------------------------------------------------------ */
+
+export type ObiBinanceGateDecision =
+  | { readonly blocked: false; readonly reason: null }
+  | {
+      readonly blocked: true;
+      readonly reason: 'runaway_abs' | 'contra_direction' | 'unavailable_required';
+      readonly movePct: number | null;
+      readonly direction: 'UP' | 'DOWN' | 'FLAT' | null;
+      readonly outcome: Outcome;
+    };
+
+/**
+ * Decide whether to block an OBI entry on the given outcome based on the
+ * deep Binance assessment of the underlying coin.
+ *
+ * Two distinct block conditions:
+ *
+ *   1. |binanceMovePct| >= binanceRunawayAbsPct
+ *      → blanket block regardless of direction. The slot already moved
+ *        too much; the outcome is rapidly pricing to 0 or 1 and our
+ *        mean-reversion edge is gone.
+ *
+ *   2. |binanceMovePct| >= binanceContraAbsPct AND chosen outcome
+ *      contradicts Binance direction
+ *      → UP direction + buying NO (bet on DOWN) is contra, DOWN + YES is
+ *        contra. Allows with-flow entries at moderate moves but cuts
+ *        contra-trend entries that historically hit hard stops.
+ *
+ * Fail-open: if assessment is missing, unavailable, or the gate is
+ * disabled, returns blocked=false. The 2026-04-08 runaway fix is
+ * specifically for markets where we HAVE Binance data and chose to
+ * ignore it.
+ */
+export function checkObiBinanceGate(params: {
+  readonly assessment: DeepBinanceAssessment | undefined | null;
+  readonly outcome: Outcome;
+  readonly config: Pick<
+    ObiEngineConfig,
+    'binanceGateEnabled' | 'binanceRunawayAbsPct' | 'binanceContraAbsPct'
+  >;
+}): ObiBinanceGateDecision {
+  const { assessment, outcome, config } = params;
+  if (!config.binanceGateEnabled) {
+    return { blocked: false, reason: null };
+  }
+  if (!assessment || !assessment.available) {
+    return { blocked: false, reason: null };
+  }
+  if (
+    assessment.binanceMovePct === null ||
+    !Number.isFinite(assessment.binanceMovePct)
+  ) {
+    return { blocked: false, reason: null };
+  }
+
+  const movePct = assessment.binanceMovePct;
+  const absMove = Math.abs(movePct);
+  const direction = assessment.direction;
+
+  // (1) Absolute runaway: block regardless of direction.
+  if (absMove >= config.binanceRunawayAbsPct) {
+    return {
+      blocked: true,
+      reason: 'runaway_abs',
+      movePct,
+      direction,
+      outcome,
+    };
+  }
+
+  // (2) Directional contradiction: block if the chosen outcome fights
+  // the Binance move and the move is already material.
+  if (absMove >= config.binanceContraAbsPct) {
+    const contradicts =
+      (direction === 'UP' && outcome === 'NO') ||
+      (direction === 'DOWN' && outcome === 'YES');
+    if (contradicts) {
+      return {
+        blocked: true,
+        reason: 'contra_direction',
+        movePct,
+        direction,
+        outcome,
+      };
+    }
+  }
+
+  return { blocked: false, reason: null };
+}
+
+/* ------------------------------------------------------------------ */
 /*  Engine                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -170,8 +283,17 @@ export class ObiEngine {
     positionManager: PositionManager;
     config: ObiEngineConfig;
     nowMs?: number;
+    /**
+     * Optional deep Binance fair-value assessment for the underlying coin.
+     * When provided AND `config.binanceGateEnabled` is true, the runaway gate
+     * will block entries on slots where Binance has already moved past
+     * `binanceRunawayAbsPct`, or where the chosen outcome contradicts the
+     * Binance direction past `binanceContraAbsPct`. Fail-open: missing /
+     * unavailable assessment is treated as "no opinion" and never blocks.
+     */
+    deepBinanceAssessment?: DeepBinanceAssessment | null;
   }): StrategySignal[] {
-    const { market, orderbook, positionManager, config } = params;
+    const { market, orderbook, positionManager, config, deepBinanceAssessment } = params;
     if (!config.enabled) {
       return [];
     }
@@ -253,6 +375,30 @@ export class ObiEngine {
     // Pick strongest imbalance.
     candidates.sort((a, b) => a.ratio - b.ratio);
     const chosen = candidates[0]!;
+
+    // === Binance runaway gate (2026-04-08 binary runaway fix) ===
+    // Block OBI entries when the underlying coin has already moved past the
+    // configured threshold for the current 5-min slot. Mean-reversion edge
+    // evaporates on runaway slots and we historically end up holding the
+    // losing-side until redemption at $0. Fail-open if assessment missing.
+    const gateDecision = checkObiBinanceGate({
+      assessment: deepBinanceAssessment ?? null,
+      outcome: chosen.outcome,
+      config,
+    });
+    if (gateDecision.blocked) {
+      logger.info('OBI engine entry blocked by Binance gate', {
+        marketId: market.marketId,
+        marketTitle: market.title,
+        reason: gateDecision.reason,
+        outcome: gateDecision.outcome,
+        binanceMovePct: gateDecision.movePct,
+        binanceDirection: gateDecision.direction,
+        runawayAbsPct: config.binanceRunawayAbsPct,
+        contraAbsPct: config.binanceContraAbsPct,
+      });
+      return [];
+    }
 
     // === Dust-trap prevention ===
     // CLOB requires 5 shares min AND $1 min notional. If the entry leaves the

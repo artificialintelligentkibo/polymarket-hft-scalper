@@ -1092,6 +1092,7 @@ export class MarketMakerRuntime {
         orderbook,
         positionManager,
         config: config.obiEngine,
+        deepBinanceAssessment,
       });
       const obiExitSignals = this.obiEngine.generateExitSignals({
         market,
