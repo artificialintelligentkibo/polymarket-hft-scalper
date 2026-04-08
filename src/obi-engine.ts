@@ -448,6 +448,27 @@ export class ObiEngine {
       if (thinDepth >= config.thinThresholdUsd) continue;
       if (ratio > config.entryImbalanceRatio) continue;
 
+      // Phase 10 (2026-04-08) — DIRECTIONAL BUG FIX:
+      // Classical LOB imbalance is DIRECTIONAL, not symmetric.
+      //   thin ask + thick bid = buying pressure  → price ↑ → BUY ✓
+      //   thin bid + thick ask = selling pressure → price ↓ → SELL (not BUY!)
+      //
+      // The old code treated both cases as "BUY this outcome" which produced
+      // a catastrophic -$1.38 loss on 2026-04-08 12:49 (YES bought at 0.54
+      // with thin bid $24 vs thick ask $320 → price collapsed to 0.31 within
+      // 4 seconds, hard-stopped with full loss).
+      //
+      // In Polymarket binary markets the two outcomes are mirrored:
+      //   YES thin bid  ⇔  NO thin ask  (same liquidity imbalance)
+      // so the symmetric NO candidate will still be picked up on the NO
+      // iteration of this loop with the CORRECT direction.
+      //
+      // Therefore: only accept thin-ASK candidates (bullish imbalance for
+      // the current outcome). This is the ONLY setup where "BUY thin side"
+      // aligns with the mean-reversion thesis vague-sourdough actually
+      // trades ("wait for book to rebalance, price returns to thick side").
+      if (thinSide === 'bid') continue;
+
       const bestAsk = book.bestAsk;
       if (bestAsk === null) continue;
       if (bestAsk < config.minEntryPrice || bestAsk > config.maxEntryPrice) continue;
@@ -505,11 +526,18 @@ export class ObiEngine {
     // position too small to be SOLD at any reasonable exit price, we'd get
     // stuck and the position would redeem at $0.
     //
-    // Compute auto-sized shares: enough so that even at half the entry price,
-    // the position is still above CLOB minimums with a safety buffer.
-    const safetyBuffer = 1.5; // require 1.5x CLOB notional minimum at exit.
+    // Phase 11 (2026-04-08): bumped safety buffer 1.5 → 2.5 and tightened
+    // worst-exit-price assumption from bestAsk*0.5 (50% drawdown) to
+    // bestAsk*0.3 (70% drawdown) after live dust trap observed at entry 0.36
+    // → collapse to 0.11 (30% of entry, 70% drawdown). Old code sized 9
+    // shares; CLOB min at 0.11 was 9.091, position abandoned $3.24 cost basis.
+    //
+    // New formula for entry 0.36: worstExit=0.108, shares=ceil(2.5/0.108)=24
+    // → at actual collapse 0.11: 24*0.11 = $2.64 ≫ $1 min → sellable.
+    const safetyBuffer = 2.5;
+    const worstExitPrice = Math.max(0.05, chosen.bestAsk * 0.3);
     const minSharesForExitNotional = Math.ceil(
-      (config.clobMinNotionalUsd * safetyBuffer) / Math.max(0.05, chosen.bestAsk * 0.5)
+      (config.clobMinNotionalUsd * safetyBuffer) / worstExitPrice
     );
     const sizedShares = Math.max(
       config.entryShares,
@@ -567,6 +595,33 @@ export class ObiEngine {
     const reason =
       `OBI thin ${chosen.thinSide} $${chosen.thinDepth.toFixed(2)} vs $${chosen.thickDepth.toFixed(2)}` +
       ` (ratio ${chosen.ratio.toFixed(3)}) | bestAsk ${chosen.bestAsk.toFixed(3)}`;
+
+    // Phase 14 (2026-04-08): emit Binance assessment on every OBI entry so we
+    // can post-mortem losing trades and verify whether the runaway gate is
+    // actually catching volatile slots. On 2026-04-08 two entries hit hard
+    // stop / dust on markets where Binance had already moved significantly
+    // but gate fail-open'd because assessment was null or below threshold.
+    logger.info('OBI entry accepted — Binance diagnostic snapshot', {
+      marketId: market.marketId,
+      marketTitle: market.title,
+      outcome: chosen.outcome,
+      thinSide: chosen.thinSide,
+      thinDepthUsd: chosen.thinDepth,
+      thickDepthUsd: chosen.thickDepth,
+      ratio: chosen.ratio,
+      bestAsk: chosen.bestAsk,
+      finalShares,
+      entryNotional,
+      binanceHasAssessment: deepBinanceAssessment !== null && deepBinanceAssessment !== undefined,
+      binanceAvailable: deepBinanceAssessment?.available ?? null,
+      binanceCoin: deepBinanceAssessment?.coin ?? null,
+      binanceMovePct: deepBinanceAssessment?.binanceMovePct ?? null,
+      binanceDirection: deepBinanceAssessment?.direction ?? null,
+      binanceVolatilityRatio: deepBinanceAssessment?.volatilityRatio ?? null,
+      binanceFundingRate: deepBinanceAssessment?.fundingRate ?? null,
+      gateRunawayAbsPct: config.binanceRunawayAbsPct,
+      gateContraAbsPct: config.binanceContraAbsPct,
+    });
 
     this.lastEntryMs.set(market.marketId, nowMs);
 
@@ -1045,10 +1100,13 @@ export class ObiEngine {
     // exit and we get the orphan-flatten spam observed in the 2026-04-08
     // XRP slot.
     const ORPHAN_EMIT_THROTTLE_MS = 5_000;
-    // Hard give-up: once the slot has been over for this long, the orders
-    // won't fill on any reasonable book and we should drop the position from
-    // tracking so it can flow into auto-redeem instead of looping forever.
-    const ORPHAN_GIVE_UP_AFTER_MS = 120_000;
+    // Phase 12 (2026-04-08): was 120s, reduced to 30s after observing
+    // ETH 9:00 slot dust on 2026-04-08 13:00 — 9 shares at price 0.11
+    // (notional $0.99) failed MIN_ORDER_SIZE filter on every flatten
+    // attempt and we spammed 9 "orphan flatten emitted" WARN logs over
+    // 60 seconds, each one hitting the same filter rejection. At this
+    // point the position is dust — stop pretending we can still exit it.
+    const ORPHAN_GIVE_UP_AFTER_MS = 30_000;
 
     for (const [marketId, position] of this.positions.entries()) {
       if (excludeMarketIds?.has(marketId)) continue;
@@ -1097,6 +1155,39 @@ export class ObiEngine {
       }
       if (targetPrice === null || targetPrice <= 0) {
         targetPrice = 0.01;
+      }
+
+      // Phase 12 (2026-04-08): dust detection — if current shares × current
+      // best bid is below the CLOB min notional + a small buffer, the
+      // downstream MIN_ORDER_SIZE filter will reject EVERY flatten attempt
+      // (live observed on 2026-04-08 ETH 9:00 slot: 9 shares × 0.11 = $0.99,
+      // minimum 9.091, failed 9 times in a row while remainingMs went from
+      // -61s to -119s). Stop emitting, drop position tracking, let auto-redeem
+      // path handle the residual.
+      const projectedNotional = liveShares * targetPrice;
+      const dustThreshold = config.clobMinNotionalUsd * 1.02; // 2% buffer for rounding
+      if (projectedNotional < dustThreshold) {
+        logger.info('OBI orphan flatten skipped — position is dust, forcing redeem', {
+          marketId,
+          outcome: position.outcome,
+          liveShares,
+          targetPrice,
+          projectedNotional: roundTo(projectedNotional, 4),
+          dustThreshold: roundTo(dustThreshold, 4),
+          remainingMs,
+          reason: 'shares × best bid below CLOB min notional — cannot flatten, stopping spam',
+        });
+        // Propagate to coin cooldown (this is effectively a losing exit).
+        this.lastLosingExitMs.set(marketId, nowMs);
+        const dustCoin = extractCoinFromObiTitle(position.marketTitle);
+        if (dustCoin !== null) {
+          this.lastLosingExitMsByCoin.set(dustCoin, nowMs);
+        }
+        // Drop engine-side tracking so we never emit for this market again.
+        // The host's dust-abandon path (and redeem-on-settlement) take over.
+        this.positions.delete(marketId);
+        this.lastOrphanEmitMs.delete(marketId);
+        continue;
       }
 
       if (config.shadowMode) {

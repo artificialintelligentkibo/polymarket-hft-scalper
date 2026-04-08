@@ -1486,6 +1486,18 @@ export class MarketMakerRuntime {
     // bypass the 500ms sleep and parallelise cancels — every millisecond
     // counts when the book is collapsing (live SOL trade lost extra $0.50+
     // because the old sequential cancel-wait took 2.5s to release collateral).
+    // Phase 13 (2026-04-08): instrument emergency OBI exits end-to-end so
+    // we can finally pinpoint where the 2.5s signal→order latency comes
+    // from. Live observed: hard stop 2582ms, MM exit quote 2603ms, both
+    // on 2026-04-08 post-12:48. Trade budget is 100-300ms.
+    const obiExitIsEmergency =
+      !paperTradingEnabled &&
+      isObiExitSignal(executionSignal.signalType) &&
+      executionSignal.action === 'SELL' &&
+      this.isEmergencyObiExit(executionSignal);
+    const obiLatencyT0 = executionSignal.generatedAt ?? Date.now();
+    const obiLatencyEnterExecute = Date.now();
+
     if (
       !paperTradingEnabled &&
       isObiExitSignal(executionSignal.signalType) &&
@@ -1500,6 +1512,7 @@ export class MarketMakerRuntime {
       });
     }
 
+    const obiLatencyPostCancel = Date.now();
     const startedAt = Date.now();
     const execution = await this.executor.executeSignal({
       market,
@@ -1507,6 +1520,21 @@ export class MarketMakerRuntime {
       signal: executionSignal,
     });
     const executionCompletedAt = Date.now();
+
+    if (obiExitIsEmergency) {
+      logger.warn('OBI emergency exit latency breakdown', {
+        marketId: market.marketId,
+        signalType: executionSignal.signalType,
+        reason: executionSignal.reason,
+        t0SignalGeneratedAt: obiLatencyT0,
+        msSignalToExecuteEntry: obiLatencyEnterExecute - obiLatencyT0,
+        msCancelQuotes: obiLatencyPostCancel - obiLatencyEnterExecute,
+        msExecutorSubmit: executionCompletedAt - obiLatencyPostCancel,
+        msTotalSignalToSubmit: executionCompletedAt - obiLatencyT0,
+        executorLatencySignalToOrderMs: execution.latencySignalToOrderMs,
+        executorLatencyRoundTripMs: execution.latencyRoundTripMs,
+      });
+    }
     const effectiveShares = execution.fillConfirmed ? execution.filledShares : 0;
     const effectivePrice = execution.fillPrice ?? execution.price;
     const effectiveNotionalUsd = execution.fillConfirmed

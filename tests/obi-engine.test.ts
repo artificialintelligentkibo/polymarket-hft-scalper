@@ -202,15 +202,72 @@ test('obi engine skips when imbalance ratio above threshold', () => {
   assert.deepEqual(signals, []);
 });
 
-test('obi engine emits OBI_ENTRY_BUY for YES when YES has thin bid', () => {
+test('Phase 10: YES thin-bid alone is rejected (directional bug fix)', () => {
+  // Phase 10 (2026-04-08): thin-BID is a BEARISH imbalance signal, so
+  // "BUY YES on thin-bid" catches falling knives. Live loss -$1.38 on
+  // 2026-04-08 12:49 (YES @ 0.54 → hard stop @ 0.31 in 4 seconds).
+  // Engine must now REJECT thin-bid setups. The symmetric NO candidate
+  // (which would have thin-ask in a mirrored book) would still be picked
+  // up — see the next test for the mirror case.
   const engine = new ObiEngine();
   const signals = engine.generateSignals({
     market: createMarket(),
     orderbook: createOrderbook({
       yesBid: 0.20,
       yesAsk: 0.21,
-      yesBidDepth: 4,
+      yesBidDepth: 4,     // YES thin bid (bearish → do NOT buy YES)
       yesAskDepth: 800,
+      noBid: 0.78,
+      noAsk: 0.80,
+      noBidDepth: 400,    // NO balanced (no imbalance on NO side)
+      noAskDepth: 400,
+    }),
+    positionManager: new PositionManager('market-1'),
+    config: baseConfig(),
+    nowMs: FIXED_NOW,
+  });
+  assert.deepEqual(signals, []);
+});
+
+test('Phase 10: mirrored book (YES thin-bid / NO thin-ask) picks NO side', () => {
+  // In a real Polymarket binary market, YES thin-bid implies NO thin-ask
+  // because NO = 1 - YES. Engine must pick the bullish NO side.
+  // Using prices within baseConfig maxEntryPrice=0.5 bounds.
+  const engine = new ObiEngine();
+  const signals = engine.generateSignals({
+    market: createMarket(),
+    orderbook: createOrderbook({
+      yesBid: 0.64,
+      yesAsk: 0.65,
+      yesBidDepth: 4,     // YES thin bid — skipped by Phase 10
+      yesAskDepth: 800,
+      noBid: 0.34,
+      noAsk: 0.35,
+      noBidDepth: 800,    // NO thick bid (thick side)
+      noAskDepth: 4,      // NO thin ask (bullish for NO → BUY NO)
+    }),
+    positionManager: new PositionManager('market-1'),
+    config: baseConfig(),
+    nowMs: FIXED_NOW,
+  });
+  assert.equal(signals.length, 1);
+  const sig = signals[0]!;
+  assert.equal(sig.signalType, 'OBI_ENTRY_BUY');
+  assert.equal(sig.outcome, 'NO');
+  assert.equal(sig.action, 'BUY');
+  assert.equal(sig.targetPrice, 0.35);
+  assert.equal(sig.urgency, 'cross');
+});
+
+test('obi engine emits OBI_ENTRY_BUY for YES when YES has thin ASK (post-Phase 10)', () => {
+  const engine = new ObiEngine();
+  const signals = engine.generateSignals({
+    market: createMarket(),
+    orderbook: createOrderbook({
+      yesBid: 0.20,
+      yesAsk: 0.21,
+      yesBidDepth: 800,   // YES thick bid
+      yesAskDepth: 4,     // YES thin ask (bullish for YES → BUY YES)
       noBid: 0.78,
       noAsk: 0.80,
       noBidDepth: 400,
@@ -226,9 +283,6 @@ test('obi engine emits OBI_ENTRY_BUY for YES when YES has thin bid', () => {
   assert.equal(sig.outcome, 'YES');
   assert.equal(sig.action, 'BUY');
   assert.equal(sig.targetPrice, 0.21);
-  // Phase 9 (2026-04-08): OBI entries are now TAKER (cross) — grabbing thin
-  // resting liquidity is by definition a book-crossing trade. Post-only was
-  // silently rejected by CLOB ("order crosses book") causing 0 fills.
   assert.equal(sig.urgency, 'cross');
   assert.equal(sig.strategyLayer, 'OBI');
 });
@@ -259,8 +313,8 @@ test('obi engine returns no entries during slot warmup', () => {
   const signals = engine.generateSignals({
     market: createMarket(),
     orderbook: createOrderbook({
-      yesBidDepth: 4,
-      yesAskDepth: 800,
+      yesBidDepth: 800,  // Phase 10: thin-ASK
+      yesAskDepth: 4,
     }),
     positionManager: new PositionManager('market-1'),
     config: baseConfig({ slotWarmupMs: 30_000 }),
@@ -273,7 +327,7 @@ test('obi engine respects cooldown window', () => {
   const engine = new ObiEngine();
   const cfg = baseConfig({ cooldownMs: 30_000 });
   const market = createMarket();
-  const ob = createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 });
+  const ob = createOrderbook({ yesBidDepth: 800, yesAskDepth: 4 });
   const pm = new PositionManager('market-1');
   const first = engine.generateSignals({
     market,
@@ -332,8 +386,8 @@ test('Phase 8: coin-wide cooldown blocks entries on a different SOL slot after a
   const obA = createOrderbook({
     noBid: 0.43,
     noAsk: 0.44,
-    noBidDepth: 4,
-    noAskDepth: 800,
+    noBidDepth: 800,  // Phase 10: thick bid
+    noAskDepth: 4,    // Phase 10: thin ask (bullish)
   });
   const sigsA = engine.generateSignals({
     market: slotA,
@@ -467,7 +521,7 @@ test('Phase 8: coin cooldown set to 0 disables the gate entirely', () => {
   const slotB = createMarket({ marketId: 'sol-b', title: 'SOL Up or Down' });
   const sigs = engine.generateSignals({
     market: slotB,
-    orderbook: createOrderbook({ noBid: 0.43, noAsk: 0.44, noBidDepth: 4, noAskDepth: 800 }),
+    orderbook: createOrderbook({ noBid: 0.43, noAsk: 0.44, noBidDepth: 800, noAskDepth: 4 }),
     positionManager: new PositionManager(slotB.marketId),
     config: cfg,
     nowMs: FIXED_NOW + 6_000,
@@ -480,8 +534,8 @@ test('obi engine onEntryFill emits OBI_MM_QUOTE_ASK when enabled', () => {
   const ob = createOrderbook({
     yesBid: 0.20,
     yesAsk: 0.21,
-    yesBidDepth: 4,
-    yesAskDepth: 800,
+    yesBidDepth: 800,  // Phase 10: flip to thin-ASK
+    yesAskDepth: 4,
   });
   const followOns = engine.onEntryFill({
     marketId: 'market-1',
@@ -547,8 +601,8 @@ test('OBI_MM_QUOTE_ASK respects spread target when it sits above bestAsk', () =>
   const ob = createOrderbook({
     yesBid: 0.20,
     yesAsk: 0.21,
-    yesBidDepth: 4,
-    yesAskDepth: 800,
+    yesBidDepth: 800,  // Phase 10: flip to thin-ASK
+    yesAskDepth: 4,
   });
   const followOns = engine.onEntryFill({
     marketId: 'market-1',
@@ -585,7 +639,7 @@ test('obi engine emits OBI_REBALANCE_EXIT when ratio recovers', () => {
     fillPrice: 0.21,
     filledShares: 8,
     totalLiveShares: 8,
-    orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
+    orderbook: createOrderbook({ yesBidDepth: 800, yesAskDepth: 4 }),
     config: baseConfig(),
     nowMs: FIXED_NOW,
   });
@@ -618,7 +672,7 @@ test('obi engine emits OBI_SCALP_EXIT when bid moves above entry+edge', () => {
     fillPrice: 0.20,
     filledShares: 8,
     totalLiveShares: 8,
-    orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
+    orderbook: createOrderbook({ yesBidDepth: 800, yesAskDepth: 4 }),
     config: baseConfig(),
     nowMs: FIXED_NOW,
   });
@@ -627,8 +681,8 @@ test('obi engine emits OBI_SCALP_EXIT when bid moves above entry+edge', () => {
   const scalpBook = createOrderbook({
     yesBid: 0.30,
     yesAsk: 0.31,
-    yesBidDepth: 4,
-    yesAskDepth: 800,
+    yesBidDepth: 800,  // Phase 10: thin-ASK (imbalance for exit check)
+    yesAskDepth: 4,
   });
   const exitSignals = engine.generateExitSignals({
     market,
@@ -646,7 +700,7 @@ test('obi engine shadow mode logs but emits no signals', () => {
   const before = engine.getStats();
   const signals = engine.generateSignals({
     market: createMarket(),
-    orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
+    orderbook: createOrderbook({ yesBidDepth: 800, yesAskDepth: 4 }),
     positionManager: new PositionManager('market-1'),
     config: baseConfig({ shadowMode: true }),
     nowMs: FIXED_NOW,
@@ -665,7 +719,7 @@ test('obi engine clearState removes per-market state but preserves losing-exit c
   // post-exit position cleanup.
   const engine = new ObiEngine();
   const market = createMarket();
-  const ob = createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 });
+  const ob = createOrderbook({ yesBidDepth: 800, yesAskDepth: 4 });
   const cfg = baseConfig();
   const losingCooldownCfg = { ...cfg, losingExitCooldownMs: 300_000 };
 
@@ -684,12 +738,14 @@ test('obi engine clearState removes per-market state but preserves losing-exit c
   // Trigger a losing exit so lastLosingExitMs is recorded.
   const pm = new PositionManager(market.marketId);
   pm.applyFill({ outcome: 'YES', side: 'BUY', shares: 8, price: 0.21 });
-  // Force an imbalance collapse so the engine emits a losing exit.
+  // Force an imbalance collapse: position was entered with thinSide='ask'
+  // (bullish setup per Phase 10), and the book now flips to thin-bid
+  // (bearish) — ratio of stored thinSide inverts past imbalanceCollapseRatio.
   const collapseBook = createOrderbook({
     yesBid: 0.18,
     yesAsk: 0.19,
-    yesBidDepth: 800,
-    yesAskDepth: 4,
+    yesBidDepth: 4,    // bid became thin — bearish collapse for YES
+    yesAskDepth: 800,  // ask became thick
   });
   const exitSignals = engine.generateExitSignals({
     market,
@@ -735,8 +791,8 @@ test('obi engine onEntryFill accumulates multi-clip partial fills (2026-04-08 re
   const ob = createOrderbook({
     yesBid: 0.43,
     yesAsk: 0.44,
-    yesBidDepth: 4,
-    yesAskDepth: 800,
+    yesBidDepth: 800,  // Phase 10: thin-ASK
+    yesAskDepth: 4,
   });
 
   // First clip: 10 shares filled @ $0.44
@@ -805,7 +861,7 @@ test('obi engine getOrphanFlattenSignals throttles and gives up after 120s', () 
     fillPrice: 0.30,
     filledShares: 12,
     totalLiveShares: 12,
-    orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
+    orderbook: createOrderbook({ yesBidDepth: 800, yesAskDepth: 4 }),
     config: baseConfig(),
     slotEndTime: slotEnd,
     nowMs: slotEndMs - 60_000,
@@ -1027,8 +1083,8 @@ test('obi engine: Binance runaway blocks entry signal', () => {
     orderbook: createOrderbook({
       yesBid: 0.20,
       yesAsk: 0.21,
-      yesBidDepth: 4,
-      yesAskDepth: 800,
+      yesBidDepth: 800,  // Phase 10: flip to thin-ASK (bullish for YES)
+      yesAskDepth: 4,
       noBidDepth: 400,
       noAskDepth: 400,
     }),
@@ -1054,8 +1110,8 @@ test('obi engine: Binance with-flow allows entry signal', () => {
     orderbook: createOrderbook({
       yesBid: 0.20,
       yesAsk: 0.21,
-      yesBidDepth: 4,
-      yesAskDepth: 800,
+      yesBidDepth: 800,  // Phase 10: flip to thin-ASK (bullish for YES)
+      yesAskDepth: 4,
       noBidDepth: 400,
       noAskDepth: 400,
     }),
@@ -1083,8 +1139,8 @@ test('obi engine: missing Binance assessment does not block (fail-open)', () => 
     orderbook: createOrderbook({
       yesBid: 0.20,
       yesAsk: 0.21,
-      yesBidDepth: 4,
-      yesAskDepth: 800,
+      yesBidDepth: 800,  // Phase 10: flip to thin-ASK (bullish for YES)
+      yesAskDepth: 4,
       noBidDepth: 400,
       noAskDepth: 400,
     }),
