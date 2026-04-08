@@ -18,7 +18,9 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     entryImbalanceRatio: 0.35,
     exitRebalanceRatio: 0.65,
     entryShares: 8,
-    maxPositionShares: 20,
+    // Phase 15: needs to be high enough to cover dust-safety minimum.
+    // At bestAsk=0.21, worstExit=0.063, minShares=ceil(2.5/0.063)=40 → use 60.
+    maxPositionShares: 60,
     cooldownMs: 15_000,
     slotWarmupMs: 5_000,
     stopEntryBeforeEndMs: 60_000,

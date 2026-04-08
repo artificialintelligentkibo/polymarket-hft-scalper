@@ -552,6 +552,25 @@ export class ObiEngine {
       return [];
     }
 
+    // Phase 15 (2026-04-08): if the risk cap forced finalShares BELOW the
+    // dust-safety minimum, we'd be re-entering exactly the trap Phase 11 was
+    // meant to prevent. Refuse the entry instead of silently shrinking into
+    // dust. This kicks in when OBI_MAX_POSITION_SHARES is set too low relative
+    // to the entry price (e.g. max=12 but dust-safety needs 24 @ bestAsk=0.36).
+    if (finalShares < minSharesForExitNotional) {
+      logger.info('OBI entry refused — risk cap below dust-safety minimum', {
+        marketId: market.marketId,
+        outcome: chosen.outcome,
+        bestAsk: chosen.bestAsk,
+        finalShares,
+        minSharesForExitNotional,
+        maxPositionShares: config.maxPositionShares,
+        worstExitPrice,
+        hint: 'increase OBI_MAX_POSITION_SHARES or lower OBI_MAX_ENTRY_PRICE',
+      });
+      return [];
+    }
+
     const entryNotional = roundTo(finalShares * chosen.bestAsk, 4);
     if (entryNotional < config.minEntryNotionalUsd) {
       return [];
