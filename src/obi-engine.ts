@@ -104,6 +104,19 @@ export interface ObiEngineConfig {
    * contra-trend entries that historically ended in hard stops.
    */
   readonly binanceContraAbsPct: number;
+  /**
+   * Phase 18 (2026-04-08): when true, REQUIRE Binance direction to align
+   * with the chosen outcome (UP→YES, DOWN→NO). FLAT direction or any
+   * misalignment blocks the entry regardless of magnitude. This is
+   * stricter than `binanceContraAbsPct` (which only blocks when the move
+   * is already large) — it refuses entries where Binance has no clear
+   * directional opinion at all.
+   *
+   * Live incident 2026-04-08 16:07: SOL OBI entry on YES with Binance
+   * FLAT (+1.2%) → SOL crashed to 0.01 within 2 minutes → full $8.55 loss.
+   * The contra gate didn't fire because absMove (0.012) was below 0.15.
+   */
+  readonly binanceRequireAlignment: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -202,7 +215,12 @@ export type ObiBinanceGateDecision =
   | { readonly blocked: false; readonly reason: null }
   | {
       readonly blocked: true;
-      readonly reason: 'runaway_abs' | 'contra_direction' | 'unavailable_required';
+      readonly reason:
+        | 'runaway_abs'
+        | 'contra_direction'
+        | 'unavailable_required'
+        | 'flat_direction'
+        | 'misaligned_strict';
       readonly movePct: number | null;
       readonly direction: 'UP' | 'DOWN' | 'FLAT' | null;
       readonly outcome: Outcome;
@@ -235,7 +253,10 @@ export function checkObiBinanceGate(params: {
   readonly outcome: Outcome;
   readonly config: Pick<
     ObiEngineConfig,
-    'binanceGateEnabled' | 'binanceRunawayAbsPct' | 'binanceContraAbsPct'
+    | 'binanceGateEnabled'
+    | 'binanceRunawayAbsPct'
+    | 'binanceContraAbsPct'
+    | 'binanceRequireAlignment'
   >;
 }): ObiBinanceGateDecision {
   const { assessment, outcome, config } = params;
@@ -277,6 +298,34 @@ export function checkObiBinanceGate(params: {
       return {
         blocked: true,
         reason: 'contra_direction',
+        movePct,
+        direction,
+        outcome,
+      };
+    }
+  }
+
+  // (3) Phase 18: strict directional alignment requirement.
+  // Block any entry where Binance is FLAT (no directional opinion) or
+  // where the chosen outcome doesn't match the Binance direction.
+  // This is the gate that would have stopped the SOL 16:07 loss.
+  if (config.binanceRequireAlignment) {
+    if (direction === 'FLAT') {
+      return {
+        blocked: true,
+        reason: 'flat_direction',
+        movePct,
+        direction,
+        outcome,
+      };
+    }
+    const misaligned =
+      (direction === 'UP' && outcome === 'NO') ||
+      (direction === 'DOWN' && outcome === 'YES');
+    if (misaligned) {
+      return {
+        blocked: true,
+        reason: 'misaligned_strict',
         movePct,
         direction,
         outcome,
@@ -1102,6 +1151,138 @@ export class ObiEngine {
    * signal still goes out with a defensive low targetPrice so the executor
    * can cross the spread.
    */
+  /**
+   * Phase 16 (2026-04-08): emergency hard-stop sweep.
+   *
+   * The normal hard-stop check lives inside generateExitSignals, which is
+   * only called by the host loop when a market is in the eligible-candidate
+   * list. If a market falls out of that list (slot ageing, filtering,
+   * candidate-pool churn) while we still hold a position, hard stop is
+   * silently bypassed and the position can implode.
+   *
+   * Live incident 2026-04-08 16:07: SOL OBI position bought at 0.45 with
+   * hardStopUsd=0.60. Best ask collapsed 0.45→0.01 over 2.5 minutes. Hard
+   * stop never fired (no log line at all). Position lost full $8.55.
+   *
+   * This sweep iterates ALL tracked OBI positions every cycle (called from
+   * the host's main loop), pulls the freshest orderbook via callback, and
+   * unconditionally fires the hard-stop signal if livePnl < -hardStopUsd.
+   * Independent of the per-market candidate loop.
+   *
+   * Fallback: when bestBid is null (one-sided book), uses bestAsk * 0.9
+   * as a defensive estimate so we still detect crashes from the ask side.
+   */
+  getEmergencyHardStopSignals(params: {
+    positionManager: (marketId: string) => PositionManager | null;
+    getOrderbook: (marketId: string) => MarketOrderbookSnapshot | null;
+    config: ObiEngineConfig;
+    excludeMarketIds?: Set<string>;
+    nowMs?: number;
+  }): StrategySignal[] {
+    const { positionManager, getOrderbook, config, excludeMarketIds } = params;
+    if (!config.enabled) return [];
+    const nowMs = params.nowMs ?? Date.now();
+    const out: StrategySignal[] = [];
+
+    // Throttle: 3s between repeat hard-stop emits per market. Cancel + sell
+    // typically settles within 1-2s; we don't want to spam fills.
+    const HARD_STOP_THROTTLE_MS = 3_000;
+
+    for (const [marketId, position] of this.positions.entries()) {
+      if (excludeMarketIds?.has(marketId)) continue;
+
+      const pm = positionManager(marketId);
+      if (!pm) continue;
+      const liveShares = pm.getShares(position.outcome);
+      if (liveShares <= 0) continue;
+
+      // Pull fresh orderbook from host. Fall back to last cached on the
+      // position object if host has nothing newer.
+      const orderbook = getOrderbook(marketId) ?? position.lastOrderbook ?? null;
+      if (!orderbook) continue;
+      const book = position.outcome === 'YES' ? orderbook.yes : orderbook.no;
+
+      // Defensive PnL price: prefer bestBid (what we'd actually realise on
+      // a market sell), fall back to bestAsk * 0.9 if the bid side is empty
+      // or zero. The 0.9 multiplier mirrors a typical market-impact haircut
+      // and is intentionally pessimistic so we err on the side of firing.
+      let pnlPrice: number | null = null;
+      let priceSource: 'bestBid' | 'bestAsk*0.9' | null = null;
+      if (book.bestBid !== null && book.bestBid > 0) {
+        pnlPrice = book.bestBid;
+        priceSource = 'bestBid';
+      } else if (book.bestAsk !== null && book.bestAsk > 0) {
+        pnlPrice = roundTo(book.bestAsk * 0.9, 6);
+        priceSource = 'bestAsk*0.9';
+      }
+      if (pnlPrice === null) continue;
+
+      const livePnlUsd = roundTo(
+        (pnlPrice - position.entryPrice) * liveShares,
+        4
+      );
+
+      if (livePnlUsd > -config.hardStopUsd) continue;
+
+      // Throttle repeat emits.
+      const lastEmit = this.lastOrphanEmitMs.get(marketId);
+      if (lastEmit !== undefined && nowMs - lastEmit < HARD_STOP_THROTTLE_MS) {
+        continue;
+      }
+
+      logger.warn('OBI emergency hard stop (sweep path)', {
+        marketId,
+        outcome: position.outcome,
+        entryPrice: position.entryPrice,
+        liveShares,
+        pnlPrice,
+        priceSource,
+        livePnlUsd,
+        hardStopUsd: config.hardStopUsd,
+        reason: 'sweep detected loss beyond hard-stop, market may be outside candidate loop',
+      });
+
+      this.lastOrphanEmitMs.set(marketId, nowMs);
+      this.totalExits += 1;
+      this.recordLosingExit(
+        { marketId, title: position.marketTitle } as MarketCandidate,
+        nowMs
+      );
+
+      out.push({
+        marketId,
+        marketTitle: position.marketTitle,
+        signalType: 'OBI_REBALANCE_EXIT',
+        priority: 999,
+        generatedAt: nowMs,
+        action: 'SELL',
+        outcome: position.outcome,
+        outcomeIndex: outcomeIndex(position.outcome),
+        shares: liveShares,
+        targetPrice: pnlPrice,
+        referencePrice: position.entryPrice,
+        tokenPrice: pnlPrice,
+        midPrice: orderbook.combined?.combinedMid ?? pnlPrice,
+        fairValue: position.entryPrice,
+        edgeAmount: 0,
+        combinedBid: orderbook.combined?.combinedBid ?? 0,
+        combinedAsk: orderbook.combined?.combinedAsk ?? 0,
+        combinedMid: orderbook.combined?.combinedMid ?? 0,
+        combinedDiscount: 0,
+        combinedPremium: 0,
+        fillRatio: 1,
+        capitalClamp: 1,
+        priceMultiplier: 1,
+        urgency: 'cross',
+        reduceOnly: true,
+        reason: `OBI emergency hard stop (sweep): pnl $${livePnlUsd.toFixed(2)} <= -$${config.hardStopUsd.toFixed(2)} via ${priceSource}`,
+        strategyLayer: resolveStrategyLayer('OBI_REBALANCE_EXIT'),
+      });
+    }
+
+    return out;
+  }
+
   getOrphanFlattenSignals(params: {
     positionManager: (marketId: string) => PositionManager | null;
     config: ObiEngineConfig;

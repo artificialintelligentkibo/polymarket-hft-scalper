@@ -45,6 +45,7 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     binanceGateEnabled: false,
     binanceRunawayAbsPct: 0.30,
     binanceContraAbsPct: 0.15,
+    binanceRequireAlignment: false,
     ...overrides,
   };
 }
@@ -946,6 +947,7 @@ test('checkObiBinanceGate: disabled gate always allows', () => {
       binanceGateEnabled: false,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, false);
@@ -959,6 +961,7 @@ test('checkObiBinanceGate: missing assessment fail-open', () => {
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, false);
@@ -972,6 +975,7 @@ test('checkObiBinanceGate: unavailable assessment fail-open', () => {
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, false);
@@ -985,6 +989,7 @@ test('checkObiBinanceGate: null movePct fail-open', () => {
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, false);
@@ -998,6 +1003,7 @@ test('checkObiBinanceGate: blocks runaway up regardless of outcome (YES)', () =>
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, true);
@@ -1015,6 +1021,7 @@ test('checkObiBinanceGate: blocks runaway down regardless of outcome (NO)', () =
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, true);
@@ -1029,6 +1036,7 @@ test('checkObiBinanceGate: blocks contra-direction (UP + buy NO)', () => {
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, true);
@@ -1046,6 +1054,7 @@ test('checkObiBinanceGate: blocks contra-direction (DOWN + buy YES)', () => {
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, true);
@@ -1060,6 +1069,7 @@ test('checkObiBinanceGate: allows with-flow (UP + buy YES)', () => {
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, false);
@@ -1073,6 +1083,7 @@ test('checkObiBinanceGate: allows small move below contra threshold', () => {
       binanceGateEnabled: true,
       binanceRunawayAbsPct: 0.30,
       binanceContraAbsPct: 0.15,
+      binanceRequireAlignment: false,
     },
   });
   assert.equal(decision.blocked, false);

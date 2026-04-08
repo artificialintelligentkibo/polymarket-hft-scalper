@@ -422,21 +422,120 @@ export class MarketMakerRuntime {
           } catch { /* best-effort */ }
         }
       } else {
-        logger.warn('Redeem PnL deferred - market resolution unavailable', {
-          conditionId,
-          title: String((payload as { title?: unknown })?.title ?? entry.marketTitle ?? 'Unknown'),
-          redeemedShares,
-          yesShares: redeemSettlement.yesShares,
-          noShares: redeemSettlement.noShares,
-          pairedShares: redeemSettlement.pairedShares,
-          yesFinalPrice: resolution.yesFinalPrice,
-          noFinalPrice: resolution.noFinalPrice,
-          costBasis: entry.totalCostUsd,
-          soldShares: entry.soldShares,
-          soldCostUsd: entry.soldCostUsd,
-          soldProceeds: entry.soldProceeds,
-          reason: 'Resolution lookup did not return a verified winning outcome',
-        });
+        // Phase 17 (2026-04-08): even when the strict resolution checker
+        // hasn't verified a winningOutcome, we frequently HAVE yesFinalPrice
+        // and noFinalPrice from the CLOB tick feed. The bot has already
+        // submitted the redeem and got `actualPayoutUsd` from
+        // `resolveVerifiedRedeemPayoutUsd` — the money is already gone (or
+        // returned). We MUST record the realized PnL into totalDayPnl,
+        // otherwise the dashboard reports stale fake-positive values and
+        // the operator is flying blind.
+        //
+        // Live incident 2026-04-08 16:13: SOL OBI position lost full $8.55
+        // (yesFinalPrice 0.235, noFinalPrice 0.765 → NO won, bot held YES,
+        // payout 0). resolution.resolved was false at redeem time so the
+        // loss vanished from day PnL. Dashboard kept reporting +$1.46
+        // while actual cash dropped from $24.75 to $21.43 (-$3.32).
+        let derivedWinningOutcome: 'YES' | 'NO' | null = null;
+        if (
+          resolution.yesFinalPrice !== null &&
+          resolution.noFinalPrice !== null
+        ) {
+          derivedWinningOutcome =
+            resolution.yesFinalPrice >= resolution.noFinalPrice ? 'YES' : 'NO';
+        } else if (resolution.yesFinalPrice !== null) {
+          derivedWinningOutcome =
+            resolution.yesFinalPrice >= 0.5 ? 'YES' : 'NO';
+        } else if (resolution.noFinalPrice !== null) {
+          derivedWinningOutcome =
+            resolution.noFinalPrice >= 0.5 ? 'NO' : 'YES';
+        }
+
+        if (derivedWinningOutcome !== null) {
+          const derivedPayoutUsd = resolveVerifiedRedeemPayoutUsd({
+            yesShares: redeemSettlement.yesShares,
+            noShares: redeemSettlement.noShares,
+            winningOutcome: derivedWinningOutcome,
+          });
+          const result = this.costBasisLedger.calculateRedeemPnl(
+            conditionId,
+            redeemedShares,
+            derivedPayoutUsd
+          );
+          if (result.found && Number.isFinite(result.pnl)) {
+            const dayState = market
+              ? recordSettlementPnl({
+                  slotKey: getSlotKey(market),
+                  marketId: market.marketId,
+                  marketTitle: market.title,
+                  pnl: result.pnl,
+                  outcome: resolveSlotOutcome(market, derivedWinningOutcome),
+                  slotStart: market.startTime,
+                  slotEnd: market.endTime,
+                  now: redeemedAt,
+                })
+              : recordDayPnlDelta(result.pnl, redeemedAt, config);
+            this.redeemPnlToday = roundTo(this.redeemPnlToday + result.pnl, 4);
+            logger.warn(
+              'Redeem PnL recorded from derived resolution (Phase 17 fallback)',
+              {
+                conditionId,
+                title: String(
+                  (payload as { title?: unknown })?.title ??
+                    entry.marketTitle ??
+                    'Unknown'
+                ),
+                redeemedShares,
+                yesShares: redeemSettlement.yesShares,
+                noShares: redeemSettlement.noShares,
+                derivedWinningOutcome,
+                yesFinalPrice: resolution.yesFinalPrice,
+                noFinalPrice: resolution.noFinalPrice,
+                derivedPayoutUsd,
+                costBasis: entry.totalCostUsd,
+                redeemPnl: result.pnl,
+                newDayPnl: dayState.dayPnl,
+                reason:
+                  'strict resolution unverified, derived winner from CLOB final prices',
+              }
+            );
+            dayStateOverride = {
+              totalDayPnl: dayState.dayPnl,
+              dayDrawdown: dayState.drawdown,
+            };
+          } else {
+            logger.warn(
+              'Redeem PnL deferred - cost basis lookup failed despite derived winner',
+              {
+                conditionId,
+                derivedWinningOutcome,
+                yesFinalPrice: resolution.yesFinalPrice,
+                noFinalPrice: resolution.noFinalPrice,
+              }
+            );
+          }
+        } else {
+          logger.warn('Redeem PnL deferred - market resolution unavailable', {
+            conditionId,
+            title: String(
+              (payload as { title?: unknown })?.title ??
+                entry.marketTitle ??
+                'Unknown'
+            ),
+            redeemedShares,
+            yesShares: redeemSettlement.yesShares,
+            noShares: redeemSettlement.noShares,
+            pairedShares: redeemSettlement.pairedShares,
+            yesFinalPrice: resolution.yesFinalPrice,
+            noFinalPrice: resolution.noFinalPrice,
+            costBasis: entry.totalCostUsd,
+            soldShares: entry.soldShares,
+            soldCostUsd: entry.soldCostUsd,
+            soldProceeds: entry.soldProceeds,
+            reason:
+              'Resolution lookup did not return a verified winning outcome AND no CLOB final prices available',
+          });
+        }
       }
 
       this.costBasisLedger.consume(conditionId);
@@ -884,6 +983,61 @@ export class MarketMakerRuntime {
         });
       }
     );
+
+    // === Phase 16: OBI emergency hard-stop sweep ===
+    // Iterates ALL tracked OBI positions every cycle (independent of the
+    // per-market candidate loop) and fires hard-stop SELL signals on any
+    // position whose unrealised PnL is past -hardStopUsd. Catches the
+    // 2026-04-08 SOL incident where a position fell out of the candidate
+    // list mid-slot and the in-loop hard stop was silently bypassed.
+    if (config.obiEngine.enabled) {
+      try {
+        // NOTE: do NOT exclude preparedMarketIds here. The throttle inside
+        // getEmergencyHardStopSignals (3s) prevents double-firing if the
+        // in-loop generateExitSignals already emitted. The point of the
+        // sweep is to be a safety net even for in-loop markets, in case
+        // generateExitSignals returned early for any reason.
+        const hardStops = this.obiEngine.getEmergencyHardStopSignals({
+          positionManager: (marketId) => this.positions.get(marketId) ?? null,
+          getOrderbook: (marketId) => this.latestBooks.get(marketId) ?? null,
+          config: config.obiEngine,
+        });
+        for (const sig of hardStops) {
+          const stopBook = this.latestBooks.get(sig.marketId);
+          const stopPosManager = this.positions.get(sig.marketId);
+          const stopMarket = this.markets.get(sig.marketId);
+          if (!stopBook || !stopPosManager || !stopMarket) {
+            logger.warn('OBI hard-stop sweep skipped: missing context', {
+              marketId: sig.marketId,
+              hasBook: !!stopBook,
+              hasPosManager: !!stopPosManager,
+              hasMarket: !!stopMarket,
+            });
+            continue;
+          }
+          this.scheduleBackgroundTask(async () => {
+            try {
+              await this.executeSignal(
+                stopMarket,
+                stopBook,
+                stopPosManager,
+                sig,
+                getSlotKey(stopMarket)
+              );
+            } catch (error) {
+              logger.warn('OBI hard-stop sweep execution failed', {
+                marketId: sig.marketId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          });
+        }
+      } catch (error) {
+        logger.warn('OBI hard-stop sweep failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
 
     // === OBI orphan slot-end safety net ===
     // After the normal per-market cycle, check if any OBI position is held on

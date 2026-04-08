@@ -1350,6 +1350,14 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.OBI_BINANCE_CONTRA_ABS_PCT, '0.15')
       ),
+      // Phase 18 (2026-04-08): strict Binance directional alignment.
+      // When true, OBI entries require Binance direction to match outcome
+      // (UP→YES, DOWN→NO) and reject FLAT direction outright. Default off
+      // to preserve historical behaviour; flip on for small bankrolls.
+      binanceRequireAlignment: parseBoolean(
+        env.OBI_BINANCE_REQUIRE_ALIGNMENT,
+        false
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
