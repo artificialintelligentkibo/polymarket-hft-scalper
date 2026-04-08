@@ -2167,6 +2167,26 @@ export class MarketMakerRuntime {
             const obiOrderbook = obiBook;
             this.scheduleBackgroundTask(async () => {
               try {
+                // Variant A2 (2026-04-08 MM refresh race): onEntryFill fires
+                // on EVERY partial fill of OBI_ENTRY_BUY, and each call emits
+                // a fresh OBI_MM_QUOTE_ASK sized against the accumulated
+                // position. The previous OBI_MM_QUOTE_ASK from the earlier
+                // partial fill is still resting on CLOB, locking the same
+                // shares as collateral ("sum of active orders: N"). Without
+                // cancelling first, the new quote fails with "balance is
+                // not enough" and retries storm. Reuse the exit-path helper
+                // — it cancels by (marketId, outcome, side=SELL,
+                // OBI_MM_QUOTE_*) which matches what we need here.
+                if (
+                  obiSignal.signalType === 'OBI_MM_QUOTE_ASK' ||
+                  obiSignal.signalType === 'OBI_MM_QUOTE_BID'
+                ) {
+                  await this.cancelPendingObiMakerQuotes({
+                    marketId: fill.marketId,
+                    outcome: obiSignal.outcome,
+                    triggeredBy: obiSignal.signalType,
+                  });
+                }
                 await this.executeSignal(
                   market,
                   obiOrderbook,
@@ -3658,7 +3678,7 @@ export class MarketMakerRuntime {
           this.getPendingOrderKey(params.marketId, params.outcome)
         );
         cancelledCount += 1;
-        logger.info('Cancelled pending OBI maker quote before exit', {
+        logger.info('Cancelled pending OBI maker quote', {
           marketId: params.marketId,
           outcome: params.outcome,
           triggeredBy: params.triggeredBy,
@@ -3671,7 +3691,7 @@ export class MarketMakerRuntime {
         // Don't block the exit on a cancel failure — the placeOrder will
         // either retry past it or fail with the same balance error, which
         // is at least no worse than before this fix.
-        logger.warn('Failed to cancel pending OBI maker quote before exit', {
+        logger.warn('Failed to cancel pending OBI maker quote', {
           marketId: params.marketId,
           outcome: params.outcome,
           triggeredBy: params.triggeredBy,
