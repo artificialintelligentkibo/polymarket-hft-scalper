@@ -48,6 +48,18 @@ export function isQuotingSignalType(signalType: SignalType): boolean {
   );
 }
 
+/**
+ * True for OBI position-exit signals (collapse, hard-stop, scalp, rebalance,
+ * orphan flatten — all of which are emitted as either OBI_REBALANCE_EXIT or
+ * OBI_SCALP_EXIT depending on the trigger). These signals must FIRST cancel
+ * any pending OBI_MM_QUOTE_ASK on the same market+outcome, otherwise the
+ * resting maker order locks the underlying shares as collateral and the
+ * exit fails with "balance not enough" until the maker times out.
+ */
+export function isObiExitSignal(signalType: SignalType): boolean {
+  return signalType === 'OBI_REBALANCE_EXIT' || signalType === 'OBI_SCALP_EXIT';
+}
+
 export function bypassesBinanceEdge(signalType: SignalType): boolean {
   return (
     signalType === 'LATENCY_MOMENTUM_BUY' ||

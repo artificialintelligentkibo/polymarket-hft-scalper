@@ -91,6 +91,7 @@ import {
 import {
   bypassesBinanceEdge,
   isLayerConflict,
+  isObiExitSignal,
   isQuotingSignalType,
   resolveStrategyLayer,
   type StrategyLayer,
@@ -1458,6 +1459,25 @@ export class MarketMakerRuntime {
 
     const beforeSnapshot = positionManager.getSnapshot();
     const beforeOutcomeLayer = positionManager.getPositionLayer(executionSignal.outcome);
+
+    // OBI exit signals (OBI_REBALANCE_EXIT / OBI_SCALP_EXIT — the umbrella
+    // type for hard stop, collapse, rebalance, scalp, orphan flatten) must
+    // first cancel any pending OBI_MM_QUOTE_ASK on the same market+outcome
+    // so the resting maker order's collateral is released before we try to
+    // submit the cross-spread exit. See cancelPendingObiMakerQuotes for the
+    // full rationale (2026-04-08 race condition).
+    if (
+      !paperTradingEnabled &&
+      isObiExitSignal(executionSignal.signalType) &&
+      executionSignal.action === 'SELL'
+    ) {
+      await this.cancelPendingObiMakerQuotes({
+        marketId: market.marketId,
+        outcome: executionSignal.outcome,
+        triggeredBy: executionSignal.signalType,
+      });
+    }
+
     const startedAt = Date.now();
     const execution = await this.executor.executeSignal({
       market,
@@ -3583,6 +3603,94 @@ export class MarketMakerRuntime {
 
       return !this.isDustAbandoned(market.marketId, signal.outcome);
     });
+  }
+
+  /**
+   * Cancel any pending OBI maker quotes (OBI_MM_QUOTE_ASK / OBI_MM_QUOTE_BID)
+   * for the given market+outcome BEFORE submitting an OBI exit signal.
+   *
+   * Why this exists: when an OBI entry fills, the engine immediately posts
+   * a resting OBI_MM_QUOTE_ASK at entry+spread to capture the rebalance.
+   * Polymarket CLOB locks the underlying outcome tokens as collateral for
+   * that resting sell ("sum of active orders: N"). On the next tick, if
+   * the book reverses and the engine emits an exit signal (HARD_STOP /
+   * COLLAPSE / REBALANCE / SCALP — all containerised as OBI_REBALANCE_EXIT
+   * or OBI_SCALP_EXIT), the new sell order is rejected by CLOB with
+   * "balance is not enough -> balance: N, sum of active orders: N" because
+   * the exact same shares are already committed to the resting maker.
+   *
+   * The 2026-04-08 XRP / BTC sessions reproduced this multiple times. The
+   * exit eventually got through after retries, but at significantly worse
+   * prices because the book moved during the retry storm.
+   *
+   * Fix: before any OBI exit, walk the FillTracker for pending OBI maker
+   * orders on the same (marketId, outcome) and cancel them. Wait briefly
+   * for CLOB to release collateral. Then proceed with the exit.
+   *
+   * Returns the number of orders successfully cancelled.
+   */
+  private async cancelPendingObiMakerQuotes(params: {
+    marketId: string;
+    outcome: StrategySignal['outcome'];
+    triggeredBy: StrategySignal['signalType'];
+  }): Promise<number> {
+    const pending = this.fillTracker
+      .getPendingOrders()
+      .filter(
+        (order) =>
+          order.marketId === params.marketId &&
+          order.outcome === params.outcome &&
+          order.side === 'SELL' &&
+          (order.signalType === 'OBI_MM_QUOTE_ASK' ||
+            order.signalType === 'OBI_MM_QUOTE_BID')
+      );
+
+    if (pending.length === 0) {
+      return 0;
+    }
+
+    let cancelledCount = 0;
+    for (const order of pending) {
+      try {
+        await this.executor.cancelOrder(order.orderId);
+        this.fillTracker.forgetPendingOrder(order.orderId);
+        this.clearPendingLiveOrder(
+          this.getPendingOrderKey(params.marketId, params.outcome)
+        );
+        cancelledCount += 1;
+        logger.info('Cancelled pending OBI maker quote before exit', {
+          marketId: params.marketId,
+          outcome: params.outcome,
+          triggeredBy: params.triggeredBy,
+          cancelledOrderId: order.orderId,
+          cancelledSignalType: order.signalType,
+          cancelledShares: order.submittedShares,
+          cancelledPrice: order.submittedPrice,
+        });
+      } catch (error) {
+        // Don't block the exit on a cancel failure — the placeOrder will
+        // either retry past it or fail with the same balance error, which
+        // is at least no worse than before this fix.
+        logger.warn('Failed to cancel pending OBI maker quote before exit', {
+          marketId: params.marketId,
+          outcome: params.outcome,
+          triggeredBy: params.triggeredBy,
+          orderId: order.orderId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (cancelledCount > 0) {
+      // Brief pause to let CLOB release the collateral on the cancelled
+      // orders. Empirically the existing maker→taker fallback path uses
+      // 2000ms, but for time-critical exits (hard stop) we want to be much
+      // faster. 250ms is comfortably above the observed network round-trip
+      // (~50-100ms) and has been sufficient in similar engines.
+      await sleep(250);
+    }
+
+    return cancelledCount;
   }
 
   private abandonPositionForRedeem(params: {

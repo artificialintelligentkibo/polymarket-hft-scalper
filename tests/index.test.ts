@@ -638,6 +638,188 @@ test('dust-abandoned positions are pruned when inventory disappears', () => {
   assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), false);
 });
 
+// Regression: 2026-04-08 OBI race condition.
+//
+// When an OBI entry fills, the engine immediately posts a resting
+// OBI_MM_QUOTE_ASK that locks the underlying outcome tokens as collateral.
+// If the book reverses on the next tick and the engine fires an exit
+// (OBI_REBALANCE_EXIT for hard stop / collapse / rebalance, or
+// OBI_SCALP_EXIT), the exit is rejected by CLOB with
+// "balance is not enough -> sum of active orders: N" because the same
+// shares are committed to the resting maker.
+//
+// Fix: cancelPendingObiMakerQuotes is called before any OBI exit, walking
+// the FillTracker for matching maker orders and cancelling them.
+test('OBI exit signal cancels pending OBI_MM_QUOTE_ASK before submitting exit', async () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 8,
+    price: 0.39,
+  });
+
+  const cancelledOrderIds: string[] = [];
+  const callOrder: string[] = [];
+
+  runtime.syncRuntimeStatus = () => {};
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.executor = {
+    executeSignal: async () => {
+      callOrder.push('executeSignal');
+      return createExecutionReport({
+        side: 'SELL',
+        shares: 8,
+        filledShares: 8,
+        fillPrice: 0.32,
+        simulation: false,
+      });
+    },
+    cancelOrder: async (orderId: string) => {
+      callOrder.push(`cancelOrder:${orderId}`);
+      cancelledOrderIds.push(orderId);
+    },
+    getOutcomeTokenBalance: async () => 8,
+    invalidateOutcomeBalanceCache: () => {},
+    invalidateBalanceValidationCache: () => {},
+  };
+  runtime.fillTracker = {
+    getPendingOrders: () => [
+      {
+        orderId: 'maker-order-1',
+        marketId: 'market-1',
+        slotKey: 'slot-1',
+        tokenId: 'yes-token',
+        outcome: 'YES',
+        side: 'SELL',
+        submittedShares: 8,
+        submittedPrice: 0.396,
+        signalType: 'OBI_MM_QUOTE_ASK',
+        placedAt: Date.now(),
+        slotEndTime: market.endTime!,
+        lastCheckedAt: 0,
+        filledSharesSoFar: 0,
+      },
+    ],
+    forgetPendingOrder: () => {},
+    hasPendingOrderFor: () => false,
+    registerPendingOrder: () => {},
+  };
+  runtime.recordSkippedSignal = () => {};
+
+  const exitSignal = createSignal({
+    signalType: 'OBI_REBALANCE_EXIT',
+    action: 'SELL',
+    reduceOnly: true,
+    shares: 8,
+    targetPrice: 0.32,
+    referencePrice: 0.39,
+    tokenPrice: 0.32,
+    midPrice: 0.355,
+    fairValue: 0.39,
+    urgency: 'cross',
+  });
+
+  await runtime.executeSignal(market, orderbook, positionManager, exitSignal, 'slot-1');
+
+  assert.deepEqual(
+    cancelledOrderIds,
+    ['maker-order-1'],
+    'pending OBI_MM_QUOTE_ASK must be cancelled before exit'
+  );
+  assert.equal(callOrder[0], 'cancelOrder:maker-order-1', 'cancel must happen first');
+  assert.equal(callOrder[1], 'executeSignal', 'exit submission must happen after cancel');
+});
+
+test('non-OBI exit signal does not cancel pending OBI_MM_QUOTE_ASK', async () => {
+  // Sanity: a SLOT_FLATTEN or SNIPER_SCALP_EXIT must not touch OBI maker
+  // orders — the helper is scoped to OBI exits only so we don't accidentally
+  // interfere with sniper or other layer behaviour.
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+  const orderbook = createOrderbook();
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 8,
+    price: 0.39,
+  });
+
+  const cancelledOrderIds: string[] = [];
+
+  runtime.syncRuntimeStatus = () => {};
+  runtime.statusMonitor = {
+    isPaused: () => false,
+    getState: () => ({ reason: null, source: null }),
+  };
+  runtime.executor = {
+    executeSignal: async () =>
+      createExecutionReport({
+        side: 'SELL',
+        shares: 8,
+        filledShares: 8,
+        simulation: false,
+      }),
+    cancelOrder: async (orderId: string) => {
+      cancelledOrderIds.push(orderId);
+    },
+    getOutcomeTokenBalance: async () => 8,
+    invalidateOutcomeBalanceCache: () => {},
+    invalidateBalanceValidationCache: () => {},
+  };
+  runtime.fillTracker = {
+    getPendingOrders: () => [
+      {
+        orderId: 'maker-order-1',
+        marketId: 'market-1',
+        slotKey: 'slot-1',
+        tokenId: 'yes-token',
+        outcome: 'YES',
+        side: 'SELL',
+        submittedShares: 8,
+        submittedPrice: 0.396,
+        signalType: 'OBI_MM_QUOTE_ASK',
+        placedAt: Date.now(),
+        slotEndTime: market.endTime!,
+        lastCheckedAt: 0,
+        filledSharesSoFar: 0,
+      },
+    ],
+    forgetPendingOrder: () => {},
+    hasPendingOrderFor: () => false,
+    registerPendingOrder: () => {},
+  };
+  runtime.recordSkippedSignal = () => {};
+
+  const slotFlatten = createSignal({
+    signalType: 'SLOT_FLATTEN',
+    action: 'SELL',
+    reduceOnly: true,
+    shares: 8,
+    targetPrice: 0.32,
+    referencePrice: 0.39,
+    tokenPrice: 0.32,
+    midPrice: 0.355,
+    fairValue: 0.39,
+    urgency: 'cross',
+  });
+
+  await runtime.executeSignal(market, orderbook, positionManager, slotFlatten, 'slot-1');
+
+  assert.deepEqual(
+    cancelledOrderIds,
+    [],
+    'non-OBI exit signals must not cancel OBI maker orders'
+  );
+});
+
 test('executeSignal keeps the live pending-order cooldown until fill confirmation arrives', async () => {
   const runtime = new MarketMakerRuntime() as any;
   const market = createMarket();
