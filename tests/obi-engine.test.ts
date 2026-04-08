@@ -298,6 +298,7 @@ test('obi engine onEntryFill emits OBI_MM_QUOTE_ASK when enabled', () => {
     outcome: 'YES',
     fillPrice: 0.21,
     filledShares: 8,
+    totalLiveShares: 8,
     orderbook: ob,
     config: baseConfig(),
     nowMs: FIXED_NOW,
@@ -329,6 +330,7 @@ test('obi engine emits OBI_REBALANCE_EXIT when ratio recovers', () => {
     outcome: 'YES',
     fillPrice: 0.21,
     filledShares: 8,
+    totalLiveShares: 8,
     orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
     config: baseConfig(),
     nowMs: FIXED_NOW,
@@ -361,6 +363,7 @@ test('obi engine emits OBI_SCALP_EXIT when bid moves above entry+edge', () => {
     outcome: 'YES',
     fillPrice: 0.20,
     filledShares: 8,
+    totalLiveShares: 8,
     orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
     config: baseConfig(),
     nowMs: FIXED_NOW,
@@ -407,6 +410,7 @@ test('obi engine clearState removes per-market state', () => {
     outcome: 'YES',
     fillPrice: 0.21,
     filledShares: 8,
+    totalLiveShares: 8,
     orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
     config: baseConfig(),
     nowMs: FIXED_NOW,
@@ -424,4 +428,138 @@ test('obi engine clearState removes per-market state', () => {
     nowMs: FIXED_NOW + 1_000,
   });
   assert.equal(signals.length, 1);
+});
+
+// Regression: 2026-04-08 XRP $5.28 incident.
+//
+// Two-clip partial fill (10 + 2 shares) used to overwrite the position state
+// on the second call AND emit an MM_QUOTE_ASK sized to just the 2-share
+// increment. The undersized quote then failed CLOB minimums and triggered
+// dust-abandonment of the entire 12-share position.
+//
+// After the fix:
+//   - the second onEntryFill must accumulate (12 total shares, VWAP price)
+//   - the emitted MM_QUOTE_ASK must be sized to the FULL accumulated position
+test('obi engine onEntryFill accumulates multi-clip partial fills (2026-04-08 regression)', () => {
+  const engine = new ObiEngine();
+  const ob = createOrderbook({
+    yesBid: 0.43,
+    yesAsk: 0.44,
+    yesBidDepth: 4,
+    yesAskDepth: 800,
+  });
+
+  // First clip: 10 shares filled @ $0.44
+  const firstFollowOns = engine.onEntryFill({
+    marketId: 'market-xrp',
+    outcome: 'NO',
+    fillPrice: 0.44,
+    filledShares: 10,
+    totalLiveShares: 10,
+    orderbook: ob,
+    config: baseConfig(),
+    nowMs: FIXED_NOW,
+  });
+  const firstAsk = firstFollowOns.find((s) => s.signalType === 'OBI_MM_QUOTE_ASK');
+  assert.ok(firstAsk, 'first MM_QUOTE_ASK expected');
+  assert.equal(firstAsk!.shares, 10, 'first quote should be sized to 10 shares');
+
+  // Second clip: 2 more shares fill @ $0.45 (slightly different price to
+  // exercise VWAP). totalLiveShares is now 12.
+  const secondFollowOns = engine.onEntryFill({
+    marketId: 'market-xrp',
+    outcome: 'NO',
+    fillPrice: 0.45,
+    filledShares: 2,
+    totalLiveShares: 12,
+    orderbook: ob,
+    config: baseConfig(),
+    nowMs: FIXED_NOW + 1_000,
+  });
+  const secondAsk = secondFollowOns.find((s) => s.signalType === 'OBI_MM_QUOTE_ASK');
+  assert.ok(secondAsk, 'second MM_QUOTE_ASK expected');
+  assert.equal(
+    secondAsk!.shares,
+    12,
+    'second quote MUST be sized to FULL accumulated position (12), not increment (2)'
+  );
+  // Reference price should be VWAP of (10*0.44 + 2*0.45)/12 = 0.4417
+  assert.ok(
+    Math.abs((secondAsk!.referencePrice ?? 0) - 0.441667) < 0.001,
+    `expected VWAP ~0.4417, got ${secondAsk!.referencePrice}`
+  );
+
+  // Position state should also be accumulated (single position, 12 shares).
+  const positions = engine.getActivePositions();
+  assert.equal(positions.length, 1);
+  assert.equal(positions[0]!.entryShares, 12);
+});
+
+// Regression: 2026-04-08 orphan-flatten spam.
+//
+// Once a slot ends, getOrphanFlattenSignals used to re-emit a flatten on
+// every tick (~2.5s) with no throttle and no upper bound on lateness. After
+// the fix:
+//   - successive calls within 5s of an emit must NOT re-emit
+//   - once the slot has been over for >120s, the position is dropped from
+//     tracking and no further signals are emitted
+test('obi engine getOrphanFlattenSignals throttles and gives up after 120s', () => {
+  const engine = new ObiEngine();
+  const slotEnd = '2026-04-08T05:50:00Z';
+  const slotEndMs = Date.parse(slotEnd);
+
+  engine.onEntryFill({
+    marketId: 'market-orphan',
+    marketTitle: 'Orphan Test',
+    outcome: 'YES',
+    fillPrice: 0.30,
+    filledShares: 12,
+    totalLiveShares: 12,
+    orderbook: createOrderbook({ yesBidDepth: 4, yesAskDepth: 800 }),
+    config: baseConfig(),
+    slotEndTime: slotEnd,
+    nowMs: slotEndMs - 60_000,
+  });
+
+  const pmFactory = (marketId: string) =>
+    marketId === 'market-orphan'
+      ? new FakePositionManager(marketId, { YES: 12, NO: 0 })
+      : null;
+
+  // First call after slot end — should emit.
+  const first = engine.getOrphanFlattenSignals({
+    positionManager: pmFactory,
+    config: baseConfig(),
+    nowMs: slotEndMs + 5_000,
+  });
+  assert.equal(first.length, 1, 'first call should emit one flatten signal');
+
+  // Immediately after — throttled.
+  const second = engine.getOrphanFlattenSignals({
+    positionManager: pmFactory,
+    config: baseConfig(),
+    nowMs: slotEndMs + 6_000,
+  });
+  assert.equal(second.length, 0, 'second call within 5s must be throttled');
+
+  // After throttle window expires — emits again.
+  const third = engine.getOrphanFlattenSignals({
+    positionManager: pmFactory,
+    config: baseConfig(),
+    nowMs: slotEndMs + 11_000,
+  });
+  assert.equal(third.length, 1, 'after throttle window, should emit again');
+
+  // Far past slot end — give up entirely, position dropped from tracking.
+  const fourth = engine.getOrphanFlattenSignals({
+    positionManager: pmFactory,
+    config: baseConfig(),
+    nowMs: slotEndMs + 130_000,
+  });
+  assert.equal(fourth.length, 0, 'past 120s give-up window, must not emit');
+  assert.equal(
+    engine.getActivePositions().length,
+    0,
+    'position should be dropped from tracking after give-up'
+  );
 });

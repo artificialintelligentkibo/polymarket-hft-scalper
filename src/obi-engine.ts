@@ -81,8 +81,10 @@ export interface ObiEngineConfig {
 interface ObiPosition {
   readonly marketId: string;
   readonly outcome: Outcome;
-  readonly entryPrice: number;
-  readonly entryShares: number;
+  /** VWAP entry price across all partial fills accumulated into this position. */
+  entryPrice: number;
+  /** Total accumulated shares across all partial fills. */
+  entryShares: number;
   readonly enteredAtMs: number;
   readonly initialRatio: number;
   readonly thinSide: 'bid' | 'ask';
@@ -143,6 +145,8 @@ export class ObiEngine {
   private readonly lastEntryMs = new Map<string, number>();
   /** Markets where we recently exited at a loss — extra cooldown applies. */
   private readonly lastLosingExitMs = new Map<string, number>();
+  /** Last time getOrphanFlattenSignals emitted for a market — used to throttle. */
+  private readonly lastOrphanEmitMs = new Map<string, number>();
   /** Last available USDC balance reported by host. Used for pre-flight check. */
   private availableUsdcBalance: number | null = null;
   private totalEntries = 0;
@@ -347,8 +351,19 @@ export class ObiEngine {
   }
 
   /**
-   * Called immediately after an OBI_ENTRY_BUY fill is confirmed. Records
-   * the position and returns Layer-2 MM quote signals.
+   * Called immediately after an OBI_ENTRY_BUY fill is confirmed. Records the
+   * position and returns Layer-2 MM quote signals.
+   *
+   * IMPORTANT — partial fill semantics: this is invoked once per fill event.
+   * For multi-clip entries (e.g. 10 + 2 shares) it will be called multiple
+   * times with `filledShares` being the *increment* of that fill, not the
+   * accumulated total. We therefore:
+   *   - merge into any existing position (VWAP entry price, summed shares),
+   *   - quote MM_QUOTE_ASK against the *total* live position from
+   *     positionManager (so the maker quote is sized correctly even after
+   *     repeated partial fills),
+   *   - never overwrite slotEndMs / initialRatio / thinSide on a re-entry,
+   *     since those describe the original entry intent.
    */
   onEntryFill(params: {
     marketId: string;
@@ -358,39 +373,80 @@ export class ObiEngine {
     filledShares: number;
     orderbook: MarketOrderbookSnapshot;
     config: ObiEngineConfig;
+    /** Total live shares on this outcome AFTER this fill was applied. */
+    totalLiveShares: number;
     nowMs?: number;
     /** Slot end time (ISO string from MarketCandidate.endTime). */
     slotEndTime?: string | null;
   }): StrategySignal[] {
-    const { marketId, outcome, fillPrice, filledShares, orderbook, config } = params;
-    const nowMs = params.nowMs ?? Date.now();
-    const title = params.marketTitle ?? marketId;
-    const slotEndMs = parseTimeMs(params.slotEndTime ?? null);
-
-    const book = outcome === 'YES' ? orderbook.yes : orderbook.no;
-    const bidDepth = roundTo(book.depthNotionalBid, 4);
-    const askDepth = roundTo(book.depthNotionalAsk, 4);
-    const thinSide: 'bid' | 'ask' = bidDepth <= askDepth ? 'bid' : 'ask';
-    const thinDepth = thinSide === 'bid' ? bidDepth : askDepth;
-    const thickDepth = thinSide === 'bid' ? askDepth : bidDepth;
-    const initialRatio = safeRatio(thinDepth, thickDepth);
-
-    this.positions.set(marketId, {
+    const {
       marketId,
       outcome,
-      entryPrice: fillPrice,
-      entryShares: filledShares,
-      enteredAtMs: nowMs,
-      initialRatio,
-      thinSide,
-      slotEndMs,
-      lastOrderbook: orderbook,
-      marketTitle: title,
-    });
+      fillPrice,
+      filledShares,
+      orderbook,
+      config,
+      totalLiveShares,
+    } = params;
+    const nowMs = params.nowMs ?? Date.now();
+    const title = params.marketTitle ?? marketId;
+
+    const book = outcome === 'YES' ? orderbook.yes : orderbook.no;
+    const existing = this.positions.get(marketId);
+
+    if (existing && existing.outcome === outcome) {
+      // Accumulate partial fill into existing position via VWAP. We do not
+      // touch initialRatio / thinSide / slotEndMs — they describe the original
+      // entry context and must stay stable across partial fills.
+      const priorShares = existing.entryShares;
+      const newShares = roundTo(priorShares + filledShares, 6);
+      if (newShares > 0) {
+        existing.entryPrice = roundTo(
+          (existing.entryPrice * priorShares + fillPrice * filledShares) /
+            newShares,
+          6
+        );
+        existing.entryShares = newShares;
+      }
+      existing.lastOrderbook = orderbook;
+    } else {
+      const bidDepth = roundTo(book.depthNotionalBid, 4);
+      const askDepth = roundTo(book.depthNotionalAsk, 4);
+      const thinSide: 'bid' | 'ask' = bidDepth <= askDepth ? 'bid' : 'ask';
+      const thinDepth = thinSide === 'bid' ? bidDepth : askDepth;
+      const thickDepth = thinSide === 'bid' ? askDepth : bidDepth;
+      const initialRatio = safeRatio(thinDepth, thickDepth);
+      const slotEndMs = parseTimeMs(params.slotEndTime ?? null);
+
+      this.positions.set(marketId, {
+        marketId,
+        outcome,
+        entryPrice: fillPrice,
+        entryShares: filledShares,
+        enteredAtMs: nowMs,
+        initialRatio,
+        thinSide,
+        slotEndMs,
+        lastOrderbook: orderbook,
+        marketTitle: title,
+      });
+    }
     // Lock cooldown on confirmed fill so even if generateSignals re-runs we
     // don't re-enter immediately.
     this.lastEntryMs.set(marketId, nowMs);
     this.totalEntries += 1;
+
+    // Use total live shares for the maker quote, not just this fill's
+    // increment, otherwise repeated partial fills produce undersized quotes
+    // that fail CLOB minimums and trigger dust-abandonment of the entire
+    // healthy position.
+    const quoteShares = roundTo(
+      Math.max(0, Number.isFinite(totalLiveShares) ? totalLiveShares : filledShares),
+      4
+    );
+    // Reference price for the maker quote is the position's accumulated VWAP
+    // (so spread is computed against actual cost basis, not just this clip).
+    const quoteRefPrice = this.positions.get(marketId)?.entryPrice ?? fillPrice;
 
     if (config.shadowMode) {
       logger.info('OBI engine (shadow) onEntryFill', {
@@ -398,16 +454,17 @@ export class ObiEngine {
         outcome,
         fillPrice,
         filledShares,
-        initialRatio,
+        accumulatedShares: quoteShares,
+        accumulatedEntryPrice: quoteRefPrice,
       });
       return [];
     }
 
     const signals: StrategySignal[] = [];
 
-    if (config.mmAskEnabled && filledShares > 0) {
+    if (config.mmAskEnabled && quoteShares > 0) {
       const askPrice = roundTo(
-        Math.min(0.99, fillPrice * (1 + config.mmAskSpreadTicks)),
+        Math.min(0.99, quoteRefPrice * (1 + config.mmAskSpreadTicks)),
         6
       );
       signals.push({
@@ -419,13 +476,13 @@ export class ObiEngine {
         action: 'SELL',
         outcome,
         outcomeIndex: outcomeIndex(outcome),
-        shares: filledShares,
+        shares: quoteShares,
         targetPrice: askPrice,
-        referencePrice: fillPrice,
-        tokenPrice: book.midPrice ?? fillPrice,
+        referencePrice: quoteRefPrice,
+        tokenPrice: book.midPrice ?? quoteRefPrice,
         midPrice: book.midPrice,
-        fairValue: fillPrice,
-        edgeAmount: roundTo(askPrice - fillPrice, 6),
+        fairValue: quoteRefPrice,
+        edgeAmount: roundTo(askPrice - quoteRefPrice, 6),
         combinedBid: orderbook.combined.combinedBid,
         combinedAsk: orderbook.combined.combinedAsk,
         combinedMid: orderbook.combined.combinedMid,
@@ -436,7 +493,7 @@ export class ObiEngine {
         priceMultiplier: 1,
         urgency: 'passive',
         reduceOnly: true,
-        reason: `OBI maker ASK ${outcome} @ ${askPrice.toFixed(3)} (entry ${fillPrice.toFixed(3)})`,
+        reason: `OBI maker ASK ${outcome} @ ${askPrice.toFixed(3)} (entry VWAP ${quoteRefPrice.toFixed(3)}, total ${quoteShares.toFixed(2)} shares)`,
         strategyLayer: resolveStrategyLayer('OBI_MM_QUOTE_ASK'),
       });
     }
@@ -459,7 +516,7 @@ export class ObiEngine {
           action: 'BUY',
           outcome: oppositeOutcome,
           outcomeIndex: outcomeIndex(oppositeOutcome),
-          shares: filledShares,
+          shares: quoteShares,
           targetPrice: bidPrice,
           referencePrice: oppBestBid,
           tokenPrice: oppositeBook.midPrice ?? bidPrice,
@@ -712,11 +769,40 @@ export class ObiEngine {
     const nowMs = params.nowMs ?? Date.now();
     const out: StrategySignal[] = [];
 
+    // Throttle: do not re-emit a flatten for the same market within this
+    // window. Crossing-spread sells take a few seconds to propagate through
+    // FillTracker; without this throttle, every 2.5s tick re-fires the same
+    // exit and we get the orphan-flatten spam observed in the 2026-04-08
+    // XRP slot.
+    const ORPHAN_EMIT_THROTTLE_MS = 5_000;
+    // Hard give-up: once the slot has been over for this long, the orders
+    // won't fill on any reasonable book and we should drop the position from
+    // tracking so it can flow into auto-redeem instead of looping forever.
+    const ORPHAN_GIVE_UP_AFTER_MS = 120_000;
+
     for (const [marketId, position] of this.positions.entries()) {
       if (excludeMarketIds?.has(marketId)) continue;
       if (position.slotEndMs === null) continue;
       const remainingMs = position.slotEndMs - nowMs;
       if (remainingMs > config.cancelAllBeforeEndMs) continue;
+
+      // Slot has been over too long — give up emitting flatten signals so
+      // the redeem path can take over. Clear tracking state.
+      if (remainingMs < -ORPHAN_GIVE_UP_AFTER_MS) {
+        logger.info('OBI orphan flatten given up — slot ended too long ago', {
+          marketId,
+          outcome: position.outcome,
+          remainingMs,
+        });
+        this.positions.delete(marketId);
+        this.lastOrphanEmitMs.delete(marketId);
+        continue;
+      }
+
+      const lastEmit = this.lastOrphanEmitMs.get(marketId);
+      if (lastEmit !== undefined && nowMs - lastEmit < ORPHAN_EMIT_THROTTLE_MS) {
+        continue;
+      }
 
       const pm = positionManager(marketId);
       if (!pm) continue;
@@ -745,6 +831,7 @@ export class ObiEngine {
 
       if (config.shadowMode) {
         this.totalShadowDecisions += 1;
+        this.lastOrphanEmitMs.set(marketId, nowMs);
         logger.info('OBI engine (shadow) orphan slot-end flatten', {
           marketId,
           outcome: position.outcome,
@@ -757,6 +844,7 @@ export class ObiEngine {
 
       this.totalExits += 1;
       this.lastLosingExitMs.set(marketId, nowMs);
+      this.lastOrphanEmitMs.set(marketId, nowMs);
       logger.warn('OBI orphan slot-end flatten emitted', {
         marketId,
         outcome: position.outcome,
@@ -809,6 +897,7 @@ export class ObiEngine {
     this.positions.delete(marketId);
     this.lastEntryMs.delete(marketId);
     this.lastLosingExitMs.delete(marketId);
+    this.lastOrphanEmitMs.delete(marketId);
   }
 
   /** Operational counters for the dashboard. */

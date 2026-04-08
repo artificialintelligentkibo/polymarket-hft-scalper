@@ -1275,9 +1275,10 @@ export class MarketMakerRuntime {
       book,
       positionManager,
     });
+    const fullAvailableShares = positionManager.getShares(signal.outcome);
     let guardedSell = resolveReduceOnlySellGuard({
       signal,
-      availableShares: positionManager.getShares(signal.outcome),
+      availableShares: fullAvailableShares,
       referencePrice: exitGuardPrice,
     });
     if (signal.action === 'SELL' && signal.reduceOnly) {
@@ -1287,10 +1288,42 @@ export class MarketMakerRuntime {
         guardedSell.blockedRemainderShares
       );
       if (guardedSell.skip) {
+        // Before condemning the position to redeem, check whether the FULL
+        // available position would also fail the minimum-size guard. If the
+        // full position IS still sellable, this signal is just undersized
+        // (e.g. an MM quote sized to a partial-fill increment) and we should
+        // skip it WITHOUT abandoning — a subsequent exit signal will use the
+        // full position size and clear cleanly. Without this check, one
+        // undersized maker quote would freeze the entire healthy position
+        // until slot-end redeem (the 2026-04-08 XRP $5.28 incident).
+        const fullPositionGuard = resolveReduceOnlySellGuard({
+          signal: { ...signal, shares: fullAvailableShares },
+          availableShares: fullAvailableShares,
+          referencePrice: exitGuardPrice,
+        });
+        if (!fullPositionGuard.skip) {
+          this.recordSkippedSignal({
+            signal,
+            filterReason: 'MIN_ORDER_SIZE',
+            details: `signalShares=${guardedSell.requestedShares.toFixed(4)} minimum=${guardedSell.minimumShares.toFixed(4)} fullAvailable=${fullAvailableShares.toFixed(4)} (full position still sellable, not abandoning)`,
+          });
+          logger.debug(
+            'Reduce-only SELL skipped because signal undersized vs full position; not abandoning',
+            {
+              marketId: market.marketId,
+              signalType: signal.signalType,
+              outcome: signal.outcome,
+              signalShares: roundTo(guardedSell.requestedShares, 4),
+              minimumShares: roundTo(guardedSell.minimumShares, 4),
+              fullAvailableShares: roundTo(fullAvailableShares, 4),
+            }
+          );
+          return null;
+        }
         this.recordSkippedSignal({
           signal,
           filterReason: 'MIN_ORDER_SIZE',
-          details: `shares=${guardedSell.requestedShares.toFixed(4)} minimum=${guardedSell.minimumShares.toFixed(4)}`,
+          details: `shares=${guardedSell.requestedShares.toFixed(4)} minimum=${guardedSell.minimumShares.toFixed(4)} fullAvailable=${fullAvailableShares.toFixed(4)}`,
         });
         this.abandonPositionForRedeem({
           market,
@@ -2095,6 +2128,10 @@ export class MarketMakerRuntime {
           this.latestBooks.get(fill.marketId) ??
           this.quotingEngine.getContext(fill.marketId)?.orderbook;
         if (obiBook) {
+          // Use the post-fill cumulative position from positionManager so the
+          // engine can quote MM ASK against the FULL position size (handles
+          // multi-clip partial fills correctly).
+          const totalLiveShares = positionManager.getShares(fill.outcome);
           const mmSignals = this.obiEngine.onEntryFill({
             marketId: fill.marketId,
             marketTitle: market.title,
@@ -2103,6 +2140,7 @@ export class MarketMakerRuntime {
             filledShares: fill.filledShares,
             orderbook: obiBook,
             config: config.obiEngine,
+            totalLiveShares,
             slotEndTime: market.endTime,
           });
           for (const obiSignal of mmSignals) {
