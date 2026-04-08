@@ -172,6 +172,101 @@ test('passive MM bids respect the quote target instead of joining a richer live 
   assert.equal(plan.urgency, 'passive');
 });
 
+test('OBI_ENTRY_BUY passive sits one tick BELOW the ask, not at the bestBid (2026-04-08 SOL fix)', () => {
+  // Regression: SOL 09:36 incident — OBI signal said bestAsk 0.31, executor
+  // placed passive BUY at bestBid 0.18, then 35s later filled into the
+  // collapsing book. After the fix, OBI passive BUYs must be at bestAsk-1tick.
+  const runtimeConfig = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+  });
+
+  const executor = new OrderExecutor(undefined, runtimeConfig) as any;
+  const plan = executor.buildExecutionPlan(
+    createSignal({
+      signalType: 'OBI_ENTRY_BUY',
+      action: 'BUY',
+      outcome: 'YES',
+      urgency: 'passive',
+      targetPrice: 0.31,
+      referencePrice: 0.21,
+      tokenPrice: 0.21,
+      midPrice: 0.21,
+    }),
+    {
+      bids: [{ price: 0.18, size: 100 }],
+      asks: [{ price: 0.31, size: 100 }],
+      bestBid: 0.18,
+      bestAsk: 0.31,
+    }
+  );
+
+  // bestAsk - 1 tick = 0.305 (tick=0.005 inferred from price < 0.5)
+  assert.equal(plan.price, 0.305);
+  assert.equal(plan.postOnly, true);
+});
+
+test('OBI_ENTRY_BUY improve sits one tick BELOW the ask too', () => {
+  const runtimeConfig = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+  });
+
+  const executor = new OrderExecutor(undefined, runtimeConfig) as any;
+  const plan = executor.buildExecutionPlan(
+    createSignal({
+      signalType: 'OBI_ENTRY_BUY',
+      action: 'BUY',
+      outcome: 'NO',
+      urgency: 'improve',
+      targetPrice: 0.34,
+      referencePrice: 0.30,
+      tokenPrice: 0.30,
+      midPrice: 0.30,
+    }),
+    {
+      bids: [{ price: 0.29, size: 100 }],
+      asks: [{ price: 0.34, size: 100 }],
+      bestBid: 0.29,
+      bestAsk: 0.34,
+    }
+  );
+
+  assert.equal(plan.price, 0.335);
+  assert.equal(plan.postOnly, true);
+});
+
+test('OBI_ENTRY_BUY in MM mode is forced top-of-book maker even when signal urgency is cross', () => {
+  // Live live mode forces post-only, so urgency=cross becomes improve, and the
+  // OBI special-case routes to top-of-bid maker (bestAsk - 1 tick).
+  const runtimeConfig = createConfig({
+    ...process.env,
+    MARKET_MAKER_MODE: 'true',
+    DYNAMIC_QUOTING_ENABLED: 'true',
+  });
+
+  const executor = new OrderExecutor(undefined, runtimeConfig) as any;
+  const plan = executor.buildExecutionPlan(
+    createSignal({
+      signalType: 'OBI_ENTRY_BUY',
+      action: 'BUY',
+      urgency: 'cross',
+      targetPrice: 0.31,
+    }),
+    {
+      bids: [{ price: 0.18, size: 100 }],
+      asks: [{ price: 0.31, size: 100 }],
+      bestBid: 0.18,
+      bestAsk: 0.31,
+    }
+  );
+
+  assert.equal(plan.price, 0.305);
+  assert.equal(plan.postOnly, true);
+});
+
 test('passive MM asks respect the quote target instead of walking down to the live ask', () => {
   const runtimeConfig = createConfig({
     ...process.env,

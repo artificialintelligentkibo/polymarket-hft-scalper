@@ -407,6 +407,34 @@ export class OrderExecutor {
         };
       }
 
+      // 2026-04-08 OBI passive-routing fix:
+      // OBI_ENTRY_BUY signals carry targetPrice = bestAsk (the price the OBI
+      // engine wants to buy at, since the imbalance points up). The default
+      // passive BUY routing below would `min(bestBid, targetPrice)` and place
+      // the order AT the bestBid — which is the wrong side of an order-book
+      // imbalance trade and was observed in the SOL 09:36 incident: signal
+      // said bestAsk 0.31, executor placed passive BUY at 0.18, which then
+      // filled 35 seconds later only after the market collapsed to 0.18 (we
+      // caught a falling knife and got abandoned at 0.09).
+      //
+      // Force OBI maker BUYs (and similar top-of-book maker entries) to sit
+      // at one tick BELOW the ask, so we are top-of-bid maker, never below
+      // the touch. Still post-only — never crosses, never pays the spread.
+      if (
+        signal.signalType === 'OBI_ENTRY_BUY' &&
+        effectiveUrgency !== 'cross' &&
+        bestAsk !== null
+      ) {
+        const topOfBidCap = Math.max(0.01, bestAsk - tick);
+        const desired = signal.targetPrice ?? topOfBidCap;
+        return {
+          price: roundTo(Math.min(desired, topOfBidCap), 6),
+          postOnly: true,
+          orderType: resolveOrderType(signal, this.runtimeConfig),
+          urgency: effectiveUrgency,
+        };
+      }
+
       if (effectiveUrgency === 'cross') {
         return {
           price: bestAsk ?? fallbackPrice,
