@@ -638,6 +638,102 @@ test('dust-abandoned positions are pruned when inventory disappears', () => {
   assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), false);
 });
 
+test('recheckDustAbandonmentOnRecovery lifts flag when bid recovers above CLOB minimum', () => {
+  // 2026-04-08 SOL 09:35 regression: position abandoned at $0.09 must be
+  // re-eligible to trade when price recovers to ~$0.50.
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 10,
+    price: 0.18,
+  });
+  runtime.positions.set(market.marketId, positionManager);
+  runtime.dustAbandonedPositions.add('market-1:YES');
+
+  // Build a healthy orderbook with bestBid 0.50 — 10 * 0.50 = $5 notional,
+  // far above the $1 CLOB minimum.
+  const orderbook = createOrderbook();
+  (orderbook.yes as any).bestBid = 0.50;
+  (orderbook.yes as any).bestAsk = 0.51;
+
+  runtime.recheckDustAbandonmentOnRecovery(market, orderbook);
+
+  assert.equal(
+    runtime.dustAbandonedPositions.has('market-1:YES'),
+    false,
+    'flag must be lifted once notional recovers',
+  );
+});
+
+test('recheckDustAbandonmentOnRecovery keeps flag when bid is still too low', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 10,
+    price: 0.18,
+  });
+  runtime.positions.set(market.marketId, positionManager);
+  runtime.dustAbandonedPositions.add('market-1:YES');
+
+  // bestBid 0.08 → 10 * 0.08 = $0.80 < $1 minimum, still abandoned.
+  const orderbook = createOrderbook();
+  (orderbook.yes as any).bestBid = 0.08;
+  (orderbook.yes as any).bestAsk = 0.09;
+
+  runtime.recheckDustAbandonmentOnRecovery(market, orderbook);
+
+  assert.equal(
+    runtime.dustAbandonedPositions.has('market-1:YES'),
+    true,
+    'flag must persist when notional still below minimum',
+  );
+});
+
+test('recheckDustAbandonmentOnRecovery removes flag when shares are zero', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+
+  // Position manager exists but has no shares (already exited or never had).
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  runtime.positions.set(market.marketId, positionManager);
+  runtime.dustAbandonedPositions.add('market-1:YES');
+
+  const orderbook = createOrderbook();
+
+  runtime.recheckDustAbandonmentOnRecovery(market, orderbook);
+
+  assert.equal(runtime.dustAbandonedPositions.has('market-1:YES'), false);
+});
+
+test('recheckDustAbandonmentOnRecovery is no-op when not abandoned', () => {
+  const runtime = new MarketMakerRuntime() as any;
+  const market = createMarket();
+
+  const positionManager = new PositionManager(market.marketId, market.endTime);
+  positionManager.applyFill({
+    outcome: 'YES',
+    side: 'BUY',
+    shares: 10,
+    price: 0.50,
+  });
+  runtime.positions.set(market.marketId, positionManager);
+
+  const orderbook = createOrderbook();
+
+  // Should not throw, should not add anything.
+  runtime.recheckDustAbandonmentOnRecovery(market, orderbook);
+
+  assert.equal(runtime.dustAbandonedPositions.size, 0);
+});
+
 // Regression: 2026-04-08 OBI race condition.
 //
 // When an OBI entry fills, the engine immediately posts a resting

@@ -1074,6 +1074,11 @@ export class MarketMakerRuntime {
       deepBinanceAssessment,
     } = preparedTick;
 
+    // 2026-04-08 dust-abandon recovery: if this market has a dust-abandoned
+    // position and the orderbook just printed a healthier best bid, lift the
+    // flag so OBI exit signals can re-engage instead of waiting for redeem.
+    this.recheckDustAbandonmentOnRecovery(market, orderbook);
+
     const signals = this.signalEngine.generateSignals({
       market,
       orderbook,
@@ -3822,6 +3827,58 @@ export class MarketMakerRuntime {
       const positionManager = this.positions.get(marketId);
       if (!positionManager || positionManager.getShares(outcome) <= 0) {
         this.dustAbandonedPositions.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Re-check a dust-abandoned position when a fresh orderbook is available.
+   * If the current best bid * shares is large enough to clear the CLOB
+   * minimum-notional gate (with safety buffer), we lift the dust-abandon
+   * flag so the next OBI exit signal can fire normally.
+   *
+   * This is the 2026-04-08 fix for the SOL 09:35 case where price recovered
+   * from $0.09 → $0.50 (5x) after we abandoned at $0.09, and we permanently
+   * lost the ability to trade out of a winning position.
+   */
+  private recheckDustAbandonmentOnRecovery(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot
+  ): void {
+    for (const outcome of ['YES', 'NO'] as const) {
+      const key = this.getMarketOutcomeKey(market.marketId, outcome);
+      if (!this.dustAbandonedPositions.has(key)) continue;
+
+      const positionManager = this.positions.get(market.marketId);
+      if (!positionManager) continue;
+
+      const shares = positionManager.getShares(outcome);
+      if (shares <= 0) {
+        this.dustAbandonedPositions.delete(key);
+        continue;
+      }
+
+      const book = outcome === 'YES' ? orderbook.yes : orderbook.no;
+      const bestBid = book.bestBid;
+      if (bestBid === null || !Number.isFinite(bestBid) || bestBid <= 0) continue;
+
+      const minimumShares = resolveMinimumTradableShares(bestBid, 0);
+      // Require a 20% safety buffer above the bare minimum so that minor
+      // price wiggles between this re-check and the next exit attempt don't
+      // immediately re-trigger abandonment.
+      const requiredShares = roundTo(minimumShares * 1.2, 4);
+      if (shares >= requiredShares) {
+        this.dustAbandonedPositions.delete(key);
+        logger.info('Dust-abandoned position recovered — lifting flag', {
+          marketId: market.marketId,
+          marketTitle: market.title,
+          outcome,
+          shares: roundTo(shares, 4),
+          bestBid,
+          notional: roundTo(shares * bestBid, 4),
+          minimumShares,
+          requiredShares,
+        });
       }
     }
   }
