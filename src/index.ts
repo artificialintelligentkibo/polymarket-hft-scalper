@@ -1481,15 +1481,22 @@ export class MarketMakerRuntime {
     // so the resting maker order's collateral is released before we try to
     // submit the cross-spread exit. See cancelPendingObiMakerQuotes for the
     // full rationale (2026-04-08 race condition).
+    //
+    // Phase 7 (2026-04-08): for HARD STOP / COLLAPSE / CANCEL-ALL exits we
+    // bypass the 500ms sleep and parallelise cancels — every millisecond
+    // counts when the book is collapsing (live SOL trade lost extra $0.50+
+    // because the old sequential cancel-wait took 2.5s to release collateral).
     if (
       !paperTradingEnabled &&
       isObiExitSignal(executionSignal.signalType) &&
       executionSignal.action === 'SELL'
     ) {
+      const emergency = this.isEmergencyObiExit(executionSignal);
       await this.cancelPendingObiMakerQuotes({
         marketId: market.marketId,
         outcome: executionSignal.outcome,
         triggeredBy: executionSignal.signalType,
+        emergency,
       });
     }
 
@@ -3771,7 +3778,21 @@ export class MarketMakerRuntime {
     marketId: string;
     outcome: StrategySignal['outcome'];
     triggeredBy: StrategySignal['signalType'];
+    /**
+     * Emergency mode (Phase 7, 2026-04-08): when true, fire all cancels in
+     * parallel via Promise.allSettled and skip the post-cancel sleep entirely.
+     * Used for hard-stop / collapse / cancel-all exits where every millisecond
+     * of latency directly costs PnL because the book is collapsing.
+     *
+     * Trade-off: emergency cancels do not give CLOB time to release the
+     * collateral before the cross-spread exit is submitted. The exit may
+     * encounter a "sum of active orders" race and trigger retry-loop logic
+     * in OrderExecutor. That's an acceptable price vs. waiting 500ms+ while
+     * the price falls another 5-10 cents.
+     */
+    emergency?: boolean;
   }): Promise<number> {
+    const emergency = params.emergency === true;
     const pending = this.fillTracker
       .getPendingOrders()
       .filter(
@@ -3802,8 +3823,7 @@ export class MarketMakerRuntime {
     // For logging purposes, build a lookup of pending order metadata by ID.
     const pendingById = new Map(pending.map((p) => [p.orderId, p]));
 
-    let cancelledCount = 0;
-    for (const orderId of orderIdsToCancel) {
+    const cancelOne = async (orderId: string): Promise<boolean> => {
       const order = pendingById.get(orderId);
       try {
         await this.executor.cancelOrder(orderId);
@@ -3816,7 +3836,6 @@ export class MarketMakerRuntime {
         this.clearPendingLiveOrder(
           this.getPendingOrderKey(params.marketId, params.outcome)
         );
-        cancelledCount += 1;
         logger.info('Cancelled pending OBI maker quote', {
           marketId: params.marketId,
           outcome: params.outcome,
@@ -3826,7 +3845,9 @@ export class MarketMakerRuntime {
           cancelledShares: order?.submittedShares,
           cancelledPrice: order?.submittedPrice,
           source: order ? 'fillTracker' : 'restingRegistry',
+          emergency,
         });
+        return true;
       } catch (error) {
         // Don't block the exit on a cancel failure — the placeOrder will
         // either retry past it or fail with the same balance error, which
@@ -3836,23 +3857,68 @@ export class MarketMakerRuntime {
           outcome: params.outcome,
           triggeredBy: params.triggeredBy,
           orderId,
+          emergency,
           message: error instanceof Error ? error.message : String(error),
         });
+        return false;
+      }
+    };
+
+    let cancelledCount = 0;
+
+    if (emergency) {
+      // Phase 7: parallel cancels, no per-cancel await ordering, no sleep.
+      // We DO still await Promise.allSettled because cancelOrder() RPCs are
+      // cheap (~50-100ms) and parallelising them is much faster than the old
+      // sequential N×100ms loop. The post-cancel 500ms sleep is what really
+      // killed us — that's gone in emergency mode.
+      const results = await Promise.allSettled(
+        Array.from(orderIdsToCancel).map((orderId) => cancelOne(orderId))
+      );
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value === true) {
+          cancelledCount += 1;
+        }
+      }
+    } else {
+      // Normal exit (rebalance / scalp): sequential cancel + 500ms wait, the
+      // original safe path that prevents sum-of-active-orders races.
+      for (const orderId of orderIdsToCancel) {
+        if (await cancelOne(orderId)) {
+          cancelledCount += 1;
+        }
+      }
+      if (cancelledCount > 0) {
+        // Brief pause to let CLOB release the collateral on the cancelled
+        // orders. 500ms is comfortably above the observed network round-trip
+        // (~50-100ms) and gives CLOB enough time to release collateral.
+        await sleep(500);
       }
     }
 
-    if (cancelledCount > 0) {
-      // Brief pause to let CLOB release the collateral on the cancelled
-      // orders. Empirically the existing maker→taker fallback path uses
-      // 2000ms, but for time-critical exits (hard stop) we want to be much
-      // faster. 500ms is comfortably above the observed network round-trip
-      // (~50-100ms) and gives CLOB enough time to release collateral —
-      // bumped from 250ms after the 2026-04-08 BTC race that hit 3 retries
-      // with sum-of-active-orders still locked.
-      await sleep(500);
-    }
-
     return cancelledCount;
+  }
+
+  /**
+   * Phase 7 (2026-04-08): detect emergency OBI exits where every millisecond
+   * of latency translates directly into worse fill price. We distinguish them
+   * by inspecting the `reason` string set by the engine in obi-engine.ts:
+   *
+   *   - "OBI hard stop: pnl ..."   → position is bleeding past hardStopUsd
+   *   - "OBI collapse: ratio ..."  → imbalance reversed against us
+   *   - "OBI cancel-all: ..."      → slot is about to settle
+   *
+   * Normal exits ("OBI rebalance: ratio ..." book-healed and OBI_SCALP_EXIT
+   * take-profit) keep the original safe path with 500ms collateral wait.
+   */
+  private isEmergencyObiExit(signal: StrategySignal): boolean {
+    if (!isObiExitSignal(signal.signalType)) return false;
+    const reason = signal.reason ?? '';
+    return (
+      reason.startsWith('OBI hard stop') ||
+      reason.startsWith('OBI collapse') ||
+      reason.startsWith('OBI cancel-all')
+    );
   }
 
   private abandonPositionForRedeem(params: {

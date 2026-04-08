@@ -838,6 +838,171 @@ test('cancelPendingObiMakerQuotes returns 0 when nothing pending', async () => {
   assert.equal(cancelled, 0);
 });
 
+test('isEmergencyObiExit detects hard stop, collapse, and cancel-all reasons', () => {
+  // Phase 7: emergency exits skip the 500ms cancel-wait sleep.
+  const runtime = new MarketMakerRuntime() as any;
+  const baseSignal = {
+    marketId: 'market-1',
+    marketTitle: 'BTC',
+    signalType: 'OBI_REBALANCE_EXIT',
+    priority: 900,
+    action: 'SELL',
+    outcome: 'YES',
+    outcomeIndex: 0,
+    shares: 7,
+    targetPrice: 0.30,
+    referencePrice: 0.30,
+    tokenPrice: 0.30,
+    midPrice: 0.30,
+    fairValue: 0.30,
+    edgeAmount: 0,
+    combinedBid: null,
+    combinedAsk: null,
+    combinedMid: null,
+    combinedDiscount: null,
+    combinedPremium: null,
+    fillRatio: 1,
+    capitalClamp: 1,
+    priceMultiplier: 1,
+    urgency: 'cross',
+    reduceOnly: true,
+  };
+
+  // Emergency cases
+  assert.equal(
+    runtime.isEmergencyObiExit({ ...baseSignal, reason: 'OBI hard stop: pnl $-1.19 <= -$1.00' }),
+    true,
+    'hard stop must be emergency'
+  );
+  assert.equal(
+    runtime.isEmergencyObiExit({ ...baseSignal, reason: 'OBI collapse: ratio 2.500 >= 1.500' }),
+    true,
+    'collapse must be emergency'
+  );
+  assert.equal(
+    runtime.isEmergencyObiExit({ ...baseSignal, reason: 'OBI cancel-all: 18000ms to slot end' }),
+    true,
+    'cancel-all must be emergency'
+  );
+
+  // Non-emergency cases
+  assert.equal(
+    runtime.isEmergencyObiExit({ ...baseSignal, reason: 'OBI rebalance: ratio 1.238 >= 0.650' }),
+    false,
+    'normal rebalance is NOT emergency'
+  );
+  assert.equal(
+    runtime.isEmergencyObiExit({
+      ...baseSignal,
+      signalType: 'OBI_SCALP_EXIT',
+      reason: 'OBI scalp: edge $0.08',
+    }),
+    false,
+    'scalp take-profit is NOT emergency'
+  );
+
+  // Non-OBI exit signals are never emergency
+  assert.equal(
+    runtime.isEmergencyObiExit({
+      ...baseSignal,
+      signalType: 'EMERGENCY_FLATTEN',
+      reason: 'OBI hard stop: ...',
+    }),
+    false,
+    'non-OBI signal type returns false even with matching reason'
+  );
+});
+
+test('cancelPendingObiMakerQuotes emergency mode skips post-cancel sleep and parallelises', async () => {
+  // Phase 7: regression test for SOL hard-stop 2.5s latency. Emergency mode
+  // must (a) cancel all orders in parallel and (b) NOT wait the 500ms sleep.
+  const runtime = new MarketMakerRuntime() as any;
+  const cancelStartTimes: number[] = [];
+  const cancelEndTimes: number[] = [];
+  runtime.executor = {
+    cancelOrder: async (_orderId: string) => {
+      const start = Date.now();
+      cancelStartTimes.push(start);
+      // Simulate 100ms RPC latency.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      cancelEndTimes.push(Date.now());
+    },
+  };
+  runtime.fillTracker = {
+    getPendingOrders: () => [],
+    forgetPendingOrder: () => {},
+  };
+
+  // 3 resting orders.
+  for (const orderId of ['0xA', '0xB', '0xC']) {
+    runtime.rememberRestingObiMakerOrder({
+      marketId: 'market-1',
+      outcome: 'NO',
+      orderId,
+    });
+  }
+
+  const startedAt = Date.now();
+  const cancelled = await runtime.cancelPendingObiMakerQuotes({
+    marketId: 'market-1',
+    outcome: 'NO',
+    triggeredBy: 'OBI_REBALANCE_EXIT',
+    emergency: true,
+  });
+  const totalMs = Date.now() - startedAt;
+
+  assert.equal(cancelled, 3);
+  // Parallel: total time should be ~100ms (one RPC latency), NOT 3 × 100 = 300ms
+  // and definitely NOT 300 + 500ms sleep = 800ms.
+  assert.ok(
+    totalMs < 250,
+    `emergency cancel must be ~100ms (parallel + no sleep), got ${totalMs}ms`
+  );
+  // All cancels must have started within ~10ms of each other (true parallelism).
+  const startSpread = Math.max(...cancelStartTimes) - Math.min(...cancelStartTimes);
+  assert.ok(
+    startSpread < 20,
+    `emergency cancels must start in parallel, got ${startSpread}ms spread`
+  );
+});
+
+test('cancelPendingObiMakerQuotes normal mode keeps sequential + 500ms sleep', async () => {
+  // Phase 7: non-emergency exits must still use the safe path that waits
+  // 500ms after cancels for CLOB to release collateral.
+  const runtime = new MarketMakerRuntime() as any;
+  runtime.executor = {
+    cancelOrder: async (_orderId: string) => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    },
+  };
+  runtime.fillTracker = {
+    getPendingOrders: () => [],
+    forgetPendingOrder: () => {},
+  };
+
+  runtime.rememberRestingObiMakerOrder({
+    marketId: 'market-1',
+    outcome: 'YES',
+    orderId: '0xORDER',
+  });
+
+  const startedAt = Date.now();
+  const cancelled = await runtime.cancelPendingObiMakerQuotes({
+    marketId: 'market-1',
+    outcome: 'YES',
+    triggeredBy: 'OBI_REBALANCE_EXIT',
+    // emergency: false (default)
+  });
+  const totalMs = Date.now() - startedAt;
+
+  assert.equal(cancelled, 1);
+  // Normal path: 50ms cancel + 500ms sleep ≈ 550ms minimum
+  assert.ok(
+    totalMs >= 500,
+    `normal mode must wait the 500ms sleep, got ${totalMs}ms`
+  );
+});
+
 test('recheckDustAbandonmentOnRecovery is no-op when not abandoned', () => {
   const runtime = new MarketMakerRuntime() as any;
   const market = createMarket();
