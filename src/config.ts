@@ -650,8 +650,16 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
   }
 
   if (preset === 'ORDER_BOOK_IMBALANCE') {
+    // Deep Binance is allowed (and useful) in OBI mode purely as a price
+    // feed for the runaway gate. We keep BINANCE_WS_ENABLED on whenever the
+    // user opts in via DEEP_BINANCE_MODE, but always disable Binance edge
+    // signal generation (we don't want regular Binance edge signals competing
+    // with OBI entries).
+    const keepBinanceWs = input.DEEP_BINANCE_MODE && input.BINANCE_WS_ENABLED;
     console.log(
-      '[strategy] ACTIVE_STRATEGY=ORDER_BOOK_IMBALANCE — vague-sourdough OBI mode (standalone Layer 1, Binance disabled)'
+      `[strategy] ACTIVE_STRATEGY=ORDER_BOOK_IMBALANCE — vague-sourdough OBI mode (standalone Layer 1, Binance ${
+        keepBinanceWs ? 'price feed ON for runaway gate' : 'disabled'
+      })`
     );
     return {
       ...input,
@@ -662,7 +670,7 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
       PAIRED_ARB_ENABLED: false,
       pairedArbitrage: { ...input.pairedArbitrage, enabled: false },
       binance: { ...input.binance, edgeEnabled: false },
-      BINANCE_WS_ENABLED: false,
+      BINANCE_WS_ENABLED: keepBinanceWs,
       obiEngine: { ...input.obiEngine, enabled: true },
       // OBI is a standalone Layer 1 engine with its own Layer 2 quoting
       // (OBI_MM_QUOTE_ASK). Running the regular MM_QUOTE engine in parallel
@@ -2065,11 +2073,12 @@ export function isDynamicQuotingEnabled(candidate: AppConfig = config): boolean 
 }
 
 export function isDeepBinanceEnabled(candidate: AppConfig = config): boolean {
-  return (
-    isDynamicQuotingEnabled(candidate) &&
-    candidate.DEEP_BINANCE_MODE &&
-    candidate.BINANCE_WS_ENABLED
-  );
+  // Deep Binance is a standalone price feed used by:
+  //   1. quoting-engine (only runs in MM mode anyway)
+  //   2. OBI engine Binance runaway gate (runs in OBI standalone mode)
+  // It must NOT require dynamic quoting to be enabled, otherwise the OBI
+  // preset (which disables MM/quoting) can never use the Binance gate.
+  return candidate.DEEP_BINANCE_MODE && candidate.BINANCE_WS_ENABLED;
 }
 
 function deepFreeze<T>(value: T): T {
