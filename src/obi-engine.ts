@@ -25,7 +25,11 @@
  */
 
 import type { DeepBinanceAssessment } from './binance-deep-integration.js';
-import type { MarketOrderbookSnapshot, Outcome } from './clob-fetcher.js';
+import type {
+  MarketOrderbookSnapshot,
+  Outcome,
+  TokenBookSnapshot,
+} from './clob-fetcher.js';
 import type { MarketCandidate } from './monitor.js';
 import type { PositionManager } from './position-manager.js';
 import type { StrategySignal } from './strategy-types.js';
@@ -142,6 +146,32 @@ function parseTimeMs(value: string | null | undefined): number | null {
 
 function outcomeIndex(outcome: Outcome): 0 | 1 {
   return outcome === 'YES' ? 0 : 1;
+}
+
+/**
+ * Infer the price tick size for a Polymarket binary book. We try to derive
+ * it from the spacing between actual book levels first; if that fails (sparse
+ * book) we fall back to 0.01 for prices ≥ 0.10 (the OBI universe) and 0.001
+ * for sub-cent micro markets.
+ */
+function inferObiTickSize(book: TokenBookSnapshot, fallbackPrice: number): number {
+  const sideTick = (levels: ReadonlyArray<{ price: number }>): number => {
+    if (levels.length < 2) return Number.NaN;
+    const sorted = [...levels].sort((a, b) => a.price - b.price);
+    let minDiff = Number.POSITIVE_INFINITY;
+    for (let i = 1; i < sorted.length; i += 1) {
+      const diff = sorted[i].price - sorted[i - 1].price;
+      if (diff > 0 && diff < minDiff) minDiff = diff;
+    }
+    return Number.isFinite(minDiff) ? minDiff : Number.NaN;
+  };
+  const fromBids = sideTick(book.bids);
+  const fromAsks = sideTick(book.asks);
+  const candidates = [fromBids, fromAsks].filter((v) => Number.isFinite(v) && v > 0);
+  if (candidates.length > 0) {
+    return roundTo(Math.min(...candidates), 6);
+  }
+  return fallbackPrice >= 0.1 ? 0.01 : 0.001;
 }
 
 interface ObiCandidate {
@@ -609,10 +639,27 @@ export class ObiEngine {
     const signals: StrategySignal[] = [];
 
     if (config.mmAskEnabled && quoteShares > 0) {
-      const askPrice = roundTo(
-        Math.min(0.99, quoteRefPrice * (1 + config.mmAskSpreadTicks)),
-        6
-      );
+      // Bug fix (2026-04-08 SOL/NO incident): the previous calculation
+      //   askPrice = quoteRefPrice * (1 + spread)
+      // ignored the live book entirely. With entryVWAP=0.34 and spread=0.015
+      // it produced 0.3451, which CLOB normalizes to a valid tick and
+      // crosses bestBid → 6 consecutive "invalid post-only order: order
+      // crosses book" rejections.
+      //
+      // Correct logic: place the ask at max(spread target, current bestAsk),
+      // also guaranteeing we sit at least 1 tick above the current bestBid,
+      // then snap UP to the tick grid so CLOB never normalizes us into a
+      // crossing price.
+      const tick = inferObiTickSize(book, quoteRefPrice);
+      const spreadTarget = quoteRefPrice * (1 + config.mmAskSpreadTicks);
+      const bestAskFloor =
+        book.bestAsk !== null && book.bestAsk > 0 ? book.bestAsk : 0;
+      const bestBidFloor =
+        book.bestBid !== null && book.bestBid > 0 ? book.bestBid + tick : 0;
+      const safeFloor = Math.max(bestAskFloor, bestBidFloor, quoteRefPrice + tick);
+      const rawAsk = Math.max(spreadTarget, safeFloor);
+      const snappedAsk = Math.ceil(rawAsk / tick - 1e-9) * tick;
+      const askPrice = roundTo(Math.min(0.99, snappedAsk), 4);
       signals.push({
         marketId,
         marketTitle: title,

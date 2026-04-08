@@ -316,6 +316,70 @@ test('obi engine onEntryFill emits OBI_MM_QUOTE_ASK when enabled', () => {
   assert.equal(ask!.urgency, 'passive');
 });
 
+test('OBI_MM_QUOTE_ASK never crosses book — regression for 2026-04-08 SOL/NO incident', () => {
+  // Live incident: bot bought 9 NO @ 0.34, bestBid was 0.34 / bestAsk was 0.35.
+  // The old formula `entryVWAP * (1 + 0.015) = 0.3451` got rounded by CLOB to a
+  // tick that crossed bestBid → 6 consecutive "order crosses book" rejections.
+  // After the fix, MM_QUOTE_ASK price must be:
+  //   - on a valid tick grid (multiple of 0.01 for prices ≥ 0.10)
+  //   - strictly above bestBid
+  //   - at or above bestAsk (so post-only never matches)
+  const engine = new ObiEngine();
+  const ob = createOrderbook({
+    noBid: 0.34,
+    noAsk: 0.35,
+    noBidDepth: 200,
+    noAskDepth: 20,
+  });
+  const followOns = engine.onEntryFill({
+    marketId: 'market-1',
+    outcome: 'NO',
+    fillPrice: 0.34,
+    filledShares: 9,
+    totalLiveShares: 9,
+    orderbook: ob,
+    config: baseConfig(),
+    nowMs: FIXED_NOW,
+  });
+  const ask = followOns.find((s) => s.signalType === 'OBI_MM_QUOTE_ASK');
+  assert.ok(ask, 'expected OBI_MM_QUOTE_ASK');
+  // Snapped UP to 0.01 tick grid: ceil(max(0.3451, 0.35) / 0.01) * 0.01 = 0.35
+  assert.equal(ask!.targetPrice, 0.35);
+  // Strictly above bestBid (would otherwise cross)
+  assert.ok(ask!.targetPrice! > 0.34, 'targetPrice must be strictly above bestBid');
+  // At least at bestAsk (joins queue, doesn't cross)
+  assert.ok(ask!.targetPrice! >= 0.35, 'targetPrice must be ≥ bestAsk');
+  // Tick alignment — no fractional cents
+  const remainder = Math.round(ask!.targetPrice! * 1000) % 10;
+  assert.equal(remainder, 0, 'targetPrice must be on 0.01 tick grid');
+});
+
+test('OBI_MM_QUOTE_ASK respects spread target when it sits above bestAsk', () => {
+  // When spread target (entryVWAP * 1.05) is above bestAsk, the engine should
+  // prefer the wider spread and snap it up to the tick grid.
+  const engine = new ObiEngine();
+  const ob = createOrderbook({
+    yesBid: 0.20,
+    yesAsk: 0.21,
+    yesBidDepth: 4,
+    yesAskDepth: 800,
+  });
+  const followOns = engine.onEntryFill({
+    marketId: 'market-1',
+    outcome: 'YES',
+    fillPrice: 0.20,
+    filledShares: 8,
+    totalLiveShares: 8,
+    orderbook: ob,
+    config: baseConfig({ mmAskSpreadTicks: 0.10 }), // 10% spread → 0.22
+    nowMs: FIXED_NOW,
+  });
+  const ask = followOns.find((s) => s.signalType === 'OBI_MM_QUOTE_ASK');
+  assert.ok(ask);
+  // 0.20 * 1.10 = 0.22, snapped to 0.01 tick = 0.22
+  assert.equal(ask!.targetPrice, 0.22);
+});
+
 class FakePositionManager extends PositionManager {
   constructor(marketId: string, private readonly stub: Record<Outcome, number>) {
     super(marketId);
