@@ -1289,17 +1289,26 @@ export class MarketMakerRuntime {
     // flag so OBI exit signals can re-engage instead of waiting for redeem.
     this.recheckDustAbandonmentOnRecovery(market, orderbook);
 
-    const signals = this.signalEngine.generateSignals({
-      market,
-      orderbook,
-      positionManager,
-      riskAssessment,
-      binanceFairValueAdjustment,
-      binanceAssessment,
-      binanceVelocityPctPerSec,
-      sniperEntryOverride,
-    });
-    this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
+    // Phase 22 (2026-04-09): when OBI engine is the active strategy, SKIP the
+    // legacy signal engine entirely. The legacy engine (COMBINED_DISCOUNT_BUY_BOTH,
+    // EXTREME_BUY, etc.) has NO Phase 15–22 safety guards and produced catastrophic
+    // losses: 6× XRP buys at 49¢ → sold at 28¢ = -$7.34, and 2× ETH buys that
+    // dust-trapped for -$16.26. OBI is the sole entry engine when enabled.
+    const signals: StrategySignal[] = config.obiEngine.enabled
+      ? []
+      : this.signalEngine.generateSignals({
+          market,
+          orderbook,
+          positionManager,
+          riskAssessment,
+          binanceFairValueAdjustment,
+          binanceAssessment,
+          binanceVelocityPctPerSec,
+          sniperEntryOverride,
+        });
+    if (!config.obiEngine.enabled) {
+      this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
+    }
 
     if (config.obiEngine.enabled) {
       // Phase 21: OBI compounding — scale entry/max shares with bankroll growth.
