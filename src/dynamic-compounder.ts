@@ -251,10 +251,10 @@ export class DynamicCompounder {
    * sizes unchanged), above it scales linearly up to 5×.
    *
    * Formula: clamp(bankroll / threshold, 1.0, 5.0)
-   *   $40  / $200 = 0.20 → clamped to 1.0 (no change)
-   *   $200 / $200 = 1.0  → 1× (start of scaling)
-   *   $400 / $200 = 2.0  → 2× entry/max shares
-   *   $1000/ $200 = 5.0  → 5× (cap)
+   *   $40  / $100 = 0.40 → clamped to 1.0 (no change)
+   *   $100 / $100 = 1.0  → 1× (start of scaling)
+   *   $200 / $100 = 2.0  → 2× entry/max shares
+   *   $500 / $100 = 5.0  → 5× (cap)
    *
    * Drawdown guard is already baked into bankrollUsd via recalculate(),
    * so during drawdown the bankroll figure is halved → multiplier drops.
