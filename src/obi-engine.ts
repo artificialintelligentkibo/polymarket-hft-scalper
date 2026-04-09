@@ -392,6 +392,172 @@ export class ObiEngine {
   private totalExits = 0;
   private totalShadowDecisions = 0;
 
+  // ─── OBI Session Stats (Phase 20: dashboard) ──────────────────
+  private readonly gateBlockCounts = new Map<string, number>();
+  private readonly gateBlockLastSeen = new Map<string, string>();
+  private gatePassed = 0;
+  private phase15Accepted = 0;
+  private phase15Refused = 0;
+  private phase15LastRefusal: string | null = null;
+  private sessionWins = 0;
+  private sessionLosses = 0;
+  private sessionRedeems = 0;
+  private sessionRealizedPnl = 0;
+  private readonly coinEntries = new Map<string, number>();
+  private readonly coinExits = new Map<string, number>();
+  private readonly coinBlocks = new Map<string, number>();
+  private readonly coinRefusals = new Map<string, number>();
+  private readonly coinPnl = new Map<string, number>();
+  private readonly coinLastAction = new Map<string, string>();
+  private readonly coinLastActionAt = new Map<string, string>();
+  private readonly recentDecisions: Array<{
+    timestamp: string;
+    coin: string | null;
+    action: string;
+    reason: string;
+    detail: string;
+  }> = [];
+  private drawdownGuardTriggers = 0;
+
+  /** Record a Binance gate block decision for dashboard stats. */
+  recordGateBlock(reason: string, coin: string | null): void {
+    this.gateBlockCounts.set(reason, (this.gateBlockCounts.get(reason) ?? 0) + 1);
+    this.gateBlockLastSeen.set(reason, new Date().toISOString());
+    if (coin) this.coinBlocks.set(coin, (this.coinBlocks.get(coin) ?? 0) + 1);
+    this.pushDecision(coin, 'BLOCKED', reason, '');
+  }
+
+  /** Record a Binance gate pass for dashboard stats. */
+  recordGatePass(coin: string | null): void {
+    this.gatePassed++;
+  }
+
+  /** Record a Phase 15 dust-safety refusal. */
+  recordPhase15Refusal(coin: string | null, detail: string): void {
+    this.phase15Refused++;
+    this.phase15LastRefusal = detail;
+    if (coin) this.coinRefusals.set(coin, (this.coinRefusals.get(coin) ?? 0) + 1);
+    this.pushDecision(coin, 'REFUSED', 'Phase 15 dust-safety', detail);
+  }
+
+  /** Record a Phase 15 pass (entry accepted). */
+  recordPhase15Accept(coin: string | null): void {
+    this.phase15Accepted++;
+  }
+
+  /** Record an entry fill for dashboard stats. */
+  recordEntryForStats(coin: string | null, detail: string): void {
+    if (coin) {
+      this.coinEntries.set(coin, (this.coinEntries.get(coin) ?? 0) + 1);
+      this.coinLastAction.set(coin, 'entry');
+      this.coinLastActionAt.set(coin, new Date().toISOString());
+    }
+    this.pushDecision(coin, 'ENTRY ✓', 'fill confirmed', detail);
+  }
+
+  /** Record an exit for dashboard stats. */
+  recordExitForStats(coin: string | null, pnl: number, exitType: string): void {
+    if (coin) {
+      this.coinExits.set(coin, (this.coinExits.get(coin) ?? 0) + 1);
+      this.coinPnl.set(coin, (this.coinPnl.get(coin) ?? 0) + pnl);
+      this.coinLastAction.set(coin, exitType.toLowerCase());
+      this.coinLastActionAt.set(coin, new Date().toISOString());
+    }
+    this.sessionRealizedPnl += pnl;
+    if (pnl >= 0) this.sessionWins++;
+    else this.sessionLosses++;
+    this.pushDecision(coin, exitType, pnl >= 0 ? 'win' : 'loss', `PnL ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+  }
+
+  /** Record a redeem event for stats. */
+  recordRedeemForStats(coin: string | null, pnl: number): void {
+    this.sessionRedeems++;
+    this.sessionRealizedPnl += pnl;
+    if (pnl >= 0) this.sessionWins++;
+    else this.sessionLosses++;
+    if (coin) {
+      this.coinPnl.set(coin, (this.coinPnl.get(coin) ?? 0) + pnl);
+      this.coinExits.set(coin, (this.coinExits.get(coin) ?? 0) + 1);
+      this.coinLastAction.set(coin, 'redeem');
+      this.coinLastActionAt.set(coin, new Date().toISOString());
+    }
+    this.pushDecision(coin, 'REDEEM ✓', 'Phase 17', `PnL ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+  }
+
+  /** Record drawdown guard trigger for stats. */
+  recordDrawdownGuardTrigger(): void {
+    this.drawdownGuardTriggers++;
+  }
+
+  private pushDecision(coin: string | null, action: string, reason: string, detail: string): void {
+    this.recentDecisions.push({
+      timestamp: new Date().toISOString(),
+      coin,
+      action,
+      reason,
+      detail,
+    });
+    // Keep last 12
+    while (this.recentDecisions.length > 12) {
+      this.recentDecisions.shift();
+    }
+  }
+
+  /** Build stats snapshot for runtime-status sync. */
+  getSessionStats(cfg: ObiEngineConfig, drawdownGuardActive: boolean): import('./runtime-status.js').ObiSessionStats {
+    const totalDecisions = this.gatePassed + [...this.gateBlockCounts.values()].reduce((a, b) => a + b, 0);
+    const gateReasons: Record<string, import('./runtime-status.js').ObiGateReasonStats> = {};
+    for (const reason of ['runaway_abs', 'contra_direction', 'flat_direction', 'misaligned_strict', 'unavailable_required']) {
+      gateReasons[reason] = {
+        count: this.gateBlockCounts.get(reason) ?? 0,
+        lastSeenAt: this.gateBlockLastSeen.get(reason) ?? null,
+      };
+    }
+    const coins = new Set([
+      ...this.coinEntries.keys(), ...this.coinExits.keys(),
+      ...this.coinBlocks.keys(), ...this.coinRefusals.keys(), ...this.coinPnl.keys(),
+    ]);
+    const coinStats: Record<string, import('./runtime-status.js').ObiCoinStats> = {};
+    for (const coin of coins) {
+      coinStats[coin] = {
+        coin,
+        entries: this.coinEntries.get(coin) ?? 0,
+        exits: this.coinExits.get(coin) ?? 0,
+        blocks: this.coinBlocks.get(coin) ?? 0,
+        refusals: this.coinRefusals.get(coin) ?? 0,
+        realizedPnl: this.coinPnl.get(coin) ?? 0,
+        lastAction: this.coinLastAction.get(coin) ?? null,
+        lastActionAt: this.coinLastActionAt.get(coin) ?? null,
+      };
+    }
+    const totalBlocks = [...this.gateBlockCounts.values()].reduce((a, b) => a + b, 0);
+    return {
+      enabled: cfg.enabled,
+      shadowMode: false,
+      entries: this.totalEntries,
+      exits: this.totalExits,
+      wins: this.sessionWins,
+      losses: this.sessionLosses,
+      redeems: this.sessionRedeems,
+      realizedPnl: this.sessionRealizedPnl,
+      passRate: totalDecisions > 0 ? this.gatePassed / totalDecisions : 0,
+      gateReasons,
+      totalGateBlocks: totalBlocks,
+      totalGatePassed: this.gatePassed,
+      phase15Accepted: this.phase15Accepted,
+      phase15Refused: this.phase15Refused,
+      phase15LastRefusal: this.phase15LastRefusal,
+      coinStats,
+      recentDecisions: [...this.recentDecisions],
+      drawdownGuardActive,
+      drawdownGuardTriggers: this.drawdownGuardTriggers,
+      maxPositionShares: cfg.maxPositionShares,
+      maxEntryPrice: cfg.maxEntryPrice,
+      cooldownMs: cfg.cooldownMs,
+      stopEntryBeforeEndMs: cfg.stopEntryBeforeEndMs,
+    };
+  }
+
   /**
    * Update the cached USDC balance. Host should call this each cycle from
    * the same source the order executor uses, so generateSignals can pre-flight
@@ -559,6 +725,8 @@ export class ObiEngine {
       config,
     });
     if (gateDecision.blocked) {
+      const coin = extractCoinFromObiTitle(market.title);
+      this.recordGateBlock(gateDecision.reason, coin);
       logger.info('OBI engine entry blocked by Binance gate', {
         marketId: market.marketId,
         marketTitle: market.title,
@@ -609,6 +777,8 @@ export class ObiEngine {
     // dust. This kicks in when OBI_MAX_POSITION_SHARES is set too low relative
     // to the entry price (e.g. max=12 but dust-safety needs 24 @ bestAsk=0.36).
     if (finalShares < minSharesForExitNotional) {
+      const coin = extractCoinFromObiTitle(market.title);
+      this.recordPhase15Refusal(coin, `bestAsk=${chosen.bestAsk} need=${minSharesForExitNotional} cap=${config.maxPositionShares}`);
       logger.info('OBI entry refused — risk cap below dust-safety minimum', {
         marketId: market.marketId,
         outcome: chosen.outcome,
@@ -671,6 +841,10 @@ export class ObiEngine {
     // actually catching volatile slots. On 2026-04-08 two entries hit hard
     // stop / dust on markets where Binance had already moved significantly
     // but gate fail-open'd because assessment was null or below threshold.
+    const entCoin = extractCoinFromObiTitle(market.title);
+    this.recordGatePass(entCoin);
+    this.recordPhase15Accept(entCoin);
+
     logger.info('OBI entry accepted — Binance diagnostic snapshot', {
       marketId: market.marketId,
       marketTitle: market.title,

@@ -153,6 +153,58 @@ export interface LotteryStatsSnapshot {
   readonly totalPayoutUsdc: number;
 }
 
+// ─── OBI Dashboard Stats ──────────────────────────────────────────
+
+export interface ObiGateReasonStats {
+  readonly count: number;
+  readonly lastSeenAt: string | null;
+}
+
+export interface ObiCoinStats {
+  readonly coin: string;
+  readonly entries: number;
+  readonly exits: number;
+  readonly blocks: number;
+  readonly refusals: number;
+  readonly realizedPnl: number;
+  readonly lastAction: string | null;
+  readonly lastActionAt: string | null;
+}
+
+export interface ObiDecisionRecord {
+  readonly timestamp: string;
+  readonly coin: string | null;
+  readonly action: string;
+  readonly reason: string;
+  readonly detail: string;
+}
+
+export interface ObiSessionStats {
+  readonly enabled: boolean;
+  readonly shadowMode: boolean;
+  readonly entries: number;
+  readonly exits: number;
+  readonly wins: number;
+  readonly losses: number;
+  readonly redeems: number;
+  readonly realizedPnl: number;
+  readonly passRate: number;
+  readonly gateReasons: Record<string, ObiGateReasonStats>;
+  readonly totalGateBlocks: number;
+  readonly totalGatePassed: number;
+  readonly phase15Accepted: number;
+  readonly phase15Refused: number;
+  readonly phase15LastRefusal: string | null;
+  readonly coinStats: Record<string, ObiCoinStats>;
+  readonly recentDecisions: readonly ObiDecisionRecord[];
+  readonly drawdownGuardActive: boolean;
+  readonly drawdownGuardTriggers: number;
+  readonly maxPositionShares: number;
+  readonly maxEntryPrice: number;
+  readonly cooldownMs: number;
+  readonly stopEntryBeforeEndMs: number;
+}
+
 export interface RuntimeStatusSnapshot {
   readonly updatedAt: string;
   readonly pid: number | null;
@@ -211,6 +263,7 @@ export interface RuntimeStatusSnapshot {
   readonly lastSignals: readonly RuntimeSignalSnapshot[];
   readonly recentSkippedSignals: readonly SkippedSignalRecord[];
   readonly lastSlotReport: RuntimeSlotSnapshot | null;
+  readonly obiStats: ObiSessionStats | null;
 }
 
 export function resolveRuntimeMode(runtimeConfig: AppConfig = config): RuntimeMode {
@@ -292,6 +345,7 @@ export function createRuntimeStatusSnapshot(
     lastSignals: [],
     recentSkippedSignals: [],
     lastSlotReport: null,
+    obiStats: null,
     ...overrides,
   };
 }
@@ -478,6 +532,9 @@ function normalizeRuntimeStatus(
           .slice(-8)
       : [],
     lastSlotReport: normalizeRuntimeSlot(value.lastSlotReport),
+    obiStats: value.obiStats && typeof value.obiStats === 'object'
+      ? (value.obiStats as ObiSessionStats)
+      : null,
   };
 }
 

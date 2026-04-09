@@ -28,6 +28,7 @@ import {
   type RuntimePositionSnapshot,
   type SniperStatsSnapshot,
   type RuntimeStatusSnapshot,
+  type ObiSessionStats,
 } from '../src/runtime-status.js';
 import { checkPolymarketStatus, writeStatusControlCommand } from '../src/status-monitor.js';
 import { resetSlotReporterState } from '../src/slot-reporter.js';
@@ -435,6 +436,136 @@ function printStatus(runtimeConfig: AppConfig): void {
   }
 }
 
+// ─── OBI Dashboard Sections ─────────────────────────────────────────
+
+function renderObiSessionStats(stats: ObiSessionStats): string {
+  const winRate = (stats.wins + stats.losses) > 0
+    ? `${((stats.wins / (stats.wins + stats.losses)) * 100).toFixed(0)}%`
+    : 'n/a';
+  const passRate = `${(stats.passRate * 100).toFixed(0)}%`;
+  return renderTable(
+    ['METRIC', 'VALUE', 'METRIC', 'VALUE'],
+    [20, 12, 20, 12],
+    [
+      ['Entries', color.bold(String(stats.entries)), 'Exits', color.bold(String(stats.exits))],
+      ['Wins', color.green(String(stats.wins)), 'Losses', color.red(String(stats.losses))],
+      ['Win Rate', color.bold(winRate), 'Redeems (P17)', color.cyan(String(stats.redeems))],
+      ['Realized PnL', formatSignedCurrency(stats.realizedPnl), 'Gate Pass Rate', color.bold(passRate)],
+      ['Max Cap (sh)', color.bold(String(stats.maxPositionShares)), 'Max Price', color.bold(stats.maxEntryPrice.toFixed(2))],
+      ['Cooldown', color.dim(`${stats.cooldownMs}ms`), 'Stop Before End', color.dim(`${stats.stopEntryBeforeEndMs}ms`)],
+      ['Drawdown Guard', stats.drawdownGuardActive ? color.yellow('ACTIVE (0.5x)') : color.green('OFF'), 'Guard Triggers', color.bold(String(stats.drawdownGuardTriggers))],
+    ]
+  );
+}
+
+function renderObiBinanceGate(stats: ObiSessionStats): string {
+  const gateOrder = ['misaligned_strict', 'flat_direction', 'runaway_abs', 'contra_direction', 'unavailable_required'];
+  const totalDecisions = stats.totalGatePassed + stats.totalGateBlocks;
+  const rows: string[][] = [
+    [
+      color.green('passed'),
+      color.green(String(stats.totalGatePassed)),
+      totalDecisions > 0 ? `${((stats.totalGatePassed / totalDecisions) * 100).toFixed(0)}%` : '-',
+      color.dim('—'),
+    ],
+  ];
+  for (const reason of gateOrder) {
+    const g = stats.gateReasons[reason];
+    if (!g) continue;
+    const cnt = g.count;
+    const pct = totalDecisions > 0 ? `${((cnt / totalDecisions) * 100).toFixed(0)}%` : '-';
+    const lastSeen = g.lastSeenAt
+      ? g.lastSeenAt.slice(11, 19) + ' UTC'
+      : color.dim('never');
+    const label = reason.replace(/_/g, ' ');
+    rows.push([
+      cnt > 0 ? color.red(label) : color.dim(label),
+      cnt > 0 ? color.red(String(cnt)) : color.dim('0'),
+      pct,
+      lastSeen,
+    ]);
+  }
+  return renderTable(
+    ['DECISION', 'COUNT', '%', 'LAST SEEN'],
+    [22, 7, 6, 16],
+    rows
+  );
+}
+
+function renderObiDustSafety(stats: ObiSessionStats): string {
+  const lines: string[] = [];
+  const total = stats.phase15Accepted + stats.phase15Refused;
+  lines.push(
+    `Cap: ${color.bold(String(stats.maxPositionShares))} shares   ` +
+    `Accepted: ${color.green(String(stats.phase15Accepted))}   ` +
+    `Refused: ${color.red(String(stats.phase15Refused))}` +
+    (total > 0 ? `   (${((stats.phase15Accepted / total) * 100).toFixed(0)}% pass)` : '')
+  );
+  if (stats.phase15LastRefusal) {
+    lines.push(color.dim(`Last refusal: ${stats.phase15LastRefusal}`));
+  }
+  return lines.join('\n');
+}
+
+function renderObiCoinBreakdown(stats: ObiSessionStats): string {
+  const coins = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE'];
+  const rows: string[][] = [];
+  for (const coin of coins) {
+    const c = stats.coinStats[coin];
+    if (!c && !coins.includes(coin)) continue;
+    const entries = c?.entries ?? 0;
+    const exits = c?.exits ?? 0;
+    const blocks = c?.blocks ?? 0;
+    const refusals = c?.refusals ?? 0;
+    const pnl = c?.realizedPnl ?? 0;
+    const lastAction = c?.lastAction ?? color.dim('—');
+    rows.push([
+      color.bold(coin),
+      entries > 0 ? color.green(String(entries)) : color.dim('0'),
+      exits > 0 ? color.cyan(String(exits)) : color.dim('0'),
+      blocks > 0 ? color.red(String(blocks)) : color.dim('0'),
+      refusals > 0 ? color.yellow(String(refusals)) : color.dim('0'),
+      pnl !== 0 ? formatSignedCurrency(pnl) : color.dim('$0.00'),
+      lastAction,
+    ]);
+  }
+  return renderTable(
+    ['COIN', 'ENTRIES', 'EXITS', 'BLOCKS', 'REFUSED', 'PNL', 'LAST'],
+    [6, 8, 7, 8, 8, 10, 10],
+    rows
+  );
+}
+
+function renderObiRecentDecisions(stats: ObiSessionStats): string {
+  if (stats.recentDecisions.length === 0) {
+    return color.dim('No OBI decisions recorded yet.');
+  }
+  const rows: string[][] = [];
+  // Show newest first, limit to 10
+  const decisions = [...stats.recentDecisions].reverse().slice(0, 10);
+  for (const d of decisions) {
+    const time = d.timestamp.slice(11, 19);
+    const coin = d.coin ?? '?';
+    let actionStr: string;
+    if (d.action.includes('ENTRY') || d.action.includes('REDEEM')) {
+      actionStr = color.green(d.action);
+    } else if (d.action === 'BLOCKED') {
+      actionStr = color.red(d.action);
+    } else if (d.action === 'REFUSED') {
+      actionStr = color.yellow(d.action);
+    } else {
+      actionStr = color.cyan(d.action);
+    }
+    const reasonDetail = d.detail ? `${d.reason} ${color.dim(d.detail)}` : d.reason;
+    rows.push([color.dim(time), color.bold(coin), actionStr, reasonDetail]);
+  }
+  return renderTable(
+    ['TIME', 'COIN', 'ACTION', 'REASON'],
+    [10, 6, 16, 40],
+    rows
+  );
+}
+
 function renderDashboardFrame(runtimeConfig: AppConfig): string {
   const inspection = inspectBot(runtimeConfig);
   const runtimeStatus = inspection.runtimeStatus;
@@ -451,16 +582,26 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
           ['manager', inspection.manager ?? 'n/a'],
         ];
 
+  const obiStats = runtimeStatus?.obiStats;
+  const isObiMode = obiStats?.enabled === true;
+
   const lines = [
     renderBanner(
-      'POLYMARKET SCALPER  |  LIVE RUNTIME DASHBOARD',
-      color.dim('5-minute slots  •  dual-sided market-maker  •  real-time monitor')
+      isObiMode
+        ? 'OBI SCALPER  |  LIVE DASHBOARD'
+        : 'POLYMARKET SCALPER  |  LIVE RUNTIME DASHBOARD',
+      isObiMode
+        ? color.dim('order book imbalance  |  thin-side entry  |  rebalance exit')
+        : color.dim('5-minute slots  |  dual-sided market-maker  |  real-time monitor')
     ),
     renderInfoBar([
       ['time', now],
       ['mode', stripAnsi(formatModeLabel(inspection.mode))],
       ['status', stripAnsi(statusLabel)],
       ...headerSupplementalEntries,
+      ...(isObiMode
+        ? [['day PnL', formatSignedCurrency(runtimeStatus?.totalDayPnl ?? 0)] as const]
+        : []),
     ]),
   ];
 
@@ -490,52 +631,93 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   lines.push('');
   lines.push(
     renderSection(
-      'LIVE POSITIONS  -  OPEN INVENTORY NOW',
+      isObiMode ? 'OBI POSITIONS' : 'LIVE POSITIONS  -  OPEN INVENTORY NOW',
       renderOpenPositions(runtimeStatus?.openPositions ?? [])
     )
   );
-  lines.push('');
-  lines.push(
-    renderSection(
-      'MM QUOTES  -  ACTIVE QUOTING AND INVENTORY',
-      renderMmQuotes(runtimeStatus)
-    )
-  );
-  lines.push('');
-  lines.push(
-    renderSection(
-      'BOT PERFORMANCE STATS',
-      renderPerformance(inspection, runtimeStatus, runtimeConfig)
-    )
-  );
-  lines.push('');
-  lines.push(
-    renderSection(
-      'STRATEGY LAYERS',
-      renderStrategyLayers(runtimeStatus)
-    )
-  );
-  lines.push('');
-  lines.push(
-    renderSection(
-      'SNIPER ENGINE  -  BINANCE-LED SIGNAL STATUS',
-      renderSniperStats(runtimeStatus?.sniperStats)
-    )
-  );
-  lines.push('');
-  lines.push(
-    renderSection(
-      'LOTTERY LAYER',
-      renderLotteryStats(runtimeStatus)
-    )
-  );
-  lines.push('');
-  lines.push(
-    renderSection(
-      'RECENT SIGNALS',
-      renderRecentSignals(runtimeStatus?.lastSignals ?? [])
-    )
-  );
+
+  if (isObiMode && obiStats) {
+    // OBI-focused sections
+    lines.push('');
+    lines.push(
+      renderSection(
+        'OBI SESSION  -  TODAY\'S PERFORMANCE',
+        renderObiSessionStats(obiStats)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'BINANCE GATE  -  ENTRY FILTER BREAKDOWN',
+        renderObiBinanceGate(obiStats)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'DUST SAFETY  -  PHASE 15 CAP CHECK',
+        renderObiDustSafety(obiStats)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'PER-COIN BREAKDOWN',
+        renderObiCoinBreakdown(obiStats)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'RECENT OBI DECISIONS',
+        renderObiRecentDecisions(obiStats)
+      )
+    );
+  } else {
+    // Legacy sniper/MM sections
+    lines.push('');
+    lines.push(
+      renderSection(
+        'MM QUOTES  -  ACTIVE QUOTING AND INVENTORY',
+        renderMmQuotes(runtimeStatus)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'BOT PERFORMANCE STATS',
+        renderPerformance(inspection, runtimeStatus, runtimeConfig)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'STRATEGY LAYERS',
+        renderStrategyLayers(runtimeStatus)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'SNIPER ENGINE  -  BINANCE-LED SIGNAL STATUS',
+        renderSniperStats(runtimeStatus?.sniperStats)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'LOTTERY LAYER',
+        renderLotteryStats(runtimeStatus)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'RECENT SIGNALS',
+        renderRecentSignals(runtimeStatus?.lastSignals ?? [])
+      )
+    );
+  }
 
   return lines.join('\n');
 }

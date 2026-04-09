@@ -39,7 +39,7 @@ import {
   type MarketCandidate,
 } from './monitor.js';
 import { OrderBookImbalanceFilter } from './order-book-imbalance.js';
-import { ObiEngine } from './obi-engine.js';
+import { ObiEngine, extractCoinFromObiTitle } from './obi-engine.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
 import { meetsClobMinimums, resolveMinimumTradableShares } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
@@ -493,6 +493,15 @@ export class MarketMakerRuntime {
                 })
               : recordDayPnlDelta(result.pnl, redeemedAt, config);
             this.redeemPnlToday = roundTo(this.redeemPnlToday + result.pnl, 4);
+            // OBI redeem stats for dashboard
+            if (config.obiEngine.enabled) {
+              const redeemCoinTitle = String(
+                (payload as { title?: unknown })?.title ??
+                  entry.marketTitle ?? ''
+              );
+              const redeemCoin = extractCoinFromObiTitle(redeemCoinTitle);
+              this.obiEngine.recordRedeemForStats(redeemCoin, result.pnl);
+            }
             logger.warn(
               'Redeem PnL recorded from derived resolution (Phase 17 fallback)',
               {
@@ -2399,6 +2408,8 @@ export class MarketMakerRuntime {
         }
       }
       if (fill.signalType === 'OBI_ENTRY_BUY' && config.obiEngine.enabled) {
+        const obiCoin = extractCoinFromObiTitle(market.title);
+        this.obiEngine.recordEntryForStats(obiCoin, `${fill.outcome} ${fill.filledShares}sh @${roundTo(fill.fillPrice, 3)}`);
         const obiBook =
           this.latestBooks.get(fill.marketId) ??
           this.quotingEngine.getContext(fill.marketId)?.orderbook;
@@ -2552,6 +2563,16 @@ export class MarketMakerRuntime {
         market.startTime,
         market.endTime
       );
+    }
+
+    // OBI exit stats for dashboard
+    if (
+      config.obiEngine.enabled &&
+      fill.side === 'SELL' &&
+      isObiExitSignal(fill.signalType)
+    ) {
+      const exitCoin = extractCoinFromObiTitle(market.title);
+      this.obiEngine.recordExitForStats(exitCoin, realizedDelta, fill.signalType);
     }
 
     if (fill.signalType === 'HARD_STOP' && fill.side === 'SELL') {
@@ -3489,6 +3510,12 @@ export class MarketMakerRuntime {
         mmInventorySkew: config.MM_INVENTORY_SKEW_FACTOR,
         mmMaxNetDirectional: config.MM_MAX_NET_DIRECTIONAL,
         mmQuotes: this.buildRuntimeMmQuoteSnapshots(),
+        obiStats: config.obiEngine.enabled
+          ? this.obiEngine.getSessionStats(
+              config.obiEngine,
+              this.compounder.getSnapshot()?.drawdownGuardActive ?? false
+            )
+          : null,
         ...overrides,
       },
       config
