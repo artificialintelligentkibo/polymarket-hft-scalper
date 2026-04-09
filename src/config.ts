@@ -474,6 +474,12 @@ export interface AppConfig {
     readonly gracefulShutdownTimeoutMs: number;
     readonly walletPositionRefreshMs: number;
     readonly walletFundsRefreshMs: number;
+    /**
+     * Phase 19 (2026-04-09): interval for the standalone wallet-funds refresh
+     * timer that feeds the compounder drawdown guard between slot ticks.
+     * Independent of walletFundsRefreshMs, which is a per-call throttle.
+     */
+    readonly walletFundsRefreshIntervalMs: number;
   };
   readonly logging: {
     readonly level: LogLevel;
@@ -1456,6 +1462,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       walletFundsRefreshMs: Math.max(
         5_000,
         parseIntOrDefault(env.WALLET_FUNDS_REFRESH_MS, '30000')
+      ),
+      walletFundsRefreshIntervalMs: Math.max(
+        5_000,
+        parseIntOrDefault(env.WALLET_FUNDS_REFRESH_INTERVAL_MS, '20000')
       ),
     },
     logging: {

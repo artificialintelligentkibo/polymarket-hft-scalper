@@ -233,6 +233,23 @@ export class MarketMakerRuntime {
     updatedAt: null,
   };
   private lastWalletFundsRefreshAtMs = 0;
+  /**
+   * Phase 19 (2026-04-09): standalone periodic timer that refreshes wallet
+   * funds snapshot independently of the slot-processing loop. Before Phase 19,
+   * `refreshWalletFundsSnapshot()` was called only from `runCycle()` (line ~910),
+   * which made the compounder's drawdown guard blind between slot ticks.
+   * A catastrophic drop could silently reach −39% before the next recalculate,
+   * well past the configured 8% drawdown threshold.
+   *
+   * This timer fires every WALLET_FUNDS_REFRESH_INTERVAL_MS (default 20s) and
+   * ensures `compounder.recalculate()` sees a fresh balance on a predictable
+   * cadence, so the drawdown guard can activate at its configured threshold.
+   *
+   * Safety: the timer only calls the existing refresh path — no new logic,
+   * no sizing math changes. Guard activation still just halves size factor
+   * (0.5×), never halts entries or closes positions.
+   */
+  private walletFundsRefreshTimer: NodeJS.Timeout | null = null;
   private userStreamCredentials: {
     apiKey: string;
     secret: string;
@@ -591,6 +608,23 @@ export class MarketMakerRuntime {
           logger.warn('Compounding: failed to seed initial balance, will retry on next refresh');
         }
       }
+
+      // Phase 19: standalone wallet funds refresh timer so drawdown guard
+      // sees balance changes between slot ticks (not only when runCycle runs).
+      if (!isDryRunMode(config) && !isPaperTradingEnabled(config)) {
+        const intervalMs = config.runtime.walletFundsRefreshIntervalMs;
+        this.walletFundsRefreshTimer = setInterval(() => {
+          // Fire-and-forget; refreshWalletFundsSnapshot has its own throttle
+          // (walletFundsRefreshMs) so rapid re-entrancy is a no-op.
+          void this.refreshWalletFundsSnapshot(true).catch(() => {
+            /* error already logged inside */
+          });
+        }, intervalMs);
+        this.walletFundsRefreshTimer.unref?.();
+        logger.info('Compounding: wallet funds refresh timer started', {
+          intervalMs,
+        });
+      }
     }
 
     // Wire up regime filter (no-op when REGIME_FILTER_ENABLED=false)
@@ -740,6 +774,10 @@ export class MarketMakerRuntime {
 
     logger.info('Graceful shutdown started', { reason });
     try { this.narrator.logShutdown(reason); } catch { /* best-effort */ }
+    if (this.walletFundsRefreshTimer) {
+      clearInterval(this.walletFundsRefreshTimer);
+      this.walletFundsRefreshTimer = null;
+    }
     this.fillTracker.stop();
     this.userStream.stop();
 
