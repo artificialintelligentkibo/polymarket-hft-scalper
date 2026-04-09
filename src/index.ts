@@ -5419,6 +5419,16 @@ export class MarketMakerRuntime {
                 signalOutcome: 'YES',
               })
             : undefined;
+        // Fallback to deep Binance (futures) when legacy edge (spot) is
+        // unavailable — the deep integration is always connected for OBI gate.
+        const deepAssessment =
+          !(assessment && assessment.available) && coin && market.startTime
+            ? this.deepBinance.calculateFairValue({
+                coin,
+                slotStartTime: market.startTime,
+                polymarketMid: pmUpMid,
+              })
+            : undefined;
         const actionSnapshot = this.marketActions.get(marketId);
 
         return {
@@ -5432,9 +5442,17 @@ export class MarketMakerRuntime {
           pmDownMid,
           combinedDiscount,
           binanceMovePct:
-            assessment && assessment.available ? assessment.binanceMovePct : null,
+            assessment && assessment.available
+              ? assessment.binanceMovePct
+              : deepAssessment && deepAssessment.available
+                ? deepAssessment.binanceMovePct
+                : null,
           binanceDirection:
-            assessment && assessment.available ? assessment.direction : null,
+            assessment && assessment.available
+              ? assessment.direction
+              : deepAssessment && deepAssessment.available
+                ? deepAssessment.direction
+                : null,
           pmDirection:
             assessment?.pmImpliedDirection ??
             (pmUpMid === null ? 'FLAT' : pmUpMid > 0.52 ? 'UP' : pmUpMid < 0.48 ? 'DOWN' : 'FLAT'),
