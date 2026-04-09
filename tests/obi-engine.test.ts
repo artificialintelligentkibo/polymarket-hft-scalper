@@ -17,9 +17,10 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     minLiquidityUsd: 500,
     entryImbalanceRatio: 0.35,
     exitRebalanceRatio: 0.65,
-    entryShares: 8,
-    // Phase 15: needs to be high enough to cover dust-safety minimum.
-    // At bestAsk=0.21, worstExit=0.063, minShares=ceil(2.5/0.063)=40 → use 60.
+    // Phase 23: dust-safety no longer inflates shares, just gates.
+    // At bestAsk=0.21: worstExit=max(0.05, 0.21*0.50)=0.105, minShares=ceil(1/0.105)=10.
+    // entryShares must be ≥ 10 to pass the gate at bestAsk=0.21.
+    entryShares: 10,
     maxPositionShares: 60,
     cooldownMs: 15_000,
     slotWarmupMs: 5_000,
@@ -1194,23 +1195,28 @@ test('obi engine: obiSizeMultiplier scales entry shares up', () => {
     nowMs: FIXED_NOW,
   };
 
-  // Without multiplier (default 1.0) — should use static entryShares.
-  // Phase 22: dust-safety at bestAsk=0.21: worstExit=max(0.05, 0.21*0.15)=0.05,
-  // ceil(2.5/0.05)=50 → max(10,5,50)=50, capped at 60 → 50.
+  // Phase 23: dust-safety NO LONGER inflates shares. Sizing is purely from
+  // config entryShares × compounding multiplier. Dust-safety only GATES.
+  //
+  // At bestAsk=0.21: worstExit=max(0.05, 0.21*0.50)=0.105
+  // minSharesForExitNotional = ceil(1.0/0.105) = 10
+  // sizedShares = max(entryShares=10, clobMin=5) = 10 → 10 >= 10 ✅ passes gate
+
+  // Without multiplier — uses static entryShares=10.
   const base = new ObiEngine().generateSignals(params);
   assert.equal(base.length, 1);
-  assert.equal(base[0]!.shares, 50);
+  assert.equal(base[0]!.shares, 10); // Phase 23: no inflation, just config shares
 
-  // With 2× multiplier — entryShares becomes 20, but dust-safety still 50 → 50.
+  // With 2× multiplier — entryShares=10*2=20, cap=60*2=120 → 20.
   const x2 = new ObiEngine().generateSignals({ ...params, obiSizeMultiplier: 2.0 });
   assert.equal(x2.length, 1);
-  assert.equal(x2[0]!.shares, 50); // dust-safety floor dominates
+  assert.equal(x2[0]!.shares, 20); // Phase 23: compounded entry, no dust inflation
 
-  // With 2× multiplier and higher entryShares — compounding should win.
+  // With 2× multiplier and higher entryShares — compounding applies.
   const cfg3 = baseConfig({ entryShares: 30, maxPositionShares: 100 });
   const x2big = new ObiEngine().generateSignals({ ...params, config: cfg3, obiSizeMultiplier: 2.0 });
   assert.equal(x2big.length, 1);
-  // compoundedEntry = 30*2=60, dust-safety=50, max(60,5,50)=60, capped at 100*2=200 → 60
+  // compoundedEntry = 30*2=60, max(60,5)=60, capped at 100*2=200 → 60
   assert.equal(x2big[0]!.shares, 60);
 });
 

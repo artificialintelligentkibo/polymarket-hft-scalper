@@ -813,28 +813,34 @@ export class ObiEngine {
       return [];
     }
 
-    // === Dust-trap prevention ===
-    // CLOB requires 5 shares min AND $1 min notional. If the entry leaves the
-    // position too small to be SOLD at any reasonable exit price, we'd get
-    // stuck and the position would redeem at $0.
+    // === Dust-trap prevention (Phase 23 — GATE ONLY, no forced scaling) ===
     //
-    // Phase 11 (2026-04-08): bumped safety buffer 1.5 → 2.5 and tightened
-    // worst-exit-price assumption from bestAsk*0.5 (50% drawdown) to
-    // bestAsk*0.3 (70% drawdown) after live dust trap observed at entry 0.36
-    // → collapse to 0.11 (30% of entry, 70% drawdown). Old code sized 9
-    // shares; CLOB min at 0.11 was 9.091, position abandoned $3.24 cost basis.
+    // HISTORY OF THIS BUG:
+    // Phase 11-22 used minSharesForExitNotional inside Math.max() to FORCE
+    // shares UP to the dust-safety minimum. At bestAsk=0.46 this forced 37
+    // shares ($17.02) instead of the configured 6 shares ($2.76). This
+    // INCREASED losses 6× on wrong-side trades:
+    //   - SOL 37sh × $0.46 = $17.02 → lost $16.79 (should have been ~$2.76)
+    //   - ETH 39sh × $0.43 = $16.77 → won $22.00 (lucky, but oversized)
     //
-    // Phase 22 (2026-04-09): tightened from bestAsk*0.3 (70% drawdown) to
-    // bestAsk*0.15 (85% drawdown). Live incident: ETH YES entry @ 0.26 →
-    // collapse to 0.02 (92% drawdown). Phase 15 approved 33 shares at 0.3×
-    // worst-exit=0.078, but actual exit was 0.02 → 33*0.02 = $0.66 < $1 CLOB
-    // min → dust trap → full $8.10 loss on redeem. The 0.15× multiplier
-    // would have required ceil(2.5/0.039)=65 shares at 0.26 entry, which
-    // exceeds maxPositionShares=35 → Phase 15 would have REFUSED the entry.
-    const safetyBuffer = 2.5;
-    const worstExitPrice = Math.max(0.05, chosen.bestAsk * 0.15);
+    // Phase 23 (2026-04-09): minSharesForExitNotional is now ONLY a gate
+    // check — if the configured entry size can't satisfy it, the entry is
+    // REFUSED instead of being silently inflated. This respects the user's
+    // configured position size and risk limits.
+    //
+    // For 5-minute binary markets, dust-trapping costs at most ~$0.50-1.00
+    // of unrecoverable value (shares × crashedPrice that we can't sell).
+    // Inflating positions to avoid this trivial loss was catastrophically
+    // wrong — it turned $3 risks into $17 risks.
+    //
+    // Gate parameters: buffer=1.0 (just the CLOB minimum), worst-exit=50%
+    // drawdown. This is lenient enough to allow 6-share entries at typical
+    // OBI prices (0.30-0.50) while still blocking truly dangerous tiny
+    // positions at extreme prices.
+    const dustSafetyBuffer = 1.0;
+    const dustWorstExitPrice = Math.max(0.05, chosen.bestAsk * 0.50);
     const minSharesForExitNotional = Math.ceil(
-      (config.clobMinNotionalUsd * safetyBuffer) / worstExitPrice
+      (config.clobMinNotionalUsd * dustSafetyBuffer) / dustWorstExitPrice
     );
     // Phase 21: compounding — scale entry and cap by multiplier.
     // Multiplier is 1.0 below threshold (no change), up to 5.0 at high bankroll.
@@ -842,10 +848,10 @@ export class ObiEngine {
     const compoundedEntryShares = Math.round(config.entryShares * mult);
     const compoundedMaxShares = Math.round(config.maxPositionShares * mult);
 
+    // Phase 23: size ONLY from configured shares — no dust-safety inflation.
     const sizedShares = Math.max(
       compoundedEntryShares,
       config.clobMinShares,
-      minSharesForExitNotional
     );
 
     // Cap at compounded maxPositionShares to respect risk limits.
@@ -855,15 +861,16 @@ export class ObiEngine {
       return [];
     }
 
-    // Phase 15 (2026-04-08): if the risk cap forced finalShares BELOW the
-    // dust-safety minimum, we'd be re-entering exactly the trap Phase 11 was
-    // meant to prevent. Refuse the entry instead of silently shrinking into
-    // dust. This kicks in when OBI_MAX_POSITION_SHARES is set too low relative
-    // to the entry price (e.g. max=12 but dust-safety needs 24 @ bestAsk=0.36).
+    // Phase 23 gate: refuse entry if position is too small to exit via CLOB
+    // sell. At typical OBI prices (0.30-0.50) with 6 shares this passes:
+    //   0.46 entry → worstExit=0.23 → need ceil(1/0.23)=5 → 6≥5 ✅
+    //   0.30 entry → worstExit=0.15 → need ceil(1/0.15)=7 → 6<7 ❌ refused
+    // If refused, the position is too small to safely exit. User should
+    // increase OBI_ENTRY_SHARES or narrow OBI_MIN_ENTRY_PRICE.
     if (finalShares < minSharesForExitNotional) {
       const coin = extractCoinFromObiTitle(market.title);
       this.recordPhase15Refusal(coin, `bestAsk=${chosen.bestAsk} need=${minSharesForExitNotional} cap=${compoundedMaxShares}`);
-      logger.info('OBI entry refused — risk cap below dust-safety minimum', {
+      logger.info('OBI entry refused — dust-safety gate (position too small to exit)', {
         marketId: market.marketId,
         outcome: chosen.outcome,
         bestAsk: chosen.bestAsk,
@@ -871,8 +878,8 @@ export class ObiEngine {
         minSharesForExitNotional,
         maxPositionShares: compoundedMaxShares,
         obiSizeMultiplier: mult,
-        worstExitPrice,
-        hint: 'increase OBI_MAX_POSITION_SHARES or lower OBI_MAX_ENTRY_PRICE',
+        dustWorstExitPrice,
+        hint: 'increase OBI_ENTRY_SHARES or raise OBI_MIN_ENTRY_PRICE',
       });
       return [];
     }
