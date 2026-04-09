@@ -616,6 +616,17 @@ export class ObiEngine {
     // Slot timing checks based on MarketCandidate.startTime / endTime.
     const slotStartMs = parseTimeMs(market.startTime);
     const slotEndMs = parseTimeMs(market.endTime);
+
+    // Phase 22: hard guard — never enter a slot that has already ended.
+    // Protects against stale market candidates and clock drift on VPS.
+    if (slotEndMs !== null && nowMs >= slotEndMs) {
+      return [];
+    }
+    // Also reject if slot hasn't started yet (future slot from discovery).
+    if (slotStartMs !== null && nowMs < slotStartMs) {
+      return [];
+    }
+
     if (slotStartMs !== null && nowMs - slotStartMs < config.slotWarmupMs) {
       return [];
     }
