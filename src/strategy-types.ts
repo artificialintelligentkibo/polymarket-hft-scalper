@@ -38,8 +38,10 @@ export const QUOTING_SIGNAL_TYPES = [
   'INVENTORY_REBALANCE_QUOTE',
   'MM_QUOTE_BID',
   'MM_QUOTE_ASK',
-  'OBI_MM_QUOTE_ASK',
-  'OBI_MM_QUOTE_BID',
+  // Phase 25: OBI_MM_QUOTE_ASK/BID removed — they must go through the direct
+  // execution path so the bot actually posts resting sell orders after entry.
+  // Previously they were trapped in quotingEngine.syncMarketContext() and never
+  // executed, causing ALL positions to go to redeem instead of scalp-exiting.
 ] as const satisfies readonly SignalType[];
 
 export function isQuotingSignalType(signalType: SignalType): boolean {
