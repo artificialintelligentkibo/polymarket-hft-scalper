@@ -349,11 +349,77 @@ export class MarketMakerRuntime {
         conditionId,
         slug: market?.slug ?? null,
       });
-      const actualPayoutUsd = resolveVerifiedRedeemPayoutUsd({
-        yesShares: redeemSettlement.yesShares,
-        noShares: redeemSettlement.noShares,
-        winningOutcome: resolution.winningOutcome,
-      });
+
+      // Phase 24 (2026-04-09): balance-based payout verification.
+      //
+      // CRITICAL BUG FOUND: Phase 17 derived the ETH NO winner from CLOB
+      // prices (noFinalPrice=0.565 → "NO won"), but the on-chain oracle
+      // resolved YES. Payout was $0 but bot reported +$22 phantom profit.
+      // The $38.59 discrepancy caused the dashboard to show +$5.20 day PnL
+      // while the actual balance dropped $33.79.
+      //
+      // Fix: after redeem, fetch REAL wallet balance and compare to the
+      // last known balance. The delta is the actual payout from this redeem.
+      // This overrides both the resolution checker AND the CLOB-derived
+      // fallback, ensuring PnL always matches the real wallet.
+      const balanceBeforeRedeem =
+        typeof this.walletFundsSnapshot.walletCashUsd === 'number' &&
+        Number.isFinite(this.walletFundsSnapshot.walletCashUsd)
+          ? this.walletFundsSnapshot.walletCashUsd
+          : null;
+
+      let balanceVerifiedPayoutUsd: number | null = null;
+      if (balanceBeforeRedeem !== null) {
+        try {
+          // Force-refresh balance to get post-redeem amount
+          const postRedeemBalance = await this.executor.getUsdcBalance(false);
+          if (
+            typeof postRedeemBalance === 'number' &&
+            Number.isFinite(postRedeemBalance)
+          ) {
+            const delta = roundTo(postRedeemBalance - balanceBeforeRedeem, 4);
+            // Delta should be >= 0 (redeem only adds USDC, never removes).
+            // Negative delta can happen from concurrent trades; ignore those.
+            balanceVerifiedPayoutUsd = Math.max(0, delta);
+
+            // Update the wallet snapshot so subsequent redeems use fresh base.
+            this.walletFundsSnapshot = {
+              walletCashUsd: roundTo(postRedeemBalance, 2),
+              updatedAt: new Date().toISOString(),
+            };
+            this.lastWalletFundsRefreshAtMs = Date.now();
+            if (this.compounder.enabled && postRedeemBalance > 0) {
+              this.compounder.recalculate(postRedeemBalance);
+            }
+
+            logger.info('Phase 24: balance-verified redeem payout', {
+              conditionId,
+              balanceBefore: roundTo(balanceBeforeRedeem, 2),
+              balanceAfter: roundTo(postRedeemBalance, 2),
+              balanceDelta: delta,
+              verifiedPayout: balanceVerifiedPayoutUsd,
+              yesShares: redeemSettlement.yesShares,
+              noShares: redeemSettlement.noShares,
+              resolutionWinner: resolution.winningOutcome ?? 'unverified',
+            });
+          }
+        } catch (error) {
+          logger.debug('Phase 24: post-redeem balance check failed, falling back', {
+            conditionId,
+            error: String(error),
+          });
+        }
+      }
+
+      // Use balance-verified payout if available, otherwise fall back to
+      // resolution-based calculation.
+      const actualPayoutUsd = balanceVerifiedPayoutUsd !== null
+        ? balanceVerifiedPayoutUsd
+        : resolveVerifiedRedeemPayoutUsd({
+            yesShares: redeemSettlement.yesShares,
+            noShares: redeemSettlement.noShares,
+            winningOutcome: resolution.winningOutcome,
+          });
 
       let dayStateOverride:
         | {
@@ -439,41 +505,68 @@ export class MarketMakerRuntime {
           } catch { /* best-effort */ }
         }
       } else {
-        // Phase 17 (2026-04-08): even when the strict resolution checker
-        // hasn't verified a winningOutcome, we frequently HAVE yesFinalPrice
-        // and noFinalPrice from the CLOB tick feed. The bot has already
-        // submitted the redeem and got `actualPayoutUsd` from
-        // `resolveVerifiedRedeemPayoutUsd` — the money is already gone (or
-        // returned). We MUST record the realized PnL into totalDayPnl,
-        // otherwise the dashboard reports stale fake-positive values and
-        // the operator is flying blind.
+        // Phase 17+24 fallback: resolution checker failed to verify winner.
         //
-        // Live incident 2026-04-08 16:13: SOL OBI position lost full $8.55
-        // (yesFinalPrice 0.235, noFinalPrice 0.765 → NO won, bot held YES,
-        // payout 0). resolution.resolved was false at redeem time so the
-        // loss vanished from day PnL. Dashboard kept reporting +$1.46
-        // while actual cash dropped from $24.75 to $21.43 (-$3.32).
+        // Phase 24 upgrade: when balance-verified payout is available, use it
+        // INSTEAD of CLOB-derived winner. CLOB prices are unreliable:
+        //   - Live incident 2026-04-09: ETH NO noFinalPrice=0.565 → derived
+        //     "NO won", but oracle resolved YES → payout was $0, not $38.59.
+        //     Bot reported phantom +$22 profit while real balance dropped $33.79.
+        //
+        // Balance-verified payout is ground truth: it's the actual USDC delta
+        // measured from the wallet before/after redeem.
+        //
+        // Legacy Phase 17 CLOB derivation is kept as last resort when balance
+        // check fails (e.g. RPC error during post-redeem balance fetch).
+        const useBalanceVerified = balanceVerifiedPayoutUsd !== null;
         let derivedWinningOutcome: 'YES' | 'NO' | null = null;
-        if (
-          resolution.yesFinalPrice !== null &&
-          resolution.noFinalPrice !== null
-        ) {
-          derivedWinningOutcome =
-            resolution.yesFinalPrice >= resolution.noFinalPrice ? 'YES' : 'NO';
-        } else if (resolution.yesFinalPrice !== null) {
-          derivedWinningOutcome =
-            resolution.yesFinalPrice >= 0.5 ? 'YES' : 'NO';
-        } else if (resolution.noFinalPrice !== null) {
-          derivedWinningOutcome =
-            resolution.noFinalPrice >= 0.5 ? 'NO' : 'YES';
+
+        if (useBalanceVerified) {
+          // Determine winner from actual payout: if we got paid, our side won.
+          const heldYes = redeemSettlement.yesShares > 0;
+          const heldNo = redeemSettlement.noShares > 0;
+          if (balanceVerifiedPayoutUsd! > 0.01) {
+            // We got paid → our side won
+            derivedWinningOutcome = heldNo && !heldYes ? 'NO' : 'YES';
+          } else {
+            // We got $0 → our side lost
+            derivedWinningOutcome = heldNo && !heldYes ? 'YES' : 'NO';
+          }
+          logger.info('Phase 24: using balance-verified payout for PnL', {
+            conditionId,
+            balanceVerifiedPayoutUsd,
+            derivedWinningOutcome,
+            heldYes: redeemSettlement.yesShares,
+            heldNo: redeemSettlement.noShares,
+            clobYesFinalPrice: resolution.yesFinalPrice,
+            clobNoFinalPrice: resolution.noFinalPrice,
+          });
+        } else {
+          // Legacy Phase 17: derive from CLOB prices (unreliable but better than nothing)
+          if (
+            resolution.yesFinalPrice !== null &&
+            resolution.noFinalPrice !== null
+          ) {
+            derivedWinningOutcome =
+              resolution.yesFinalPrice >= resolution.noFinalPrice ? 'YES' : 'NO';
+          } else if (resolution.yesFinalPrice !== null) {
+            derivedWinningOutcome =
+              resolution.yesFinalPrice >= 0.5 ? 'YES' : 'NO';
+          } else if (resolution.noFinalPrice !== null) {
+            derivedWinningOutcome =
+              resolution.noFinalPrice >= 0.5 ? 'NO' : 'YES';
+          }
         }
 
         if (derivedWinningOutcome !== null) {
-          const derivedPayoutUsd = resolveVerifiedRedeemPayoutUsd({
-            yesShares: redeemSettlement.yesShares,
-            noShares: redeemSettlement.noShares,
-            winningOutcome: derivedWinningOutcome,
-          });
+          // Phase 24: use balance-verified payout when available, else CLOB-derived
+          const derivedPayoutUsd = useBalanceVerified
+            ? balanceVerifiedPayoutUsd!
+            : resolveVerifiedRedeemPayoutUsd({
+                yesShares: redeemSettlement.yesShares,
+                noShares: redeemSettlement.noShares,
+                winningOutcome: derivedWinningOutcome,
+              });
           const result = this.costBasisLedger.calculateRedeemPnl(
             conditionId,
             redeemedShares,
@@ -503,7 +596,9 @@ export class MarketMakerRuntime {
               this.obiEngine.recordRedeemForStats(redeemCoin, result.pnl);
             }
             logger.warn(
-              'Redeem PnL recorded from derived resolution (Phase 17 fallback)',
+              useBalanceVerified
+                ? 'Redeem PnL recorded from BALANCE VERIFICATION (Phase 24)'
+                : 'Redeem PnL recorded from derived resolution (Phase 17 fallback)',
               {
                 conditionId,
                 title: String(
@@ -518,11 +613,11 @@ export class MarketMakerRuntime {
                 yesFinalPrice: resolution.yesFinalPrice,
                 noFinalPrice: resolution.noFinalPrice,
                 derivedPayoutUsd,
+                balanceVerifiedPayoutUsd,
                 costBasis: entry.totalCostUsd,
                 redeemPnl: result.pnl,
                 newDayPnl: dayState.dayPnl,
-                reason:
-                  'strict resolution unverified, derived winner from CLOB final prices',
+                source: useBalanceVerified ? 'balance-delta' : 'clob-prices',
               }
             );
             dayStateOverride = {
