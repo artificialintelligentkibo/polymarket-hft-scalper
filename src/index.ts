@@ -371,13 +371,29 @@ export class MarketMakerRuntime {
       let balanceVerifiedPayoutUsd: number | null = null;
       if (balanceBeforeRedeem !== null) {
         try {
-          // Force-refresh balance to get post-redeem amount
-          const postRedeemBalance = await this.executor.getUsdcBalance(false);
+          // Phase 24b: wait for Safe relay to deliver USDC + RPC to index state.
+          // Without delay, balance reads stale (164ms after tx mined = same value).
+          // Retry once more if first attempt shows zero delta.
+          await sleep(5000);
+          let postRedeemBalance = await this.executor.getUsdcBalance(true);
+          let delta = typeof postRedeemBalance === 'number' && Number.isFinite(postRedeemBalance)
+            ? roundTo(postRedeemBalance - balanceBeforeRedeem, 4)
+            : -1;
+
+          // Retry once if delta is zero/negative — RPC may still be stale
+          if (delta <= 0.001) {
+            logger.info('Phase 24b: first balance check showed no change, retrying after 5s...');
+            await sleep(5000);
+            postRedeemBalance = await this.executor.getUsdcBalance(true);
+            delta = typeof postRedeemBalance === 'number' && Number.isFinite(postRedeemBalance)
+              ? roundTo(postRedeemBalance - balanceBeforeRedeem, 4)
+              : -1;
+          }
+
           if (
             typeof postRedeemBalance === 'number' &&
             Number.isFinite(postRedeemBalance)
           ) {
-            const delta = roundTo(postRedeemBalance - balanceBeforeRedeem, 4);
             // Delta should be >= 0 (redeem only adds USDC, never removes).
             // Negative delta can happen from concurrent trades; ignore those.
             balanceVerifiedPayoutUsd = Math.max(0, delta);
