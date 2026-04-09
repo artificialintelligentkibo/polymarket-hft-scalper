@@ -368,6 +368,8 @@ export function extractCoinFromObiTitle(title: string): string | null {
 export class ObiEngine {
   private readonly positions = new Map<string, ObiPosition>();
   private readonly lastEntryMs = new Map<string, number>();
+  /** Phase 21 diagnostic: throttle "no candidates" log to once per market+slot. */
+  private readonly lastDiagLogMs = new Map<string, number>();
   /** Markets where we recently exited at a loss — extra cooldown applies. */
   private readonly lastLosingExitMs = new Map<string, number>();
   /**
@@ -663,20 +665,32 @@ export class ObiEngine {
     }
 
     const candidates: ObiCandidate[] = [];
+    // Phase 21 diagnostic: track per-outcome skip reasons for this tick.
+    const skipReasons: Array<{ outcome: string; reason: string; detail: string }> = [];
+
     for (const outcome of ['YES', 'NO'] as const) {
       const book = outcome === 'YES' ? orderbook.yes : orderbook.no;
       const bidDepth = roundTo(book.depthNotionalBid, 4);
       const askDepth = roundTo(book.depthNotionalAsk, 4);
       const totalLiquidity = roundTo(bidDepth + askDepth, 4);
-      if (totalLiquidity < config.minLiquidityUsd) continue;
+      if (totalLiquidity < config.minLiquidityUsd) {
+        skipReasons.push({ outcome, reason: 'low_liquidity', detail: `total=$${totalLiquidity} need=$${config.minLiquidityUsd}` });
+        continue;
+      }
 
       const thinSide: 'bid' | 'ask' = bidDepth <= askDepth ? 'bid' : 'ask';
       const thinDepth = thinSide === 'bid' ? bidDepth : askDepth;
       const thickDepth = thinSide === 'bid' ? askDepth : bidDepth;
       const ratio = safeRatio(thinDepth, thickDepth);
 
-      if (thinDepth >= config.thinThresholdUsd) continue;
-      if (ratio > config.entryImbalanceRatio) continue;
+      if (thinDepth >= config.thinThresholdUsd) {
+        skipReasons.push({ outcome, reason: 'not_thin', detail: `thinSide=${thinSide} depth=$${thinDepth.toFixed(2)} threshold=$${config.thinThresholdUsd}` });
+        continue;
+      }
+      if (ratio > config.entryImbalanceRatio) {
+        skipReasons.push({ outcome, reason: 'ratio_too_high', detail: `ratio=${ratio.toFixed(4)} max=${config.entryImbalanceRatio}` });
+        continue;
+      }
 
       // Phase 10 (2026-04-08) — DIRECTIONAL BUG FIX:
       // Classical LOB imbalance is DIRECTIONAL, not symmetric.
@@ -697,11 +711,20 @@ export class ObiEngine {
       // the current outcome). This is the ONLY setup where "BUY thin side"
       // aligns with the mean-reversion thesis vague-sourdough actually
       // trades ("wait for book to rebalance, price returns to thick side").
-      if (thinSide === 'bid') continue;
+      if (thinSide === 'bid') {
+        skipReasons.push({ outcome, reason: 'thin_bid_not_ask', detail: `bidDepth=$${bidDepth.toFixed(2)} askDepth=$${askDepth.toFixed(2)}` });
+        continue;
+      }
 
       const bestAsk = book.bestAsk;
-      if (bestAsk === null) continue;
-      if (bestAsk < config.minEntryPrice || bestAsk > config.maxEntryPrice) continue;
+      if (bestAsk === null) {
+        skipReasons.push({ outcome, reason: 'no_best_ask', detail: 'null' });
+        continue;
+      }
+      if (bestAsk < config.minEntryPrice || bestAsk > config.maxEntryPrice) {
+        skipReasons.push({ outcome, reason: 'price_out_of_range', detail: `bestAsk=${bestAsk} range=[${config.minEntryPrice},${config.maxEntryPrice}]` });
+        continue;
+      }
 
       const existingShares = positionManager.getShares(outcome);
       // Phase 21: use compounded max for the pre-filter too.
@@ -722,6 +745,24 @@ export class ObiEngine {
     }
 
     if (candidates.length === 0) {
+      // Phase 21 diagnostic: log why no candidates were found.
+      // Throttle to once per market per slot to avoid log spam.
+      const diagKey = `${market.marketId}:${market.startTime ?? 'unknown'}`;
+      if (!this.lastDiagLogMs.has(diagKey)) {
+        this.lastDiagLogMs.set(diagKey, nowMs);
+        const topReasons = skipReasons.map(s => `${s.outcome}:${s.reason}(${s.detail})`);
+        logger.info('OBI no candidates — all outcomes filtered', {
+          marketId: market.marketId,
+          marketTitle: market.title,
+          skipReasons: topReasons,
+        });
+        this.pushDecision(
+          extractCoinFromObiTitle(market.title),
+          'SKIP',
+          skipReasons[0]?.reason ?? 'unknown',
+          skipReasons.map(s => `${s.outcome}:${s.reason}`).join(', ')
+        );
+      }
       return [];
     }
 
