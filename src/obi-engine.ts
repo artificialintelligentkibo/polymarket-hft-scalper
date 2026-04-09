@@ -354,6 +354,8 @@ export function extractCoinFromObiTitle(title: string): string | null {
   if (/\bETHEREUM\b|\bETH\b/.test(upper)) return 'ETH';
   if (/\bSOLANA\b|\bSOL\b/.test(upper)) return 'SOL';
   if (/\bRIPPLE\b|\bXRP\b/.test(upper)) return 'XRP';
+  if (/\bBNB\b/.test(upper)) return 'BNB';
+  if (/\bDOGECOIN\b|\bDOGE\b/.test(upper)) return 'DOGE';
   return null;
 }
 

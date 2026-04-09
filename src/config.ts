@@ -28,7 +28,7 @@ export type SignatureType = 0 | 1 | 2;
 export type OrderMode = 'GTC' | 'FOK' | 'FAK';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 export type OrderUrgency = 'passive' | 'improve' | 'cross';
-export type TradeableCoin = 'BTC' | 'SOL' | 'XRP' | 'ETH';
+export type TradeableCoin = 'BTC' | 'SOL' | 'XRP' | 'ETH' | 'BNB' | 'DOGE';
 export type LayerConflictResolution = 'BLOCK' | 'OVERRIDE';
 
 export interface PriceMultiplierLevel {
@@ -500,7 +500,7 @@ export interface AppConfig {
 }
 
 const DEFAULT_WHITELIST_CONDITION_IDS = [] as const;
-const DEFAULT_COINS_TO_TRADE = ['BTC', 'SOL', 'XRP', 'ETH'] as const satisfies readonly TradeableCoin[];
+const DEFAULT_COINS_TO_TRADE = ['BTC', 'SOL', 'XRP', 'ETH', 'BNB', 'DOGE'] as const satisfies readonly TradeableCoin[];
 
 let dotenvLoaded = false;
 let configCache: AppConfig | undefined;
@@ -539,7 +539,7 @@ function parseStringCsv(value: string | undefined, fallback: string): string[] {
 }
 
 function parseCoinsToTrade(value?: string): TradeableCoin[] {
-  const allowedCoins = new Set<TradeableCoin>(['BTC', 'SOL', 'XRP', 'ETH']);
+  const allowedCoins = new Set<TradeableCoin>(['BTC', 'SOL', 'XRP', 'ETH', 'BNB', 'DOGE']);
   const rawCoins =
     value?.trim() ||
     DEFAULT_COINS_TO_TRADE.join(',');

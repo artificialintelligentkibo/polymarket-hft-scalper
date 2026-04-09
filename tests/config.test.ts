@@ -32,7 +32,7 @@ test('createConfig defaults to dynamic BTC/SOL/XRP/ETH market scan when whitelis
   });
 
   assert.deepEqual(candidate.WHITELIST_CONDITION_IDS, []);
-  assert.deepEqual(candidate.COINS_TO_TRADE, ['BTC', 'SOL', 'XRP', 'ETH']);
+  assert.deepEqual(candidate.COINS_TO_TRADE, ['BTC', 'SOL', 'XRP', 'ETH', 'BNB', 'DOGE']);
   assert.equal(candidate.FILTER_5MIN_ONLY, true);
   assert.equal(candidate.MIN_LIQUIDITY_USD, 500);
   assert.equal(candidate.SIMULATION_MODE, true);

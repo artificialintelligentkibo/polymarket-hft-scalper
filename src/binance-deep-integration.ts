@@ -61,6 +61,8 @@ const COIN_TO_BINANCE_FUTURES: Record<string, string> = {
   ETH: 'ethusdt',
   SOL: 'solusdt',
   XRP: 'xrpusdt',
+  BNB: 'bnbusdt',
+  DOGE: 'dogeusdt',
 };
 
 export function calculateFairValue(params: DeepBinanceFairValueParams): number {

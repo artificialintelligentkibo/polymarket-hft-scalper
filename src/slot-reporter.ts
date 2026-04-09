@@ -322,6 +322,12 @@ function extractAssetLabel(title: string): string {
   if (/\bXRP\b/i.test(normalized)) {
     return 'XRP';
   }
+  if (/\bBNB\b/i.test(normalized)) {
+    return 'BNB';
+  }
+  if (/\b(DOGE|DOGECOIN)\b/i.test(normalized)) {
+    return 'Dogecoin';
+  }
 
   return truncate(normalized, 12);
 }

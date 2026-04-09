@@ -358,6 +358,9 @@ test('Phase 8: extractCoinFromObiTitle normalises Polymarket binary slot titles'
   assert.equal(extractCoinFromObiTitle('SOL Up or Down'), 'SOL');
   assert.equal(extractCoinFromObiTitle('Solana Up or Down'), 'SOL');
   assert.equal(extractCoinFromObiTitle('XRP Up or Down'), 'XRP');
+  assert.equal(extractCoinFromObiTitle('BNB Up or Down - April 9, 6:00PM-6:05PM ET'), 'BNB');
+  assert.equal(extractCoinFromObiTitle('Dogecoin Up or Down'), 'DOGE');
+  assert.equal(extractCoinFromObiTitle('DOGE Up or Down'), 'DOGE');
   assert.equal(extractCoinFromObiTitle('Will Trump win'), null);
   assert.equal(extractCoinFromObiTitle(''), null);
 });

@@ -806,7 +806,7 @@ function renderSniperStats(stats: SniperStatsSnapshot | undefined): string {
       renderTable(
         ['COIN', 'EVALS', 'SIGNALS', 'AVG MOVE', 'MAX MOVE', 'STATUS'],
         [8, 8, 8, 10, 10, 20],
-        ['BTC', 'ETH', 'SOL', 'XRP'].flatMap((coin) => {
+        ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE'].flatMap((coin) => {
           const data = stats.coinStats[coin];
           if (!data) {
             return [];

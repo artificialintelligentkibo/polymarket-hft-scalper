@@ -114,6 +114,8 @@ const COIN_PATTERNS: Record<TradeableCoin, RegExp> = {
   ETH: /(^|[^A-Z0-9])(ETH|ETHEREUM)(?=$|[^A-Z0-9])/i,
   SOL: /(^|[^A-Z0-9])(SOL|SOLANA)(?=$|[^A-Z0-9])/i,
   XRP: /(^|[^A-Z0-9])(XRP)(?=$|[^A-Z0-9])/i,
+  BNB: /(^|[^A-Z0-9])(BNB)(?=$|[^A-Z0-9])/i,
+  DOGE: /(^|[^A-Z0-9])(DOGE|DOGECOIN)(?=$|[^A-Z0-9])/i,
 };
 
 export class MarketMonitor extends EventEmitter {

@@ -110,6 +110,8 @@ const BINANCE_SYMBOLS = {
   ETH: 'ETH/USDT',
   SOL: 'SOL/USDT',
   XRP: 'XRP/USDT',
+  BNB: 'BNB/USDT',
+  DOGE: 'DOGE/USDT',
 } as const;
 
 type CryptoSymbol = keyof typeof BINANCE_SYMBOLS;
