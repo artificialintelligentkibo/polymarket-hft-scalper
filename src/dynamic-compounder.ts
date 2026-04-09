@@ -244,6 +244,28 @@ export class DynamicCompounder {
   }
 
   /**
+   * OBI-specific compounding multiplier.
+   *
+   * Unlike sniper/MM which scale from baseSizeUsd, OBI uses a simple
+   * threshold model: below `thresholdUsd` the multiplier is 1.0 (static
+   * sizes unchanged), above it scales linearly up to 5×.
+   *
+   * Formula: clamp(bankroll / threshold, 1.0, 5.0)
+   *   $40  / $200 = 0.20 → clamped to 1.0 (no change)
+   *   $200 / $200 = 1.0  → 1× (start of scaling)
+   *   $400 / $200 = 2.0  → 2× entry/max shares
+   *   $1000/ $200 = 5.0  → 5× (cap)
+   *
+   * Drawdown guard is already baked into bankrollUsd via recalculate(),
+   * so during drawdown the bankroll figure is halved → multiplier drops.
+   */
+  getObiSizeMultiplier(thresholdUsd: number): number {
+    const snap = this.latestSnapshot;
+    if (!snap || thresholdUsd <= 0) return 1.0;
+    return clamp(snap.bankrollUsd / thresholdUsd, 1.0, 5.0);
+  }
+
+  /**
    * Check if sufficient balance exists to open the requested layers.
    * Returns the number of layers that can be funded.
    */

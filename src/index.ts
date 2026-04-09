@@ -1302,12 +1302,17 @@ export class MarketMakerRuntime {
     this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
 
     if (config.obiEngine.enabled) {
+      // Phase 21: OBI compounding — scale entry/max shares with bankroll growth.
+      const obiMult = this.compounder.enabled
+        ? this.compounder.getObiSizeMultiplier(config.obiEngine.obiCompoundThresholdUsd)
+        : 1.0;
       const obiEntrySignals = this.obiEngine.generateSignals({
         market,
         orderbook,
         positionManager,
         config: config.obiEngine,
         deepBinanceAssessment,
+        obiSizeMultiplier: obiMult,
       });
       const obiExitSignals = this.obiEngine.generateExitSignals({
         market,
@@ -3513,7 +3518,10 @@ export class MarketMakerRuntime {
         obiStats: config.obiEngine.enabled
           ? this.obiEngine.getSessionStats(
               config.obiEngine,
-              this.compounder.getSnapshot()?.drawdownGuardActive ?? false
+              this.compounder.getSnapshot()?.drawdownGuardActive ?? false,
+              this.compounder.enabled
+                ? this.compounder.getObiSizeMultiplier(config.obiEngine.obiCompoundThresholdUsd)
+                : 1.0
             )
           : null,
         ...overrides,

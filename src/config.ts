@@ -1364,6 +1364,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         env.OBI_BINANCE_REQUIRE_ALIGNMENT,
         false
       ),
+      obiCompoundThresholdUsd: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_COMPOUND_THRESHOLD_USD, '200')
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),

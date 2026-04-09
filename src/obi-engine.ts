@@ -117,6 +117,12 @@ export interface ObiEngineConfig {
    * The contra gate didn't fire because absMove (0.012) was below 0.15.
    */
   readonly binanceRequireAlignment: boolean;
+  /**
+   * Phase 21: OBI compounding threshold. When bankroll exceeds this USD
+   * value, entryShares and maxPositionShares scale up linearly (up to 5×).
+   * Below this threshold sizing stays static. Set to 0 to disable compounding.
+   */
+  readonly obiCompoundThresholdUsd: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -504,7 +510,7 @@ export class ObiEngine {
   }
 
   /** Build stats snapshot for runtime-status sync. */
-  getSessionStats(cfg: ObiEngineConfig, drawdownGuardActive: boolean): import('./runtime-status.js').ObiSessionStats {
+  getSessionStats(cfg: ObiEngineConfig, drawdownGuardActive: boolean, obiSizeMultiplier = 1.0): import('./runtime-status.js').ObiSessionStats {
     const totalDecisions = this.gatePassed + [...this.gateBlockCounts.values()].reduce((a, b) => a + b, 0);
     const gateReasons: Record<string, import('./runtime-status.js').ObiGateReasonStats> = {};
     for (const reason of ['runaway_abs', 'contra_direction', 'flat_direction', 'misaligned_strict', 'unavailable_required']) {
@@ -551,7 +557,8 @@ export class ObiEngine {
       recentDecisions: [...this.recentDecisions],
       drawdownGuardActive,
       drawdownGuardTriggers: this.drawdownGuardTriggers,
-      maxPositionShares: cfg.maxPositionShares,
+      maxPositionShares: Math.round(cfg.maxPositionShares * obiSizeMultiplier),
+      obiSizeMultiplier: roundTo(obiSizeMultiplier, 2),
       maxEntryPrice: cfg.maxEntryPrice,
       cooldownMs: cfg.cooldownMs,
       stopEntryBeforeEndMs: cfg.stopEntryBeforeEndMs,
@@ -584,6 +591,12 @@ export class ObiEngine {
      * unavailable assessment is treated as "no opinion" and never blocks.
      */
     deepBinanceAssessment?: DeepBinanceAssessment | null;
+    /**
+     * Phase 21: compounding multiplier from DynamicCompounder. Scales
+     * entryShares and maxPositionShares when bankroll exceeds threshold.
+     * Defaults to 1.0 (no scaling) when compounder is disabled or absent.
+     */
+    obiSizeMultiplier?: number;
   }): StrategySignal[] {
     const { market, orderbook, positionManager, config, deepBinanceAssessment } = params;
     if (!config.enabled) {
@@ -691,7 +704,9 @@ export class ObiEngine {
       if (bestAsk < config.minEntryPrice || bestAsk > config.maxEntryPrice) continue;
 
       const existingShares = positionManager.getShares(outcome);
-      if (existingShares >= config.maxPositionShares) continue;
+      // Phase 21: use compounded max for the pre-filter too.
+      const preFilterMax = Math.round(config.maxPositionShares * (params.obiSizeMultiplier ?? 1.0));
+      if (existingShares >= preFilterMax) continue;
 
       candidates.push({
         outcome,
@@ -758,14 +773,20 @@ export class ObiEngine {
     const minSharesForExitNotional = Math.ceil(
       (config.clobMinNotionalUsd * safetyBuffer) / worstExitPrice
     );
+    // Phase 21: compounding — scale entry and cap by multiplier.
+    // Multiplier is 1.0 below threshold (no change), up to 5.0 at high bankroll.
+    const mult = params.obiSizeMultiplier ?? 1.0;
+    const compoundedEntryShares = Math.round(config.entryShares * mult);
+    const compoundedMaxShares = Math.round(config.maxPositionShares * mult);
+
     const sizedShares = Math.max(
-      config.entryShares,
+      compoundedEntryShares,
       config.clobMinShares,
       minSharesForExitNotional
     );
 
-    // Cap at maxPositionShares to respect risk limits.
-    const finalShares = Math.min(sizedShares, config.maxPositionShares);
+    // Cap at compounded maxPositionShares to respect risk limits.
+    const finalShares = Math.min(sizedShares, compoundedMaxShares);
     if (finalShares < config.clobMinShares) {
       // Cannot satisfy CLOB minimums even at max position size — skip entry.
       return [];
@@ -778,14 +799,15 @@ export class ObiEngine {
     // to the entry price (e.g. max=12 but dust-safety needs 24 @ bestAsk=0.36).
     if (finalShares < minSharesForExitNotional) {
       const coin = extractCoinFromObiTitle(market.title);
-      this.recordPhase15Refusal(coin, `bestAsk=${chosen.bestAsk} need=${minSharesForExitNotional} cap=${config.maxPositionShares}`);
+      this.recordPhase15Refusal(coin, `bestAsk=${chosen.bestAsk} need=${minSharesForExitNotional} cap=${compoundedMaxShares}`);
       logger.info('OBI entry refused — risk cap below dust-safety minimum', {
         marketId: market.marketId,
         outcome: chosen.outcome,
         bestAsk: chosen.bestAsk,
         finalShares,
         minSharesForExitNotional,
-        maxPositionShares: config.maxPositionShares,
+        maxPositionShares: compoundedMaxShares,
+        obiSizeMultiplier: mult,
         worstExitPrice,
         hint: 'increase OBI_MAX_POSITION_SHARES or lower OBI_MAX_ENTRY_PRICE',
       });
@@ -856,6 +878,7 @@ export class ObiEngine {
       bestAsk: chosen.bestAsk,
       finalShares,
       entryNotional,
+      obiSizeMultiplier: mult,
       binanceHasAssessment: deepBinanceAssessment !== null && deepBinanceAssessment !== undefined,
       binanceAvailable: deepBinanceAssessment?.available ?? null,
       binanceCoin: deepBinanceAssessment?.coin ?? null,

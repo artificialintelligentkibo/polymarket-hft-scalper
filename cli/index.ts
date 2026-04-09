@@ -452,8 +452,9 @@ function renderObiSessionStats(stats: ObiSessionStats): string {
       ['Win Rate', color.bold(winRate), 'Redeems (P17)', color.cyan(String(stats.redeems))],
       ['Realized PnL', formatSignedCurrency(stats.realizedPnl), 'Gate Pass Rate', color.bold(passRate)],
       ['Max Cap (sh)', color.bold(String(stats.maxPositionShares)), 'Max Price', color.bold(stats.maxEntryPrice.toFixed(2))],
-      ['Cooldown', color.dim(`${stats.cooldownMs}ms`), 'Stop Before End', color.dim(`${stats.stopEntryBeforeEndMs}ms`)],
-      ['Drawdown Guard', stats.drawdownGuardActive ? color.yellow('ACTIVE (0.5x)') : color.green('OFF'), 'Guard Triggers', color.bold(String(stats.drawdownGuardTriggers))],
+      ['Compound ×', stats.obiSizeMultiplier > 1.0 ? color.cyan(`${stats.obiSizeMultiplier.toFixed(1)}×`) : color.dim('1.0× (static)'), 'Cooldown', color.dim(`${stats.cooldownMs}ms`)],
+      ['Stop Before End', color.dim(`${stats.stopEntryBeforeEndMs}ms`), 'Guard Triggers', color.bold(String(stats.drawdownGuardTriggers))],
+      ['Drawdown Guard', stats.drawdownGuardActive ? color.yellow('ACTIVE (0.5x)') : color.green('OFF'), '', ''],
     ]
   );
 }
@@ -496,7 +497,9 @@ function renderObiDustSafety(stats: ObiSessionStats): string {
   const lines: string[] = [];
   const total = stats.phase15Accepted + stats.phase15Refused;
   lines.push(
-    `Cap: ${color.bold(String(stats.maxPositionShares))} shares   ` +
+    `Cap: ${color.bold(String(stats.maxPositionShares))} shares` +
+    (stats.obiSizeMultiplier > 1.0 ? ` (${stats.obiSizeMultiplier.toFixed(1)}×)` : '') +
+    `   ` +
     `Accepted: ${color.green(String(stats.phase15Accepted))}   ` +
     `Refused: ${color.red(String(stats.phase15Refused))}` +
     (total > 0 ? `   (${((stats.phase15Accepted / total) * 100).toFixed(0)}% pass)` : '')

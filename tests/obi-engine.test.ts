@@ -46,6 +46,7 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     binanceRunawayAbsPct: 0.30,
     binanceContraAbsPct: 0.15,
     binanceRequireAlignment: false,
+    obiCompoundThresholdUsd: 200,
     ...overrides,
   };
 }
@@ -1170,4 +1171,65 @@ test('obi engine: missing Binance assessment does not block (fail-open)', () => 
     // No assessment provided.
   });
   assert.equal(signals.length, 1);
+});
+
+// ─── Phase 21: OBI Compounding ────────────────────────────────────────────────
+
+test('obi engine: obiSizeMultiplier scales entry shares up', () => {
+  const params = {
+    market: createMarket(),
+    orderbook: createOrderbook({
+      yesBid: 0.20,
+      yesAsk: 0.21,
+      yesBidDepth: 800,
+      yesAskDepth: 4,
+      noBid: 0.78,
+      noAsk: 0.80,
+      noBidDepth: 400,
+      noAskDepth: 400,
+    }),
+    positionManager: new PositionManager('market-1'),
+    config: baseConfig({ entryShares: 10, maxPositionShares: 60 }),
+    nowMs: FIXED_NOW,
+  };
+
+  // Without multiplier (default 1.0) — should use static entryShares.
+  const base = new ObiEngine().generateSignals(params);
+  assert.equal(base.length, 1);
+  // dust-safety at bestAsk=0.21: worstExit=0.063, ceil(2.5/0.063)=40 → max(10,5,40)=40
+  assert.equal(base[0]!.shares, 40);
+
+  // With 2× multiplier — entryShares becomes 20, but dust-safety still 40 → 40.
+  const x2 = new ObiEngine().generateSignals({ ...params, obiSizeMultiplier: 2.0 });
+  assert.equal(x2.length, 1);
+  assert.equal(x2[0]!.shares, 40); // dust-safety floor dominates
+
+  // With 2× multiplier and higher entryShares — compounding should win.
+  const cfg3 = baseConfig({ entryShares: 30, maxPositionShares: 100 });
+  const x2big = new ObiEngine().generateSignals({ ...params, config: cfg3, obiSizeMultiplier: 2.0 });
+  assert.equal(x2big.length, 1);
+  // compoundedEntry = 30*2=60, dust-safety=40, max(60,5,40)=60, capped at 100*2=200 → 60
+  assert.equal(x2big[0]!.shares, 60);
+});
+
+test('obi engine: obiSizeMultiplier=1.0 produces same result as no multiplier', () => {
+  const params = {
+    market: createMarket(),
+    orderbook: createOrderbook({
+      yesBid: 0.20,
+      yesAsk: 0.21,
+      yesBidDepth: 800,
+      yesAskDepth: 4,
+      noBid: 0.78,
+      noAsk: 0.80,
+      noBidDepth: 400,
+      noAskDepth: 400,
+    }),
+    positionManager: new PositionManager('market-1'),
+    config: baseConfig(),
+    nowMs: FIXED_NOW,
+  };
+  const noMult = new ObiEngine().generateSignals(params);
+  const withMult = new ObiEngine().generateSignals({ ...params, obiSizeMultiplier: 1.0 });
+  assert.equal(noMult[0]!.shares, withMult[0]!.shares);
 });

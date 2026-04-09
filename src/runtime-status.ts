@@ -200,6 +200,7 @@ export interface ObiSessionStats {
   readonly drawdownGuardActive: boolean;
   readonly drawdownGuardTriggers: number;
   readonly maxPositionShares: number;
+  readonly obiSizeMultiplier: number;
   readonly maxEntryPrice: number;
   readonly cooldownMs: number;
   readonly stopEntryBeforeEndMs: number;
