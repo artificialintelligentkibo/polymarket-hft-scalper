@@ -49,6 +49,8 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     binanceRequireAlignment: false,
     obiCompoundThresholdUsd: 200,
     maxRiskPerTradePct: 1.0, // no cap in tests by default
+    timeTakeProfitMs: 0, // disabled in tests by default
+    timeTakeProfitMinEdge: 0.005,
     ...overrides,
   };
 }

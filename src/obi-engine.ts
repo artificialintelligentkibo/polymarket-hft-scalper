@@ -129,6 +129,20 @@ export interface ObiEngineConfig {
    * E.g. 0.15 = max 15% of balance on one position. Set to 1.0 to disable.
    */
   readonly maxRiskPerTradePct: number;
+  /**
+   * Phase 26: time-based take-profit. If a position has been held for longer
+   * than this many milliseconds AND is profitable (bestBid > entryPrice by
+   * at least `timeTakeProfitMinEdge`), exit immediately. Prevents profitable
+   * positions from drifting back to break-even/loss while waiting for the
+   * full scalpExitEdge target. Set to 0 to disable.
+   */
+  readonly timeTakeProfitMs: number;
+  /**
+   * Minimum price edge (absolute, e.g. 0.005 = half a cent) required for
+   * time-based take-profit to trigger. Prevents closing at break-even where
+   * fees would eat the "profit". Only relevant when timeTakeProfitMs > 0.
+   */
+  readonly timeTakeProfitMinEdge: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1396,6 +1410,38 @@ export class ObiEngine {
         buildExit(
           'OBI_REBALANCE_EXIT',
           `OBI rebalance: ratio ${currentRatio.toFixed(3)} >= ${config.exitRebalanceRatio.toFixed(3)}`,
+          bestBid
+        ),
+      ];
+    }
+
+    // Phase 26: time-based take-profit. If position is in profit (even small)
+    // and has been held longer than timeTakeProfitMs, take the money and run.
+    // Smart money exits fast — waiting for the full scalpExitEdge target often
+    // means the edge evaporates and the position drifts to break-even or loss.
+    if (
+      config.timeTakeProfitMs > 0 &&
+      bestBid !== null &&
+      bestBid > position.entryPrice + config.timeTakeProfitMinEdge &&
+      nowMs - position.enteredAtMs >= config.timeTakeProfitMs
+    ) {
+      const holdSec = Math.round((nowMs - position.enteredAtMs) / 1000);
+      if (config.shadowMode) {
+        this.totalShadowDecisions += 1;
+        logger.info('OBI engine (shadow) would time-take-profit', {
+          marketId: market.marketId,
+          entryPrice: position.entryPrice,
+          bestBid,
+          holdSec,
+          edge: roundTo(bestBid - position.entryPrice, 4),
+        });
+        return [];
+      }
+      this.totalExits += 1;
+      return [
+        buildExit(
+          'OBI_SCALP_EXIT',
+          `OBI time-TP: held ${holdSec}s, bid ${bestBid.toFixed(3)} > entry ${position.entryPrice.toFixed(3)} + ${config.timeTakeProfitMinEdge} (edge ${roundTo(bestBid - position.entryPrice, 4)})`,
           bestBid
         ),
       ];

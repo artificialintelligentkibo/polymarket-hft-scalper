@@ -1295,6 +1295,14 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.OBI_SCALP_EXIT_EDGE, '0.08')
       ),
+      timeTakeProfitMs: Math.max(
+        0,
+        parseIntOrDefault(env.OBI_TIME_TAKE_PROFIT_MS, '45000')
+      ),
+      timeTakeProfitMinEdge: Math.max(
+        0,
+        parseFloatOrDefault(env.OBI_TIME_TAKE_PROFIT_MIN_EDGE, '0.005')
+      ),
       mmAskEnabled: parseBoolean(env.OBI_MM_ASK_ENABLED, true),
       mmBidOppositeEnabled: parseBoolean(env.OBI_MM_BID_OPPOSITE_ENABLED, false),
       mmAskSpreadTicks: Math.max(
