@@ -123,6 +123,12 @@ export interface ObiEngineConfig {
    * Below this threshold sizing stays static. Set to 0 to disable compounding.
    */
   readonly obiCompoundThresholdUsd: number;
+  /**
+   * Phase 22: maximum fraction of available balance risked per single OBI
+   * entry. Prevents a single bad trade from wiping 20%+ of the bankroll.
+   * E.g. 0.15 = max 15% of balance on one position. Set to 1.0 to disable.
+   */
+  readonly maxRiskPerTradePct: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -807,10 +813,15 @@ export class ObiEngine {
     // → collapse to 0.11 (30% of entry, 70% drawdown). Old code sized 9
     // shares; CLOB min at 0.11 was 9.091, position abandoned $3.24 cost basis.
     //
-    // New formula for entry 0.36: worstExit=0.108, shares=ceil(2.5/0.108)=24
-    // → at actual collapse 0.11: 24*0.11 = $2.64 ≫ $1 min → sellable.
+    // Phase 22 (2026-04-09): tightened from bestAsk*0.3 (70% drawdown) to
+    // bestAsk*0.15 (85% drawdown). Live incident: ETH YES entry @ 0.26 →
+    // collapse to 0.02 (92% drawdown). Phase 15 approved 33 shares at 0.3×
+    // worst-exit=0.078, but actual exit was 0.02 → 33*0.02 = $0.66 < $1 CLOB
+    // min → dust trap → full $8.10 loss on redeem. The 0.15× multiplier
+    // would have required ceil(2.5/0.039)=65 shares at 0.26 entry, which
+    // exceeds maxPositionShares=35 → Phase 15 would have REFUSED the entry.
     const safetyBuffer = 2.5;
-    const worstExitPrice = Math.max(0.05, chosen.bestAsk * 0.3);
+    const worstExitPrice = Math.max(0.05, chosen.bestAsk * 0.15);
     const minSharesForExitNotional = Math.ceil(
       (config.clobMinNotionalUsd * safetyBuffer) / worstExitPrice
     );
@@ -866,6 +877,30 @@ export class ObiEngine {
     if (config.preflightBalanceCheck && this.availableUsdcBalance !== null) {
       const requiredUsdc = entryNotional * 1.05;
       if (this.availableUsdcBalance < requiredUsdc) {
+        return [];
+      }
+    }
+
+    // === Phase 22: max-risk-per-trade guard ===
+    // Prevents a single OBI entry from risking more than X% of the bankroll.
+    // Live incident 2026-04-09: ETH YES 33sh @ $0.26 = $8.58 = 21% of $40
+    // balance → full loss on wrong-side redeem. With 15% cap and $40 balance
+    // the max entry would be $6.00 → ~23 shares @ 0.26, limiting loss.
+    if (config.maxRiskPerTradePct < 1.0 && this.availableUsdcBalance !== null) {
+      const maxNotional = this.availableUsdcBalance * config.maxRiskPerTradePct;
+      if (entryNotional > maxNotional) {
+        const coin = extractCoinFromObiTitle(market.title);
+        logger.info('OBI entry refused — exceeds max risk per trade', {
+          marketId: market.marketId,
+          outcome: chosen.outcome,
+          bestAsk: chosen.bestAsk,
+          entryNotional,
+          maxNotional: roundTo(maxNotional, 2),
+          balanceUsd: roundTo(this.availableUsdcBalance, 2),
+          maxRiskPct: config.maxRiskPerTradePct,
+        });
+        this.pushDecision(coin, 'REFUSED', 'max_risk_per_trade',
+          `$${entryNotional.toFixed(2)} > ${(config.maxRiskPerTradePct * 100).toFixed(0)}% of $${this.availableUsdcBalance.toFixed(2)}`);
         return [];
       }
     }

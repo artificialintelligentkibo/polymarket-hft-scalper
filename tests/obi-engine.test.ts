@@ -47,6 +47,7 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     binanceContraAbsPct: 0.15,
     binanceRequireAlignment: false,
     obiCompoundThresholdUsd: 200,
+    maxRiskPerTradePct: 1.0, // no cap in tests by default
     ...overrides,
   };
 }
@@ -1194,21 +1195,22 @@ test('obi engine: obiSizeMultiplier scales entry shares up', () => {
   };
 
   // Without multiplier (default 1.0) — should use static entryShares.
+  // Phase 22: dust-safety at bestAsk=0.21: worstExit=max(0.05, 0.21*0.15)=0.05,
+  // ceil(2.5/0.05)=50 → max(10,5,50)=50, capped at 60 → 50.
   const base = new ObiEngine().generateSignals(params);
   assert.equal(base.length, 1);
-  // dust-safety at bestAsk=0.21: worstExit=0.063, ceil(2.5/0.063)=40 → max(10,5,40)=40
-  assert.equal(base[0]!.shares, 40);
+  assert.equal(base[0]!.shares, 50);
 
-  // With 2× multiplier — entryShares becomes 20, but dust-safety still 40 → 40.
+  // With 2× multiplier — entryShares becomes 20, but dust-safety still 50 → 50.
   const x2 = new ObiEngine().generateSignals({ ...params, obiSizeMultiplier: 2.0 });
   assert.equal(x2.length, 1);
-  assert.equal(x2[0]!.shares, 40); // dust-safety floor dominates
+  assert.equal(x2[0]!.shares, 50); // dust-safety floor dominates
 
   // With 2× multiplier and higher entryShares — compounding should win.
   const cfg3 = baseConfig({ entryShares: 30, maxPositionShares: 100 });
   const x2big = new ObiEngine().generateSignals({ ...params, config: cfg3, obiSizeMultiplier: 2.0 });
   assert.equal(x2big.length, 1);
-  // compoundedEntry = 30*2=60, dust-safety=40, max(60,5,40)=60, capped at 100*2=200 → 60
+  // compoundedEntry = 30*2=60, dust-safety=50, max(60,5,50)=60, capped at 100*2=200 → 60
   assert.equal(x2big[0]!.shares, 60);
 });
 

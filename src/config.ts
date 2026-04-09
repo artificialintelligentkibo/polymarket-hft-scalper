@@ -1282,7 +1282,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseIntOrDefault(env.OBI_CANCEL_ALL_BEFORE_END_MS, '20000')
       ),
       minEntryPrice: clamp(
-        parseFloatOrDefault(env.OBI_MIN_ENTRY_PRICE, '0.04'),
+        parseFloatOrDefault(env.OBI_MIN_ENTRY_PRICE, '0.30'),
         0,
         1
       ),
@@ -1367,6 +1367,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       obiCompoundThresholdUsd: Math.max(
         0,
         parseFloatOrDefault(env.OBI_COMPOUND_THRESHOLD_USD, '100')
+      ),
+      maxRiskPerTradePct: clamp(
+        parseFloatOrDefault(env.OBI_MAX_RISK_PER_TRADE_PCT, '0.15'),
+        0.01,
+        1.0
       ),
     },
     paperTrading: {
