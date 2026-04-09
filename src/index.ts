@@ -1197,6 +1197,94 @@ export class MarketMakerRuntime {
       }
     }
 
+    // === Phase 26: OBI full exit sweep for orphaned positions ===
+    // The main processPreparedMarket() loop only calls generateExitSignals()
+    // for markets that pass scanEligibleMarkets() entry filters (price range,
+    // liquidity, etc.). After entry, if the market price drifts outside
+    // OBI_MIN_ENTRY_PRICE–OBI_MAX_ENTRY_PRICE, the market falls out of the
+    // candidate list and generateExitSignals() is NEVER called. Result: every
+    // position silently goes to redeem (50/50 coin flip) instead of scalp-
+    // exiting. This sweep fetches a fresh orderbook for EVERY OBI position
+    // not already processed and runs the full exit-signal evaluation (hard
+    // stop, imbalance collapse, rebalance, scalp profit, slot flatten).
+    if (config.obiEngine.enabled) {
+      try {
+        const activePositions = this.obiEngine.getActivePositions();
+        for (const pos of activePositions) {
+          if (preparedMarketIds.has(pos.marketId)) continue; // already processed in main loop
+
+          const exitMarket = this.markets.get(pos.marketId);
+          if (!exitMarket) {
+            logger.debug('Phase 26 exit sweep: no cached market candidate', {
+              marketId: pos.marketId,
+            });
+            continue;
+          }
+
+          let exitBook = this.latestBooks.get(pos.marketId) ?? null;
+
+          // Fetch a FRESH orderbook so exit decisions use live prices, not
+          // stale data from the entry tick. Best-effort: if the fetch fails,
+          // fall back to the cached book (better than skipping entirely).
+          try {
+            exitBook = await this.fetcher.getMarketSnapshot(exitMarket);
+            this.latestBooks.set(pos.marketId, exitBook);
+            this.executor.recordOrderbookSnapshot(exitBook);
+          } catch (fetchErr) {
+            logger.debug('Phase 26 exit sweep: orderbook fetch failed, using cached', {
+              marketId: pos.marketId,
+              message: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+            });
+          }
+
+          if (!exitBook) {
+            logger.debug('Phase 26 exit sweep: no orderbook available', {
+              marketId: pos.marketId,
+            });
+            continue;
+          }
+
+          const exitPosManager = this.getPositionManager(exitMarket);
+          const exitSignals = this.obiEngine.generateExitSignals({
+            market: exitMarket,
+            orderbook: exitBook,
+            positionManager: exitPosManager,
+            config: config.obiEngine,
+          });
+
+          for (const sig of exitSignals) {
+            logger.info('Phase 26 exit sweep: executing orphan exit signal', {
+              marketId: sig.marketId,
+              signalType: sig.signalType,
+              reason: sig.reason,
+              targetPrice: sig.targetPrice,
+            });
+            this.scheduleBackgroundTask(async () => {
+              try {
+                await this.executeSignal(
+                  exitMarket,
+                  exitBook!,
+                  exitPosManager,
+                  sig,
+                  getSlotKey(exitMarket)
+                );
+              } catch (error) {
+                logger.warn('Phase 26 exit sweep execution failed', {
+                  marketId: sig.marketId,
+                  signalType: sig.signalType,
+                  message: error instanceof Error ? error.message : String(error),
+                });
+              }
+            });
+          }
+        }
+      } catch (error) {
+        logger.warn('Phase 26 exit sweep failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     // === OBI orphan slot-end safety net ===
     // After the normal per-market cycle, check if any OBI position is held on
     // a market that just dropped from the candidate list and is approaching
@@ -1209,9 +1297,6 @@ export class MarketMakerRuntime {
           excludeMarketIds: preparedMarketIds,
         });
         for (const sig of orphanFlattens) {
-          // Best-effort lookup of a stale market candidate / orderbook so we
-          // can route through the normal executor. Use the most recent prepared
-          // tick if any, otherwise reconstruct minimal context.
           const orphanBook = this.latestBooks.get(sig.marketId);
           const orphanPosManager = this.positions.get(sig.marketId);
           const orphanMarket = this.markets.get(sig.marketId);
