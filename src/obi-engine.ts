@@ -1266,6 +1266,21 @@ export class ObiEngine {
       return [];
     }
 
+    // Phase 30D: if remaining shares are below minimum CLOB order size (1 share),
+    // they are untradeable dust. Clear OBI state so we stop generating futile
+    // exit signals every cycle. The shares will be auto-redeemed at settlement.
+    const DUST_THRESHOLD_SHARES = 1;
+    if (liveShares < DUST_THRESHOLD_SHARES) {
+      logger.info('OBI: dust shares below min CLOB order — clearing state for auto-redeem', {
+        marketId: market.marketId,
+        outcome: position.outcome,
+        liveShares: roundTo(liveShares, 4),
+        threshold: DUST_THRESHOLD_SHARES,
+      });
+      this.clearState(market.marketId);
+      return [];
+    }
+
     const nowMs = params.nowMs ?? Date.now();
     const slotEndMs = parseTimeMs(market.endTime) ?? position.slotEndMs;
     const book = position.outcome === 'YES' ? orderbook.yes : orderbook.no;
