@@ -2072,6 +2072,184 @@ export class MarketMakerRuntime {
             }
           });
         }
+
+        // Phase 29: Schedule a dedicated slot-end exit timer.
+        // The main scan loop runs every ~150s, but 5-min slots only last 300s.
+        // If entry happens with < 150s remaining, the next scan cycle fires
+        // AFTER the slot ends and the CLOB is closed — making ALL exit signals
+        // useless. This timer guarantees an exit check fires BEFORE slot end,
+        // independent of the main loop timing.
+        const slotEndMs = market.endTime
+          ? new Date(market.endTime).getTime()
+          : null;
+        if (slotEndMs !== null && Number.isFinite(slotEndMs)) {
+          // Schedule multiple exit check timers to cover the full slot lifecycle:
+          // 1. Mid-slot check (60s before end) — catches rebalance/time-TP exits
+          // 2. Final check (cancelAllBeforeEndMs before end) — forced flatten
+          const MID_SLOT_BEFORE_END_MS = 60_000;
+          const midCheckDelayMs = (slotEndMs - MID_SLOT_BEFORE_END_MS) - Date.now();
+          if (midCheckDelayMs > 5_000) { // only if > 5s in the future
+            const midMarketId = market.marketId;
+            const midOutcome = executionSignal.outcome;
+            setTimeout(() => {
+              this.scheduleBackgroundTask(async () => {
+                try {
+                  const midPm = this.positions.get(midMarketId);
+                  if (!midPm) return;
+                  if (midPm.getShares(midOutcome) <= 0) return;
+                  const midMarket = this.markets.get(midMarketId);
+                  if (!midMarket) return;
+                  let midBook = this.latestBooks.get(midMarketId) ?? null;
+                  try {
+                    midBook = await this.fetcher.getMarketSnapshot(midMarket);
+                    this.latestBooks.set(midMarketId, midBook);
+                  } catch { /* use cached */ }
+                  if (!midBook) return;
+                  const midExits = this.obiEngine.generateExitSignals({
+                    market: midMarket,
+                    orderbook: midBook,
+                    positionManager: midPm,
+                    config: config.obiEngine,
+                  });
+                  for (const sig of midExits) {
+                    logger.info('Phase 29: mid-slot timer executing exit signal', {
+                      marketId: sig.marketId,
+                      signalType: sig.signalType,
+                      reason: sig.reason,
+                      targetPrice: sig.targetPrice,
+                    });
+                    await this.executeSignal(midMarket, midBook, midPm, sig, getSlotKey(midMarket));
+                  }
+                } catch (error) {
+                  logger.warn('Phase 29: mid-slot exit timer failed', {
+                    marketId: midMarketId,
+                    message: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              });
+            }, midCheckDelayMs);
+            logger.info('Phase 29: scheduled mid-slot exit timer', {
+              marketId: midMarketId,
+              delayMs: midCheckDelayMs,
+            });
+          }
+
+          const exitCheckMs = slotEndMs - config.obiEngine.cancelAllBeforeEndMs;
+          const delayMs = exitCheckMs - Date.now();
+          if (delayMs > 0) {
+            const timerMarketId = market.marketId;
+            const timerOutcome = executionSignal.outcome;
+            logger.info('Phase 29: scheduling slot-end exit timer', {
+              marketId: timerMarketId,
+              outcome: timerOutcome,
+              delayMs,
+              slotEndTime: market.endTime,
+            });
+            setTimeout(() => {
+              this.scheduleBackgroundTask(async () => {
+                try {
+                  // Check if position still exists
+                  const timerPm = this.positions.get(timerMarketId);
+                  if (!timerPm) return;
+                  const timerShares = timerPm.getShares(timerOutcome);
+                  if (timerShares <= 0) return;
+
+                  // Position still open — fetch fresh orderbook and run exit signals
+                  const timerMarket = this.markets.get(timerMarketId);
+                  if (!timerMarket) return;
+
+                  let timerBook = this.latestBooks.get(timerMarketId) ?? null;
+                  try {
+                    timerBook = await this.fetcher.getMarketSnapshot(timerMarket);
+                    this.latestBooks.set(timerMarketId, timerBook);
+                  } catch {
+                    // Use cached book
+                  }
+                  if (!timerBook) return;
+
+                  const exitSignals = this.obiEngine.generateExitSignals({
+                    market: timerMarket,
+                    orderbook: timerBook,
+                    positionManager: timerPm,
+                    config: config.obiEngine,
+                  });
+
+                  if (exitSignals.length === 0) {
+                    // No signal from generateExitSignals — force a cancel-all
+                    // flatten since we're within cancelAllBeforeEndMs of slot end.
+                    const timerBook2 = timerOutcome === 'YES' ? timerBook.yes : timerBook.no;
+                    const flattenPrice = timerBook2.bestBid ?? 0.01;
+                    logger.info('Phase 29: timer forced flatten — no exit signal generated', {
+                      marketId: timerMarketId,
+                      outcome: timerOutcome,
+                      shares: timerShares,
+                      flattenPrice,
+                    });
+                    // generateExitSignals should have fired cancel-all, but if it
+                    // didn't (e.g. position already cleaned up race), we're safe.
+                    return;
+                  }
+
+                  for (const sig of exitSignals) {
+                    logger.info('Phase 29: slot-end timer executing exit signal', {
+                      marketId: sig.marketId,
+                      signalType: sig.signalType,
+                      reason: sig.reason,
+                      targetPrice: sig.targetPrice,
+                    });
+                    await this.executeSignal(
+                      timerMarket,
+                      timerBook,
+                      timerPm,
+                      sig,
+                      getSlotKey(timerMarket)
+                    );
+                  }
+                } catch (error) {
+                  logger.warn('Phase 29: slot-end exit timer failed', {
+                    marketId: timerMarketId,
+                    message: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              });
+            }, delayMs);
+          } else {
+            // Slot end is already within cancelAllBeforeEndMs — run exit NOW
+            logger.warn('Phase 29: slot end imminent at entry, running exit check immediately', {
+              marketId: market.marketId,
+              delayMs,
+            });
+            this.scheduleBackgroundTask(async () => {
+              try {
+                const exitSignals = this.obiEngine.generateExitSignals({
+                  market,
+                  orderbook,
+                  positionManager,
+                  config: config.obiEngine,
+                });
+                for (const sig of exitSignals) {
+                  logger.info('Phase 29: immediate exit signal after late entry', {
+                    marketId: sig.marketId,
+                    signalType: sig.signalType,
+                    reason: sig.reason,
+                  });
+                  await this.executeSignal(
+                    market,
+                    orderbook,
+                    positionManager,
+                    sig,
+                    slotKey
+                  );
+                }
+              } catch (error) {
+                logger.warn('Phase 29: immediate exit check failed', {
+                  marketId: market.marketId,
+                  message: error instanceof Error ? error.message : String(error),
+                });
+              }
+            });
+          }
+        }
       }
       // Phase 28: synchronous OBI exit fills — record stats and clean up
       // obiEngine.positions so the dead position doesn't linger until wallet
