@@ -2293,6 +2293,112 @@ export class MarketMakerRuntime {
             soldShares: effectiveShares,
             exitPrice: effectivePrice,
           });
+        } else if (remainingShares > 0 && remainingShares < 1) {
+          // Phase 30E: Clamped exit left a sub-1-share remainder (settlement
+          // delay — bought 7sh but only ~6.72 were on-chain when exit fired).
+          // Clear OBI state now, but schedule a retry in 45s to sell the
+          // remainder once the last shares settle on-chain.
+          this.obiEngine.clearState(market.marketId);
+          const retryMarketId = market.marketId;
+          const retryOutcome = executionSignal.outcome;
+          const retryTokenId = tokenId;
+          logger.info('Phase 30E: scheduling settlement remainder retry', {
+            marketId: retryMarketId,
+            outcome: retryOutcome,
+            remainingShares: roundTo(remainingShares, 4),
+            retryDelayMs: 45_000,
+          });
+          setTimeout(() => {
+            this.scheduleBackgroundTask(async () => {
+              try {
+                // Re-check live balance — shares may have settled by now
+                this.executor.invalidateOutcomeBalanceCache(retryTokenId);
+                const freshBalance = await this.executor.getOutcomeTokenBalance(retryTokenId, true);
+                const sellableShares = roundTo(Math.max(0, freshBalance), 4);
+                if (sellableShares < 0.01) {
+                  logger.info('Phase 30E: remainder already gone (redeemed?)', {
+                    marketId: retryMarketId, outcome: retryOutcome,
+                  });
+                  return;
+                }
+                if (sellableShares < MIN_CLOB_ORDER_SHARES) {
+                  logger.info('Phase 30E: remainder too small for CLOB, marking as dust', {
+                    marketId: retryMarketId, outcome: retryOutcome,
+                    shares: sellableShares,
+                  });
+                  this.dustAbandonedPositions.add(
+                    this.getMarketOutcomeKey(retryMarketId, retryOutcome)
+                  );
+                  return;
+                }
+                // Build a SLOT_FLATTEN signal and execute through normal flow
+                const retryMarket = this.markets.get(retryMarketId);
+                if (!retryMarket) {
+                  logger.info('Phase 30E: market gone, marking as dust', { marketId: retryMarketId });
+                  this.dustAbandonedPositions.add(
+                    this.getMarketOutcomeKey(retryMarketId, retryOutcome)
+                  );
+                  return;
+                }
+                let retryBook = this.latestBooks.get(retryMarketId) ?? null;
+                try {
+                  retryBook = await this.fetcher.getMarketSnapshot(retryMarket);
+                  this.latestBooks.set(retryMarketId, retryBook);
+                } catch { /* use cached */ }
+                if (!retryBook) return;
+
+                const retryPm = this.getPositionManager(retryMarket);
+                const liveShares = retryPm.getShares(retryOutcome);
+                if (liveShares < 0.01) return;
+
+                const book = retryOutcome === 'YES' ? retryBook.yes : retryBook.no;
+                const sellPrice = book.bestBid ?? 0.01;
+                const flattenSignal: StrategySignal = {
+                  marketId: retryMarketId,
+                  marketTitle: retryMarket.title,
+                  signalType: 'SLOT_FLATTEN',
+                  priority: 999,
+                  generatedAt: Date.now(),
+                  action: 'SELL',
+                  outcome: retryOutcome,
+                  outcomeIndex: retryOutcome === 'YES' ? 0 : 1,
+                  shares: roundTo(liveShares, 4),
+                  targetPrice: sellPrice,
+                  referencePrice: sellPrice,
+                  tokenPrice: book.midPrice ?? sellPrice,
+                  midPrice: book.midPrice ?? sellPrice,
+                  fairValue: sellPrice,
+                  edgeAmount: 0,
+                  combinedBid: retryBook.combined.combinedBid ?? null,
+                  combinedAsk: retryBook.combined.combinedAsk ?? null,
+                  combinedMid: retryBook.combined.combinedMid ?? null,
+                  combinedDiscount: null,
+                  combinedPremium: null,
+                  fillRatio: 1,
+                  capitalClamp: 1,
+                  priceMultiplier: 1,
+                  reason: `Phase 30E: settlement remainder retry (${roundTo(liveShares, 4)}sh)`,
+                  urgency: 'cross',
+                  reduceOnly: true,
+                };
+                logger.info('Phase 30E: executing settlement remainder sell', {
+                  marketId: retryMarketId, outcome: retryOutcome,
+                  shares: roundTo(liveShares, 4), price: sellPrice,
+                });
+                await this.executeSignal(
+                  retryMarket, retryBook, retryPm, flattenSignal, getSlotKey(retryMarket)
+                );
+              } catch (err) {
+                logger.warn('Phase 30E: remainder sell failed, marking as dust', {
+                  marketId: retryMarketId, outcome: retryOutcome,
+                  message: err instanceof Error ? err.message : String(err),
+                });
+                this.dustAbandonedPositions.add(
+                  this.getMarketOutcomeKey(retryMarketId, retryOutcome)
+                );
+              }
+            });
+          }, 45_000);
         }
       }
       // Phase 30: Universal slot-end exit timer for ALL strategies.
