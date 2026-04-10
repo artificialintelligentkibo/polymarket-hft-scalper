@@ -23,6 +23,7 @@ import {
   validateConfig,
 } from './config.js';
 import { CostBasisLedger } from './cost-basis-ledger.js';
+import { startDashboard, stopDashboard } from './dashboard-server.js';
 import { getDayPnlState, recordDayPnlDelta } from './day-pnl-state.js';
 import {
   FillTracker,
@@ -840,6 +841,11 @@ export class MarketMakerRuntime {
         mmEnabled: isDynamicQuotingEnabled(config),
       });
     } catch { /* narrator is best-effort */ }
+
+    // Phase 30C: start HTTP dashboard if enabled
+    if (config.dashboard.enabled) {
+      startDashboard(config, config.dashboard);
+    }
   }
 
   /**
@@ -894,6 +900,7 @@ export class MarketMakerRuntime {
 
     logger.info('Graceful shutdown started', { reason });
     try { this.narrator.logShutdown(reason); } catch { /* best-effort */ }
+    stopDashboard();
     if (this.walletFundsRefreshTimer) {
       clearInterval(this.walletFundsRefreshTimer);
       this.walletFundsRefreshTimer = null;

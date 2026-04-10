@@ -495,6 +495,11 @@ export interface AppConfig {
      */
     readonly walletFundsRefreshIntervalMs: number;
   };
+  readonly dashboard: {
+    readonly enabled: boolean;
+    readonly port: number;
+    readonly host: string;
+  };
   readonly logging: {
     readonly level: LogLevel;
     readonly directory: string;
@@ -1544,6 +1549,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         5_000,
         parseIntOrDefault(env.WALLET_FUNDS_REFRESH_INTERVAL_MS, '20000')
       ),
+    },
+    dashboard: {
+      enabled: parseBoolean(env.DASHBOARD_ENABLED, false),
+      port: Math.max(1, parseIntOrDefault(env.DASHBOARD_PORT, '3847')),
+      host: (env.DASHBOARD_HOST || '0.0.0.0').trim(),
     },
     logging: {
       level: parseLogLevel(env.LOG_LEVEL),
