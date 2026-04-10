@@ -371,6 +371,16 @@ export class SignalScalper {
     this.sniperEngine.recordFailedExit(params);
   }
 
+  /** Phase 30B: forward coin-wide cooldown after a losing sniper exit. */
+  recordSniperLosingExit(coin: string): void {
+    this.sniperEngine.recordLosingExit(coin);
+  }
+
+  /** Phase 30B: forward available balance for pre-flight sizing check. */
+  updateSniperAvailableBalance(usd: number): void {
+    this.sniperEngine.updateAvailableBalance(usd);
+  }
+
   evaluateSniperCandidate(params: {
     market: MarketCandidate;
     orderbook: MarketOrderbookSnapshot;

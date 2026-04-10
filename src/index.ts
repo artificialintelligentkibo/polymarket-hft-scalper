@@ -2646,6 +2646,24 @@ export class MarketMakerRuntime {
         new Date(completedAt)
       );
     }
+    // Phase 30B: coin-wide cooldown after a losing sniper exit
+    if (
+      effectiveShares > 0 &&
+      executionSignal.action === 'SELL' &&
+      realizedDelta < 0 &&
+      resolveStrategyLayer(executionSignal.signalType) === 'SNIPER' &&
+      config.sniper.enabled
+    ) {
+      const coin = extractCoinFromTitle(market.title);
+      if (coin) {
+        this.signalEngine.recordSniperLosingExit(coin);
+        logger.info('Sniper coin cooldown armed after losing exit', {
+          coin,
+          realizedDelta: roundTo(realizedDelta, 4),
+          cooldownMs: config.sniper.losingExitCooldownByCoinMs,
+        });
+      }
+    }
     if (effectiveShares > 0) {
       this.signalEngine.recordExecution({
         market,
@@ -4442,6 +4460,11 @@ export class MarketMakerRuntime {
       // Recalculate compounding sizes on every balance refresh
       if (this.compounder.enabled && validBalance !== null && validBalance > 0) {
         this.compounder.recalculate(validBalance);
+      }
+
+      // Phase 30B: feed sniper engine with latest available balance for pre-flight check
+      if (validBalance !== null && config.sniper.enabled) {
+        this.signalEngine.updateSniperAvailableBalance(validBalance);
       }
     } catch (error) {
       logger.debug('Wallet funds snapshot refresh failed', {

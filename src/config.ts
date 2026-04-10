@@ -93,6 +93,19 @@ export interface SniperConfig {
   readonly minVelocityPctPerSec: number;
   /** Move-to-probability calibration scale for Binance fair value estimation. */
   readonly volatilityScale: number;
+
+  // === Phase 30B: Safety guards ported from OBI ===
+
+  /** Minimum combined (bid+ask) orderbook liquidity to allow entry (0 = disabled). */
+  readonly minLiquidityUsd: number;
+  /** Block entry if |Binance move| exceeds this absolute threshold (0 = disabled). */
+  readonly runawayAbsPct: number;
+  /** After a losing exit on coin X, block new Sniper entries on any X slot for this duration. */
+  readonly losingExitCooldownByCoinMs: number;
+  /** Reject entry if available USDC < required notional × 1.05. */
+  readonly preflightBalanceCheck: boolean;
+  /** Available USDC balance for pre-flight check, refreshed externally. */
+  availableBalanceUsd?: number;
 }
 
 /**
@@ -1213,6 +1226,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         '0.005'
       ),
       volatilityScale: parseFloatOrDefault(env.SNIPER_VOLATILITY_SCALE, '0.003'),
+      // Phase 30B: Safety guards ported from OBI
+      minLiquidityUsd: Math.max(0, parseFloatOrDefault(env.SNIPER_MIN_LIQUIDITY_USD, '100')),
+      runawayAbsPct: Math.max(0, parseFloatOrDefault(env.SNIPER_RUNAWAY_ABS_PCT, '0.30')),
+      losingExitCooldownByCoinMs: Math.max(0, parseIntOrDefault(env.SNIPER_LOSING_COOLDOWN_BY_COIN_MS, '300000')),
+      preflightBalanceCheck: parseBoolean(env.SNIPER_PREFLIGHT_BALANCE_CHECK, true),
     },
     regimeFilter: {
       enabled: parseBoolean(env.REGIME_FILTER_ENABLED, false),

@@ -38,7 +38,12 @@ export type SniperRejection =
   | 'velocity_too_low'
   | 'correlated_risk_limit'
   | 'regime_ranging'
-  | 'signal_generated';
+  | 'signal_generated'
+  // Phase 30B: safety guards ported from OBI
+  | 'low_liquidity'
+  | 'runaway_move'
+  | 'coin_cooldown'
+  | 'insufficient_balance';
 
 interface SniperEvaluation {
   readonly marketId: string;
@@ -130,6 +135,8 @@ export class SniperEngine {
   private readonly peakEdges = new Map<string, number>();
   private readonly hardStopFallbackKeys = new Set<string>();
   private readonly lastEntryAt = new Map<string, number>();
+  // Phase 30B: coin-wide losing exit cooldown (same concept as OBI's losingExitCooldownByCoinMs)
+  private readonly lastLosingExitByCoin = new Map<string, number>();
   private readonly rejectionCounts = new Map<SniperRejection, number>();
   private readonly coinEvals = new Map<string, CoinEvalState>();
   private readonly directionWindows = new Map<string, DirectionWindowState>();
@@ -418,6 +425,59 @@ export class SniperEngine {
       return null;
     }
 
+    // === Phase 30B: Safety guards ported from OBI ===
+
+    // 1. Binance runaway gate — block entry if move is too extreme
+    if (
+      params.config.runawayAbsPct > 0 &&
+      movePct >= params.config.runawayAbsPct
+    ) {
+      this.reject({
+        ...evaluationBase,
+        rejection: 'runaway_move',
+      });
+      return null;
+    }
+
+    // 2. Coin-wide losing exit cooldown
+    if (params.config.losingExitCooldownByCoinMs > 0) {
+      const lastLoss = this.lastLosingExitByCoin.get(coin.toUpperCase());
+      if (lastLoss !== undefined && nowMs - lastLoss < params.config.losingExitCooldownByCoinMs) {
+        this.reject({
+          ...evaluationBase,
+          rejection: 'coin_cooldown',
+        });
+        return null;
+      }
+    }
+
+    // 3. Orderbook liquidity minimum
+    if (params.config.minLiquidityUsd > 0) {
+      const yesLiq = params.orderbook.yes.depthNotionalBid + params.orderbook.yes.depthNotionalAsk;
+      const noLiq = params.orderbook.no.depthNotionalBid + params.orderbook.no.depthNotionalAsk;
+      const totalLiquidity = Math.max(yesLiq, noLiq);
+      if (totalLiquidity < params.config.minLiquidityUsd) {
+        this.reject({
+          ...evaluationBase,
+          rejection: 'low_liquidity',
+        });
+        return null;
+      }
+    }
+
+    // 4. Pre-flight balance check
+    if (params.config.preflightBalanceCheck) {
+      const bestAskEstimate = (params.orderbook.yes.bestAsk ?? 0.5);
+      const entryNotional = params.config.baseShares * bestAskEstimate;
+      if (this._availableBalanceUsd > 0 && this._availableBalanceUsd < entryNotional * 1.05) {
+        this.reject({
+          ...evaluationBase,
+          rejection: 'insufficient_balance',
+        });
+        return null;
+      }
+    }
+
     const slotStartMs = parseSlotBoundary(params.market.startTime);
     const slotEndMs = parseSlotBoundary(params.market.endTime);
     if (slotStartMs !== null && nowMs - slotStartMs < params.config.slotWarmupMs) {
@@ -666,6 +726,17 @@ export class SniperEngine {
 
     return selectedSignals;
   }
+
+  // Phase 30B: record a losing exit to trigger coin-wide cooldown
+  recordLosingExit(coin: string, nowMs?: number): void {
+    this.lastLosingExitByCoin.set(coin.toUpperCase(), nowMs ?? Date.now());
+  }
+
+  // Phase 30B: update available balance for pre-flight check
+  updateAvailableBalance(usd: number): void {
+    this._availableBalanceUsd = usd;
+  }
+  private _availableBalanceUsd: number = 0;
 
   getStats(): SniperStatsSnapshot {
     const rejections: Record<string, number> = {};
