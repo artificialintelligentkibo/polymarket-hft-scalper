@@ -1670,7 +1670,10 @@ export class ObiEngine {
     // attempt and we spammed 9 "orphan flatten emitted" WARN logs over
     // 60 seconds, each one hitting the same filter rejection. At this
     // point the position is dust — stop pretending we can still exit it.
-    const ORPHAN_GIVE_UP_AFTER_MS = 30_000;
+    // Phase 28: increased from 30s to 60s. With the notional floor bypass
+    // for reduce-only sells, orphan flattens can now succeed at low prices.
+    // Give more time before giving up to redeem.
+    const ORPHAN_GIVE_UP_AFTER_MS = 60_000;
 
     for (const [marketId, position] of this.positions.entries()) {
       if (excludeMarketIds?.has(marketId)) continue;
@@ -1723,23 +1726,22 @@ export class ObiEngine {
 
       // Phase 12 (2026-04-08): dust detection — if current shares × current
       // best bid is below the CLOB min notional + a small buffer, the
-      // downstream MIN_ORDER_SIZE filter will reject EVERY flatten attempt
-      // (live observed on 2026-04-08 ETH 9:00 slot: 9 shares × 0.11 = $0.99,
-      // minimum 9.091, failed 9 times in a row while remainingMs went from
-      // -61s to -119s). Stop emitting, drop position tracking, let auto-redeem
-      // path handle the residual.
-      const projectedNotional = liveShares * targetPrice;
-      const dustThreshold = config.clobMinNotionalUsd * 1.02; // 2% buffer for rounding
-      if (projectedNotional < dustThreshold) {
-        logger.info('OBI orphan flatten skipped — position is dust, forcing redeem', {
+      // downstream MIN_ORDER_SIZE filter USED TO reject every flatten attempt.
+      //
+      // Phase 28 UPDATE: resolveReduceOnlySellGuard now bypasses the notional
+      // floor for reduce-only sells, so the downstream filter no longer blocks
+      // emergency exits. Only skip truly tiny dust residuals (< 1 share),
+      // NOT full positions at low prices (e.g. 7sh × $0.14 = $0.98 was wrongly
+      // classified as "dust" and abandoned to redeem → -$3.23 loss).
+      const REAL_DUST_SHARES = 1; // below 1 share is real dust
+      if (liveShares < REAL_DUST_SHARES) {
+        logger.info('OBI orphan flatten skipped — position is real dust, forcing redeem', {
           marketId,
           outcome: position.outcome,
           liveShares,
           targetPrice,
-          projectedNotional: roundTo(projectedNotional, 4),
-          dustThreshold: roundTo(dustThreshold, 4),
           remainingMs,
-          reason: 'shares × best bid below CLOB min notional — cannot flatten, stopping spam',
+          reason: 'less than 1 share — true dust residual, let redeem handle',
         });
         // Propagate to coin cooldown (this is effectively a losing exit).
         this.lastLosingExitMs.set(marketId, nowMs);

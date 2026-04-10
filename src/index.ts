@@ -41,7 +41,7 @@ import {
 import { OrderBookImbalanceFilter } from './order-book-imbalance.js';
 import { ObiEngine, extractCoinFromObiTitle } from './obi-engine.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
-import { meetsClobMinimums, resolveMinimumTradableShares } from './paired-arbitrage.js';
+import { meetsClobMinimums, resolveMinimumTradableShares, MIN_CLOB_ORDER_SHARES } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
 import { ProductTestModeController } from './product-test-mode.js';
 import {
@@ -6598,7 +6598,30 @@ export function resolveReduceOnlySellGuard(params: {
     };
   }
 
+  // Phase 28: for reduce-only sells (exits), bypass the $1 notional floor.
+  // The notional floor protects against dust ENTRIES, not emergency exits.
+  // When price crashes (e.g. $0.14), 7sh × $0.14 = $0.98 < $1 minimum,
+  // blocking ALL exit paths (hard stop, collapse, slot-end flatten).
+  // Result: position goes to redeem instead of selling on CLOB.
+  // For exits, we try to sell regardless — if Polymarket CLOB rejects the
+  // order, we fall through to redeem (same outcome as blocking, but we
+  // at least TRY). Only enforce MIN_CLOB_ORDER_SHARES (1 share).
   if (!meetsClobMinimums(requestedShares, price)) {
+    if (requestedShares >= MIN_CLOB_ORDER_SHARES) {
+      // Reduce-only sell below notional floor — allow it (Phase 28).
+      // Log will show minimumShares for debugging but won't block.
+      const remainingShares = roundTo(Math.max(0, availableShares - requestedShares), 4);
+      return {
+        skip: false,
+        reason: 'valid',
+        requestedShares,
+        executionShares: requestedShares,
+        minimumShares,
+        remainingShares,
+        blockedRemainderShares:
+          remainingShares > 0 && remainingShares < minimumShares ? remainingShares : 0,
+      };
+    }
     return {
       skip: true,
       reason: 'below_minimum',

@@ -747,14 +747,19 @@ test('obi engine clearState removes per-market state but preserves losing-exit c
   assert.equal(engine.getStats().activePositions, 1);
 
   // Trigger a losing exit so lastLosingExitMs is recorded.
+  // Phase 28: With Phase 27 price guard, collapse exit only fires when
+  // bestBid >= entryPrice (profit) OR emergencyBail (loss >= hardStop*0.5).
+  // To trigger the exit here, we need the loss to exceed the emergency bail
+  // threshold: 8 shares × (0.21 - bestBid) >= hardStop*0.5 = $1.0.
+  // That means bestBid <= 0.21 - 1.0/8 = 0.085. Use bestBid = 0.08.
   const pm = new PositionManager(market.marketId);
   pm.applyFill({ outcome: 'YES', side: 'BUY', shares: 8, price: 0.21 });
   // Force an imbalance collapse: position was entered with thinSide='ask'
   // (bullish setup per Phase 10), and the book now flips to thin-bid
   // (bearish) — ratio of stored thinSide inverts past imbalanceCollapseRatio.
   const collapseBook = createOrderbook({
-    yesBid: 0.18,
-    yesAsk: 0.19,
+    yesBid: 0.08,
+    yesAsk: 0.09,
     yesBidDepth: 4,    // bid became thin — bearish collapse for YES
     yesAskDepth: 800,  // ask became thick
   });
