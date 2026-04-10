@@ -23,7 +23,8 @@ export type EntryStrategy = 'LEGACY' | 'PAIRED_ARBITRAGE' | 'LATENCY_MOMENTUM' |
 export type ActiveStrategy =
   | 'CURRENT_SNIPER'
   | 'PAIRED_ARBITRAGE'
-  | 'ORDER_BOOK_IMBALANCE';
+  | 'ORDER_BOOK_IMBALANCE'
+  | 'ALL';
 export type SignatureType = 0 | 1 | 2;
 export type OrderMode = 'GTC' | 'FOK' | 'FAK';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -632,11 +633,15 @@ function parseActiveStrategy(value?: string): ActiveStrategy {
   if (!normalized || normalized === 'CURRENT_SNIPER') {
     return 'CURRENT_SNIPER';
   }
-  if (normalized === 'PAIRED_ARBITRAGE' || normalized === 'ORDER_BOOK_IMBALANCE') {
+  if (
+    normalized === 'PAIRED_ARBITRAGE' ||
+    normalized === 'ORDER_BOOK_IMBALANCE' ||
+    normalized === 'ALL'
+  ) {
     return normalized;
   }
   throw new Error(
-    `Invalid ACTIVE_STRATEGY: ${value}. Expected CURRENT_SNIPER, PAIRED_ARBITRAGE, or ORDER_BOOK_IMBALANCE.`
+    `Invalid ACTIVE_STRATEGY: ${value}. Expected CURRENT_SNIPER, PAIRED_ARBITRAGE, ORDER_BOOK_IMBALANCE, or ALL.`
   );
 }
 
@@ -686,6 +691,43 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
       DYNAMIC_QUOTING_ENABLED: false,
       MM_AUTO_ACTIVATE_AFTER_SNIPER: false,
       POST_ONLY_ONLY: true,
+    };
+  }
+
+  if (preset === 'ALL') {
+    // Phase 30: ALL mode — OBI + Sniper + Lottery run together.
+    // OBI handles thin-side order book imbalance entries (mean-reversion).
+    // Sniper handles Binance-led momentum entries (latency arb).
+    // Lottery follows either as a convex follow-on bet.
+    // Each strategy targets a different edge so they complement, not conflict.
+    // Layer conflict resolution prevents both from entering the SAME market.
+    const keepBinanceWs = input.DEEP_BINANCE_MODE && input.BINANCE_WS_ENABLED;
+    console.log(
+      '[strategy] ACTIVE_STRATEGY=ALL — OBI + Sniper + Lottery (multi-strategy mode)'
+    );
+    return {
+      ...input,
+      // OBI: enabled as standalone Layer 1 with its own quoting
+      obiEngine: { ...input.obiEngine, enabled: true },
+      // Sniper: enabled with Binance edge signals
+      SNIPER_MODE_ENABLED: true,
+      sniper: { ...input.sniper, enabled: true },
+      // Binance: edge enabled for Sniper, WS on for both Sniper + OBI runaway gate
+      binance: { ...input.binance, edgeEnabled: true },
+      BINANCE_WS_ENABLED: keepBinanceWs || true,
+      // Lottery: enabled as follow-on to both OBI and Sniper entries
+      // (lottery already follows OBI_ENTRY_BUY via maybeScheduleLotteryFollowOn)
+      // Latency momentum: disabled (overlaps with Sniper)
+      LATENCY_MOMENTUM_ENABLED: false,
+      latencyMomentum: { ...input.latencyMomentum, enabled: false },
+      // Paired arb: disabled (different strategy class)
+      PAIRED_ARB_ENABLED: false,
+      pairedArbitrage: { ...input.pairedArbitrage, enabled: false },
+      // MM: disabled — OBI has its own MM layer (OBI_MM_QUOTE_ASK).
+      // Regular MM_QUOTE would conflict with both OBI and Sniper.
+      MARKET_MAKER_MODE: false,
+      DYNAMIC_QUOTING_ENABLED: false,
+      MM_AUTO_ACTIVATE_AFTER_SNIPER: false,
     };
   }
 

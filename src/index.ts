@@ -1485,27 +1485,36 @@ export class MarketMakerRuntime {
     // flag so OBI exit signals can re-engage instead of waiting for redeem.
     this.recheckDustAbandonmentOnRecovery(market, orderbook);
 
-    // Phase 22 (2026-04-09): when OBI engine is the active strategy, SKIP the
-    // legacy signal engine entirely. The legacy engine (COMBINED_DISCOUNT_BUY_BOTH,
-    // EXTREME_BUY, etc.) has NO Phase 15–22 safety guards and produced catastrophic
-    // losses: 6× XRP buys at 49¢ → sold at 28¢ = -$7.34, and 2× ETH buys that
-    // dust-trapped for -$16.26. OBI is the sole entry engine when enabled.
-    const signals: StrategySignal[] = config.obiEngine.enabled
-      ? []
-      : this.signalEngine.generateSignals({
-          market,
-          orderbook,
-          positionManager,
-          riskAssessment,
-          binanceFairValueAdjustment,
-          binanceAssessment,
-          binanceVelocityPctPerSec,
-          sniperEntryOverride,
-        });
-    if (!config.obiEngine.enabled) {
+    // Phase 30: Multi-strategy signal generation.
+    // In ALL mode, both OBI and Sniper engines generate signals independently.
+    // In ORDER_BOOK_IMBALANCE mode, only OBI runs (Sniper is disabled at config level).
+    // In CURRENT_SNIPER mode, only Sniper runs (OBI is disabled at config level).
+    // Layer conflict resolution (below) prevents both from entering the SAME market.
+    //
+    // Legacy safety note (Phase 22): the dangerous legacy signals
+    // (COMBINED_DISCOUNT_BUY_BOTH, EXTREME_BUY, etc.) are only generated when
+    // Sniper is enabled via config — they go through signalEngine.generateSignals()
+    // which is gated by config.sniper.enabled. When only OBI is active, sniper
+    // config is disabled, so these signals are never produced.
+    const signals: StrategySignal[] = [];
+
+    // Sniper/Legacy engine signals (gated by sniper.enabled in config)
+    if (config.sniper.enabled) {
+      const sniperSignals = this.signalEngine.generateSignals({
+        market,
+        orderbook,
+        positionManager,
+        riskAssessment,
+        binanceFairValueAdjustment,
+        binanceAssessment,
+        binanceVelocityPctPerSec,
+        sniperEntryOverride,
+      });
+      for (const sig of sniperSignals) signals.push(sig);
       this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
     }
 
+    // OBI engine signals (gated by obiEngine.enabled in config)
     if (config.obiEngine.enabled) {
       // Phase 21: OBI compounding — scale entry/max shares with bankroll growth.
       const obiMult = this.compounder.enabled

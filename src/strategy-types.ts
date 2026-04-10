@@ -120,6 +120,17 @@ export function resolveStrategyLayer(signalType: SignalType): StrategyLayer {
   }
 }
 
+/**
+ * Returns true if two strategy layers conflict and should NOT coexist
+ * on the same market. When LAYER_CONFLICT_RESOLUTION=BLOCK, the second
+ * signal is dropped.
+ *
+ * Phase 30: OBI and SNIPER are now allowed to coexist. They target
+ * different edges (OBI = mean-reversion, Sniper = Binance momentum)
+ * and rarely fire on the same market simultaneously. When they do,
+ * per-market position limits and global exposure caps prevent over-sizing.
+ * OBI + MM_QUOTE is also allowed since OBI has its own MM layer.
+ */
 export function isLayerConflict(
   existingLayer: StrategyLayer | null,
   newLayer: StrategyLayer
@@ -128,16 +139,25 @@ export function isLayerConflict(
     return false;
   }
 
-  return !(
-    (existingLayer === 'SNIPER' && newLayer === 'MM_QUOTE') ||
-    (existingLayer === 'MM_QUOTE' && newLayer === 'SNIPER') ||
-    (existingLayer === 'SNIPER' && newLayer === 'LOTTERY') ||
-    (existingLayer === 'LOTTERY' && newLayer === 'SNIPER') ||
-    (existingLayer === 'MM_QUOTE' && newLayer === 'LOTTERY') ||
-    (existingLayer === 'LOTTERY' && newLayer === 'MM_QUOTE') ||
-    (existingLayer === 'OBI' && newLayer === 'LOTTERY') ||
-    (existingLayer === 'LOTTERY' && newLayer === 'OBI')
-  );
+  // Allowed pairs — these can coexist on the same market:
+  const ALLOWED_PAIRS: ReadonlySet<string> = new Set([
+    'SNIPER:MM_QUOTE',
+    'MM_QUOTE:SNIPER',
+    'SNIPER:LOTTERY',
+    'LOTTERY:SNIPER',
+    'MM_QUOTE:LOTTERY',
+    'LOTTERY:MM_QUOTE',
+    'OBI:LOTTERY',
+    'LOTTERY:OBI',
+    // Phase 30: OBI + SNIPER allowed in ALL mode
+    'OBI:SNIPER',
+    'SNIPER:OBI',
+    // OBI + MM_QUOTE allowed (OBI has its own MM layer)
+    'OBI:MM_QUOTE',
+    'MM_QUOTE:OBI',
+  ]);
+
+  return !ALLOWED_PAIRS.has(`${existingLayer}:${newLayer}`);
 }
 
 export interface StrategySignal {
