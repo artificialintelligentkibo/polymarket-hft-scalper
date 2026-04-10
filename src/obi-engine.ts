@@ -1345,27 +1345,41 @@ export class ObiEngine {
     // === Imbalance collapse: book fully reversed against us ===
     // Originally we entered the thin side (low ratio). If currentRatio has
     // exploded past `imbalanceCollapseRatio` (e.g. 2.0 = 2x heavier on our side
-    // now), the imbalance reversed; exit now before it gets worse.
+    // now), the imbalance reversed.
+    //
+    // Phase 27: only exit on collapse if bestBid >= entryPrice OR if the loss
+    // already exceeds half the hard stop (emergency bail). When bestBid < entry,
+    // selling locks in a loss with the same EV as redeem minus spread costs.
+    // On 5-min slots the tail risk is limited, so holding for redeem is better
+    // than paying the spread to crystallise a loss. The hard stop (-$2) still
+    // catches catastrophic moves.
     if (currentRatio >= config.imbalanceCollapseRatio) {
-      if (config.shadowMode) {
-        this.totalShadowDecisions += 1;
-        logger.info('OBI engine (shadow) would collapse-exit', {
-          marketId: market.marketId,
-          initialRatio: position.initialRatio,
-          currentRatio,
-          collapseRatio: config.imbalanceCollapseRatio,
-        });
-        return [];
+      const collapseInProfit = bestBid !== null && bestBid >= position.entryPrice;
+      const emergencyBail = livePnlUsd <= -(config.hardStopUsd * 0.5);
+      if (collapseInProfit || emergencyBail) {
+        if (config.shadowMode) {
+          this.totalShadowDecisions += 1;
+          logger.info('OBI engine (shadow) would collapse-exit', {
+            marketId: market.marketId,
+            initialRatio: position.initialRatio,
+            currentRatio,
+            collapseRatio: config.imbalanceCollapseRatio,
+            bestBid,
+            entryPrice: position.entryPrice,
+            emergencyBail,
+          });
+          return [];
+        }
+        this.totalExits += 1;
+        if (livePnlUsd < 0) this.recordLosingExit(market, nowMs);
+        return [
+          buildExit(
+            'OBI_REBALANCE_EXIT',
+            `OBI collapse: ratio ${currentRatio.toFixed(3)} >= ${config.imbalanceCollapseRatio.toFixed(3)}${emergencyBail ? ' (emergency bail)' : `, bid ${bestBid!.toFixed(3)} >= entry ${position.entryPrice.toFixed(3)}`}`,
+            bestBid
+          ),
+        ];
       }
-      this.totalExits += 1;
-      if (livePnlUsd < 0) this.recordLosingExit(market, nowMs);
-      return [
-        buildExit(
-          'OBI_REBALANCE_EXIT',
-          `OBI collapse: ratio ${currentRatio.toFixed(3)} >= ${config.imbalanceCollapseRatio.toFixed(3)}`,
-          bestBid
-        ),
-      ];
     }
 
     // Cancel-all / forced flatten window before slot end.
@@ -1394,22 +1408,33 @@ export class ObiEngine {
     }
 
     // Book healed / rebalanced.
-    if (currentRatio >= config.exitRebalanceRatio) {
+    // Phase 27: only exit on rebalance if bestBid >= entryPrice (profitable or
+    // breakeven). When the book rebalances but the price dropped below entry,
+    // selling locks in a guaranteed loss. Holding for redeem at ~$0.50 entry
+    // has better EV (+$0.07) than a -$0.56 rebalance exit. Collapse exits
+    // (ratio >= imbalanceCollapseRatio, checked above) still fire at any price
+    // as an emergency measure. Scalp exit and time-TP also only fire in profit.
+    if (
+      currentRatio >= config.exitRebalanceRatio &&
+      bestBid !== null &&
+      bestBid >= position.entryPrice
+    ) {
       if (config.shadowMode) {
         this.totalShadowDecisions += 1;
         logger.info('OBI engine (shadow) would rebalance exit', {
           marketId: market.marketId,
           initialRatio: position.initialRatio,
           currentRatio,
+          bestBid,
+          entryPrice: position.entryPrice,
         });
         return [];
       }
       this.totalExits += 1;
-      if (livePnlUsd < 0) this.recordLosingExit(market, nowMs);
       return [
         buildExit(
           'OBI_REBALANCE_EXIT',
-          `OBI rebalance: ratio ${currentRatio.toFixed(3)} >= ${config.exitRebalanceRatio.toFixed(3)}`,
+          `OBI rebalance: ratio ${currentRatio.toFixed(3)} >= ${config.exitRebalanceRatio.toFixed(3)}, bid ${bestBid.toFixed(3)} >= entry ${position.entryPrice.toFixed(3)}`,
           bestBid
         ),
       ];
