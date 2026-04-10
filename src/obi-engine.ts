@@ -170,7 +170,8 @@ interface ObiPosition {
 export interface ObiStatsSnapshot {
   readonly activePositions: number;
   readonly totalEntries: number;
-  readonly totalExits: number;
+  readonly totalExits: number;           // confirmed fills only
+  readonly totalExitSignals: number;     // all exit signals generated (debug)
   readonly totalShadowDecisions: number;
 }
 
@@ -417,7 +418,8 @@ export class ObiEngine {
   /** Last available USDC balance reported by host. Used for pre-flight check. */
   private availableUsdcBalance: number | null = null;
   private totalEntries = 0;
-  private totalExits = 0;
+  private totalExitSignals = 0;   // counts every exit signal GENERATED (may not fill)
+  private totalConfirmedExits = 0; // counts only confirmed SELL fills (via recordExitForStats)
   private totalShadowDecisions = 0;
 
   // ─── OBI Session Stats (Phase 20: dashboard) ──────────────────
@@ -483,8 +485,9 @@ export class ObiEngine {
     this.pushDecision(coin, 'ENTRY ✓', 'fill confirmed', detail);
   }
 
-  /** Record an exit for dashboard stats. */
+  /** Record an exit for dashboard stats. Only called on confirmed SELL fills. */
   recordExitForStats(coin: string | null, pnl: number, exitType: string): void {
+    this.totalConfirmedExits++;
     if (coin) {
       this.coinExits.set(coin, (this.coinExits.get(coin) ?? 0) + 1);
       this.coinPnl.set(coin, (this.coinPnl.get(coin) ?? 0) + pnl);
@@ -497,9 +500,10 @@ export class ObiEngine {
     this.pushDecision(coin, exitType, pnl >= 0 ? 'win' : 'loss', `PnL ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
   }
 
-  /** Record a redeem event for stats. */
+  /** Record a redeem event for stats. Counts as confirmed exit. */
   recordRedeemForStats(coin: string | null, pnl: number): void {
     this.sessionRedeems++;
+    this.totalConfirmedExits++;
     this.sessionRealizedPnl += pnl;
     if (pnl >= 0) this.sessionWins++;
     else this.sessionLosses++;
@@ -563,7 +567,7 @@ export class ObiEngine {
       enabled: cfg.enabled,
       shadowMode: false,
       entries: this.totalEntries,
-      exits: this.totalExits,
+      exits: this.totalConfirmedExits,
       wins: this.sessionWins,
       losses: this.sessionLosses,
       redeems: this.sessionRedeems,
@@ -1350,7 +1354,7 @@ export class ObiEngine {
         });
         return [];
       }
-      this.totalExits += 1;
+      this.totalExitSignals += 1;
       this.recordLosingExit(market, nowMs);
       return [
         buildExit(
@@ -1389,7 +1393,7 @@ export class ObiEngine {
           });
           return [];
         }
-        this.totalExits += 1;
+        this.totalExitSignals += 1;
         if (livePnlUsd < 0) this.recordLosingExit(market, nowMs);
         return [
           buildExit(
@@ -1415,7 +1419,7 @@ export class ObiEngine {
         });
         return [];
       }
-      this.totalExits += 1;
+      this.totalExitSignals += 1;
       if (livePnlUsd < 0) this.recordLosingExit(market, nowMs);
       return [
         buildExit(
@@ -1449,7 +1453,7 @@ export class ObiEngine {
         });
         return [];
       }
-      this.totalExits += 1;
+      this.totalExitSignals += 1;
       return [
         buildExit(
           'OBI_REBALANCE_EXIT',
@@ -1481,7 +1485,7 @@ export class ObiEngine {
         });
         return [];
       }
-      this.totalExits += 1;
+      this.totalExitSignals += 1;
       return [
         buildExit(
           'OBI_SCALP_EXIT',
@@ -1505,7 +1509,7 @@ export class ObiEngine {
         });
         return [];
       }
-      this.totalExits += 1;
+      this.totalExitSignals += 1;
       return [
         buildExit(
           'OBI_SCALP_EXIT',
@@ -1579,6 +1583,13 @@ export class ObiEngine {
       const liveShares = pm.getShares(position.outcome);
       if (liveShares <= 0) continue;
 
+      // Phase 31: dust check — sub-1-share positions can't be sold on CLOB.
+      // Don't waste cycles generating hard-stop signals for dust.
+      if (liveShares < 1) {
+        this.clearState(marketId);
+        continue;
+      }
+
       // Pull fresh orderbook from host. Fall back to last cached on the
       // position object if host has nothing newer.
       const orderbook = getOrderbook(marketId) ?? position.lastOrderbook ?? null;
@@ -1626,7 +1637,7 @@ export class ObiEngine {
       });
 
       this.lastOrphanEmitMs.set(marketId, nowMs);
-      this.totalExits += 1;
+      this.totalExitSignals += 1;
       this.recordLosingExit(
         { marketId, title: position.marketTitle } as MarketCandidate,
         nowMs
@@ -1788,7 +1799,7 @@ export class ObiEngine {
         continue;
       }
 
-      this.totalExits += 1;
+      this.totalExitSignals += 1;
       this.lastLosingExitMs.set(marketId, nowMs);
       // Phase 8: orphan flattens are usually losing — propagate to coin map
       // so we don't immediately re-enter another slot of the same coin.
@@ -1868,7 +1879,8 @@ export class ObiEngine {
     return {
       activePositions: this.positions.size,
       totalEntries: this.totalEntries,
-      totalExits: this.totalExits,
+      totalExits: this.totalConfirmedExits,
+      totalExitSignals: this.totalExitSignals,
       totalShadowDecisions: this.totalShadowDecisions,
     };
   }
