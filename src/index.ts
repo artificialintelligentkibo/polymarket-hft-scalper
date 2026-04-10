@@ -1801,7 +1801,9 @@ export class MarketMakerRuntime {
     if (
       !paperTradingEnabled &&
       executionSignal.action === 'SELL' &&
-      executionSignal.signalType !== 'HARD_STOP'
+      executionSignal.signalType !== 'HARD_STOP' &&
+      executionSignal.signalType !== 'OBI_REBALANCE_EXIT' &&
+      executionSignal.signalType !== 'OBI_SCALP_EXIT'
     ) {
       if (
         shouldDeferSignalForSettlement({
@@ -2068,6 +2070,26 @@ export class MarketMakerRuntime {
                 message: error instanceof Error ? error.message : String(error),
               });
             }
+          });
+        }
+      }
+      // Phase 28: synchronous OBI exit fills — record stats and clean up
+      // obiEngine.positions so the dead position doesn't linger until wallet
+      // reconciliation. Previously only async fills (via fillTracker) did this.
+      if (
+        (executionSignal.signalType === 'OBI_REBALANCE_EXIT' ||
+          executionSignal.signalType === 'OBI_SCALP_EXIT') &&
+        executionSignal.action === 'SELL' &&
+        config.obiEngine.enabled
+      ) {
+        const remainingShares = positionManager.getShares(executionSignal.outcome);
+        if (remainingShares <= 0) {
+          this.obiEngine.clearState(market.marketId);
+          logger.info('Phase 28: OBI exit fill — cleared position tracking', {
+            marketId: market.marketId,
+            signalType: executionSignal.signalType,
+            soldShares: effectiveShares,
+            exitPrice: effectivePrice,
           });
         }
       }

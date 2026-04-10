@@ -1277,9 +1277,13 @@ export class ObiEngine {
     const currentRatio = safeRatio(thinDepth, thickDepth);
 
     // Compute live PnL for hard-stop and tracking.
+    // Phase 28: when bestBid is null (bid side wiped out), fall back to
+    // bestAsk * 0.9 as a pessimistic estimate. Previously defaulted to 0,
+    // which silently disabled the hard stop (0 <= -$2 = false).
+    const pnlPrice = bestBid ?? (book.bestAsk !== null ? roundTo(book.bestAsk * 0.9, 4) : null);
     const livePnlUsd =
-      bestBid !== null
-        ? roundTo((bestBid - position.entryPrice) * liveShares, 4)
+      pnlPrice !== null
+        ? roundTo((pnlPrice - position.entryPrice) * liveShares, 4)
         : 0;
 
     const buildExit = (
