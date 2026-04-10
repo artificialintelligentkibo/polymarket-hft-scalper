@@ -1998,6 +1998,79 @@ export class MarketMakerRuntime {
         shares: effectiveShares,
         price: effectivePrice,
       });
+      // Phase 27: OBI entry fills confirmed synchronously were NEVER reaching
+      // obiEngine.onEntryFill() — that method only lived in applyConfirmedFill()
+      // (the fill-tracker async path). When CLOB confirms the fill inline
+      // (fillConfirmed=true), handleExecution enters this branch and skips
+      // fillTracker registration entirely. Result: obiEngine.positions stays
+      // empty → generateExitSignals() always returns [] → 0 exits, 100% redeems.
+      if (
+        executionSignal.signalType === 'OBI_ENTRY_BUY' &&
+        executionSignal.action === 'BUY' &&
+        config.obiEngine.enabled
+      ) {
+        const obiCoin = extractCoinFromObiTitle(market.title);
+        this.obiEngine.recordEntryForStats(
+          obiCoin,
+          `${executionSignal.outcome} ${effectiveShares}sh @${roundTo(effectivePrice, 3)}`
+        );
+        const totalLiveShares = positionManager.getShares(executionSignal.outcome);
+        const mmSignals = this.obiEngine.onEntryFill({
+          marketId: market.marketId,
+          marketTitle: market.title,
+          outcome: executionSignal.outcome,
+          fillPrice: effectivePrice,
+          filledShares: effectiveShares,
+          orderbook,
+          config: config.obiEngine,
+          totalLiveShares,
+          slotEndTime: market.endTime,
+        });
+        for (const obiSignal of mmSignals) {
+          this.scheduleBackgroundTask(async () => {
+            try {
+              if (
+                obiSignal.signalType === 'OBI_MM_QUOTE_ASK' ||
+                obiSignal.signalType === 'OBI_MM_QUOTE_BID'
+              ) {
+                const currentShares = positionManager.getShares(obiSignal.outcome);
+                const minShares = resolveMinimumTradableShares(
+                  obiSignal.targetPrice ?? obiSignal.referencePrice ?? Number.NaN,
+                  0
+                );
+                if (currentShares < minShares) {
+                  logger.info('OBI maker quote skipped - position closed or dust before dispatch', {
+                    marketId: market.marketId,
+                    outcome: obiSignal.outcome,
+                    signalType: obiSignal.signalType,
+                    currentShares: roundTo(currentShares, 4),
+                    minShares: roundTo(minShares, 4),
+                  });
+                  return;
+                }
+                await this.cancelPendingObiMakerQuotes({
+                  marketId: market.marketId,
+                  outcome: obiSignal.outcome,
+                  triggeredBy: obiSignal.signalType,
+                });
+              }
+              await this.executeSignal(
+                market,
+                orderbook,
+                positionManager,
+                obiSignal,
+                slotKey
+              );
+            } catch (error) {
+              logger.warn('Phase 27 OBI post-entry signal execution failed', {
+                marketId: market.marketId,
+                signalType: obiSignal.signalType,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          });
+        }
+      }
       this.syncBlockedExitRemainderFromInventory(
         market.marketId,
         executionSignal.outcome,
