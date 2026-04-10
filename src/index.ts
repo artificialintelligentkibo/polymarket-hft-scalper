@@ -1801,9 +1801,17 @@ export class MarketMakerRuntime {
     if (
       !paperTradingEnabled &&
       executionSignal.action === 'SELL' &&
+      // Phase 30: exempt ALL exit/flatten signal types from settlement cooldown.
+      // Previously only HARD_STOP and OBI exits were exempt. But SNIPER_SCALP_EXIT,
+      // SLOT_FLATTEN, and TRAILING_TAKE_PROFIT were deferred near slot end, causing
+      // missed exits for Sniper, MM, Lottery, and Latency Momentum strategies.
       executionSignal.signalType !== 'HARD_STOP' &&
       executionSignal.signalType !== 'OBI_REBALANCE_EXIT' &&
-      executionSignal.signalType !== 'OBI_SCALP_EXIT'
+      executionSignal.signalType !== 'OBI_SCALP_EXIT' &&
+      executionSignal.signalType !== 'SNIPER_SCALP_EXIT' &&
+      executionSignal.signalType !== 'SLOT_FLATTEN' &&
+      executionSignal.signalType !== 'TRAILING_TAKE_PROFIT' &&
+      executionSignal.signalType !== 'INVENTORY_REBALANCE'
     ) {
       if (
         shouldDeferSignalForSettlement({
@@ -2269,6 +2277,138 @@ export class MarketMakerRuntime {
             soldShares: effectiveShares,
             exitPrice: effectivePrice,
           });
+        }
+      }
+      // Phase 30: Universal slot-end exit timer for ALL strategies.
+      // The main scan loop runs every ~150s but 5-min slots are 300s.
+      // If any strategy (Sniper, Lottery, MM, Latency, OBI) enters with
+      // < 150s remaining, the next scan fires AFTER the CLOB closes.
+      // OBI has its own Phase 29 timers (mid-slot + cancel-all). For
+      // ALL other strategies, schedule a SLOT_FLATTEN safety net.
+      // This timer is harmless if the main loop fires first — it checks
+      // if position still exists before doing anything.
+      if (
+        executionSignal.action === 'BUY' &&
+        executionSignal.signalType !== 'OBI_ENTRY_BUY' && // OBI has Phase 29 timers
+        market.endTime
+      ) {
+        const universalSlotEndMs = new Date(market.endTime).getTime();
+        if (Number.isFinite(universalSlotEndMs)) {
+          const UNIVERSAL_FLATTEN_BEFORE_END_MS = 20_000; // 20s before slot end
+          const universalDelayMs = (universalSlotEndMs - UNIVERSAL_FLATTEN_BEFORE_END_MS) - Date.now();
+          if (universalDelayMs > 0) {
+            const flattenMarketId = market.marketId;
+            const flattenOutcome = executionSignal.outcome;
+            const flattenSignalType = executionSignal.signalType;
+            logger.info('Phase 30: scheduling universal slot-end flatten timer', {
+              marketId: flattenMarketId,
+              outcome: flattenOutcome,
+              entrySignalType: flattenSignalType,
+              delayMs: universalDelayMs,
+            });
+            setTimeout(() => {
+              this.scheduleBackgroundTask(async () => {
+                try {
+                  const flatPm = this.positions.get(flattenMarketId);
+                  if (!flatPm) return;
+                  const flatShares = flatPm.getShares(flattenOutcome);
+                  if (flatShares <= 0) return; // Already exited
+
+                  const flatMarket = this.markets.get(flattenMarketId);
+                  if (!flatMarket) return;
+
+                  // Fetch fresh orderbook
+                  let flatBook = this.latestBooks.get(flattenMarketId) ?? null;
+                  try {
+                    flatBook = await this.fetcher.getMarketSnapshot(flatMarket);
+                    this.latestBooks.set(flattenMarketId, flatBook);
+                  } catch { /* use cached */ }
+                  if (!flatBook) return;
+
+                  // Run risk manager for SLOT_FLATTEN + HARD_STOP check
+                  const flatRisk = this.riskManager.checkRiskLimits({
+                    market: flatMarket,
+                    orderbook: flatBook,
+                    positionManager: flatPm,
+                  });
+
+                  // Also run strategy-specific exits (sniper scalp exit, etc.)
+                  let exitSignals: StrategySignal[] = [...flatRisk.forcedSignals];
+
+                  // If OBI is disabled, also check sniper/lottery exit signals
+                  if (!config.obiEngine.enabled) {
+                    const legacyExits = this.signalEngine.generateSignals({
+                      market: flatMarket,
+                      orderbook: flatBook,
+                      positionManager: flatPm,
+                      riskAssessment: flatRisk,
+                      binanceFairValueAdjustment: undefined,
+                      binanceAssessment: undefined,
+                      binanceVelocityPctPerSec: null,
+                    }).filter(s => s.action === 'SELL');
+                    exitSignals.push(...legacyExits);
+                  }
+
+                  // If no exit signals but position still open, force flatten
+                  if (exitSignals.length === 0 && flatShares > 0) {
+                    const flatOutcomeBook = flattenOutcome === 'YES' ? flatBook.yes : flatBook.no;
+                    const flatPrice = flatOutcomeBook.bestBid ?? 0.01;
+                    exitSignals.push({
+                      marketId: flattenMarketId,
+                      marketTitle: flatMarket.title,
+                      signalType: 'SLOT_FLATTEN',
+                      priority: 1000,
+                      generatedAt: Date.now(),
+                      action: 'SELL',
+                      outcome: flattenOutcome,
+                      outcomeIndex: flattenOutcome === 'YES' ? 0 : 1,
+                      shares: flatShares,
+                      targetPrice: flatPrice,
+                      referencePrice: flatPrice,
+                      tokenPrice: flatPrice,
+                      midPrice: flatOutcomeBook.midPrice,
+                      fairValue: flatPrice,
+                      edgeAmount: 0,
+                      combinedBid: flatBook.combined.combinedBid,
+                      combinedAsk: flatBook.combined.combinedAsk,
+                      combinedMid: flatBook.combined.combinedMid,
+                      combinedDiscount: flatBook.combined.combinedDiscount,
+                      combinedPremium: flatBook.combined.combinedPremium,
+                      fillRatio: 1,
+                      capitalClamp: 1,
+                      priceMultiplier: 1,
+                      urgency: 'cross',
+                      reduceOnly: true,
+                      reason: `Phase 30: universal slot-end flatten (entry was ${flattenSignalType})`,
+                      strategyLayer: 'SNIPER',
+                    } as StrategySignal);
+                  }
+
+                  for (const sig of exitSignals) {
+                    logger.info('Phase 30: universal timer executing exit', {
+                      marketId: sig.marketId,
+                      signalType: sig.signalType,
+                      reason: sig.reason,
+                      targetPrice: sig.targetPrice,
+                      entryType: flattenSignalType,
+                    });
+                    await this.executeSignal(
+                      flatMarket,
+                      flatBook,
+                      flatPm,
+                      sig,
+                      getSlotKey(flatMarket)
+                    );
+                  }
+                } catch (error) {
+                  logger.warn('Phase 30: universal slot-end flatten timer failed', {
+                    marketId: flattenMarketId,
+                    message: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              });
+            }, universalDelayMs);
+          }
         }
       }
       this.syncBlockedExitRemainderFromInventory(
