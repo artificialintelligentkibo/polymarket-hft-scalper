@@ -7,7 +7,11 @@ import { clamp, roundTo } from './utils.js';
 
 const ESTIMATED_SETTLEMENT_FEE = 0.02;
 export const MIN_CLOB_ORDER_NOTIONAL_USD = 1;
-export const MIN_CLOB_ORDER_SHARES = 5;
+// Phase 27: lowered from 5 → 1. With partial fills (e.g. 4.81 out of 7
+// requested), the old 5-share floor blocked ALL exit signals, forcing
+// positions to redeem. The $1 notional floor (MIN_CLOB_ORDER_NOTIONAL_USD)
+// is the real Polymarket CLOB guard against dust orders.
+export const MIN_CLOB_ORDER_SHARES = 1;
 const PENDING_HARD_STOP_PROTECTION_MS = 10_000;
 
 export interface PairedArbConfig {
