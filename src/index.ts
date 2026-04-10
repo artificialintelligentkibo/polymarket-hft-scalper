@@ -4094,6 +4094,40 @@ export class MarketMakerRuntime {
 
   private syncRuntimeStatus(overrides: Parameters<typeof writeRuntimeStatus>[0]): void {
     const openPositions = this.buildRuntimePositionSnapshots();
+
+    // Phase 30D: auto-mark sub-1-share positions on expired slots as dust-abandoned.
+    // This catches residuals from partial fills that OBI/Sniper already cleared from
+    // their own tracking but that still show in the wallet as phantom positions.
+    const nowMs = Date.now();
+    const MIN_TRADEABLE_SHARES = 1;
+    for (let i = 0; i < openPositions.length; i++) {
+      const pos = openPositions[i];
+      if (pos.dustAbandoned) continue;
+      if (pos.grossExposureShares >= MIN_TRADEABLE_SHARES) continue;
+      if (pos.grossExposureShares <= 0) continue;
+      // Only auto-abandon if slot already ended (+30s grace for settlement)
+      const slotEndMs = pos.slotEnd ? new Date(pos.slotEnd).getTime() : 0;
+      if (slotEndMs > 0 && nowMs > slotEndMs + 30_000) {
+        for (const outcome of ['YES', 'NO'] as const) {
+          const key = this.getMarketOutcomeKey(pos.marketId, outcome);
+          if (!this.dustAbandonedPositions.has(key)) {
+            const shares = outcome === 'YES' ? pos.yesShares : pos.noShares;
+            if (shares > 0 && shares < MIN_TRADEABLE_SHARES) {
+              this.dustAbandonedPositions.add(key);
+              logger.info('Auto dust-abandon: sub-1-share residual on expired slot', {
+                marketId: pos.marketId,
+                outcome,
+                shares: roundTo(shares, 4),
+                slotEnd: pos.slotEnd,
+              });
+            }
+          }
+        }
+        // Update snapshot in-place so current cycle already reflects dust status
+        (openPositions as any)[i] = { ...pos, dustAbandoned: true };
+      }
+    }
+
     const dayState = getDayPnlState();
     const pendingQuoteExposure = this.getPendingQuoteExposure();
     const layerSummary = this.collectLayerRuntimeSummary(pendingQuoteExposure);
