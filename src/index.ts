@@ -2479,6 +2479,15 @@ export class MarketMakerRuntime {
             }
           });
         }
+        // Phase 35B: schedule dedicated VS time-exit timer (like OBI Phase 29).
+        // The main scan loop runs every ~150s — a 5s time-exit window is impossible
+        // to hit. Schedule a timer that fires at T - timeExitBeforeEndMs.
+        this.scheduleVsTimeExitTimer(
+          market.marketId,
+          executionSignal.outcome,
+          market.endTime,
+          slotKey
+        );
       }
       // Phase 28: synchronous OBI exit fills — record stats and clean up
       // obiEngine.positions so the dead position doesn't linger until wallet
@@ -2607,12 +2616,22 @@ export class MarketMakerRuntime {
         }
       }
       // VS Engine exit fills — clear position tracking.
+      // Also handles SLOT_FLATTEN that exits a VS-tracked position (belt-and-suspenders).
       if (
-        isVsExitSignal(executionSignal.signalType) &&
         executionSignal.action === 'SELL' &&
-        config.vsEngine.enabled
+        config.vsEngine.enabled &&
+        (isVsExitSignal(executionSignal.signalType) ||
+         (executionSignal.signalType === 'SLOT_FLATTEN' && this.vsEngine.hasPosition(market.marketId)))
       ) {
         const remainingShares = positionManager.getShares(executionSignal.outcome);
+        // Record exit stats for VS when not already recorded by timer
+        if (!isVsExitSignal(executionSignal.signalType)) {
+          const vsPos = this.vsEngine.getActivePositions().get(market.marketId);
+          const entryVwap = vsPos?.entryVwap ?? effectivePrice;
+          const realizedDelta = (effectivePrice - entryVwap) * effectiveShares;
+          const exitCoin = extractCoinFromTitle(market.title);
+          this.vsEngine.recordExitForStats(exitCoin, realizedDelta, executionSignal.signalType);
+        }
         if (remainingShares <= 0) {
           this.vsEngine.clearState(market.marketId);
           logger.info('VS exit fill — cleared position tracking', {
@@ -2634,6 +2653,8 @@ export class MarketMakerRuntime {
       if (
         executionSignal.action === 'BUY' &&
         executionSignal.signalType !== 'OBI_ENTRY_BUY' && // OBI has Phase 29 timers
+        executionSignal.signalType !== 'VS_ENTRY_BUY' && // VS has Phase 35B timers
+        executionSignal.signalType !== 'VS_MOMENTUM_BUY' && // VS has Phase 35B timers
         market.endTime
       ) {
         const universalSlotEndMs = new Date(market.endTime).getTime();
@@ -3525,6 +3546,13 @@ export class MarketMakerRuntime {
             });
           }
         }
+        // Phase 35B: schedule dedicated VS time-exit timer (async fill path)
+        this.scheduleVsTimeExitTimer(
+          fill.marketId,
+          fill.outcome,
+          market.endTime,
+          fill.slotKey
+        );
       }
       if (fill.signalType === 'SNIPER_BUY' && config.lottery.enabled) {
         const orderbook =
@@ -5277,6 +5305,157 @@ export class MarketMakerRuntime {
       await sleep(500);
     }
     return cancelledCount;
+  }
+
+  /**
+   * Phase 35B: schedule a dedicated VS time-exit timer.
+   *
+   * The main scan loop runs every ~150s but VS_TIME_EXIT fires at T-5s (or
+   * whatever timeExitBeforeEndMs is). That window is nearly impossible to hit
+   * from the scan loop. This timer guarantees the exit fires on time.
+   *
+   * Also schedules a cancel-all timer slightly before the time-exit to remove
+   * any resting VS maker quotes.
+   */
+  private scheduleVsTimeExitTimer(
+    marketId: string,
+    outcome: StrategySignal['outcome'],
+    endTime: string | null,
+    slotKey: string
+  ): void {
+    if (!endTime) return;
+    const slotEndMs = new Date(endTime).getTime();
+    if (!Number.isFinite(slotEndMs)) return;
+
+    const cfg = config.vsEngine;
+    const timeExitDelayMs = (slotEndMs - cfg.timeExitBeforeEndMs) - Date.now();
+    if (timeExitDelayMs <= 0) {
+      // Already past time-exit window — fire immediately
+      logger.info('Phase 35B: VS time-exit already due, firing immediately', {
+        marketId, outcome, remainingMs: slotEndMs - Date.now(),
+      });
+    }
+
+    const effectiveDelayMs = Math.max(0, timeExitDelayMs);
+
+    // Schedule cancel-all 2s before time-exit (mirrors OBI pattern)
+    const cancelDelayMs = Math.max(0, effectiveDelayMs - 2000);
+    setTimeout(() => {
+      this.scheduleBackgroundTask(async () => {
+        try {
+          const cancelCount = await this.cancelPendingVsMakerQuotes(marketId, outcome);
+          if (cancelCount > 0) {
+            logger.info('Phase 35B: cancelled VS maker quotes before time-exit', {
+              marketId, outcome, cancelCount,
+            });
+          }
+        } catch (error) {
+          logger.debug('Phase 35B: VS cancel-before-exit failed', {
+            marketId, message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+    }, cancelDelayMs);
+
+    // Schedule the actual time-exit
+    setTimeout(() => {
+      this.scheduleBackgroundTask(async () => {
+        try {
+          // Re-check: does VS engine still have a position?
+          if (!this.vsEngine.hasPosition(marketId)) return;
+
+          const pm = this.positions.get(marketId);
+          if (!pm) return;
+          const liveShares = pm.getShares(outcome);
+          if (liveShares <= 0) {
+            this.vsEngine.clearState(marketId);
+            return;
+          }
+
+          const exitMarket = this.markets.get(marketId);
+          if (!exitMarket) return;
+
+          // Fetch fresh orderbook
+          let exitBook = this.latestBooks.get(marketId) ?? null;
+          try {
+            exitBook = await this.fetcher.getMarketSnapshot(exitMarket);
+            this.latestBooks.set(marketId, exitBook);
+          } catch { /* use cached */ }
+          if (!exitBook) return;
+
+          const outcomeBook = outcome === 'YES' ? exitBook.yes : exitBook.no;
+          const bestBid = outcomeBook.bestBid ?? 0.01;
+
+          // Skip if bid too low (would be a guaranteed loss)
+          if (bestBid < cfg.timeExitMinPrice) {
+            logger.info('Phase 35B: VS time-exit skipped — bid too low', {
+              marketId, outcome, bestBid, minPrice: cfg.timeExitMinPrice,
+            });
+            return;
+          }
+
+          const exitSignal: StrategySignal = {
+            marketId,
+            marketTitle: exitMarket.title,
+            signalType: 'VS_TIME_EXIT',
+            priority: 980,
+            generatedAt: Date.now(),
+            action: 'SELL',
+            outcome,
+            outcomeIndex: outcome === 'YES' ? 0 : 1,
+            shares: liveShares,
+            targetPrice: bestBid,
+            referencePrice: bestBid,
+            tokenPrice: outcomeBook.midPrice,
+            midPrice: outcomeBook.midPrice,
+            fairValue: null,
+            edgeAmount: 0,
+            combinedBid: exitBook.combined.combinedBid,
+            combinedAsk: exitBook.combined.combinedAsk,
+            combinedMid: exitBook.combined.combinedMid,
+            combinedDiscount: exitBook.combined.combinedDiscount,
+            combinedPremium: exitBook.combined.combinedPremium,
+            fillRatio: 1,
+            capitalClamp: 1,
+            priceMultiplier: 1,
+            urgency: 'cross',
+            reduceOnly: true,
+            reason: `Phase 35B: VS time-exit timer fired, ${roundTo((slotEndMs - Date.now()) / 1000, 1)}s left`,
+            strategyLayer: 'VS_ENGINE',
+          } as StrategySignal;
+
+          logger.info('Phase 35B: VS time-exit timer executing', {
+            marketId, outcome, shares: liveShares, bestBid,
+            remainingSec: roundTo((slotEndMs - Date.now()) / 1000, 1),
+          });
+
+          await this.executeSignal(exitMarket, exitBook, pm, exitSignal, slotKey);
+
+          // Record VS exit stats
+          const exitCoin = extractCoinFromTitle(exitMarket.title);
+          const remainingShares = pm.getShares(outcome);
+          if (remainingShares <= 0) {
+            this.vsEngine.clearState(marketId);
+          }
+          // Estimate PnL from this exit
+          const vsPos = this.vsEngine.getActivePositions().get(marketId);
+          const entryVwap = vsPos?.entryVwap ?? bestBid;
+          const realizedDelta = (bestBid - entryVwap) * liveShares;
+          this.vsEngine.recordExitForStats(exitCoin, realizedDelta, 'VS_TIME_EXIT');
+        } catch (error) {
+          logger.warn('Phase 35B: VS time-exit timer failed', {
+            marketId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+    }, effectiveDelayMs);
+
+    logger.info('Phase 35B: scheduled VS time-exit timer', {
+      marketId, outcome,
+      delayMs: effectiveDelayMs,
+      firesAtSec: roundTo(effectiveDelayMs / 1000, 1),
+    });
   }
 
   /**

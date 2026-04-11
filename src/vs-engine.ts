@@ -83,6 +83,8 @@ export interface VsEngineConfig {
   readonly minLiquidityUsd: number;
   readonly minEntryPrice: number;
   readonly maxEntryPrice: number;
+  // Direction filter — prevent YES/NO flipping when FV ≈ 0.50
+  readonly minDirectionThreshold: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -407,6 +409,13 @@ export class VsEngine {
     const movePct = ((spotPrice - strikePrice) / strikePrice) * 100;
     const favorUp = movePct > 0;
 
+    // Direction threshold — prevent YES/NO flipping when FV ≈ 0.50
+    if (Math.abs(fairValueUp - 0.50) < config.minDirectionThreshold) {
+      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+        `FV_too_flat |FV-0.50|=${roundTo(Math.abs(fairValueUp - 0.50), 4)} < ${config.minDirectionThreshold}`, fairValueUp);
+      return [];
+    }
+
     // Quote on the favored side only (accumulate inventory in Binance direction)
     const outcome: Outcome = favorUp ? 'YES' : 'NO';
     const fairValue = favorUp ? fairValueUp : fairValueDown;
@@ -440,6 +449,9 @@ export class VsEngine {
       `FV=${roundTo(fairValue, 3)} bid=${bidPrice} move=${roundTo(movePct, 3)}%`, fairValue);
 
     if (config.shadowMode) return [];
+
+    // Lock cooldown on signal GENERATION to prevent duplicates before fill confirms
+    this.lastEntryMs.set(market.marketId, Date.now());
 
     signals.push(this.buildSignal({
       market,
@@ -523,6 +535,9 @@ export class VsEngine {
       `zScore=${roundTo(zScore, 2)} FV=${roundTo(fairValue, 3)} ask=${bestAsk}`, fairValue);
 
     if (config.shadowMode) return [];
+
+    // Lock cooldown on signal GENERATION to prevent duplicates before fill confirms
+    this.lastEntryMs.set(market.marketId, Date.now());
 
     return [this.buildSignal({
       market,

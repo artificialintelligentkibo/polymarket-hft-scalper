@@ -1580,6 +1580,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         1
       ),
+      minDirectionThreshold: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_MIN_DIRECTION_THRESHOLD, '0.03')
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
