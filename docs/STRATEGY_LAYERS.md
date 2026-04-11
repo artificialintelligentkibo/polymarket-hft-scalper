@@ -1,261 +1,330 @@
 # Strategy Layers
 
-This runtime can operate as a coordinated four-layer system modeled on the real Polymarket trading pattern seen in high-frequency 5-minute crypto wallets such as vague-sourdough.
+This document focuses on orchestration. The repo now contains several engines, but the important operational question is how they coexist inside one runtime.
 
 ## Overview
 
 ```text
-ORCHESTRATOR (src/index.ts)
-  -> SNIPER
-  -> MM_QUOTE
-  -> PAIRED_ARB
-  -> LOTTERY
-  -> shared risk, exposure, and conflict rules
+src/index.ts
+  -> shared market scan
+  -> shared position manager
+  -> shared order executor
+  -> shared runtime-status and dashboards
+  -> strategy layers:
+       SNIPER
+       MM_QUOTE
+       PAIRED_ARB
+       LOTTERY
+       OBI
+       VS_ENGINE
 ```
 
-The important change is not just that all four layers exist. The important change is that they now share one orchestration path, one global exposure budget, and one set of coexistence rules.
+The layers are not just "enabled or disabled". They also have:
 
-## Layer 1: SNIPER
+- conflict rules
+- priority rules
+- shared exposure accounting
+- shared reporting and dashboard state
 
-Purpose:
+## Layer Catalog
 
-- directional, Binance-led entries
-- fast repricing capture
-- highest urgency among non-arbitrage entries
+| Layer | Main signals | Primary job |
+|---|---|---|
+| `SNIPER` | `SNIPER_BUY`, `SNIPER_SCALP_EXIT` | Binance-led directional entries and fast exits |
+| `MM_QUOTE` | `MM_QUOTE_BID`, `MM_QUOTE_ASK` | Regular passive quoting and inventory shaping |
+| `PAIRED_ARB` | `PAIRED_ARB_BUY_YES`, `PAIRED_ARB_BUY_NO`, `PAIRED_ARB_REBALANCE` | Binary parity capture |
+| `LOTTERY` | `LOTTERY_BUY` plus shared exits | Cheap convex follow-on tickets |
+| `OBI` | `OBI_ENTRY_BUY`, `OBI_SCALP_EXIT`, `OBI_REBALANCE_EXIT`, `OBI_MM_QUOTE_*` | Standalone order-book imbalance trading |
+| `VS_ENGINE` | `VS_ENTRY_BUY`, `VS_MM_BID`, `VS_MM_ASK`, `VS_MOMENTUM_BUY`, `VS_SCALP_EXIT`, `VS_TIME_EXIT` | Binance latency arb with slot-open fair value |
 
-Entry logic:
-
-- requires Binance move, PM lag, and edge after fees
-- sizes with sniper base/strong share settings
-- respects sniper cooldown and correlated-direction window
-
-Exit logic:
-
-- `SNIPER_SCALP_EXIT` when Polymarket reprices above entry
-- Binance reversal stop if the move flips against the position
-- time stop when `SNIPER_MAX_HOLD_MS` is reached and the trade is not working
-
-Legacy `HARD_STOP` and `TRAILING_TAKE_PROFIT` are suppressed for tagged sniper positions because sniper manages its own exits. `SLOT_FLATTEN` still acts as universal slot-end cleanup.
-
-## Layer 2: MM_QUOTE
+## SNIPER
 
 Purpose:
 
-- passive quote placement
-- spread capture and inventory smoothing
-- optional auto-activation after a sniper fill
+- aggressive Binance-led entry
+- fast PM repricing capture
+- directional edge rather than parity edge
+
+Entry path:
+
+- uses Binance move, PM lag, and fee-aware edge
+- can be filtered by regime and correlation windows
+- supports balance preflight checks
+
+Exit path:
+
+- sniper scalp exits
+- reversal logic
+- time stop
+- shared slot-end cleanup
+
+Typical coexistence:
+
+- can coexist with `MM_QUOTE`
+- can coexist with `LOTTERY`
+- can coexist with `OBI`
+- can coexist with `VS_ENGINE`
+- should not coexist with `PAIRED_ARB` on the same market
+
+## MM_QUOTE
+
+Purpose:
+
+- regular passive quoting
+- inventory smoothing
+- optional post-sniper spread capture
+
+Important boundary:
+
+- this is the regular quoting engine
+- it is not the same as OBI maker follow-ons
+- it is not the same as VS phase-1 quoting
+
+Typical coexistence:
+
+- can coexist with `SNIPER`
+- can coexist with `LOTTERY`
+- can coexist with `OBI`
+- can coexist with `VS_ENGINE`
+- should not coexist with `PAIRED_ARB` on the same market
+
+Preset caveat:
+
+- `ORDER_BOOK_IMBALANCE` disables it
+- `ALL` disables it
+
+That is intentional. OBI and VS already have their own quote paths.
+
+## PAIRED_ARB
+
+Purpose:
+
+- buy both outcomes when payout parity is favorable
+- minimize reliance on direction
 
 Behavior:
 
-- runs through `src/quoting-engine.ts`
-- respects market-maker limits, skew, concurrent-market cap, and pending quote exposure
-- can coexist with sniper on the same market
+- synchronous paired legs are atomic
+- async starter-leg behavior is allowed when configured
+- normal directional signal caps do not apply the same way
 
-When `MM_AUTO_ACTIVATE_AFTER_SNIPER=true`, a confirmed `SNIPER_BUY` arms quote management for that market and tightens the opposite-side quote slightly to attract hedging fills.
+Coexistence:
 
-## Layer 3: PAIRED_ARB
+- should run alone on a market
+- conflicts with `SNIPER`, `MM_QUOTE`, `LOTTERY`, `OBI`, and `VS_ENGINE`
 
-Purpose:
+Operational rule:
 
-- both outcomes cheap at the same time
-- low directional dependence
-- prefers settlement rather than routine scalp exits
+- when paired arb is the chosen edge, prefer the `PAIRED_ARBITRAGE` preset and keep the runtime simple
 
-Behavior:
-
-- atomic paired legs when both sides are present in one tick
-- can still use async accumulation if enabled
-- protected from sniper-style hard stops and trailing exits
-- only the global `RISK_LIMIT` emergency brake can force the position out early
-
-## Layer 4: LOTTERY
+## LOTTERY
 
 Purpose:
 
-- convex opposite-side betting after a confirmed sniper fill
-- fixed-cost asymmetric upside
-- lowest execution priority and never allowed to block sniper flow
+- small fixed-risk opposite-side tickets
+- convex follow-on after a trigger fill
 
 Behavior:
 
-- runs through `src/lottery-engine.ts`
-- triggers only after a successful `SNIPER_BUY` when enabled
-- targets the opposite outcome in a cheap price band, usually `3-7` cents
-- always submits passive `LOTTERY_BUY` orders
-- uses fixed-risk sizing from `LOTTERY_MAX_RISK_USDC`
-- holds to settlement or slot-end cleanup instead of routine profit-taking
+- usually follows `SNIPER_BUY`
+- may also coexist with other layers at the platform level
+- uses fixed ticket-risk logic rather than broad inventory sizing
 
-Why it exists:
+Coexistence:
 
-- sniper generates many small directional edges
-- lottery adds rare but outsized reversal payouts
-- fixed entry cost makes the downside explicit: the maximum loss is the ticket cost
+- can coexist with `SNIPER`
+- can coexist with `MM_QUOTE`
+- can coexist with `OBI`
+- can coexist with `VS_ENGINE`
+- should not coexist with `PAIRED_ARB` on the same market
 
-Risk behavior:
+## OBI
 
-- no legacy `HARD_STOP`
-- no legacy `TRAILING_TAKE_PROFIT`
-- `SLOT_FLATTEN` still closes lottery inventory at slot end if the market has not settled yet
-- tiny sub-minimum tails can fall through to auto-redeem / settlement cleanup
+Purpose:
 
-## Layer Interaction Rules
+- trade PM order-book imbalance directly
+- enter on thin-side structures
+- exit on scalp, rebalance, hard stop, collapse, time take-profit, or slot-end cleanup
 
-Allowed:
+Behavior:
+
+- maintains its own position state
+- can post `OBI_MM_QUOTE_ASK`
+- has its own Binance gate and dust protections
+- exposes rich runtime stats in the dashboard
+
+Coexistence:
+
+- can coexist with `SNIPER`
+- can coexist with `MM_QUOTE`
+- can coexist with `LOTTERY`
+- does not coexist with `PAIRED_ARB`
+- does not coexist with `VS_ENGINE` on the same market under current conflict rules
+
+Important distinction:
+
+- OBI as a layer is not the same as the OBI filter used to gate regular MM activation
+
+## VS_ENGINE
+
+Purpose:
+
+- trade a modeled fair value from Binance slot-open data and realized volatility
+- use phase-1 passive quotes and phase-2 momentum
+
+Behavior:
+
+- maintains its own state and stats
+- cancels resting VS maker quotes before exits
+- tracks its own hard-stop and orphan cleanup path
+
+Coexistence:
+
+- can coexist with `SNIPER`
+- can coexist with `MM_QUOTE`
+- can coexist with `LOTTERY`
+- does not coexist with `PAIRED_ARB`
+- does not coexist with `OBI` on the same market under current conflict rules
+
+## Conflict Resolution
+
+The code uses `isLayerConflict()` from [src/strategy-types.ts](../src/strategy-types.ts).
+
+Allowed same-market pairs:
 
 - `SNIPER + MM_QUOTE`
 - `SNIPER + LOTTERY`
 - `MM_QUOTE + LOTTERY`
-- same layer across multiple markets within per-layer caps
+- `OBI + SNIPER`
+- `OBI + MM_QUOTE`
+- `OBI + LOTTERY`
+- `VS_ENGINE + SNIPER`
+- `VS_ENGINE + MM_QUOTE`
+- `VS_ENGINE + LOTTERY`
 
-Blocked:
+Blocked same-market combinations:
 
-- `SNIPER + PAIRED_ARB`
-- `MM_QUOTE + PAIRED_ARB`
-- `LOTTERY + PAIRED_ARB`
+- anything involving `PAIRED_ARB` with another layer
+- `OBI + VS_ENGINE`
+- `OBI + PAIRED_ARB`
+- `VS_ENGINE + PAIRED_ARB`
 
-Conflict handling is controlled by:
+Runtime behavior is controlled by:
 
 ```env
 LAYER_CONFLICT_RESOLUTION=BLOCK
 ```
 
-`BLOCK` is the recommended production mode.
+`BLOCK` is the recommended live setting.
 
 ## Shared Risk Layer
 
-Per-layer limits still apply:
+Every layer still has local controls, but they all feed into shared platform limits.
 
-- sniper position caps
-- MM gross/net inventory caps
-- paired-arb per-side limits
-- lottery fixed-risk ticket caps
+Global controls:
 
-Shared controls now apply on top:
+- `GLOBAL_MAX_EXPOSURE_USD`
+- `MAX_DRAWDOWN_USDC`
+- `MAX_NET_YES`
+- `MAX_NET_NO`
+- latency gate and API circuit-breaker gate
 
-```env
-GLOBAL_MAX_EXPOSURE_USD=50
-MAX_DRAWDOWN_USDC=-10
-```
+The runtime exposes per-layer and global exposure in `runtime-status.json`, including:
 
-Meaning:
+- `sniperUsd`
+- `mmUsd`
+- `pairedArbUsd`
+- `lotteryUsd`
+- `obiUsd`
+- `vsUsd`
+- `totalUsd`
 
-- when total exposure reaches `GLOBAL_MAX_EXPOSURE_USD`, fresh entries are blocked across all layers
-- `MAX_DRAWDOWN_USDC` remains the emergency stop for the whole runtime
+## Priority And Execution Notes
 
-## Recommended Profiles
+Some execution rules matter more than the raw layer list:
 
-Conservative:
+- paired-arb buy legs are treated atomically
+- OBI exits cancel pending OBI maker orders before trying to sell
+- VS exits cancel pending VS maker orders before trying to sell
+- slot-end flattening is still the universal last-resort cleanup path
+- pause mode blocks new entries but keeps safety exits alive
 
-```env
-SNIPER_MODE_ENABLED=true
-MARKET_MAKER_MODE=true
-DYNAMIC_QUOTING_ENABLED=true
-PAIRED_ARB_ENABLED=false
-SNIPER_BASE_SHARES=6
-SNIPER_STRONG_SHARES=8
-SNIPER_MAX_POSITION_SHARES=10
-MM_MAX_GROSS_EXPOSURE_USD=8
-GLOBAL_MAX_EXPOSURE_USD=25
-```
+This means the runtime is not simply "pick the highest-priority signal". It also coordinates collateral, pending quotes, and cleanup timing.
 
-Moderate:
+## Dashboard Mapping
 
-```env
-SNIPER_MODE_ENABLED=true
-MARKET_MAKER_MODE=true
-DYNAMIC_QUOTING_ENABLED=true
-PAIRED_ARB_ENABLED=true
-LOTTERY_LAYER_ENABLED=true
-SNIPER_BASE_SHARES=6
-SNIPER_STRONG_SHARES=10
-SNIPER_MAX_POSITION_SHARES=12
-MM_MAX_GROSS_EXPOSURE_USD=10
-PAIRED_ARB_MAX_SHARES=8
-LOTTERY_MAX_RISK_USDC=12
-GLOBAL_MAX_EXPOSURE_USD=50
-```
+The terminal dashboard adapts to the active layers.
 
-Aggressive:
+When OBI is active, you will usually see:
 
-```env
-SNIPER_MODE_ENABLED=true
-MARKET_MAKER_MODE=true
-DYNAMIC_QUOTING_ENABLED=true
-PAIRED_ARB_ENABLED=true
-LOTTERY_LAYER_ENABLED=true
-SNIPER_BASE_SHARES=8
-SNIPER_STRONG_SHARES=12
-SNIPER_MAX_POSITION_SHARES=16
-MM_MAX_GROSS_EXPOSURE_USD=15
-PAIRED_ARB_MAX_SHARES=10
-LOTTERY_MAX_RISK_USDC=20
-GLOBAL_MAX_EXPOSURE_USD=75
-```
+- `ACTIVE MARKETS`
+- `OBI POSITIONS`
+- `OBI SESSION`
+- `BINANCE GATE`
+- `RECENT OBI DECISIONS`
 
-## Lottery Configuration
+When VS is active, you will also see:
 
-| Parameter | Default | Description |
-|---|---:|---|
-| `LOTTERY_LAYER_ENABLED` | `false` | Master switch for the lottery layer. |
-| `LOTTERY_MAX_RISK_USDC` | `12` | Maximum risk per lottery ticket. |
-| `LOTTERY_MIN_CENTS` | `0.03` | Minimum acceptable opposite-side ask. |
-| `LOTTERY_MAX_CENTS` | `0.07` | Maximum acceptable opposite-side ask. |
-| `LOTTERY_ONLY_AFTER_SNIPER` | `true` | Restricts lottery entries to confirmed `SNIPER_BUY` fills. |
-| `LOTTERY_MAX_PER_SLOT` | `1` | Caps lottery tickets per five-minute slot. |
+- `VS ENGINE`
+- `RECENT VS DECISIONS`
 
-Recommended settings:
+When OBI is not the dominant layer, you will see the more generic platform view:
 
-- Conservative: `LOTTERY_MAX_RISK_USDC=8`, `LOTTERY_MAX_CENTS=0.05`
-- Moderate: `LOTTERY_MAX_RISK_USDC=12`, `LOTTERY_MAX_CENTS=0.07`
-- Aggressive: `LOTTERY_MAX_RISK_USDC=20`, `LOTTERY_MAX_CENTS=0.10`
+- `MM QUOTES`
+- `BOT PERFORMANCE STATS`
+- `STRATEGY LAYERS`
+- `SNIPER ENGINE`
+- `LOTTERY LAYER`
+- `RECENT SIGNALS`
 
-## Dashboard Guide
+The HTTP dashboard uses the same `runtime-status.json` data but renders it as a web page.
 
-The production dashboard now includes:
+## Recommended Layer Combinations
 
-- `portfolio`, `cash`, and `available` in the header
-- `STRATEGY LAYERS` with per-layer status, position count, exposure, and PnL
-- `LOTTERY LAYER` with tickets, hits, active entries, total risk, payout, and ROI
-- `RECENT SIGNALS` with a `LAYER` column
+### OBI-first live trading
 
-Interpretation:
+Use:
 
-- `ACTIVE` means the layer currently has live inventory or active MM markets
-- `WATCHING` means enabled but not currently deployed
-- `OFF` means disabled in config
+- `ACTIVE_STRATEGY=ORDER_BOOK_IMBALANCE`
+- `OBI_ENGINE_ENABLED=true`
+- optional `VS_ENGINE_ENABLED=true`
 
-`Position abandoned for redeem - below CLOB minimum sell size` is expected for tiny dust tails after a live partial exit and is not the same as a failed exit loop.
+Why:
 
-## Troubleshooting
+- cleanest live mental model
+- most explicit OBI telemetry
+- avoids regular MM conflicts
 
-Why is SNIPER not trading?
+### Paired-arb only
 
-- check `SNIPER_MIN_BINANCE_MOVE_PCT`
-- check `SNIPER_MIN_EDGE_AFTER_FEES`
-- inspect `sniperStats.rejections` in `runtime-status.json`
+Use:
 
-Why is MM_QUOTE not starting after sniper?
+- `ACTIVE_STRATEGY=PAIRED_ARBITRAGE`
 
-- confirm `MARKET_MAKER_MODE=true`
-- confirm `DYNAMIC_QUOTING_ENABLED=true`
-- confirm `MM_AUTO_ACTIVATE_AFTER_SNIPER=true`
+Why:
 
-Why is PAIRED_ARB not firing?
+- simplest low-directionality deployment
+- no need to reason about mixed-layer coexistence
 
-- verify both sides are below `PAIRED_ARB_MAX_PAIR_COST`
-- check minimum depth and share floors
-- check market conflict rules if sniper or MM are already active on that market
+### Full platform
 
-Why is LOTTERY not firing?
+Use:
 
-- confirm `LOTTERY_LAYER_ENABLED=true`
-- confirm the trigger was a filled `SNIPER_BUY`
-- confirm the opposite-side ask is inside `LOTTERY_MIN_CENTS` / `LOTTERY_MAX_CENTS`
-- check `LOTTERY_MAX_PER_SLOT`
-- check `globalExposure.totalUsd` if fresh entries are blocked
+- `ACTIVE_STRATEGY=ALL`
 
-Why are new entries blocked?
+Why:
 
-- inspect `globalExposure.totalUsd`
-- inspect `MAX_DRAWDOWN_USDC`
-- check the recent skipped signals list for `global_exposure_limit` or `layer_conflict`
+- highest activity
+- mixes OBI, sniper, and lottery
+- still respects shared exposure and conflict rules
+
+## Common Layer Confusion
+
+- `MM_QUOTE` is not `OBI_MM_QUOTE_ASK`
+- `MM_QUOTE` is not `VS_MM_BID` or `VS_MM_ASK`
+- `CURRENT_SNIPER` is not the same thing as "only sniper"
+- OBI and VS can both be enabled in the platform, but current same-market conflict rules still block them from owning the same market together
+
+## Bottom Line
+
+The layer model is now one of the core product features of the repo. If documentation or operations ignore that model, the runtime becomes hard to reason about. If you keep the layer boundaries clear, the platform is much easier to run safely.

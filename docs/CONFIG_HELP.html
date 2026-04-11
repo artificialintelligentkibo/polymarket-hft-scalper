@@ -1,1065 +1,537 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Polymarket HFT Scalper Config Help</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket HFT Scalper Configuration Helper</title>
   <style>
     :root {
-      --bg: #0b1020;
-      --panel: #11172b;
-      --panel-2: #18203a;
-      --line: #273253;
-      --text: #e7ecf7;
-      --muted: #a3afc9;
-      --blue: #68a3ff;
-      --green: #4ade80;
-      --amber: #fbbf24;
-      --red: #f87171;
-      --purple: #b794f4;
-      --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
-      --sans: "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
-      color-scheme: dark;
+      --bg: #0c1220;
+      --surface: #121a2a;
+      --surface-2: #182236;
+      --border: #2b3853;
+      --text: #e8eefc;
+      --muted: #98a7c7;
+      --accent: #57c7ff;
+      --accent-2: #7ae3b1;
+      --warn: #ffd166;
+      --danger: #ff7b7b;
+      --code: #101827;
+      --shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
     }
 
-    * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
+    * {
+      box-sizing: border-box;
+    }
 
     body {
       margin: 0;
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
       background:
-        radial-gradient(circle at top right, rgba(104, 163, 255, 0.12), transparent 28%),
-        radial-gradient(circle at top left, rgba(34, 211, 238, 0.08), transparent 26%),
-        linear-gradient(180deg, #0a0f1e 0%, #0b1020 100%);
+        radial-gradient(circle at top right, rgba(87, 199, 255, 0.16), transparent 28%),
+        radial-gradient(circle at top left, rgba(122, 227, 177, 0.12), transparent 24%),
+        linear-gradient(180deg, #0a1020, #0c1220 30%, #0f1728 100%);
       color: var(--text);
-      font-family: var(--sans);
-      line-height: 1.55;
+      line-height: 1.6;
+    }
+
+    .wrap {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 56px;
     }
 
     .hero {
-      padding: 44px 28px 28px;
-      border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(24, 32, 58, 0.92), rgba(11, 16, 32, 0.96));
-    }
-
-    .hero-inner,
-    .content,
-    .toolbar-inner {
-      width: min(1160px, calc(100% - 32px));
-      margin: 0 auto;
-    }
-
-    .eyebrow {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid rgba(104, 163, 255, 0.24);
-      background: rgba(104, 163, 255, 0.08);
-      color: var(--blue);
-      font-size: 12px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      font-weight: 700;
-    }
-
-    h1 {
-      margin: 16px 0 10px;
-      font-size: clamp(30px, 4vw, 44px);
-      line-height: 1.05;
-      letter-spacing: -0.03em;
-    }
-
-    .hero p {
-      max-width: 900px;
-      margin: 0;
-      font-size: 16px;
-      color: var(--muted);
-    }
-
-    .links,
-    .nav,
-    .search-wrap {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-
-    .link-chip,
-    .nav a {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 14px;
-      border-radius: 12px;
-      text-decoration: none;
-      color: var(--text);
-      background: rgba(24, 32, 58, 0.86);
-      border: 1px solid var(--line);
-      transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
-    }
-
-    .nav a {
-      padding: 8px 12px;
-      border-radius: 999px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .link-chip:hover,
-    .nav a:hover {
-      transform: translateY(-1px);
-      border-color: rgba(104, 163, 255, 0.42);
-      background: rgba(29, 39, 69, 0.96);
-      color: var(--text);
-    }
-
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 12px;
-      margin-top: 24px;
-    }
-
-    .summary-card,
-    .callout,
-    .section,
-    .filter-note,
-    .empty-state {
-      border: 1px solid var(--line);
-      background: rgba(17, 23, 43, 0.88);
-    }
-
-    .summary-card {
-      padding: 16px;
-      border-radius: 16px;
-    }
-
-    .summary-card h3 {
-      margin: 0 0 6px;
-      font-size: 14px;
-      letter-spacing: 0.02em;
-      text-transform: uppercase;
-      color: var(--blue);
-    }
-
-    .summary-card p,
-    .callout,
-    .filter-note,
-    .section-header p,
-    .param-note,
-    .param-default,
-    .empty-state {
-      color: var(--muted);
-    }
-
-    .toolbar {
-      position: sticky;
-      top: 0;
-      z-index: 20;
-      backdrop-filter: blur(10px);
-      background: rgba(11, 16, 32, 0.88);
-      border-bottom: 1px solid var(--line);
-    }
-
-    .toolbar-inner {
-      padding: 14px 0;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: 12px;
-    }
-
-    .search-input {
-      flex: 1 1 360px;
-      min-width: 240px;
-      padding: 12px 14px;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: var(--panel);
-      color: var(--text);
-      font: inherit;
-    }
-
-    .search-input:focus {
-      outline: 2px solid rgba(104, 163, 255, 0.35);
-      border-color: rgba(104, 163, 255, 0.45);
-    }
-
-    .filter-note {
-      padding: 12px 14px;
-      border-radius: 14px;
-      font-size: 13px;
-    }
-
-    .content {
-      padding: 24px 0 80px;
-    }
-
-    .callout {
-      padding: 18px 20px;
-      border-radius: 18px;
+      background: linear-gradient(135deg, rgba(87, 199, 255, 0.12), rgba(122, 227, 177, 0.08));
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 28px;
+      box-shadow: var(--shadow);
       margin-bottom: 24px;
     }
 
-    .callout strong,
-    .param-desc,
-    .section-header h2 {
+    .eyebrow {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(87, 199, 255, 0.12);
+      color: var(--accent);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(30px, 5vw, 48px);
+      line-height: 1.1;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 900px;
+      color: var(--muted);
+      font-size: 17px;
+    }
+
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 18px 0 0;
+    }
+
+    .nav a,
+    .links a {
       color: var(--text);
+      text-decoration: none;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.03);
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 14px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .card,
+    .section {
+      background: rgba(18, 26, 42, 0.95);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .card {
+      padding: 18px;
+    }
+
+    .card h2,
+    .section h2 {
+      margin: 0 0 10px;
+      font-size: 20px;
     }
 
     .section {
-      margin-bottom: 28px;
-      border-radius: 20px;
-      overflow: hidden;
+      padding: 22px;
+      margin-bottom: 18px;
     }
 
-    .section-header {
-      padding: 20px 22px;
-      border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(24, 32, 58, 0.92), rgba(17, 23, 43, 0.92));
+    .section p,
+    .card p,
+    li,
+    td {
+      color: var(--muted);
     }
 
-    .section-header h2 {
-      margin: 0 0 6px;
-      font-size: 22px;
-      letter-spacing: -0.02em;
-    }
-
-    .params {
-      padding: 8px 12px 12px;
+    .stack {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
       gap: 12px;
     }
 
-    .param {
-      padding: 16px;
+    .mini {
+      padding: 12px 14px;
       border-radius: 16px;
-      border: 1px solid rgba(39, 50, 83, 0.92);
-      background: rgba(12, 18, 34, 0.92);
-      min-height: 188px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
     }
 
-    .param-top {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
+    .mini strong {
+      display: block;
+      color: var(--text);
+      margin-bottom: 4px;
     }
 
-    .param-name {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 5px 8px;
-      border-radius: 10px;
-      background: rgba(104, 163, 255, 0.12);
-      color: var(--blue);
-      font-family: var(--mono);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.02em;
-      cursor: pointer;
-      border: 1px solid rgba(104, 163, 255, 0.16);
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      overflow: hidden;
+      border-radius: 16px;
     }
 
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 4px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 700;
+    th,
+    td {
+      text-align: left;
+      vertical-align: top;
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(43, 56, 83, 0.75);
+    }
+
+    th {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.03);
+      font-size: 13px;
       letter-spacing: 0.04em;
       text-transform: uppercase;
-      border: 1px solid transparent;
     }
 
-    .badge-type { background: rgba(183, 148, 244, 0.12); color: var(--purple); border-color: rgba(183, 148, 244, 0.22); }
-    .badge-safety { background: rgba(248, 113, 113, 0.12); color: var(--red); border-color: rgba(248, 113, 113, 0.22); }
-    .badge-core { background: rgba(74, 222, 128, 0.12); color: var(--green); border-color: rgba(74, 222, 128, 0.22); }
-    .badge-tune { background: rgba(251, 191, 36, 0.12); color: var(--amber); border-color: rgba(251, 191, 36, 0.22); }
+    tr:last-child td {
+      border-bottom: none;
+    }
 
-    .param-default,
-    .param-note {
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 2px 6px;
+      color: var(--accent-2);
+    }
+
+    ul {
       margin: 0;
-      font-size: 13px;
-      font-family: var(--mono);
-      word-break: break-word;
+      padding-left: 18px;
     }
 
-    .param-desc {
-      margin: 0;
-      font-size: 14px;
-      flex: 1;
+    .note,
+    .warn {
+      padding: 14px 16px;
+      border-radius: 16px;
+      margin-top: 14px;
     }
 
-    .param.hide,
-    .section.hide {
-      display: none;
+    .note {
+      background: rgba(87, 199, 255, 0.08);
+      border: 1px solid rgba(87, 199, 255, 0.2);
     }
 
-    .empty-state {
-      display: none;
-      margin-top: 24px;
-      padding: 22px;
-      border-radius: 18px;
-      text-align: center;
+    .warn {
+      background: rgba(255, 209, 102, 0.08);
+      border: 1px solid rgba(255, 209, 102, 0.2);
     }
 
-    .empty-state.show { display: block; }
+    .warn strong {
+      color: var(--warn);
+    }
 
-    .toast {
-      position: fixed;
-      left: 50%;
-      bottom: 24px;
-      transform: translateX(-50%) translateY(14px);
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.18s ease, transform 0.18s ease;
-      background: rgba(104, 163, 255, 0.96);
-      color: #fff;
-      padding: 10px 14px;
+    .links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 5px 10px;
       border-radius: 999px;
-      font-size: 13px;
-      font-weight: 700;
-      box-shadow: 0 16px 38px rgba(0, 0, 0, 0.35);
+      background: rgba(122, 227, 177, 0.1);
+      color: var(--accent-2);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
 
-    .toast.show {
-      opacity: 1;
-      transform: translateX(-50%) translateY(0);
-    }
-
-    @media (max-width: 640px) {
-      .hero { padding: 30px 18px 24px; }
-      .hero-inner, .content, .toolbar-inner { width: min(100% - 20px, 1160px); }
-      .params { grid-template-columns: 1fr; }
+    .danger {
+      color: var(--danger);
     }
   </style>
 </head>
 <body>
-  <header class="hero">
-    <div class="hero-inner">
-      <div class="eyebrow">Visual Config Explorer</div>
-      <h1>Polymarket HFT Scalper Configuration Help</h1>
+  <div class="wrap">
+    <section class="hero">
+      <div class="eyebrow">Platform Configuration Helper</div>
+      <h1>Polymarket HFT Scalper is now a multi-strategy platform.</h1>
       <p>
-        Browser-friendly companion for <code>.env.example</code>. Use this page to understand what each
-        environment variable controls, which knobs affect safety, and which settings only matter in
-        specific modes such as paper trading, paired arbitrage, or autonomous market making.
+        Use this page as a fast mental map for the current control model: runtime modes,
+        <code>ACTIVE_STRATEGY</code> presets, strategy engines, dashboards, and reporting.
+        For exact defaults and validation ranges, the code in <code>src/config.ts</code> is still the source of truth.
+      </p>
+      <div class="nav">
+        <a href="#control-stack">Control Stack</a>
+        <a href="#presets">Presets</a>
+        <a href="#engines">Engines</a>
+        <a href="#dashboards">Dashboards</a>
+        <a href="#profiles">Profiles</a>
+      </div>
+    </section>
+
+    <div class="grid" id="control-stack">
+      <article class="card">
+        <span class="pill">Step 1</span>
+        <h2>Runtime Mode</h2>
+        <div class="stack">
+          <div class="mini">
+            <strong>Simulation</strong>
+            <code>SIMULATION_MODE=true</code> and <code>DRY_RUN=true</code>
+          </div>
+          <div class="mini">
+            <strong>Product Test</strong>
+            <code>PRODUCT_TEST_MODE=true</code> with real but constrained flow
+          </div>
+          <div class="mini">
+            <strong>Production</strong>
+            Live trading with normal runtime controls
+          </div>
+        </div>
+      </article>
+
+      <article class="card">
+        <span class="pill">Step 2</span>
+        <h2>Preset Layer</h2>
+        <p>
+          <code>ACTIVE_STRATEGY</code> is the high-level switch. It can turn engines on or off
+          after your raw env has already been parsed.
+        </p>
+        <div class="note">
+          <strong>Important:</strong> <code>CURRENT_SNIPER</code> means "no preset override", not "only sniper".
+        </div>
+      </article>
+
+      <article class="card">
+        <span class="pill">Step 3</span>
+        <h2>Engine Layer</h2>
+        <p>
+          After preset overrides, individual engines such as <code>OBI_ENGINE_ENABLED</code>,
+          <code>SNIPER_MODE_ENABLED</code>, and <code>VS_ENGINE_ENABLED</code> decide what actually runs.
+        </p>
+      </article>
+    </div>
+
+    <section class="section" id="presets">
+      <h2>Strategy Presets</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Preset</th>
+            <th>Best Use</th>
+            <th>What It Does</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>CURRENT_SNIPER</code></td>
+            <td>Manual compatibility mode</td>
+            <td>Leaves your flags as configured.</td>
+          </tr>
+          <tr>
+            <td><code>ORDER_BOOK_IMBALANCE</code></td>
+            <td>Modern OBI-first live deployment</td>
+            <td>Turns on OBI, turns off sniper/latency/paired arb, disables regular MM, keeps Binance feed only when needed for OBI or VS.</td>
+          </tr>
+          <tr>
+            <td><code>PAIRED_ARBITRAGE</code></td>
+            <td>Lowest-directionality deployment</td>
+            <td>Runs paired arb only and disables directional layers.</td>
+          </tr>
+          <tr>
+            <td><code>ALL</code></td>
+            <td>True multi-strategy platform mode</td>
+            <td>Runs OBI and sniper together, preserves VS if enabled, and pairs well with <code>LOTTERY_LAYER_ENABLED=true</code> when you want follow-on convexity. Regular MM still stays off.</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="warn">
+        <strong>Why regular MM turns off in OBI and ALL:</strong> OBI and VS already have their own quote paths. Running the generic
+        <code>MM_QUOTE</code> engine in parallel would create confusing same-market ownership conflicts.
+      </div>
+    </section>
+
+    <section class="section" id="engines">
+      <h2>Engine Map</h2>
+      <div class="grid">
+        <article class="card">
+          <h2>OBI</h2>
+          <p>Standalone order-book imbalance trading with its own entries, exits, and maker follow-ons.</p>
+          <ul>
+            <li><code>OBI_ENGINE_ENABLED</code></li>
+            <li><code>OBI_SHADOW_MODE</code></li>
+            <li><code>OBI_BINANCE_REQUIRE_ALIGNMENT</code></li>
+            <li><code>OBI_TIME_TAKE_PROFIT_MS</code></li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>VS Engine</h2>
+          <p>Binance latency arb with slot-open strike, realized volatility, fair-value MM, and late momentum.</p>
+          <ul>
+            <li><code>VS_ENGINE_ENABLED</code></li>
+            <li><code>VS_SHADOW_MODE</code></li>
+            <li><code>VS_MOMENTUM_THRESHOLD_SIGMAS</code></li>
+            <li><code>VS_TARGET_EXIT_PRICE</code></li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>Sniper</h2>
+          <p>Fast Binance-led directional entry engine with PM-lag and fee-aware filters.</p>
+          <ul>
+            <li><code>SNIPER_MODE_ENABLED</code></li>
+            <li><code>SNIPER_MIN_BINANCE_MOVE_PCT</code></li>
+            <li><code>SNIPER_MIN_EDGE_AFTER_FEES</code></li>
+            <li><code>REGIME_FILTER_ENABLED</code></li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>Regular MM</h2>
+          <p>Passive quoting from the dedicated quoting engine. Separate from OBI and VS quoting.</p>
+          <ul>
+            <li><code>MARKET_MAKER_MODE</code></li>
+            <li><code>DYNAMIC_QUOTING_ENABLED</code></li>
+            <li><code>MM_QUOTE_SHARES</code></li>
+            <li><code>MM_MAX_GROSS_EXPOSURE_USD</code></li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>Paired Arb</h2>
+          <p>Parity-based YES plus NO trading with atomic pair handling and async starter-leg support.</p>
+          <ul>
+            <li><code>PAIRED_ARB_ENABLED</code></li>
+            <li><code>PAIRED_ARB_ASYNC_ENABLED</code></li>
+            <li><code>PAIRED_ARB_MIN_NET_EDGE</code></li>
+            <li><code>PAIRED_ARB_MAX_PAIR_COST</code></li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>Lottery</h2>
+          <p>Small fixed-risk opposite-side convexity layer, usually following a trigger fill.</p>
+          <ul>
+            <li><code>LOTTERY_LAYER_ENABLED</code></li>
+            <li><code>LOTTERY_MAX_RISK_USDC</code></li>
+            <li><code>LOTTERY_ONLY_AFTER_SNIPER</code></li>
+            <li><code>LOTTERY_MAX_PER_SLOT</code></li>
+          </ul>
+        </article>
+      </div>
+      <div class="note">
+        <strong>Do not confuse these:</strong> <code>ORDER_BOOK_IMBALANCE_ENABLED</code> is only a filter for regular MM activation.
+        <code>OBI_ENGINE_ENABLED</code> is the real OBI strategy.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Shared Controls</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Group</th>
+            <th>Examples</th>
+            <th>Why It Matters</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Shared risk</td>
+            <td><code>GLOBAL_MAX_EXPOSURE_USD</code>, <code>MAX_DRAWDOWN_USDC</code>, <code>MAX_NET_YES</code>, <code>MAX_NET_NO</code></td>
+            <td>All engines feed into the same bankroll and directional limits.</td>
+          </tr>
+          <tr>
+            <td>Execution</td>
+            <td><code>ORDER_TYPE</code>, <code>ORDER_TYPE_FALLBACK</code>, <code>POST_ONLY_ONLY</code>, <code>SLIPPAGE_TOLERANCE</code></td>
+            <td>Changes how every layer reaches the book.</td>
+          </tr>
+          <tr>
+            <td>Compounding</td>
+            <td><code>COMPOUNDING_ENABLED</code>, <code>COMPOUNDING_GLOBAL_EXPOSURE_PCT</code></td>
+            <td>Moves the platform from static sizing to bankroll-aware sizing.</td>
+          </tr>
+          <tr>
+            <td>Monitoring</td>
+            <td><code>STATUS_CHECK_INTERVAL_MS</code>, <code>AUTO_PAUSE_ON_INCIDENT</code></td>
+            <td>Lets the runtime auto-pause entries on platform incidents.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section" id="dashboards">
+      <h2>Dashboards And Runtime Files</h2>
+      <div class="grid">
+        <article class="card">
+          <h2>Terminal Dashboard</h2>
+          <p>Launch with <code>npm run scalper -- dashboard</code>.</p>
+          <ul>
+            <li>Active markets</li>
+            <li>Open positions</li>
+            <li>OBI session and gate breakdown</li>
+            <li>VS decisions</li>
+            <li>Layer status and recent signals</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>HTTP Dashboard</h2>
+          <p>Enable with:</p>
+          <ul>
+            <li><code>DASHBOARD_ENABLED=true</code></li>
+            <li><code>DASHBOARD_HOST=0.0.0.0</code></li>
+            <li><code>DASHBOARD_PORT=3847</code></li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>Runtime Status</h2>
+          <p>The dashboards read <code>reports/runtime-status.json</code>, which now includes:</p>
+          <ul>
+            <li>layer status</li>
+            <li>portfolio, cash, available balance</li>
+            <li>OBI stats</li>
+            <li>VS stats</li>
+            <li>recent signals and skipped signals</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="profiles">
+      <h2>Shipped Config Profiles</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>File</th>
+            <th>Use It When</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>.env.example</code></td>
+            <td>You want the clean baseline and full section overview.</td>
+          </tr>
+          <tr>
+            <td><code>.env.live</code></td>
+            <td>You want the newer OBI-led platform shape with Binance feed and dashboard-heavy runtime.</td>
+          </tr>
+          <tr>
+            <td><code>.env.imbalance.example</code></td>
+            <td>You want a highly commented OBI rollout path with shadow-mode guidance.</td>
+          </tr>
+          <tr>
+            <td><code>.env.obi-minimum-risk.example</code></td>
+            <td>You want the safest low-balance OBI-only profile.</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="warn">
+        <strong>Small-balance reminder:</strong> CLOB minimums and dust behavior are real. If balance is tight, use the minimum-risk OBI profile first.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Recommended Reading Order</h2>
+      <p>
+        This helper is intentionally compact. For full context, read the docs in this order:
       </p>
       <div class="links">
-        <a class="link-chip" href="../.env.example">Open <code>.env.example</code></a>
-        <a class="link-chip" href="./CONFIGURATION.md">Open <code>docs/CONFIGURATION.md</code></a>
-        <a class="link-chip" href="../README.md">Open <code>README.md</code></a>
+        <a href="../README.md">README.md</a>
+        <a href="./CONFIGURATION.md">CONFIGURATION.md</a>
+        <a href="./STRATEGY_GUIDE.md">STRATEGY_GUIDE.md</a>
+        <a href="./STRATEGY_LAYERS.md">STRATEGY_LAYERS.md</a>
+        <a href="../SETUP.md">SETUP.md</a>
       </div>
-      <div class="summary-grid">
-        <div class="summary-card">
-          <h3>Single Source of Truth</h3>
-          <p>If this guide and runtime ever disagree, trust <code>.env.example</code> and <code>src/config.ts</code>.</p>
-        </div>
-        <div class="summary-card">
-          <h3>Live Safety</h3>
-          <p>The most dangerous switches are <code>SIMULATION_MODE</code>, <code>DRY_RUN</code>, credentials, and position limits.</p>
-        </div>
-        <div class="summary-card">
-          <h3>Paper Validation</h3>
-          <p>For realistic simulation, use <code>SIMULATION_MODE=true</code> with <code>PAPER_TRADING_ENABLED=true</code>.</p>
-        </div>
-        <div class="summary-card">
-          <h3>Search Everything</h3>
-          <p>Use the filter below to jump straight to one variable, a section, or a keyword like <code>latency</code> or <code>redeem</code>.</p>
-        </div>
+      <div class="note">
+        Exact validation ranges and default values still live in <code>src/config.ts</code>.
       </div>
-    </div>
-  </header>
-
-  <div class="toolbar">
-    <div class="toolbar-inner">
-      <div class="search-wrap">
-        <input id="search" class="search-input" type="search" placeholder="Search keys, defaults, or descriptions. Example: MM_MAX_NET_DIRECTIONAL">
-        <div class="filter-note">Click any variable name to copy the default <code>KEY=value</code> pair.</div>
-      </div>
-      <nav id="nav" class="nav" aria-label="Configuration sections"></nav>
-    </div>
+    </section>
   </div>
-
-  <main class="content">
-    <div class="callout">
-      <strong>How to use this file:</strong> start in the section that matches the mode you are testing,
-      then search for the exact variable name when you want to tune one knob. This page is intentionally
-      practical: it explains what the setting is for, when it matters, and which parameters are mostly
-      ignored unless a corresponding feature is enabled.
-    </div>
-    <div id="sections"></div>
-    <div id="empty" class="empty-state">No parameters matched this filter.</div>
-  </main>
-
-  <div id="toast" class="toast">Copied</div>
-
-  <script>
-    const sections = [
-      {
-        id: "auth",
-        title: "Authentication",
-        intro: "Credentials for Polymarket CLOB trading and gasless relayer operations. These values are required for live order placement and redeem flows.",
-        params: [
-          ["AUTH_MODE", "PROXY"],
-          ["SIGNATURE_TYPE", "2"],
-          ["SIGNER_PRIVATE_KEY", ""],
-          ["FUNDER_ADDRESS", ""],
-          ["POLYMARKET_API_KEY", ""],
-          ["POLYMARKET_API_SECRET", ""],
-          ["POLYMARKET_API_PASSPHRASE", ""],
-          ["POLYMARKET_API_KEY_ADDRESS", ""],
-          ["POLYMARKET_RELAYER_KEY", ""],
-          ["POLYMARKET_RELAYER_KEY_ADDRESS", ""]
-        ]
-      },
-      {
-        id: "mode",
-        title: "Operating Mode",
-        intro: "Master switches that decide whether the bot trades live, simulates execution, or runs a tightly scoped product test.",
-        params: [
-          ["SIMULATION_MODE", "true"],
-          ["TEST_MODE", "false"],
-          ["DRY_RUN", "true"],
-          ["PRODUCT_TEST_MODE", "false"],
-          ["ENABLE_SIGNAL", "true"],
-          ["ENTRY_STRATEGY", "LEGACY"],
-          ["PAIRED_ARB_ENABLED", "false"],
-          ["LATENCY_MOMENTUM_ENABLED", "false"],
-          ["PAPER_TRADING_ENABLED", "false"],
-          ["AUTO_REDEEM", "false"],
-          ["REDEEM_INTERVAL_MS", "30000"]
-        ]
-      },
-      {
-        id: "mm",
-        title: "Market Maker Mode",
-        intro: "Autonomous dual-sided quoting and quote-management settings. These only matter when both MM mode and dynamic quoting are enabled.",
-        params: [
-          ["MARKET_MAKER_MODE", "false"],
-          ["DYNAMIC_QUOTING_ENABLED", "false"],
-          ["MM_AUTONOMOUS_QUOTES", "true"],
-          ["MM_ALWAYS_QUOTE", "false"],
-          ["MM_QUOTE_SHARES", "5"],
-          ["MM_MAX_GROSS_EXPOSURE_USD", "15"],
-          ["MM_MAX_NET_DIRECTIONAL", "10"],
-          ["MM_MIN_SPREAD_TICKS", "2"],
-          ["MM_REQUIRE_FAIR_VALUE", "true"],
-          ["MM_MIN_BOOK_DEPTH_USD", "3"],
-          ["MM_MAX_CONCURRENT_MARKETS", "4"],
-          ["MM_INVENTORY_SKEW_FACTOR", "0.3"],
-          ["MM_MIN_EDGE_AFTER_FEE", "0.005"],
-          ["POST_ONLY_ONLY", "true"],
-          ["QUOTING_INTERVAL_MS", "150"],
-          ["MAX_IMBALANCE_PERCENT", "35"],
-          ["QUOTING_SPREAD_TICKS", "2"],
-          ["REBALANCE_ON_IMBALANCE", "true"],
-          ["DEEP_BINANCE_MODE", "false"],
-          ["BINANCE_WS_ENABLED", "true"],
-          ["BINANCE_DEPTH_LEVELS", "20"],
-          ["BINANCE_FUNDING_WEIGHT", "0.3"],
-          ["MIN_BINANCE_SPREAD_THRESHOLD", "0.004"],
-          ["DYNAMIC_SPREAD_VOL_FACTOR", "1.5"],
-          ["BINANCE_FAIR_VALUE_WEIGHT", "0.7"],
-          ["POLYMARKET_FAIR_VALUE_WEIGHT", "0.2"]
-        ]
-      },
-      {
-        id: "markets",
-        title: "Market Selection",
-        intro: "Scoping knobs that decide which markets are scanned before any strategy logic runs.",
-        params: [
-          ["COINS_TO_TRADE", "BTC,SOL,XRP,ETH"],
-          ["FILTER_5MIN_ONLY", "true"],
-          ["MIN_LIQUIDITY_USD", "500"],
-          ["WHITELIST_CONDITION_IDS", ""]
-        ]
-      },
-      {
-        id: "strategy",
-        title: "Strategy Core",
-        intro: "Shared entry and exit thresholds used by the legacy engines and by the risk layer around every strategy.",
-        params: [
-          ["MIN_COMBINED_DISCOUNT", "0.01"],
-          ["EXTREME_SELL_THRESHOLD", "0.93"],
-          ["EXTREME_BUY_THRESHOLD", "0.04"],
-          ["FAIR_VALUE_BUY_THRESHOLD", "0.005"],
-          ["FAIR_VALUE_SELL_THRESHOLD", "0.005"],
-          ["TRAILING_TAKE_PROFIT", "0.012"],
-          ["HARD_STOP_LOSS", "0.025"],
-          ["HARD_STOP_COOLDOWN_MS", "15000"],
-          ["MAX_DRAWDOWN_USDC", "-15"]
-        ]
-      },
-      {
-        id: "paired",
-        title: "Paired Arbitrage",
-        intro: "Controls for market-neutral YES+NO entries when the combined pair cost is below payout after fees.",
-        params: [
-          ["PAIRED_ARB_MIN_NET_EDGE", "0.02"],
-          ["PAIRED_ARB_MAX_PAIR_COST", "0.97"],
-          ["PAIRED_ARB_TARGET_BALANCE_RATIO", "1.0"],
-          ["PAIRED_ARB_BALANCE_TOLERANCE", "0.15"],
-          ["PAIRED_ARB_MAX_PER_SIDE", "200"],
-          ["PAIRED_ARB_MIN_SHARES", "20"],
-          ["PAIRED_ARB_MAX_SHARES", "80"],
-          ["PAIRED_ARB_COOLDOWN_MS", "5000"],
-          ["PAIRED_ARB_REQUIRE_BOTH_LIQUIDITY", "true"],
-          ["PAIRED_ARB_MIN_DEPTH_USD", "3"],
-          ["PAIRED_ARB_ASYNC_ENABLED", "true"],
-          ["PAIRED_ARB_ASYNC_MAX_ENTRY_PRICE", "0.45"],
-          ["PAIRED_ARB_ASYNC_MIN_EDGE", "0.01"],
-          ["PAIRED_ARB_ASYNC_MAX_WAIT_MS", "180000"]
-        ]
-      },
-      {
-        id: "latency",
-        title: "Latency Momentum",
-        intro: "Directional entry engine that reacts to Binance movement before Polymarket fully reprices.",
-        params: [
-          ["LATENCY_MOMENTUM_MIN_MOVE_PCT", "0.30"],
-          ["LATENCY_MOMENTUM_STRONG_MOVE_PCT", "0.50"],
-          ["LATENCY_MOMENTUM_MAX_ENTRY_WINDOW_MS", "120000"],
-          ["LATENCY_MOMENTUM_MAX_PM_LAG_PCT", "0.10"],
-          ["LATENCY_MOMENTUM_PM_MOVE_SENSITIVITY", "0.10"],
-          ["LATENCY_MOMENTUM_MIN_ENTRY_PRICE", "0.01"],
-          ["LATENCY_MOMENTUM_MAX_ENTRY_PRICE", "0.15"],
-          ["LATENCY_MOMENTUM_BASE_SHARES", "30"],
-          ["LATENCY_MOMENTUM_STRONG_SHARES", "60"],
-          ["LATENCY_MOMENTUM_MAX_POSITION_SHARES", "100"],
-          ["LATENCY_MOMENTUM_COOLDOWN_MS", "10000"],
-          ["LATENCY_MOMENTUM_INVERT_SIGNAL", "false"]
-        ]
-      },
-      {
-        id: "paper",
-        title: "Paper Trading",
-        intro: "Simulation-only fill model. These settings shape how realistic paper fills, slippage, and latency feel before going live.",
-        params: [
-          ["PAPER_TRADING_INITIAL_BALANCE", "100"],
-          ["PAPER_TRADING_LATENCY_MIN_MS", "400"],
-          ["PAPER_TRADING_LATENCY_MAX_MS", "1500"],
-          ["PAPER_TRADING_FILL_PROB_PASSIVE", "0.40"],
-          ["PAPER_TRADING_FILL_PROB_IMPROVE", "0.65"],
-          ["PAPER_TRADING_FILL_PROB_CROSS", "0.95"],
-          ["PAPER_TRADING_MAX_SLIPPAGE_TICKS", "2"],
-          ["PAPER_TRADING_SIZE_IMPACT_FACTOR", "0.5"],
-          ["PAPER_TRADING_PARTIAL_FILLS", "true"],
-          ["PAPER_TRADING_MIN_FILL_RATIO", "0.30"],
-          ["PAPER_TRADING_TRADE_LOG", "./reports/paper-trades.jsonl"]
-        ]
-      },
-      {
-        id: "ev",
-        title: "EV and Kelly",
-        intro: "Expected-value and sizing filters for non-paired directional entries. These guard against trades that look attractive before fees but are negative after costs.",
-        params: [
-          ["EV_KELLY_ENABLED", "false"],
-          ["EV_MIN_THRESHOLD", "0.005"],
-          ["EV_MIN_THRESHOLD_HIGH_FEE", "0.008"],
-          ["KELLY_FRACTION", "0.85"],
-          ["MAX_BANKROLL_PER_TRADE", "0.20"],
-          ["PREFER_MAKER_ORDERS", "true"],
-          ["DEFAULT_TAKER_FEE", "0.02"],
-          ["HIGH_FEE_TAKER_FEE", "0.0315"]
-        ]
-      },
-      {
-        id: "bayesian",
-        title: "Bayesian Fair Value Smoothing",
-        intro: "Optional smoothing layer for fair value estimates. Useful when raw order books are noisy and cause quote churn.",
-        params: [
-          ["BAYESIAN_FV_ENABLED", "false"],
-          ["BAYESIAN_FV_ALPHA", "0.35"]
-        ]
-      },
-      {
-        id: "sizing",
-        title: "Position Sizing",
-        intro: "Hard share caps and inventory thresholds that apply across runtime decisions.",
-        params: [
-          ["MIN_SHARES", "8"],
-          ["MAX_SHARES", "35"],
-          ["BASE_ORDER_SHARES", "12"],
-          ["MAX_NET_YES", "200"],
-          ["MAX_NET_NO", "250"],
-          ["INVENTORY_IMBALANCE_THRESHOLD", "90"],
-          ["INVENTORY_REBALANCE_FRACTION", "0.45"]
-        ]
-      },
-      {
-        id: "execution",
-        title: "Order Execution",
-        intro: "How the bot actually places, retries, and prices orders once a signal reaches execution.",
-        params: [
-          ["SLIPPAGE_TOLERANCE", "0.02"],
-          ["ORDER_TYPE", "GTC"],
-          ["ORDER_TYPE_FALLBACK", "GTC"],
-          ["POST_ONLY", "true"],
-          ["ORDER_RETRY_ATTEMPTS", "3"],
-          ["ORDER_RATE_LIMIT_MS", "350"],
-          ["PASSIVE_TICKS", "1"],
-          ["IMPROVE_TICKS", "1"],
-          ["CROSS_TICKS", "0"]
-        ]
-      },
-      {
-        id: "guards",
-        title: "Entry Guards",
-        intro: "Quality filters that keep the bot out of thin, wide, or obviously bad entries even when a strategy wants to trade.",
-        params: [
-          ["MIN_ENTRY_DEPTH_USD", "2"],
-          ["MAX_ENTRY_SPREAD", "0.12"],
-          ["MAX_ENTRY_SPREAD_COMBINED_DISCOUNT", "0.08"],
-          ["MAX_ENTRY_SPREAD_EXTREME", "0.15"],
-          ["MAX_ENTRY_SPREAD_FAIR_VALUE", "0.06"],
-          ["MAX_ENTRY_SPREAD_REBALANCE", "0.20"],
-          ["ENTRY_IMBALANCE_BLOCK_THRESHOLD", "100"],
-          ["MAX_SIGNALS_PER_TICK", "2"],
-          ["PRICE_MULTIPLIER_LEVELS", "0.20:1.65,0.35:1.35,0.50:1.15,0.70:1.00,1.00:0.85"],
-          ["EXIT_BEFORE_END_MS", "20000"]
-        ]
-      },
-      {
-        id: "fills",
-        title: "Fill Tracking",
-        intro: "Tracking settings for live GTC post-only orders that may fill later through the CLOB instead of immediately at submit time.",
-        params: [
-          ["FILL_POLL_INTERVAL_MS", "2500"],
-          ["FILL_POLL_TIMEOUT_MS", "120000"],
-          ["FILL_CANCEL_BEFORE_END_MS", "20000"],
-          ["BALANCE_CACHE_TTL_MS", "10000"],
-          ["SELL_AFTER_FILL_DELAY_MS", "8000"]
-        ]
-      },
-      {
-        id: "binance-edge",
-        title: "Binance Edge",
-        intro: "Directional Binance overlay used by latency-sensitive strategies and fair-value adjustments.",
-        params: [
-          ["BINANCE_EDGE_ENABLED", "true"],
-          ["BINANCE_SYMBOLS", "btcusdt,ethusdt,solusdt,xrpusdt,dogeusdt,bnbusdt,linkusdt"],
-          ["BINANCE_FLAT_THRESHOLD", "0.05"],
-          ["BINANCE_STRONG_THRESHOLD", "0.20"],
-          ["BINANCE_BOOST_MULTIPLIER", "1.5"],
-          ["BINANCE_REDUCE_MULTIPLIER", "0.5"],
-          ["BINANCE_BLOCK_STRONG_CONTRA", "true"],
-          ["BINANCE_FV_SENSITIVITY", "0.02"]
-        ]
-      },
-      {
-        id: "latency-risk",
-        title: "Latency and Risk",
-        intro: "Circuit-breaker style latency safety plus fair-value throttles that slow the bot down when data quality drops.",
-        params: [
-          ["LATENCY_PAUSE_THRESHOLD_MS", "2000"],
-          ["LATENCY_RESUME_THRESHOLD_MS", "1000"],
-          ["LATENCY_PAUSE_WINDOW_SIZE", "10"],
-          ["LATENCY_PAUSE_SAMPLE_TTL_MS", "90000"],
-          ["FV_BUY_MAX_PER_SLOT", "4"],
-          ["FV_BUY_COOLDOWN_MS", "30000"],
-          ["INVENTORY_REBALANCE_FV_BLOCK_MS", "60000"],
-          ["BINANCE_FV_DECAY_WINDOW_MS", "300000"],
-          ["BINANCE_FV_DECAY_MIN_MULTIPLIER", "0.25"]
-        ]
-      },
-      {
-        id: "infra",
-        title: "Infrastructure",
-        intro: "Network endpoints and order-book refresh controls. These usually stay at the defaults unless an endpoint fails or you are testing a custom stack.",
-        params: [
-          ["POLYMARKET_RELAYER_URL", "https://relayer-v2.polymarket.com"],
-          ["RPC_URL", "https://polygon.drpc.org"],
-          ["POLYMARKET_GEO_TOKEN", ""],
-          ["CLOB_HOST", "https://clob.polymarket.com"],
-          ["CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"],
-          ["GAMMA_API_URL", "https://gamma-api.polymarket.com"],
-          ["ORDERBOOK_DEPTH_LEVELS", "5"],
-          ["ORDERBOOK_REFRESH_MS", "1500"]
-        ]
-      },
-      {
-        id: "runtime",
-        title: "Runtime",
-        intro: "Loop pacing, market fan-out, and sizing references that affect overall runtime throughput.",
-        params: [
-          ["MARKET_SCAN_INTERVAL_MS", "2500"],
-          ["MAX_CONCURRENT_MARKETS", "6"],
-          ["MARKET_QUERY_LIMIT", "80"],
-          ["GRACEFUL_SHUTDOWN_TIMEOUT_MS", "12000"],
-          ["SIZE_LIQUIDITY_CAP_USD", "4000"],
-          ["DEPTH_REFERENCE_SHARES", "180"],
-          ["CAPITAL_REFERENCE_SHARES", "120"]
-        ]
-      },
-      {
-        id: "monitoring",
-        title: "Monitoring and Reports",
-        intro: "Output paths, log verbosity, pause behavior, and operational telemetry.",
-        params: [
-          ["REPORTS_DIR", "./reports"],
-          ["LATENCY_LOG", "./reports/latency_YYYY-MM-DD.log"],
-          ["STATE_FILE", "./reports/state.json"],
-          ["REPORTS_FILE_PREFIX", "slot-reports"],
-          ["LOG_LEVEL", "info"],
-          ["LOG_TO_FILE", "true"],
-          ["LOG_DIRECTORY", "logs"],
-          ["STATUS_CHECK_INTERVAL_MS", "300000"],
-          ["AUTO_PAUSE_ON_INCIDENT", "true"],
-          ["PAUSE_GRACE_PERIOD_MS", "60000"]
-        ]
-      },
-      {
-        id: "product-test",
-        title: "Product Test Mode",
-        intro: "Live micro-test guardrails used when you want to verify the full production path on one small slot.",
-        params: [
-          ["TEST_MIN_TRADE_USDC", "1"],
-          ["TEST_MAX_SLOTS", "1"]
-        ]
-      }
-    ];
-    const overrides = {
-      AUTH_MODE: "Selects the authentication path. PROXY is the standard Polymarket setup where a funder wallet holds positions and the signer authorizes actions.",
-      SIGNATURE_TYPE: "Tells the client which signature scheme Polymarket expects. Magic-link accounts and browser-wallet accounts use different values.",
-      SIGNER_PRIVATE_KEY: "Private key for the signer account that authorizes API and relayer actions. Never commit or share this value.",
-      FUNDER_ADDRESS: "Proxy wallet address that actually owns the Polymarket positions and balances the bot trades with.",
-      POLYMARKET_API_KEY: "CLOB API credential used for order placement, cancel, and fill queries.",
-      POLYMARKET_API_SECRET: "Secret half of the CLOB credential set.",
-      POLYMARKET_API_PASSPHRASE: "Passphrase half of the CLOB credential set.",
-      POLYMARKET_API_KEY_ADDRESS: "Signer address associated with the generated CLOB API key. This should match the key derived from SIGNER_PRIVATE_KEY.",
-      POLYMARKET_RELAYER_KEY: "Relayer credential used for gasless approve and redeem operations.",
-      POLYMARKET_RELAYER_KEY_ADDRESS: "Signer address attached to the relayer key on Polymarket.",
-      SIMULATION_MODE: "Master live-safety switch. When true, the bot does not run in full live production mode.",
-      DRY_RUN: "Second safety latch that prevents live execution even if other settings look live. Use false only when you explicitly want real orders.",
-      PRODUCT_TEST_MODE: "Runs a tiny live validation path that stops after a small number of slots. Good for verifying credentials and execution without committing full size.",
-      PAPER_TRADING_ENABLED: "Routes execution through the paper trader so fills, delays, and slot settlement are simulated locally.",
-      ENABLE_SIGNAL: "Lets strategies emit actionable signals. Set false when you want the bot to observe markets without trading logic taking action.",
-      ENTRY_STRATEGY: "Chooses the primary entry engine family: legacy, paired arbitrage, latency momentum, or all engines together.",
-      AUTO_REDEEM: "When enabled in live mode, the bot tries to claim resolved positions through the gasless relayer automatically.",
-      MARKET_MAKER_MODE: "Enables quote-driven spread capture. This is separate from directional scalping and paired-arb entry generation.",
-      DYNAMIC_QUOTING_ENABLED: "Turns on the quote-refresh loop that manages passive MM orders over time.",
-      MM_AUTONOMOUS_QUOTES: "Allows market-maker quotes to be generated without waiting for another strategy to create a seed signal first.",
-      MM_ALWAYS_QUOTE: "Keeps autonomous quoting active even when other quote sources exist. More aggressive and usually noisier.",
-      MM_QUOTE_SHARES: "Fixed share size for each autonomous MM quote. Unlike Kelly-based entries, MM uses this fixed size directly.",
-      MM_MAX_GROSS_EXPOSURE_USD: "Caps total market-maker notional exposure across tracked markets so MM cannot consume all capital.",
-      MM_MAX_NET_DIRECTIONAL: "Caps signed YES-minus-NO share imbalance for MM inventory. Lower values reduce directional drift.",
-      MM_INVENTORY_SKEW_FACTOR: "Controls how strongly MM shifts quote prices to shed excess YES or NO inventory.",
-      MM_MIN_EDGE_AFTER_FEE: "Minimum spread edge that must remain after fees before MM is willing to quote.",
-      POST_ONLY_ONLY: "Forces quote-style entries to stay maker-only. If a quote would cross the book, it is rejected instead of paying taker fees.",
-      COINS_TO_TRADE: "Comma-separated list of coin families the scanner should consider.",
-      WHITELIST_CONDITION_IDS: "Optional allow-list. When populated, the bot ignores every market whose conditionId is not listed here.",
-      MIN_COMBINED_DISCOUNT: "Minimum combined-discount edge for the legacy two-side discount engine.",
-      EXTREME_SELL_THRESHOLD: "Price region that triggers legacy extreme-sell exits or inventory relief signals.",
-      EXTREME_BUY_THRESHOLD: "Price region that triggers legacy extreme-buy entries. Raising this makes the legacy long-bias easier to activate.",
-      FAIR_VALUE_BUY_THRESHOLD: "Legacy fair-value buy trigger. Very high values such as 9.99 effectively disable that entry family.",
-      FAIR_VALUE_SELL_THRESHOLD: "Legacy fair-value sell trigger used when the current price runs far above estimated fair value.",
-      TRAILING_TAKE_PROFIT: "Trailing stop distance from the local peak after a position moves in your favor.",
-      HARD_STOP_LOSS: "Hard fail-safe exit threshold from entry cost basis.",
-      MAX_DRAWDOWN_USDC: "Daily PnL stop. Once dayPnL falls below this value, new entries halt until the day resets.",
-      PAIRED_ARB_MIN_NET_EDGE: "Minimum all-in pair edge after accounting for fees and settlement assumptions.",
-      PAIRED_ARB_MAX_PAIR_COST: "Upper bound on the combined YES+NO entry cost. Lower values are safer but trade less often.",
-      PAIRED_ARB_TARGET_BALANCE_RATIO: "Desired YES-to-NO balance when the paired-arb engine is trying to stay neutral.",
-      PAIRED_ARB_BALANCE_TOLERANCE: "How far YES and NO can drift from the target ratio before rebalance logic changes behavior.",
-      PAIRED_ARB_MAX_PER_SIDE: "Per-market inventory cap for one side of paired-arb exposure.",
-      PAIRED_ARB_MIN_SHARES: "Minimum per-leg pair size before execution clamps are applied.",
-      PAIRED_ARB_MAX_SHARES: "Maximum per-leg size for a single paired opportunity.",
-      PAIRED_ARB_REQUIRE_BOTH_LIQUIDITY: "Requires usable liquidity on both sides before a synchronous pair can enter.",
-      PAIRED_ARB_MIN_DEPTH_USD: "Minimum visible ask depth per side for paired-arb entry.",
-      PAIRED_ARB_ASYNC_ENABLED: "Allows one leg to enter before the other side is available. This introduces real directional risk if left on.",
-      PAIRED_ARB_ASYNC_MAX_ENTRY_PRICE: "Highest token price the async engine will accept for its first leg.",
-      PAIRED_ARB_ASYNC_MIN_EDGE: "Minimum async discount before the engine starts leg one.",
-      PAIRED_ARB_ASYNC_MAX_WAIT_MS: "How long the async engine can wait for the second leg before it gives up.",
-      LATENCY_MOMENTUM_MIN_MOVE_PCT: "Minimum Binance move required to create a latency momentum signal.",
-      LATENCY_MOMENTUM_STRONG_MOVE_PCT: "Binance move threshold that upgrades the signal to the larger strong-size bucket.",
-      LATENCY_MOMENTUM_MAX_ENTRY_WINDOW_MS: "Only allows latency entries within the early part of a slot, before the edge goes stale.",
-      LATENCY_MOMENTUM_MAX_PM_LAG_PCT: "Stops entries when Polymarket has already repriced too far and the latency edge is mostly gone.",
-      LATENCY_MOMENTUM_PM_MOVE_SENSITIVITY: "How strongly Polymarket movement is translated back into the Binance-style lag calculation.",
-      LATENCY_MOMENTUM_MIN_ENTRY_PRICE: "Rejects dust-priced contracts that are too low-quality to trade cleanly.",
-      LATENCY_MOMENTUM_MAX_ENTRY_PRICE: "Avoids entering latency trades when the token is already too expensive.",
-      LATENCY_MOMENTUM_BASE_SHARES: "Base order size for a standard latency signal.",
-      LATENCY_MOMENTUM_STRONG_SHARES: "Larger order size used when the latency move is especially strong.",
-      LATENCY_MOMENTUM_MAX_POSITION_SHARES: "Per-market position cap for latency momentum inventory.",
-      LATENCY_MOMENTUM_COOLDOWN_MS: "Per-market pause between latency entries.",
-      LATENCY_MOMENTUM_INVERT_SIGNAL: "Experimental switch that flips the signal direction.",
-      PAPER_TRADING_INITIAL_BALANCE: "Virtual bankroll used by the paper trader when the process starts.",
-      PAPER_TRADING_FILL_PROB_PASSIVE: "Probability that a passive maker-style paper order eventually fills.",
-      PAPER_TRADING_FILL_PROB_IMPROVE: "Probability that a slightly improved limit order fills in paper mode.",
-      PAPER_TRADING_FILL_PROB_CROSS: "Probability that an aggressive taker-style paper order fills.",
-      PAPER_TRADING_MAX_SLIPPAGE_TICKS: "Maximum extra tick slippage the paper trader can apply to aggressive orders.",
-      PAPER_TRADING_SIZE_IMPACT_FACTOR: "How much larger paper orders worsen simulated execution quality.",
-      PAPER_TRADING_PARTIAL_FILLS: "If true, paper fills can land in fragments instead of all-or-nothing.",
-      PAPER_TRADING_MIN_FILL_RATIO: "Smallest fractional fill size allowed when a paper partial fill occurs.",
-      PAPER_TRADING_TRADE_LOG: "JSONL file where the paper trader writes its simulated executions.",
-      EV_KELLY_ENABLED: "Enables expected-value filtering and Kelly-style size scaling for eligible directional entries.",
-      EV_MIN_THRESHOLD: "Minimum EV required for normal-fee markets.",
-      EV_MIN_THRESHOLD_HIGH_FEE: "Higher EV threshold used on high-fee 5-minute crypto markets.",
-      KELLY_FRACTION: "Fractional Kelly multiplier. Lower values trade smaller and more conservatively.",
-      MAX_BANKROLL_PER_TRADE: "Hard cap on bankroll usage per trade even if Kelly suggests something larger.",
-      PREFER_MAKER_ORDERS: "Biases eligible entries toward maker-style execution when possible.",
-      DEFAULT_TAKER_FEE: "Fee assumption for normal taker orders in EV calculations.",
-      HIGH_FEE_TAKER_FEE: "Fee assumption for high-fee 5-minute crypto markets in EV calculations.",
-      BAYESIAN_FV_ENABLED: "Turns on EMA-style smoothing for fair value estimates.",
-      BAYESIAN_FV_ALPHA: "Smoothing alpha. Lower values lean more on history and reduce quote noise.",
-      MIN_SHARES: "Global minimum share size used by several sizing paths before exchange floors are checked.",
-      MAX_SHARES: "Generic per-order share cap for non-MM flow.",
-      BASE_ORDER_SHARES: "Default legacy order size when no strategy-specific size overrides apply.",
-      MAX_NET_YES: "Per-market cap on YES inventory across strategies.",
-      MAX_NET_NO: "Per-market cap on NO inventory across strategies.",
-      INVENTORY_IMBALANCE_THRESHOLD: "Level of YES/NO skew that triggers imbalance handling.",
-      INVENTORY_REBALANCE_FRACTION: "Fraction of inventory the rebalance path tries to unwind at once.",
-      SLIPPAGE_TOLERANCE: "Maximum allowed price drift between signal generation and execution.",
-      ORDER_TYPE: "Primary live order type sent to the exchange.",
-      ORDER_TYPE_FALLBACK: "Secondary order type used if the preferred path fails or cannot be placed.",
-      POST_ONLY: "General maker-only switch for eligible orders.",
-      ORDER_RETRY_ATTEMPTS: "How many times execution should retry after a recoverable submit failure.",
-      PASSIVE_TICKS: "How far inside the best passive quote should rest from the current book.",
-      IMPROVE_TICKS: "Price improvement distance for improve-style limit orders.",
-      CROSS_TICKS: "Additional aggression for taker-style crossings.",
-      MIN_ENTRY_DEPTH_USD: "Minimum visible depth required before an entry is allowed.",
-      MAX_ENTRY_SPREAD: "Master spread ceiling for generic entry quality checks.",
-      MAX_ENTRY_SPREAD_COMBINED_DISCOUNT: "Spread ceiling specific to the combined-discount legacy engine.",
-      MAX_ENTRY_SPREAD_EXTREME: "Spread ceiling specific to extreme price entries.",
-      MAX_ENTRY_SPREAD_FAIR_VALUE: "Spread ceiling specific to fair-value mean-reversion entries.",
-      MAX_ENTRY_SPREAD_REBALANCE: "Spread ceiling specific to rebalance entries.",
-      ENTRY_IMBALANCE_BLOCK_THRESHOLD: "If book imbalance crosses this level, new entries are blocked.",
-      MAX_SIGNALS_PER_TICK: "Maximum number of non-exempt signals that can execute in one loop iteration.",
-      PRICE_MULTIPLIER_LEVELS: "Price-to-size curve used to shrink or expand order size at different token prices.",
-      EXIT_BEFORE_END_MS: "How early the bot tries to flatten before a slot ends.",
-      FILL_POLL_INTERVAL_MS: "How frequently the fill tracker checks live resting orders.",
-      FILL_POLL_TIMEOUT_MS: "How long the fill tracker waits before giving up on a resting order.",
-      FILL_CANCEL_BEFORE_END_MS: "How early unfilled resting orders are canceled ahead of slot end.",
-      BALANCE_CACHE_TTL_MS: "Lifetime of cached wallet balance and allowance checks.",
-      SELL_AFTER_FILL_DELAY_MS: "Legacy fallback delay after a buy fill before attempting a sell.",
-      BINANCE_EDGE_ENABLED: "Turns on the Binance directional overlay used by some strategies and filters.",
-      BINANCE_SYMBOLS: "Comma-separated Binance markets to subscribe to for reference pricing.",
-      BINANCE_FLAT_THRESHOLD: "Small move region treated as neutral rather than directional.",
-      BINANCE_STRONG_THRESHOLD: "Move region treated as strongly directional.",
-      BINANCE_BOOST_MULTIPLIER: "Multiplier applied when Binance alignment should increase trade conviction.",
-      BINANCE_REDUCE_MULTIPLIER: "Multiplier applied when Binance disagreement should shrink trade conviction.",
-      BINANCE_BLOCK_STRONG_CONTRA: "Blocks trades that go directly against a strong Binance move.",
-      BINANCE_FV_SENSITIVITY: "How sensitive fair-value adjustments are to Binance movement.",
-      LATENCY_PAUSE_THRESHOLD_MS: "Average latency level that pauses new entries for safety.",
-      LATENCY_RESUME_THRESHOLD_MS: "Latency level below which paused trading can resume.",
-      LATENCY_PAUSE_WINDOW_SIZE: "Number of recent latency samples used by the pause gate.",
-      LATENCY_PAUSE_SAMPLE_TTL_MS: "How long latency samples remain relevant before expiring.",
-      FV_BUY_MAX_PER_SLOT: "Maximum number of fair-value buys allowed per slot.",
-      FV_BUY_COOLDOWN_MS: "Cooldown between fair-value buys.",
-      INVENTORY_REBALANCE_FV_BLOCK_MS: "Window that temporarily blocks FV entries after an inventory rebalance event.",
-      BINANCE_FV_DECAY_WINDOW_MS: "Decay window for Binance-derived fair value influence.",
-      BINANCE_FV_DECAY_MIN_MULTIPLIER: "Floor multiplier for the decayed Binance fair value contribution.",
-      POLYMARKET_RELAYER_URL: "Base URL for relayer operations such as gasless approve and redeem.",
-      RPC_URL: "Polygon RPC endpoint used for chain-aware workflows.",
-      POLYMARKET_GEO_TOKEN: "Optional geo-bypass token when Polymarket API access requires it.",
-      CLOB_HOST: "Base URL for the Polymarket CLOB REST API.",
-      CLOB_WS_URL: "WebSocket URL for live CLOB subscriptions.",
-      GAMMA_API_URL: "Gamma API endpoint used for market discovery and resolution metadata.",
-      ORDERBOOK_DEPTH_LEVELS: "How many book levels to keep when using order-book snapshots.",
-      ORDERBOOK_REFRESH_MS: "Fallback refresh interval for order-book polling.",
-      MARKET_SCAN_INTERVAL_MS: "Main loop interval for scanning markets.",
-      MAX_CONCURRENT_MARKETS: "Maximum number of markets the scanner actively processes in parallel.",
-      MARKET_QUERY_LIMIT: "Upper bound on Gamma market query size per scan.",
-      GRACEFUL_SHUTDOWN_TIMEOUT_MS: "How long shutdown waits before forcing the process to stop.",
-      SIZE_LIQUIDITY_CAP_USD: "Liquidity-based sizing clamp so large balances do not overshoot thin books.",
-      DEPTH_REFERENCE_SHARES: "Reference share count used by some liquidity-based sizing heuristics.",
-      CAPITAL_REFERENCE_SHARES: "Reference share count used by capital-based sizing heuristics.",
-      REPORTS_DIR: "Base output directory for reports and generated runtime artifacts.",
-      LATENCY_LOG: "Per-day latency log file path.",
-      STATE_FILE: "State file used for day PnL, drawdown, and other runtime truth.",
-      REPORTS_FILE_PREFIX: "Prefix used when writing slot-report log files.",
-      LOG_LEVEL: "Logging verbosity for both console and file output.",
-      LOG_TO_FILE: "Toggles additional file logging.",
-      LOG_DIRECTORY: "Directory where log files are written.",
-      STATUS_CHECK_INTERVAL_MS: "How often the external status monitor checks Polymarket services.",
-      AUTO_PAUSE_ON_INCIDENT: "When true, serious exchange or API incidents automatically pause new entries.",
-      PAUSE_GRACE_PERIOD_MS: "Minimum cool-off window after an incident before normal entry flow resumes.",
-      TEST_MIN_TRADE_USDC: "Minimum live trade size used in product-test mode.",
-      TEST_MAX_SLOTS: "Maximum number of slots product-test mode is allowed to touch before stopping."
-    };
-
-    const notes = {
-      SIMULATION_MODE: "For a realistic local test, pair this with PAPER_TRADING_ENABLED=true. Simulation alone is not the same thing as paper settlement.",
-      DRY_RUN: "Live trading requires both SIMULATION_MODE=false and DRY_RUN=false.",
-      PAPER_TRADING_ENABLED: "This is the switch that makes slot settlement and paper PnL behave like a real simulation instead of a dry run.",
-      AUTO_REDEEM: "Usually keep this true in live mode and false in paper mode.",
-      MM_MAX_NET_DIRECTIONAL: "One of the most important live MM safety knobs. Lower is safer.",
-      MM_QUOTE_SHARES: "Keep this above exchange minimums so partial exits are less likely to strand dust.",
-      PAIRED_ARB_ASYNC_ENABLED: "Useful only if you explicitly accept directional exposure while waiting for leg two.",
-      EV_KELLY_ENABLED: "Paired-arb is largely exempt; this matters most for legacy and latency-based directional flow.",
-      STATE_FILE: "The dashboard reads this file as the source of truth for dayPnL and drawdown.",
-      REPORTS_FILE_PREFIX: "Slot reports are written as REPORTS_DIR/REPORTS_FILE_PREFIX_YYYY-MM-DD.log."
-    };
-
-    const safetyKeys = new Set([
-      "SIMULATION_MODE", "DRY_RUN", "SIGNER_PRIVATE_KEY", "FUNDER_ADDRESS", "POLYMARKET_API_KEY",
-      "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE", "POLYMARKET_RELAYER_KEY",
-      "MAX_DRAWDOWN_USDC", "MM_MAX_NET_DIRECTIONAL", "MM_MAX_GROSS_EXPOSURE_USD",
-      "MAX_NET_YES", "MAX_NET_NO", "PAIRED_ARB_ASYNC_ENABLED"
-    ]);
-
-    const coreKeys = new Set([
-      "PAPER_TRADING_ENABLED", "ENTRY_STRATEGY", "PAIRED_ARB_ENABLED", "LATENCY_MOMENTUM_ENABLED",
-      "MARKET_MAKER_MODE", "DYNAMIC_QUOTING_ENABLED", "AUTO_REDEEM", "STATE_FILE"
-    ]);
-
-    const tuneKeys = new Set([
-      "PAIRED_ARB_MIN_NET_EDGE", "PAIRED_ARB_MAX_PAIR_COST", "LATENCY_MOMENTUM_MIN_MOVE_PCT",
-      "MM_QUOTE_SHARES", "MM_INVENTORY_SKEW_FACTOR", "TRAILING_TAKE_PROFIT", "HARD_STOP_LOSS",
-      "MIN_LIQUIDITY_USD", "MAX_SIGNALS_PER_TICK", "QUOTING_SPREAD_TICKS"
-    ]);
-
-    function humanize(key) {
-      return key.toLowerCase().replace(/_/g, " ");
-    }
-
-    function inferType(value, key) {
-      if (value === "true" || value === "false") return "bool";
-      if (key.endsWith("_MS")) return "ms";
-      if (key.endsWith("_URL") || key.endsWith("_HOST")) return "url";
-      if (key.endsWith("_LOG") || key.endsWith("_FILE") || key.endsWith("_DIR") || key.endsWith("_DIRECTORY")) return "path";
-      if (value === "") return "string";
-      if (value.includes(",") && !value.includes(":")) return "list";
-      if (/^-?\d+$/.test(value)) return "integer";
-      if (/^-?\d+\.\d+$/.test(value)) return "float";
-      if (/[A-Z_]+/.test(value) && !value.match(/[a-z]/)) return "enum";
-      return "string";
-    }
-
-    function fallbackDescription(key) {
-      if (key.endsWith("_ENABLED")) return `Enables or disables ${humanize(key).replace(" enabled", "")}.`;
-      if (key.startsWith("AUTO_")) return `Automatic behavior switch for ${humanize(key).replace("auto ", "")}.`;
-      if (key.startsWith("MIN_")) return `Lower bound for ${humanize(key).replace("min ", "")}.`;
-      if (key.startsWith("MAX_")) return `Upper bound for ${humanize(key).replace("max ", "")}.`;
-      if (key.endsWith("_THRESHOLD")) return `Threshold used to decide when ${humanize(key).replace(" threshold", "")} becomes active.`;
-      if (key.endsWith("_COOLDOWN_MS")) return `Cooldown interval in milliseconds for ${humanize(key).replace(" cooldown ms", "")}.`;
-      if (key.endsWith("_WINDOW_MS")) return `Window length in milliseconds for ${humanize(key).replace(" window ms", "")}.`;
-      if (key.endsWith("_INTERVAL_MS")) return `Polling or refresh interval in milliseconds for ${humanize(key).replace(" interval ms", "")}.`;
-      if (key.endsWith("_PRICE")) return `Price control used by ${humanize(key)}.`;
-      if (key.endsWith("_SHARES")) return `Share-size control for ${humanize(key)}.`;
-      if (key.endsWith("_USD")) return `Dollar-denominated control for ${humanize(key)}.`;
-      return `Controls ${humanize(key)}.`;
-    }
-
-    function escapeHtml(value) {
-      return value
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
-
-    function showToast(message) {
-      const toast = document.getElementById("toast");
-      toast.textContent = message;
-      toast.classList.add("show");
-      clearTimeout(showToast.timer);
-      showToast.timer = setTimeout(() => toast.classList.remove("show"), 1400);
-    }
-
-    function render() {
-      const sectionsRoot = document.getElementById("sections");
-      const navRoot = document.getElementById("nav");
-
-      for (const section of sections) {
-        const link = document.createElement("a");
-        link.href = `#${section.id}`;
-        link.textContent = section.title;
-        navRoot.appendChild(link);
-
-        const sectionEl = document.createElement("section");
-        sectionEl.className = "section";
-        sectionEl.id = section.id;
-
-        const header = document.createElement("div");
-        header.className = "section-header";
-        header.innerHTML = `<h2>${section.title}</h2><p>${section.intro}</p>`;
-        sectionEl.appendChild(header);
-
-        const paramsWrap = document.createElement("div");
-        paramsWrap.className = "params";
-
-        for (const [key, def] of section.params) {
-          const type = inferType(def, key);
-          const article = document.createElement("article");
-          article.className = "param";
-          article.dataset.search = [
-            section.title,
-            key,
-            def,
-            type,
-            overrides[key] || fallbackDescription(key),
-            notes[key] || ""
-          ].join(" ").toLowerCase();
-
-          const badges = [`<span class="badge badge-type">${type}</span>`];
-          if (safetyKeys.has(key)) badges.push(`<span class="badge badge-safety">safety</span>`);
-          if (coreKeys.has(key)) badges.push(`<span class="badge badge-core">core</span>`);
-          if (tuneKeys.has(key)) badges.push(`<span class="badge badge-tune">tunable</span>`);
-
-          const pair = `${key}=${def}`;
-          article.innerHTML = `
-            <div class="param-top">
-              <span class="param-name" data-copy="${escapeHtml(pair)}">${escapeHtml(key)}</span>
-              ${badges.join("")}
-            </div>
-            <p class="param-default">Default: ${def === "" ? "<em>empty</em>" : escapeHtml(def)}</p>
-            <p class="param-desc">${escapeHtml(overrides[key] || fallbackDescription(key))}</p>
-            <p class="param-note">${escapeHtml(notes[key] || `Section: ${section.title}.`)}</p>
-          `;
-
-          paramsWrap.appendChild(article);
-        }
-
-        sectionEl.appendChild(paramsWrap);
-        sectionsRoot.appendChild(sectionEl);
-      }
-
-      sectionsRoot.addEventListener("click", (event) => {
-        const target = event.target.closest(".param-name");
-        if (!target) return;
-        const value = target.getAttribute("data-copy") || target.textContent || "";
-        navigator.clipboard.writeText(value).then(() => showToast(`Copied ${value}`));
-      });
-    }
-
-    function wireSearch() {
-      const input = document.getElementById("search");
-      const empty = document.getElementById("empty");
-      const sectionEls = Array.from(document.querySelectorAll(".section"));
-
-      input.addEventListener("input", () => {
-        const query = input.value.trim().toLowerCase();
-        let visibleCount = 0;
-
-        for (const sectionEl of sectionEls) {
-          const params = Array.from(sectionEl.querySelectorAll(".param"));
-          let sectionVisible = false;
-
-          for (const param of params) {
-            const match = !query || param.dataset.search.includes(query);
-            param.classList.toggle("hide", !match);
-            if (match) {
-              sectionVisible = true;
-              visibleCount += 1;
-            }
-          }
-
-          sectionEl.classList.toggle("hide", !sectionVisible);
-        }
-
-        empty.classList.toggle("show", visibleCount === 0);
-      });
-    }
-
-    render();
-    wireSearch();
-  </script>
 </body>
 </html>
