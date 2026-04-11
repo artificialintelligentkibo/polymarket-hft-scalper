@@ -3385,11 +3385,11 @@ export class MarketMakerRuntime {
       );
     }
 
-    // OBI exit stats for dashboard
+    // OBI exit stats for dashboard — count ALL OBI sell fills, not just taker exits
     if (
       config.obiEngine.enabled &&
       fill.side === 'SELL' &&
-      isObiExitSignal(fill.signalType)
+      (isObiExitSignal(fill.signalType) || fill.signalType === 'OBI_MM_QUOTE_ASK')
     ) {
       const exitCoin = extractCoinFromObiTitle(market.title);
       this.obiEngine.recordExitForStats(exitCoin, realizedDelta, fill.signalType);
