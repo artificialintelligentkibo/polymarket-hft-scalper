@@ -29,6 +29,7 @@ import {
   type SniperStatsSnapshot,
   type RuntimeStatusSnapshot,
   type ObiSessionStats,
+  type VsSessionStats,
 } from '../src/runtime-status.js';
 import { checkPolymarketStatus, writeStatusControlCommand } from '../src/status-monitor.js';
 import { resetSlotReporterState } from '../src/slot-reporter.js';
@@ -569,6 +570,82 @@ function renderObiRecentDecisions(stats: ObiSessionStats): string {
   );
 }
 
+function renderVsSessionStats(stats: VsSessionStats): string {
+  const winRate = (stats.wins + stats.losses) > 0
+    ? `${((stats.wins / (stats.wins + stats.losses)) * 100).toFixed(0)}%`
+    : 'n/a';
+  const modeStr = stats.shadowMode ? color.yellow('SHADOW') : color.green('LIVE');
+  return renderTable(
+    ['METRIC', 'VALUE', 'METRIC', 'VALUE'],
+    [20, 12, 20, 12],
+    [
+      ['Mode', modeStr, 'Volatility σ', color.bold(stats.defaultVolatility.toFixed(2))],
+      ['Entries', color.bold(String(stats.entries)), 'Exits', color.bold(String(stats.exits))],
+      ['Wins', color.green(String(stats.wins)), 'Losses', color.red(String(stats.losses))],
+      ['Win Rate', color.bold(winRate), 'Realized PnL', formatSignedCurrency(stats.realizedPnl)],
+      ['Phase 1 (MM)', color.cyan(String(stats.phase1Entries)), 'Phase 1 PnL', formatSignedCurrency(stats.phase1Pnl)],
+      ['Phase 2 (MOM)', color.cyan(String(stats.phase2Entries)), 'Phase 2 PnL', formatSignedCurrency(stats.phase2Pnl)],
+      ['Exit Target', color.bold(stats.targetExitPrice.toFixed(2)), 'Mom Max Buy', color.bold(stats.momentumMaxBuyPrice.toFixed(2))],
+    ]
+  );
+}
+
+function renderVsCoinBreakdown(stats: VsSessionStats): string {
+  const coins = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'DOGE'];
+  const rows: string[][] = [];
+  for (const coin of coins) {
+    const c = stats.coinStats[coin];
+    const entries = c?.entries ?? 0;
+    const exits = c?.exits ?? 0;
+    const p1 = c?.phase1Entries ?? 0;
+    const p2 = c?.phase2Entries ?? 0;
+    const pnl = c?.realizedPnl ?? 0;
+    const lastAction = c?.lastAction ?? color.dim('—');
+    rows.push([
+      color.bold(coin),
+      entries > 0 ? color.green(String(entries)) : color.dim('0'),
+      exits > 0 ? color.cyan(String(exits)) : color.dim('0'),
+      p1 > 0 ? color.dim(String(p1)) : color.dim('0'),
+      p2 > 0 ? color.dim(String(p2)) : color.dim('0'),
+      pnl !== 0 ? formatSignedCurrency(pnl) : color.dim('$0.00'),
+      lastAction,
+    ]);
+  }
+  return renderTable(
+    ['COIN', 'ENTRIES', 'EXITS', 'PH1', 'PH2', 'PNL', 'LAST'],
+    [6, 8, 7, 5, 5, 10, 16],
+    rows
+  );
+}
+
+function renderVsRecentDecisions(stats: VsSessionStats): string {
+  if (stats.recentDecisions.length === 0) {
+    return color.dim('No VS decisions recorded yet.');
+  }
+  const rows: string[][] = [];
+  const decisions = [...stats.recentDecisions].reverse().slice(0, 10);
+  for (const d of decisions) {
+    const time = d.timestamp.slice(11, 19);
+    const coin = d.coin ?? '?';
+    const phase = d.phase === 'MOMENTUM' ? color.yellow('MOM') : color.cyan('MM');
+    let actionStr: string;
+    if (d.action.includes('ENTRY') || d.action.includes('BUY')) {
+      actionStr = color.green(d.action);
+    } else if (d.action.includes('EXIT') || d.action.includes('SELL')) {
+      actionStr = color.cyan(d.action);
+    } else {
+      actionStr = color.dim(d.action);
+    }
+    const fvStr = d.fairValue !== null ? `fv=${d.fairValue.toFixed(3)}` : '';
+    rows.push([color.dim(time), color.bold(coin), phase, actionStr, `${d.reason} ${color.dim(fvStr)}`]);
+  }
+  return renderTable(
+    ['TIME', 'COIN', 'PHASE', 'ACTION', 'REASON'],
+    [10, 6, 5, 16, 35],
+    rows
+  );
+}
+
 function renderDashboardFrame(runtimeConfig: AppConfig): string {
   const inspection = inspectBot(runtimeConfig);
   const runtimeStatus = inspection.runtimeStatus;
@@ -718,6 +795,32 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
       renderSection(
         'RECENT SIGNALS',
         renderRecentSignals(runtimeStatus?.lastSignals ?? [])
+      )
+    );
+  }
+
+  // VS Engine section — shown when vsStats is present (parallel to OBI)
+  const vsStats = runtimeStatus?.vsStats;
+  if (vsStats?.enabled) {
+    lines.push('');
+    lines.push(
+      renderSection(
+        `VS ENGINE  -  BINANCE LATENCY ARB ${vsStats.shadowMode ? color.yellow('[SHADOW]') : ''}`,
+        renderVsSessionStats(vsStats)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'VS PER-COIN BREAKDOWN',
+        renderVsCoinBreakdown(vsStats)
+      )
+    );
+    lines.push('');
+    lines.push(
+      renderSection(
+        'RECENT VS DECISIONS',
+        renderVsRecentDecisions(vsStats)
       )
     );
   }

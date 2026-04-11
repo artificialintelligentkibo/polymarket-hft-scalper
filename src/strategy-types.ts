@@ -2,7 +2,7 @@ import type { Outcome } from './clob-fetcher.js';
 
 export type SignalAction = 'BUY' | 'SELL';
 export type SignalUrgency = 'passive' | 'improve' | 'cross';
-export type StrategyLayer = 'SNIPER' | 'MM_QUOTE' | 'PAIRED_ARB' | 'LOTTERY' | 'OBI';
+export type StrategyLayer = 'SNIPER' | 'MM_QUOTE' | 'PAIRED_ARB' | 'LOTTERY' | 'OBI' | 'VS_ENGINE';
 export type SignalType =
   | 'COMBINED_DISCOUNT_BUY_BOTH'
   | 'DEEP_BINANCE_SIGNAL'
@@ -30,7 +30,13 @@ export type SignalType =
   | 'SNIPER_SCALP_EXIT'
   | 'TRAILING_TAKE_PROFIT'
   | 'HARD_STOP'
-  | 'SLOT_FLATTEN';
+  | 'SLOT_FLATTEN'
+  | 'VS_ENTRY_BUY'
+  | 'VS_MM_BID'
+  | 'VS_MM_ASK'
+  | 'VS_MOMENTUM_BUY'
+  | 'VS_SCALP_EXIT'
+  | 'VS_TIME_EXIT';
 
 export const QUOTING_SIGNAL_TYPES = [
   'DEEP_BINANCE_SIGNAL',
@@ -62,6 +68,14 @@ export function isObiExitSignal(signalType: SignalType): boolean {
   return signalType === 'OBI_REBALANCE_EXIT' || signalType === 'OBI_SCALP_EXIT';
 }
 
+/**
+ * True for VS Engine exit signals. Must cancel pending VS_MM_BID/ASK
+ * before executing, same pattern as OBI exits.
+ */
+export function isVsExitSignal(signalType: SignalType): boolean {
+  return signalType === 'VS_SCALP_EXIT' || signalType === 'VS_TIME_EXIT';
+}
+
 export function bypassesBinanceEdge(signalType: SignalType): boolean {
   return (
     signalType === 'LATENCY_MOMENTUM_BUY' ||
@@ -77,7 +91,13 @@ export function bypassesBinanceEdge(signalType: SignalType): boolean {
     signalType === 'OBI_SCALP_EXIT' ||
     signalType === 'OBI_REBALANCE_EXIT' ||
     signalType === 'OBI_MM_QUOTE_ASK' ||
-    signalType === 'OBI_MM_QUOTE_BID'
+    signalType === 'OBI_MM_QUOTE_BID' ||
+    signalType === 'VS_ENTRY_BUY' ||
+    signalType === 'VS_MM_BID' ||
+    signalType === 'VS_MM_ASK' ||
+    signalType === 'VS_MOMENTUM_BUY' ||
+    signalType === 'VS_SCALP_EXIT' ||
+    signalType === 'VS_TIME_EXIT'
   );
 }
 
@@ -115,6 +135,13 @@ export function resolveStrategyLayer(signalType: SignalType): StrategyLayer {
     case 'OBI_MM_QUOTE_ASK':
     case 'OBI_MM_QUOTE_BID':
       return 'OBI';
+    case 'VS_ENTRY_BUY':
+    case 'VS_MM_BID':
+    case 'VS_MM_ASK':
+    case 'VS_MOMENTUM_BUY':
+    case 'VS_SCALP_EXIT':
+    case 'VS_TIME_EXIT':
+      return 'VS_ENGINE';
     default:
       return 'SNIPER';
   }
@@ -155,6 +182,15 @@ export function isLayerConflict(
     // OBI + MM_QUOTE allowed (OBI has its own MM layer)
     'OBI:MM_QUOTE',
     'MM_QUOTE:OBI',
+    // VS_ENGINE + LOTTERY allowed (convex follow-on)
+    'VS_ENGINE:LOTTERY',
+    'LOTTERY:VS_ENGINE',
+    // VS_ENGINE + MM_QUOTE allowed (VS has its own quoting)
+    'VS_ENGINE:MM_QUOTE',
+    'MM_QUOTE:VS_ENGINE',
+    // VS_ENGINE + SNIPER allowed (different edges)
+    'VS_ENGINE:SNIPER',
+    'SNIPER:VS_ENGINE',
   ]);
 
   return !ALLOWED_PAIRS.has(`${existingLayer}:${newLayer}`);

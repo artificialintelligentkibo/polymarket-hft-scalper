@@ -3,6 +3,7 @@ import type { EVKellyConfig } from './ev-kelly.js';
 import type { LatencyMomentumConfig } from './latency-momentum.js';
 import type { OrderBookImbalanceConfig } from './order-book-imbalance.js';
 import type { ObiEngineConfig } from './obi-engine.js';
+import type { VsEngineConfig } from './vs-engine.js';
 import type { PairedArbConfig } from './paired-arbitrage.js';
 import type { PaperTraderConfig } from './paper-trader.js';
 import { parseLayerMultipliers } from './dynamic-compounder.js';
@@ -464,6 +465,7 @@ export interface AppConfig {
   readonly lottery: LotteryConfig;
   readonly orderBookImbalance: OrderBookImbalanceConfig;
   readonly obiEngine: ObiEngineConfig;
+  readonly vsEngine: VsEngineConfig;
   readonly paperTrading: PaperTraderConfig;
   readonly evKelly: EVKellyConfig;
   /** Dynamic balance-aware compounding engine configuration. */
@@ -727,6 +729,8 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
       ...input,
       // OBI: enabled as standalone Layer 1 with its own quoting
       obiEngine: { ...input.obiEngine, enabled: true },
+      // VS Engine: preserve user setting (has its own VS_ENGINE_ENABLED toggle)
+      vsEngine: { ...input.vsEngine },
       // Sniper: enabled with Binance edge signals
       SNIPER_MODE_ENABLED: true,
       sniper: { ...input.sniper, enabled: true },
@@ -1445,6 +1449,135 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseFloatOrDefault(env.OBI_MAX_RISK_PER_TRADE_PCT, '0.15'),
         0.01,
         1.0
+      ),
+    },
+    vsEngine: {
+      enabled: parseBoolean(env.VS_ENGINE_ENABLED, false),
+      shadowMode: parseBoolean(env.VS_SHADOW_MODE, true),
+      // Fair value calculation
+      defaultVolatility: Math.max(
+        0.01,
+        parseFloatOrDefault(env.VS_DEFAULT_VOLATILITY, '0.60')
+      ),
+      volLookbackMs: Math.max(
+        10_000,
+        parseIntOrDefault(env.VS_VOL_LOOKBACK_MS, '300000')
+      ),
+      minVolSamples: Math.max(
+        3,
+        parseIntOrDefault(env.VS_MIN_VOL_SAMPLES, '10')
+      ),
+      // Phase 1: Passive MM
+      mmSpreadCents: Math.max(
+        0.005,
+        parseFloatOrDefault(env.VS_MM_SPREAD_CENTS, '0.02')
+      ),
+      mmMinPrice: clamp(
+        parseFloatOrDefault(env.VS_MM_MIN_PRICE, '0.10'),
+        0.01,
+        0.99
+      ),
+      mmMaxPrice: clamp(
+        parseFloatOrDefault(env.VS_MM_MAX_PRICE, '0.90'),
+        0.01,
+        0.99
+      ),
+      mmShares: Math.max(
+        1,
+        parseIntOrDefault(env.VS_MM_SHARES, '7')
+      ),
+      mmMaxPositionShares: Math.max(
+        1,
+        parseIntOrDefault(env.VS_MM_MAX_POSITION_SHARES, '14')
+      ),
+      mmCooldownMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_MM_COOLDOWN_MS, '5000')
+      ),
+      // Phase 2: Aggressive Momentum
+      momentumThresholdSigmas: Math.max(
+        0.1,
+        parseFloatOrDefault(env.VS_MOMENTUM_THRESHOLD_SIGMAS, '1.0')
+      ),
+      momentumMaxBuyPrice: clamp(
+        parseFloatOrDefault(env.VS_MOMENTUM_MAX_BUY_PRICE, '0.85'),
+        0.50,
+        0.98
+      ),
+      momentumShares: Math.max(
+        1,
+        parseIntOrDefault(env.VS_MOMENTUM_SHARES, '7')
+      ),
+      momentumMaxPositionShares: Math.max(
+        1,
+        parseIntOrDefault(env.VS_MOMENTUM_MAX_POSITION_SHARES, '20')
+      ),
+      // Exit
+      targetExitPrice: clamp(
+        parseFloatOrDefault(env.VS_TARGET_EXIT_PRICE, '0.97'),
+        0.50,
+        0.995
+      ),
+      timeExitBeforeEndMs: Math.max(
+        1000,
+        parseIntOrDefault(env.VS_TIME_EXIT_BEFORE_END_MS, '5000')
+      ),
+      timeExitMinPrice: clamp(
+        parseFloatOrDefault(env.VS_TIME_EXIT_MIN_PRICE, '0.50'),
+        0.01,
+        0.99
+      ),
+      // Timing
+      slotWarmupMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_SLOT_WARMUP_MS, '5000')
+      ),
+      stopEntryBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_STOP_ENTRY_BEFORE_END_MS, '30000')
+      ),
+      cancelAllBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_CANCEL_ALL_BEFORE_END_MS, '20000')
+      ),
+      momentumPhaseMs: Math.max(
+        5000,
+        parseIntOrDefault(env.VS_MOMENTUM_PHASE_MS, '30000')
+      ),
+      // Safety
+      hardStopUsd: Math.max(
+        0.5,
+        parseFloatOrDefault(env.VS_HARD_STOP_USD, '3.0')
+      ),
+      cooldownMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_COOLDOWN_MS, '8000')
+      ),
+      losingExitCooldownMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_LOSING_EXIT_COOLDOWN_MS, '300000')
+      ),
+      losingExitCooldownByCoinMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_LOSING_EXIT_COOLDOWN_BY_COIN_MS, '600000')
+      ),
+      preflightBalanceCheck: parseBoolean(
+        env.VS_PREFLIGHT_BALANCE_CHECK,
+        true
+      ),
+      minLiquidityUsd: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_MIN_LIQUIDITY_USD, '200')
+      ),
+      minEntryPrice: clamp(
+        parseFloatOrDefault(env.VS_MIN_ENTRY_PRICE, '0.10'),
+        0,
+        1
+      ),
+      maxEntryPrice: clamp(
+        parseFloatOrDefault(env.VS_MAX_ENTRY_PRICE, '0.90'),
+        0,
+        1
       ),
     },
     paperTrading: {

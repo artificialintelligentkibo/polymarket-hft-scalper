@@ -42,6 +42,7 @@ import {
 import { OrderBookImbalanceFilter } from './order-book-imbalance.js';
 import { ObiEngine, extractCoinFromObiTitle } from './obi-engine.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
+import { VsEngine } from './vs-engine.js';
 import { meetsClobMinimums, resolveMinimumTradableShares, MIN_CLOB_ORDER_SHARES } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
 import { ProductTestModeController } from './product-test-mode.js';
@@ -93,6 +94,7 @@ import {
   bypassesBinanceEdge,
   isLayerConflict,
   isObiExitSignal,
+  isVsExitSignal,
   isQuotingSignalType,
   resolveStrategyLayer,
   type StrategyLayer,
@@ -178,6 +180,7 @@ export class MarketMakerRuntime {
   private readonly regimeFilter = new RegimeFilter(config.regimeFilter);
   private readonly orderBookImbalance = new OrderBookImbalanceFilter(config.orderBookImbalance);
   private readonly obiEngine = new ObiEngine();
+  private readonly vsEngine = new VsEngine();
   private readonly redeemer = new AutoRedeemer();
   private readonly narrator = new TradeNarrator(config.REPORTS_DIR);
   private readonly resolutionChecker = new ResolutionChecker();
@@ -1130,6 +1133,11 @@ export class MarketMakerRuntime {
         this.walletFundsSnapshot.walletCashUsd ?? null
       );
     }
+    if (config.vsEngine.enabled) {
+      this.vsEngine.setAvailableUsdcBalance(
+        this.walletFundsSnapshot.walletCashUsd ?? 0
+      );
+    }
 
     const preparedMarketIds = new Set<string>(
       preparedTicks.map((p) => p.market.marketId)
@@ -1199,6 +1207,38 @@ export class MarketMakerRuntime {
         }
       } catch (error) {
         logger.warn('OBI hard-stop sweep failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // === VS Engine hard-stop sweep (mirrors OBI hard-stop) ===
+    if (config.vsEngine.enabled) {
+      try {
+        const vsHardStops = this.vsEngine.getEmergencyHardStopSignals({
+          getPositionManager: (marketId) => this.positions.get(marketId) ?? undefined,
+          getOrderbook: (marketId) => this.latestBooks.get(marketId) ?? undefined,
+          getMarket: (marketId) => this.markets.get(marketId) ?? undefined,
+          config: config.vsEngine,
+        });
+        for (const sig of vsHardStops) {
+          const stopBook = this.latestBooks.get(sig.marketId);
+          const stopPosManager = this.positions.get(sig.marketId);
+          const stopMarket = this.markets.get(sig.marketId);
+          if (!stopBook || !stopPosManager || !stopMarket) continue;
+          this.scheduleBackgroundTask(async () => {
+            try {
+              await this.executeSignal(stopMarket, stopBook, stopPosManager, sig, getSlotKey(stopMarket));
+            } catch (error) {
+              logger.warn('VS hard-stop sweep execution failed', {
+                marketId: sig.marketId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          });
+        }
+      } catch (error) {
+        logger.warn('VS hard-stop sweep failed', {
           message: error instanceof Error ? error.message : String(error),
         });
       }
@@ -1335,6 +1375,38 @@ export class MarketMakerRuntime {
         }
       } catch (error) {
         logger.warn('OBI orphan flatten check failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // === VS Engine orphan flatten sweep ===
+    if (config.vsEngine.enabled) {
+      try {
+        const vsOrphans = this.vsEngine.getOrphanFlattenSignals({
+          getPositionManager: (marketId) => this.positions.get(marketId) ?? undefined,
+          getOrderbook: (marketId) => this.latestBooks.get(marketId) ?? undefined,
+          getMarket: (marketId) => this.markets.get(marketId) ?? undefined,
+          config: config.vsEngine,
+        });
+        for (const sig of vsOrphans) {
+          const orphanBook = this.latestBooks.get(sig.marketId);
+          const orphanPosManager = this.positions.get(sig.marketId);
+          const orphanMarket = this.markets.get(sig.marketId);
+          if (!orphanBook || !orphanPosManager || !orphanMarket) continue;
+          this.scheduleBackgroundTask(async () => {
+            try {
+              await this.executeSignal(orphanMarket, orphanBook, orphanPosManager, sig, getSlotKey(orphanMarket));
+            } catch (error) {
+              logger.warn('VS orphan flatten execution failed', {
+                marketId: sig.marketId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          });
+        }
+      } catch (error) {
+        logger.warn('VS orphan flatten sweep failed', {
           message: error instanceof Error ? error.message : String(error),
         });
       }
@@ -1601,6 +1673,26 @@ export class MarketMakerRuntime {
       for (const sig of obiEntrySignals) signals.push(sig);
       for (const sig of obiExitSignals) signals.push(sig);
     }
+
+    // VS Engine signals (Binance latency arb — gated by vsEngine.enabled)
+    if (config.vsEngine.enabled) {
+      const vsEntrySignals = this.vsEngine.generateSignals({
+        market,
+        orderbook,
+        positionManager,
+        config: config.vsEngine,
+        binanceFeed: this.binanceEdge,
+      });
+      const vsExitSignals = this.vsEngine.generateExitSignals({
+        market,
+        orderbook,
+        positionManager,
+        config: config.vsEngine,
+      });
+      for (const sig of vsEntrySignals) signals.push(sig);
+      for (const sig of vsExitSignals) signals.push(sig);
+    }
+
     const sniperFilteredSignals = this.applySniperCorrelationFilter(
       market,
       signals,
@@ -2006,6 +2098,15 @@ export class MarketMakerRuntime {
       });
     }
 
+    // VS exit signals must cancel pending VS_MM_BID/ASK before exit
+    if (
+      !paperTradingEnabled &&
+      isVsExitSignal(executionSignal.signalType) &&
+      executionSignal.action === 'SELL'
+    ) {
+      await this.cancelPendingVsMakerQuotes(market.marketId, executionSignal.outcome);
+    }
+
     const obiLatencyPostCancel = Date.now();
     const startedAt = Date.now();
     const execution = await this.executor.executeSignal({
@@ -2332,6 +2433,47 @@ export class MarketMakerRuntime {
           }
         }
       }
+      // VS Engine entry fills — register position tracking and post-entry MM signals.
+      if (
+        (executionSignal.signalType === 'VS_ENTRY_BUY' ||
+          executionSignal.signalType === 'VS_MOMENTUM_BUY') &&
+        executionSignal.action === 'BUY' &&
+        config.vsEngine.enabled
+      ) {
+        const vsPhase = executionSignal.signalType === 'VS_MOMENTUM_BUY' ? 'MOMENTUM' as const : 'MM' as const;
+        const vsCoin = extractCoinFromTitle(market.title);
+        this.vsEngine.recordEntryForStats(
+          vsCoin,
+          `${executionSignal.outcome} ${effectiveShares}sh @${roundTo(effectivePrice, 3)} [${vsPhase}]`
+        );
+        const strikePrice = this.binanceEdge.getSlotOpenPrice(
+          vsCoin ?? '', market.startTime
+        ) ?? this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0;
+        const mmSignals = this.vsEngine.onEntryFill({
+          marketId: market.marketId,
+          marketTitle: market.title,
+          outcome: executionSignal.outcome,
+          fillPrice: effectivePrice,
+          filledShares: effectiveShares,
+          slotEndTime: market.endTime,
+          slotStartTime: market.startTime,
+          strikePrice,
+          phase: vsPhase,
+        });
+        for (const vsSig of mmSignals) {
+          this.scheduleBackgroundTask(async () => {
+            try {
+              await this.executeSignal(market, orderbook, positionManager, vsSig, slotKey);
+            } catch (error) {
+              logger.warn('VS post-entry signal execution failed', {
+                marketId: market.marketId,
+                signalType: vsSig.signalType,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          });
+        }
+      }
       // Phase 28: synchronous OBI exit fills — record stats and clean up
       // obiEngine.positions so the dead position doesn't linger until wallet
       // reconciliation. Previously only async fills (via fillTracker) did this.
@@ -2456,6 +2598,23 @@ export class MarketMakerRuntime {
               }
             });
           }, 45_000);
+        }
+      }
+      // VS Engine exit fills — clear position tracking.
+      if (
+        isVsExitSignal(executionSignal.signalType) &&
+        executionSignal.action === 'SELL' &&
+        config.vsEngine.enabled
+      ) {
+        const remainingShares = positionManager.getShares(executionSignal.outcome);
+        if (remainingShares <= 0) {
+          this.vsEngine.clearState(market.marketId);
+          logger.info('VS exit fill — cleared position tracking', {
+            marketId: market.marketId,
+            signalType: executionSignal.signalType,
+            soldShares: effectiveShares,
+            exitPrice: effectivePrice,
+          });
         }
       }
       // Phase 30: Universal slot-end exit timer for ALL strategies.
@@ -3317,6 +3476,50 @@ export class MarketMakerRuntime {
           }
         }
       }
+      // VS Engine entry fill (async path) — register position tracking
+      if (
+        (fill.signalType === 'VS_ENTRY_BUY' || fill.signalType === 'VS_MOMENTUM_BUY') &&
+        config.vsEngine.enabled
+      ) {
+        const vsCoin = extractCoinFromTitle(market.title);
+        const vsPhase = fill.signalType === 'VS_MOMENTUM_BUY' ? 'MOMENTUM' as const : 'MM' as const;
+        this.vsEngine.recordEntryForStats(
+          vsCoin,
+          `${fill.outcome} ${fill.filledShares}sh @${roundTo(fill.fillPrice, 3)} [${vsPhase}]`
+        );
+        const strikePrice = this.binanceEdge.getSlotOpenPrice(
+          vsCoin ?? '', market.startTime
+        ) ?? this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0;
+        const mmSignals = this.vsEngine.onEntryFill({
+          marketId: fill.marketId,
+          marketTitle: market.title,
+          outcome: fill.outcome,
+          fillPrice: fill.fillPrice,
+          filledShares: fill.filledShares,
+          slotEndTime: market.endTime,
+          slotStartTime: market.startTime,
+          strikePrice,
+          phase: vsPhase,
+        });
+        const vsBook =
+          this.latestBooks.get(fill.marketId) ??
+          this.quotingEngine.getContext(fill.marketId)?.orderbook;
+        if (vsBook) {
+          for (const vsSig of mmSignals) {
+            this.scheduleBackgroundTask(async () => {
+              try {
+                await this.executeSignal(market, vsBook, positionManager, vsSig, fill.slotKey);
+              } catch (error) {
+                logger.debug('VS follow-on quote execution failed', {
+                  marketId: fill.marketId,
+                  signalType: vsSig.signalType,
+                  message: error instanceof Error ? error.message : String(error),
+                });
+              }
+            });
+          }
+        }
+      }
       if (fill.signalType === 'SNIPER_BUY' && config.lottery.enabled) {
         const orderbook =
           this.latestBooks.get(fill.marketId) ?? this.quotingEngine.getContext(fill.marketId)?.orderbook;
@@ -3393,6 +3596,16 @@ export class MarketMakerRuntime {
     ) {
       const exitCoin = extractCoinFromObiTitle(market.title);
       this.obiEngine.recordExitForStats(exitCoin, realizedDelta, fill.signalType);
+    }
+
+    // VS exit stats for dashboard
+    if (
+      config.vsEngine.enabled &&
+      fill.side === 'SELL' &&
+      (isVsExitSignal(fill.signalType) || fill.signalType === 'VS_MM_ASK')
+    ) {
+      const exitCoin = extractCoinFromTitle(market.title);
+      this.vsEngine.recordExitForStats(exitCoin, realizedDelta, fill.signalType);
     }
 
     if (fill.signalType === 'HARD_STOP' && fill.side === 'SELL') {
@@ -4094,6 +4307,7 @@ export class MarketMakerRuntime {
         lotteryUsd:
           strategyLayers.find((entry) => entry.layer === 'LOTTERY')?.exposureUsd ?? 0,
         obiUsd: strategyLayers.find((entry) => entry.layer === 'OBI')?.exposureUsd ?? 0,
+        vsUsd: strategyLayers.find((entry) => entry.layer === 'VS_ENGINE')?.exposureUsd ?? 0,
         totalUsd: roundTo(
           strategyLayers.reduce((sum, entry) => sum + entry.exposureUsd, 0),
           4
@@ -4373,6 +4587,9 @@ export class MarketMakerRuntime {
                 : 1.0
             )
           : null,
+        vsStats: config.vsEngine.enabled
+          ? this.vsEngine.getSessionStats(config.vsEngine)
+          : null,
         ...overrides,
       },
       config
@@ -4478,6 +4695,7 @@ export class MarketMakerRuntime {
     this.latestBooks.delete(marketId);
     this.orderBookImbalance.clearState(marketId);
     this.obiEngine.clearState(marketId);
+    this.vsEngine.clearState(marketId);
     this.marketActions.delete(marketId);
     this.clearDustAbandonmentForMarket(marketId);
     // Variant A4: drop any tracked resting OBI maker orders for this market.
@@ -5005,6 +5223,53 @@ export class MarketMakerRuntime {
       }
     }
 
+    return cancelledCount;
+  }
+
+  /**
+   * Cancel pending VS_MM_BID/ASK maker orders before a VS exit, mirroring
+   * the OBI cancel flow but simplified (no resting-orders registry).
+   */
+  private async cancelPendingVsMakerQuotes(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): Promise<number> {
+    const pending = this.fillTracker
+      .getPendingOrders()
+      .filter(
+        (order) =>
+          order.marketId === marketId &&
+          order.outcome === outcome &&
+          order.side === 'SELL' &&
+          (order.signalType === 'VS_MM_ASK' || order.signalType === 'VS_MM_BID')
+      );
+    if (pending.length === 0) return 0;
+
+    let cancelledCount = 0;
+    for (const order of pending) {
+      try {
+        await this.executor.cancelOrder(order.orderId);
+        this.fillTracker.forgetPendingOrder(order.orderId);
+        this.clearPendingLiveOrder(this.getPendingOrderKey(marketId, outcome));
+        logger.info('Cancelled pending VS maker quote', {
+          marketId,
+          outcome,
+          cancelledOrderId: order.orderId,
+          cancelledSignalType: order.signalType,
+        });
+        cancelledCount += 1;
+      } catch (error) {
+        logger.warn('Failed to cancel pending VS maker quote', {
+          marketId,
+          outcome,
+          orderId: order.orderId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    if (cancelledCount > 0) {
+      await sleep(500);
+    }
     return cancelledCount;
   }
 

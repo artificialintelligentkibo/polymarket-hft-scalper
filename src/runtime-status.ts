@@ -34,6 +34,7 @@ export interface RuntimeGlobalExposureSnapshot {
   readonly pairedArbUsd: number;
   readonly lotteryUsd: number;
   readonly obiUsd: number;
+  readonly vsUsd: number;
   readonly totalUsd: number;
   readonly maxUsd: number;
 }
@@ -206,6 +207,47 @@ export interface ObiSessionStats {
   readonly stopEntryBeforeEndMs: number;
 }
 
+// ─── VS Engine Dashboard Stats ───────────────────────────────────
+
+export interface VsCoinStats {
+  readonly coin: string;
+  readonly entries: number;
+  readonly exits: number;
+  readonly phase1Entries: number;
+  readonly phase2Entries: number;
+  readonly realizedPnl: number;
+  readonly lastAction: string | null;
+  readonly lastActionAt: string | null;
+}
+
+export interface VsDecisionRecord {
+  readonly timestamp: string;
+  readonly coin: string | null;
+  readonly action: string;
+  readonly phase: string;
+  readonly reason: string;
+  readonly fairValue: number | null;
+}
+
+export interface VsSessionStats {
+  readonly enabled: boolean;
+  readonly shadowMode: boolean;
+  readonly entries: number;
+  readonly exits: number;
+  readonly wins: number;
+  readonly losses: number;
+  readonly realizedPnl: number;
+  readonly phase1Entries: number;
+  readonly phase1Pnl: number;
+  readonly phase2Entries: number;
+  readonly phase2Pnl: number;
+  readonly coinStats: Record<string, VsCoinStats>;
+  readonly recentDecisions: readonly VsDecisionRecord[];
+  readonly targetExitPrice: number;
+  readonly momentumMaxBuyPrice: number;
+  readonly defaultVolatility: number;
+}
+
 export interface RuntimeStatusSnapshot {
   readonly updatedAt: string;
   readonly pid: number | null;
@@ -265,6 +307,7 @@ export interface RuntimeStatusSnapshot {
   readonly recentSkippedSignals: readonly SkippedSignalRecord[];
   readonly lastSlotReport: RuntimeSlotSnapshot | null;
   readonly obiStats: ObiSessionStats | null;
+  readonly vsStats: VsSessionStats | null;
 }
 
 export function resolveRuntimeMode(runtimeConfig: AppConfig = config): RuntimeMode {
@@ -347,6 +390,7 @@ export function createRuntimeStatusSnapshot(
     recentSkippedSignals: [],
     lastSlotReport: null,
     obiStats: null,
+    vsStats: null,
     ...overrides,
   };
 }
@@ -536,6 +580,9 @@ function normalizeRuntimeStatus(
     obiStats: value.obiStats && typeof value.obiStats === 'object'
       ? (value.obiStats as ObiSessionStats)
       : null,
+    vsStats: value.vsStats && typeof value.vsStats === 'object'
+      ? (value.vsStats as VsSessionStats)
+      : null,
   };
 }
 
@@ -669,6 +716,18 @@ function createDefaultStrategyLayersSnapshot(
       exposureUsd: 0,
       pnlUsd: 0,
     },
+    {
+      layer: 'VS_ENGINE',
+      enabled: runtimeConfig.vsEngine.enabled,
+      status: (() => {
+        if (!runtimeConfig.vsEngine.enabled) return 'OFF' as const;
+        return runtimeConfig.vsEngine.shadowMode ? 'WATCHING' as const : 'ACTIVE' as const;
+      })(),
+      positionCount: 0,
+      marketCount: 0,
+      exposureUsd: 0,
+      pnlUsd: 0,
+    },
   ];
 }
 
@@ -681,6 +740,7 @@ function createDefaultGlobalExposureSnapshot(
     pairedArbUsd: 0,
     lotteryUsd: 0,
     obiUsd: 0,
+    vsUsd: 0,
     totalUsd: 0,
     maxUsd: runtimeConfig.GLOBAL_MAX_EXPOSURE_USD,
   };
@@ -899,6 +959,7 @@ function normalizeGlobalExposure(
     pairedArbUsd: normalizeNumber(record.pairedArbUsd, 0),
     lotteryUsd: normalizeNumber(record.lotteryUsd, 0),
     obiUsd: normalizeNumber(record.obiUsd, 0),
+    vsUsd: normalizeNumber(record.vsUsd, 0),
     totalUsd: normalizeNumber(record.totalUsd, 0),
     maxUsd: normalizeNumber(record.maxUsd, runtimeConfig.GLOBAL_MAX_EXPOSURE_USD),
   };

@@ -292,6 +292,7 @@ test('runtime status preserves strategy layer snapshots and signal layers for da
         pairedArbUsd: 0,
         lotteryUsd: 0.31,
         obiUsd: 0,
+        vsUsd: 0,
         totalUsd: 8.06,
         maxUsd: 50,
       },
