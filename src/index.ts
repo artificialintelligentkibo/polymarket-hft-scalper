@@ -1340,6 +1340,63 @@ export class MarketMakerRuntime {
       }
     }
 
+    // === Phase 32: zombie position sweep + dust-abandon recovery ===
+    // Two problems solved:
+    // A) Zombie positions: exist in positionManager (on-chain shares) but
+    //    lost OBI engine tracking. Re-register them so exit signals resume.
+    // B) Wrongly dust-abandoned: position marked abandoned during settlement
+    //    delay (on-chain showed 0), but shares appeared later. Clear the flag
+    //    so exits aren't permanently blocked by isDustAbandoned().
+    if (config.obiEngine.enabled) {
+      for (const [marketId, positionManager] of this.positions.entries()) {
+        const market = this.markets.get(marketId);
+        if (!market) continue;
+
+        for (const outcome of ['YES', 'NO'] as const) {
+          const shares = positionManager.getShares(outcome);
+          if (shares < 1) continue; // dust — skip, auto-redeem handles it
+
+          // (B) Clear stale dust-abandoned flag for ANY position with tradeable shares
+          const key = this.getMarketOutcomeKey(marketId, outcome);
+          if (this.dustAbandonedPositions.has(key)) {
+            this.dustAbandonedPositions.delete(key);
+            logger.info('Phase 32: cleared stale dust-abandoned flag — position has tradeable shares', {
+              marketId, outcome, shares: roundTo(shares, 4),
+            });
+          }
+
+          // (A) Re-register zombie positions that lost OBI engine tracking
+          if (!this.obiEngine.hasPosition(marketId)) {
+            const book = this.latestBooks.get(marketId);
+            if (!book) continue;
+
+            const outcomeBook = outcome === 'YES' ? book.yes : book.no;
+            const defensivePrice = outcomeBook.midPrice ?? outcomeBook.bestBid ?? 0.50;
+
+            logger.warn('Phase 32: re-registering zombie position in OBI engine', {
+              marketId,
+              marketTitle: market.title,
+              outcome,
+              shares: roundTo(shares, 4),
+              defensivePrice,
+            });
+
+            this.obiEngine.onEntryFill({
+              marketId,
+              marketTitle: market.title,
+              outcome,
+              fillPrice: defensivePrice,
+              filledShares: shares,
+              orderbook: book,
+              config: config.obiEngine,
+              totalLiveShares: shares,
+              slotEndTime: market.endTime,
+            });
+          }
+        }
+      }
+    }
+
     this.syncRuntimeStatus({
       activeSlotsCount: markets.length,
     });

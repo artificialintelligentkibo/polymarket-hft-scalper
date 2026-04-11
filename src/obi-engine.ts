@@ -1711,17 +1711,39 @@ export class ObiEngine {
       const remainingMs = position.slotEndMs - nowMs;
       if (remainingMs > config.cancelAllBeforeEndMs) continue;
 
-      // Slot has been over too long — give up emitting flatten signals so
-      // the redeem path can take over. Clear tracking state.
+      // Slot has been over too long — give up on DUST positions only.
+      // Phase 32: NEVER give up on positions with ≥ 1 tradeable share.
+      // Previously this unconditionally deleted ALL positions after 60s,
+      // causing 31 entries / 0 exits overnight — positions with 2-3 shares
+      // became zombies with no exit mechanism.
       if (remainingMs < -ORPHAN_GIVE_UP_AFTER_MS) {
-        logger.info('OBI orphan flatten given up — slot ended too long ago', {
-          marketId,
-          outcome: position.outcome,
-          remainingMs,
-        });
-        this.positions.delete(marketId);
-        this.lastOrphanEmitMs.delete(marketId);
-        continue;
+        const pm = positionManager(marketId);
+        const liveShares = pm ? pm.getShares(position.outcome) : 0;
+        if (liveShares < 1) {
+          logger.info('OBI orphan flatten given up — dust position, slot ended too long ago', {
+            marketId,
+            outcome: position.outcome,
+            liveShares: roundTo(liveShares, 4),
+            remainingMs,
+          });
+          this.positions.delete(marketId);
+          this.lastOrphanEmitMs.delete(marketId);
+          continue;
+        }
+        // Position still has tradeable shares — keep tracking and continue
+        // to emit flatten signals below. Just throttle to avoid spam.
+        // Log only once per 30s to avoid log flood.
+        const lastGiveUpLog = this.lastOrphanEmitMs.get(marketId);
+        if (!lastGiveUpLog || nowMs - lastGiveUpLog > 30_000) {
+          logger.warn('OBI orphan flatten: slot ended but position still has tradeable shares — continuing exits', {
+            marketId,
+            outcome: position.outcome,
+            liveShares: roundTo(liveShares, 4),
+            remainingMs,
+            elapsed: `${Math.round(-remainingMs / 1000)}s past slot end`,
+          });
+        }
+        // Fall through to emit flatten signal below
       }
 
       const lastEmit = this.lastOrphanEmitMs.get(marketId);
@@ -1853,6 +1875,11 @@ export class ObiEngine {
   /** Snapshot of currently tracked OBI positions (for diagnostics / dashboard). */
   getActivePositions(): readonly Readonly<ObiPosition>[] {
     return Array.from(this.positions.values());
+  }
+
+  /** Check if a market is tracked by the OBI engine. */
+  hasPosition(marketId: string): boolean {
+    return this.positions.has(marketId);
   }
 
   /**
