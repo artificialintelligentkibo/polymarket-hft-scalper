@@ -5042,6 +5042,26 @@ export class MarketMakerRuntime {
       return;
     }
 
+    // Phase 32: HARD GUARD — never abandon positions with ≥ 1 tradeable share.
+    // Previously, settlement delays could trick reconcileLiveReduceOnlySellSignal
+    // into seeing 0 shares on-chain → "below_minimum" → abandon → permanent block.
+    // This caused 31 entries / 0 exits overnight.
+    const positionManager = this.positions.get(params.market.marketId);
+    if (positionManager) {
+      const actualShares = positionManager.getShares(params.signal.outcome);
+      if (actualShares >= 1) {
+        logger.warn('Phase 32: BLOCKED abandon for position with tradeable shares — settlement delay suspected', {
+          marketId: params.market.marketId,
+          outcome: params.signal.outcome,
+          actualSharesInPosManager: roundTo(actualShares, 4),
+          requestedShares: params.requestedShares,
+          minimumShares: params.minimumShares,
+          referencePrice: params.referencePrice,
+        });
+        return;
+      }
+    }
+
     this.dustAbandonedPositions.add(key);
     this.signalEngine.clearSniperEntry(params.market.marketId, params.signal.outcome);
     logger.info('Position abandoned for redeem - below CLOB minimum sell size', {
