@@ -5042,14 +5042,16 @@ export class MarketMakerRuntime {
       return;
     }
 
-    // Phase 32: HARD GUARD — never abandon positions with ≥ 1 tradeable share.
-    // Previously, settlement delays could trick reconcileLiveReduceOnlySellSignal
-    // into seeing 0 shares on-chain → "below_minimum" → abandon → permanent block.
-    // This caused 31 entries / 0 exits overnight.
+    // Phase 32: HARD GUARD — never abandon positions with ≥ 1 tradeable share
+    // UNLESS the market's slot has already ended (expired markets can't be sold on CLOB,
+    // so abandon-for-redeem is the only way to recover the value).
     const positionManager = this.positions.get(params.market.marketId);
     if (positionManager) {
       const actualShares = positionManager.getShares(params.signal.outcome);
-      if (actualShares >= 1) {
+      const slotEnded = params.market.endTime
+        ? Date.now() > new Date(params.market.endTime).getTime()
+        : false;
+      if (actualShares >= 1 && !slotEnded) {
         logger.warn('Phase 32: BLOCKED abandon for position with tradeable shares — settlement delay suspected', {
           marketId: params.market.marketId,
           outcome: params.signal.outcome,
@@ -5059,6 +5061,14 @@ export class MarketMakerRuntime {
           referencePrice: params.referencePrice,
         });
         return;
+      }
+      if (actualShares >= 1 && slotEnded) {
+        logger.info('Phase 34: allowing abandon for expired slot — shares cannot be sold on CLOB', {
+          marketId: params.market.marketId,
+          outcome: params.signal.outcome,
+          actualShares: roundTo(actualShares, 4),
+          endTime: params.market.endTime,
+        });
       }
     }
 
