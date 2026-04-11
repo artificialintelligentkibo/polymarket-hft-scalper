@@ -448,7 +448,8 @@ export class BinanceEdgeProvider {
     return (
       this.runtimeConfig.binance.edgeEnabled ||
       this.runtimeConfig.LATENCY_MOMENTUM_ENABLED ||
-      this.runtimeConfig.PAPER_TRADING_ENABLED
+      this.runtimeConfig.PAPER_TRADING_ENABLED ||
+      this.runtimeConfig.vsEngine.enabled
     );
   }
 }

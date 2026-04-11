@@ -623,7 +623,7 @@ function renderVsRecentDecisions(stats: VsSessionStats): string {
     return color.dim('No VS decisions recorded yet.');
   }
   const rows: string[][] = [];
-  const decisions = [...stats.recentDecisions].reverse().slice(0, 10);
+  const decisions = [...stats.recentDecisions].reverse().slice(0, 5);
   for (const d of decisions) {
     const time = d.timestamp.slice(11, 19);
     const coin = d.coin ?? '?';
@@ -717,7 +717,7 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   );
 
   if (isObiMode && obiStats) {
-    // OBI-focused sections
+    // OBI-focused sections (compact: hide empty sub-sections)
     lines.push('');
     lines.push(
       renderSection(
@@ -725,27 +725,37 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
         renderObiSessionStats(obiStats)
       )
     );
-    lines.push('');
-    lines.push(
-      renderSection(
-        'BINANCE GATE  -  ENTRY FILTER BREAKDOWN',
-        renderObiBinanceGate(obiStats)
-      )
-    );
-    lines.push('');
-    lines.push(
-      renderSection(
-        'DUST SAFETY  -  PHASE 15 CAP CHECK',
-        renderObiDustSafety(obiStats)
-      )
-    );
-    lines.push('');
-    lines.push(
-      renderSection(
-        'PER-COIN BREAKDOWN',
-        renderObiCoinBreakdown(obiStats)
-      )
-    );
+    // Only show Binance Gate & Dust Safety when there's actual activity
+    const hasGateActivity = obiStats.totalGatePassed > 0 || obiStats.totalGateBlocks > 0;
+    if (hasGateActivity) {
+      lines.push('');
+      lines.push(
+        renderSection(
+          'BINANCE GATE  -  ENTRY FILTER BREAKDOWN',
+          renderObiBinanceGate(obiStats)
+        )
+      );
+    }
+    const hasDustActivity = obiStats.phase15Accepted > 0 || obiStats.phase15Refused > 0;
+    if (hasDustActivity) {
+      lines.push('');
+      lines.push(
+        renderSection(
+          'DUST SAFETY  -  PHASE 15 CAP CHECK',
+          renderObiDustSafety(obiStats)
+        )
+      );
+    }
+    // Only show coin breakdown when there are entries
+    if (obiStats.entries > 0) {
+      lines.push('');
+      lines.push(
+        renderSection(
+          'PER-COIN BREAKDOWN',
+          renderObiCoinBreakdown(obiStats)
+        )
+      );
+    }
     lines.push('');
     lines.push(
       renderSection(
@@ -809,13 +819,15 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
         renderVsSessionStats(vsStats)
       )
     );
-    lines.push('');
-    lines.push(
-      renderSection(
-        'VS PER-COIN BREAKDOWN',
-        renderVsCoinBreakdown(vsStats)
-      )
-    );
+    if (vsStats.entries > 0) {
+      lines.push('');
+      lines.push(
+        renderSection(
+          'VS PER-COIN BREAKDOWN',
+          renderVsCoinBreakdown(vsStats)
+        )
+      );
+    }
     lines.push('');
     lines.push(
       renderSection(

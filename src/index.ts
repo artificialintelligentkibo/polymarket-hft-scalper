@@ -1676,6 +1676,12 @@ export class MarketMakerRuntime {
 
     // VS Engine signals (Binance latency arb — gated by vsEngine.enabled)
     if (config.vsEngine.enabled) {
+      // VS needs Binance slot-open price even when binance.edgeEnabled=false (OBI preset).
+      // Ensure recordSlotOpen is called so getSlotOpenPrice returns data.
+      const vsCoin = extractCoinFromTitle(market.title);
+      if (vsCoin) {
+        this.binanceEdge.recordSlotOpen(vsCoin, market.startTime);
+      }
       const vsEntrySignals = this.vsEngine.generateSignals({
         market,
         orderbook,

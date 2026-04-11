@@ -686,10 +686,11 @@ function applyStrategyPreset(input: AppConfig): AppConfig {
     // user opts in via DEEP_BINANCE_MODE, but always disable Binance edge
     // signal generation (we don't want regular Binance edge signals competing
     // with OBI entries).
-    const keepBinanceWs = input.DEEP_BINANCE_MODE && input.BINANCE_WS_ENABLED;
+    // Keep Binance WS when: DEEP_BINANCE_MODE (for runaway gate) OR VS_ENGINE (needs price feed)
+    const keepBinanceWs = (input.DEEP_BINANCE_MODE && input.BINANCE_WS_ENABLED) || input.vsEngine.enabled;
     console.log(
       `[strategy] ACTIVE_STRATEGY=ORDER_BOOK_IMBALANCE — vague-sourdough OBI mode (standalone Layer 1, Binance ${
-        keepBinanceWs ? 'price feed ON for runaway gate' : 'disabled'
+        keepBinanceWs ? 'price feed ON' + (input.vsEngine.enabled ? ' for VS Engine' : ' for runaway gate') : 'disabled'
       })`
     );
     return {
