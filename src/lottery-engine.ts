@@ -363,6 +363,16 @@ export class LotteryEngine {
     this.activeEntries.delete(this.getEntryKey(marketId, outcome));
   }
 
+  getActivePositions(): Array<{ marketId: string; outcome: Outcome }> {
+    return Array.from(this.activeEntries.keys()).map((key) => {
+      const sep = key.lastIndexOf(':');
+      return {
+        marketId: key.slice(0, sep),
+        outcome: key.slice(sep + 1) as Outcome,
+      };
+    });
+  }
+
   isLotteryPosition(marketId: string, outcome: Outcome): boolean {
     return this.activeEntries.has(this.getEntryKey(marketId, outcome));
   }

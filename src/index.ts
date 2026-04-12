@@ -1436,6 +1436,73 @@ export class MarketMakerRuntime {
       }
     }
 
+    // === Lottery orphan exit sweep ===
+    // Same problem as OBI Phase 26: after lottery entry, the market may fall
+    // out of the candidate list (price drifted, slot nearly ended) and
+    // generateExitSignals() is never called. Lottery tickets sit forever,
+    // silently losing their full cost. This sweep runs exit evaluation for
+    // every active lottery position not already in the main processing list.
+    if (config.lottery.enabled) {
+      try {
+        const activeLotteryPositions = this.lotteryEngine.getActivePositions();
+        for (const pos of activeLotteryPositions) {
+          if (preparedMarketIds.has(pos.marketId)) continue; // already processed
+
+          const lotMarket = this.markets.get(pos.marketId);
+          if (!lotMarket) continue;
+
+          let lotBook = this.latestBooks.get(pos.marketId) ?? null;
+          try {
+            lotBook = await this.fetcher.getMarketSnapshot(lotMarket);
+            this.latestBooks.set(pos.marketId, lotBook);
+            this.executor.recordOrderbookSnapshot(lotBook);
+          } catch {
+            // fall back to cached book
+          }
+          if (!lotBook) continue;
+
+          const lotPosManager = this.getPositionManager(lotMarket);
+          const lotExitSignals = this.lotteryEngine.generateExitSignals({
+            market: lotMarket,
+            orderbook: lotBook,
+            positionManager: lotPosManager,
+            nowMs: Date.now(),
+            config: config.lottery,
+          });
+
+          for (const sig of lotExitSignals) {
+            logger.info('Lottery orphan exit sweep: executing exit signal', {
+              marketId: sig.marketId,
+              signalType: sig.signalType,
+              reason: sig.reason,
+              targetPrice: sig.targetPrice,
+            });
+            this.scheduleBackgroundTask(async () => {
+              try {
+                await this.executeSignal(
+                  lotMarket,
+                  lotBook!,
+                  lotPosManager,
+                  sig,
+                  getSlotKey(lotMarket)
+                );
+              } catch (error) {
+                logger.warn('Lottery orphan exit sweep execution failed', {
+                  marketId: sig.marketId,
+                  signalType: sig.signalType,
+                  message: error instanceof Error ? error.message : String(error),
+                });
+              }
+            });
+          }
+        }
+      } catch (error) {
+        logger.warn('Lottery orphan exit sweep failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     // === Phase 32: zombie position sweep + dust-abandon recovery ===
     // Two problems solved:
     // A) Zombie positions: exist in positionManager (on-chain shares) but
