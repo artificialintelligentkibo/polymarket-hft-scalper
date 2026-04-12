@@ -212,7 +212,7 @@ export class MarketMakerRuntime {
    * until the market is cleaned up. Prevents the cross-cycle race condition
    * where a VS limit order with 0 sync fill lets OBI enter the same slot.
    */
-  private readonly slotStrategyClaim = new Map<string, 'OBI' | 'VS_ENGINE'>();
+  private readonly slotStrategyClaim = new Map<string, 'OBI' | 'VS_ENGINE' | 'SNIPER' | 'LOTTERY'>();
   private readonly marketActions = new Map<string, RuntimeMarketActionSnapshot>();
   private readonly marketWork = new Map<string, Promise<void>>();
   private readonly pendingSlotReports = new Set<string>();
@@ -1532,10 +1532,15 @@ export class MarketMakerRuntime {
           // Phase 35C: skip if VS engine owns this position or the slot is
           // claimed by VS_ENGINE — otherwise OBI hard-stop sweep would fire
           // exit signals on VS positions (caused -$2.82 loss on 2026-04-12).
+          // Phase 38: also skip if SNIPER or LOTTERY owns this position —
+          // OBI was hijacking sniper exits (OBI_REBALANCE_EXIT after 3s).
+          const claim = this.slotStrategyClaim.get(marketId);
           if (
             !this.obiEngine.hasPosition(marketId) &&
             !this.vsEngine.hasPosition(marketId) &&
-            this.slotStrategyClaim.get(marketId) !== 'VS_ENGINE'
+            claim !== 'VS_ENGINE' &&
+            claim !== 'SNIPER' &&
+            claim !== 'LOTTERY'
           ) {
             const book = this.latestBooks.get(marketId);
             if (!book) continue;
@@ -1947,7 +1952,7 @@ export class MarketMakerRuntime {
         // the other strategy from entering this market on the next scan cycle.
         if (this.isEntrySignal(candidate.signal)) {
           const layer = this.resolveSignalLayer(candidate.signal);
-          if (layer === 'OBI' || layer === 'VS_ENGINE') {
+          if (layer === 'OBI' || layer === 'VS_ENGINE' || layer === 'SNIPER' || layer === 'LOTTERY') {
             this.slotStrategyClaim.set(market.marketId, layer);
           }
         }
@@ -3584,6 +3589,11 @@ export class MarketMakerRuntime {
       this.armSettlementConfirmation(fill.marketId, fill.outcome, fill.filledAt);
       this.executor.invalidateOutcomeBalanceCache(fill.tokenId);
       this.executor.invalidateBalanceValidationCache();
+      // Phase 38: reinforce SNIPER claim on async fill so Phase 32 zombie
+      // sweep doesn't re-register this position as OBI (causing premature exits).
+      if (fill.signalType === 'SNIPER_BUY') {
+        this.slotStrategyClaim.set(fill.marketId, 'SNIPER');
+      }
       if (
         fill.signalType === 'SNIPER_BUY' &&
         isDynamicQuotingEnabled(config) &&
