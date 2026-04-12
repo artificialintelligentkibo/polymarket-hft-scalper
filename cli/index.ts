@@ -546,8 +546,8 @@ function renderObiRecentDecisions(stats: ObiSessionStats): string {
     return color.dim('No OBI decisions recorded yet.');
   }
   const rows: string[][] = [];
-  // Show newest first, limit to 10
-  const decisions = [...stats.recentDecisions].reverse().slice(0, 10);
+  // Show newest first, limit to 3 (compact dashboard)
+  const decisions = [...stats.recentDecisions].reverse().slice(0, 3);
   for (const d of decisions) {
     const time = d.timestamp.slice(11, 19);
     const coin = d.coin ?? '?';
@@ -624,7 +624,7 @@ function renderVsRecentDecisions(stats: VsSessionStats): string {
     return color.dim('No VS decisions recorded yet.');
   }
   const rows: string[][] = [];
-  const decisions = [...stats.recentDecisions].reverse().slice(0, 5);
+  const decisions = [...stats.recentDecisions].reverse().slice(0, 3);
   for (const d of decisions) {
     const time = d.timestamp.slice(11, 19);
     const coin = d.coin ?? '?';
@@ -715,12 +715,10 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   ];
 
   if (runtimeStatus?.isPaused) {
-    lines.push('');
     lines.push(color.red(color.bold('BOT PAUSED - Polymarket status issue or manual pause')));
   }
 
   if (runtimeStatus?.latencyPaused) {
-    lines.push('');
     lines.push(
       color.yellow(
         color.bold(
@@ -730,14 +728,12 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
     );
   }
 
-  lines.push('');
   lines.push(
     renderSection(
       'ACTIVE MARKETS  -  SCANNING LIVE SIGNALS',
-      renderActiveMarkets(runtimeStatus?.activeMarkets ?? [], runtimeStatus?.sniperStats)
+      renderActiveMarkets(filterCurrentSlotMarkets(runtimeStatus?.activeMarkets ?? []), runtimeStatus?.sniperStats)
     )
   );
-  lines.push('');
   lines.push(
     renderSection(
       isObiMode ? 'OBI POSITIONS' : 'LIVE POSITIONS  -  OPEN INVENTORY NOW',
@@ -747,7 +743,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
 
   if (isObiMode && obiStats) {
     // OBI-focused sections (compact: hide empty sub-sections)
-    lines.push('');
     lines.push(
       renderSection(
         'OBI SESSION  -  TODAY\'S PERFORMANCE',
@@ -757,7 +752,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
     // Only show Binance Gate & Dust Safety when there's actual activity
     const hasGateActivity = obiStats.totalGatePassed > 0 || obiStats.totalGateBlocks > 0;
     if (hasGateActivity) {
-      lines.push('');
       lines.push(
         renderSection(
           'BINANCE GATE  -  ENTRY FILTER BREAKDOWN',
@@ -767,7 +761,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
     }
     const hasDustActivity = obiStats.phase15Accepted > 0 || obiStats.phase15Refused > 0;
     if (hasDustActivity) {
-      lines.push('');
       lines.push(
         renderSection(
           'DUST SAFETY  -  PHASE 15 CAP CHECK',
@@ -777,7 +770,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
     }
     // Only show coin breakdown when there are entries
     if (obiStats.entries > 0) {
-      lines.push('');
       lines.push(
         renderSection(
           'PER-COIN BREAKDOWN',
@@ -785,7 +777,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
         )
       );
     }
-    lines.push('');
     lines.push(
       renderSection(
         'RECENT OBI DECISIONS',
@@ -794,42 +785,36 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
     );
   } else {
     // Legacy sniper/MM sections
-    lines.push('');
     lines.push(
       renderSection(
         'MM QUOTES  -  ACTIVE QUOTING AND INVENTORY',
         renderMmQuotes(runtimeStatus)
       )
     );
-    lines.push('');
     lines.push(
       renderSection(
         'BOT PERFORMANCE STATS',
         renderPerformance(inspection, runtimeStatus, runtimeConfig)
       )
     );
-    lines.push('');
     lines.push(
       renderSection(
         'STRATEGY LAYERS',
         renderStrategyLayers(runtimeStatus)
       )
     );
-    lines.push('');
     lines.push(
       renderSection(
         'SNIPER ENGINE  -  BINANCE-LED SIGNAL STATUS',
         renderSniperStats(runtimeStatus?.sniperStats)
       )
     );
-    lines.push('');
     lines.push(
       renderSection(
         'LOTTERY LAYER',
         renderLotteryStats(runtimeStatus)
       )
     );
-    lines.push('');
     lines.push(
       renderSection(
         'RECENT SIGNALS',
@@ -841,7 +826,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   // VS Engine section — shown when vsStats is present (parallel to OBI)
   const vsStats = runtimeStatus?.vsStats;
   if (vsStats?.enabled) {
-    lines.push('');
     lines.push(
       renderSection(
         `VS ENGINE  -  BINANCE LATENCY ARB ${vsStats.shadowMode ? color.yellow('[SHADOW]') : ''}`,
@@ -849,7 +833,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
       )
     );
     if (vsStats.entries > 0) {
-      lines.push('');
       lines.push(
         renderSection(
           'VS PER-COIN BREAKDOWN',
@@ -857,7 +840,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
         )
       );
     }
-    lines.push('');
     lines.push(
       renderSection(
         'RECENT VS DECISIONS',
@@ -869,7 +851,6 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   // Paper Trading section — shown when paper trading is active
   const paperStats = runtimeStatus?.paperStats;
   if (paperStats?.enabled) {
-    lines.push('');
     lines.push(
       renderSection(
         'PAPER TRADING  -  VIRTUAL PERFORMANCE',
@@ -913,6 +894,17 @@ function buildProductionHeaderBalanceEntries(
 function renderSection(title: string, body: string): string {
   const heading = color.yellow(color.bold(`== ${title} ==`));
   return [heading, body].join('\n');
+}
+
+function filterCurrentSlotMarkets(
+  markets: readonly RuntimeMarketSnapshot[]
+): RuntimeMarketSnapshot[] {
+  const now = new Date().toISOString();
+  return markets.filter((m) => {
+    // Keep markets whose slot hasn't ended yet (or has no slotEnd)
+    if (!m.slotEnd) return true;
+    return m.slotEnd > now;
+  });
 }
 
 function renderActiveMarkets(
