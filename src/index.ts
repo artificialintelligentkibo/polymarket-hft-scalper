@@ -200,6 +200,14 @@ export class MarketMakerRuntime {
   private readonly positions = new Map<string, PositionManager>();
   private readonly markets = new Map<string, MarketCandidate>();
   private readonly latestBooks = new Map<string, MarketOrderbookSnapshot>();
+  /**
+   * Phase 35C: slot-level strategy claim tracker.
+   * When OBI or VS sends an entry order on a market (even if 0 sync fill),
+   * the market is "claimed" for that strategy. The other strategy skips it
+   * until the market is cleaned up. Prevents the cross-cycle race condition
+   * where a VS limit order with 0 sync fill lets OBI enter the same slot.
+   */
+  private readonly slotStrategyClaim = new Map<string, 'OBI' | 'VS_ENGINE'>();
   private readonly marketActions = new Map<string, RuntimeMarketActionSnapshot>();
   private readonly marketWork = new Map<string, Promise<void>>();
   private readonly pendingSlotReports = new Set<string>();
@@ -1650,27 +1658,36 @@ export class MarketMakerRuntime {
       this.rememberSkippedSignals(this.signalEngine.drainSkippedSignals());
     }
 
+    // Phase 35C: check slot strategy claim — if one strategy already claimed
+    // this market, the other strategy skips ENTRY signals (exits still allowed).
+    const existingClaim = this.slotStrategyClaim.get(market.marketId);
+
     // OBI engine signals (gated by obiEngine.enabled in config)
     if (config.obiEngine.enabled) {
-      // Phase 21: OBI compounding — scale entry/max shares with bankroll growth.
-      const obiMult = this.compounder.enabled
-        ? this.compounder.getObiSizeMultiplier(config.obiEngine.obiCompoundThresholdUsd)
-        : 1.0;
-      const obiEntrySignals = this.obiEngine.generateSignals({
-        market,
-        orderbook,
-        positionManager,
-        config: config.obiEngine,
-        deepBinanceAssessment,
-        obiSizeMultiplier: obiMult,
-      });
+      // Phase 35C: skip OBI entries if VS already claimed this market
+      const obiClaimBlocked = existingClaim === 'VS_ENGINE';
+      if (!obiClaimBlocked) {
+        // Phase 21: OBI compounding — scale entry/max shares with bankroll growth.
+        const obiMult = this.compounder.enabled
+          ? this.compounder.getObiSizeMultiplier(config.obiEngine.obiCompoundThresholdUsd)
+          : 1.0;
+        const obiEntrySignals = this.obiEngine.generateSignals({
+          market,
+          orderbook,
+          positionManager,
+          config: config.obiEngine,
+          deepBinanceAssessment,
+          obiSizeMultiplier: obiMult,
+        });
+        for (const sig of obiEntrySignals) signals.push(sig);
+      }
+      // Always allow OBI exits (even if VS claimed — OBI may have a legacy position)
       const obiExitSignals = this.obiEngine.generateExitSignals({
         market,
         orderbook,
         positionManager,
         config: config.obiEngine,
       });
-      for (const sig of obiEntrySignals) signals.push(sig);
       for (const sig of obiExitSignals) signals.push(sig);
     }
 
@@ -1682,20 +1699,25 @@ export class MarketMakerRuntime {
       if (vsCoin) {
         this.binanceEdge.recordSlotOpen(vsCoin, market.startTime);
       }
-      const vsEntrySignals = this.vsEngine.generateSignals({
-        market,
-        orderbook,
-        positionManager,
-        config: config.vsEngine,
-        binanceFeed: this.binanceEdge,
-      });
+      // Phase 35C: skip VS entries if OBI already claimed this market
+      const vsClaimBlocked = existingClaim === 'OBI';
+      if (!vsClaimBlocked) {
+        const vsEntrySignals = this.vsEngine.generateSignals({
+          market,
+          orderbook,
+          positionManager,
+          config: config.vsEngine,
+          binanceFeed: this.binanceEdge,
+        });
+        for (const sig of vsEntrySignals) signals.push(sig);
+      }
+      // Always allow VS exits (even if OBI claimed)
       const vsExitSignals = this.vsEngine.generateExitSignals({
         market,
         orderbook,
         positionManager,
         config: config.vsEngine,
       });
-      for (const sig of vsEntrySignals) signals.push(sig);
       for (const sig of vsExitSignals) signals.push(sig);
     }
 
@@ -1798,6 +1820,15 @@ export class MarketMakerRuntime {
 
     for (const candidate of otherCandidates) {
       try {
+        // Phase 35C: claim slot for strategy before execution.
+        // Even if the order gets 0 sync fill (limit order), the claim prevents
+        // the other strategy from entering this market on the next scan cycle.
+        if (this.isEntrySignal(candidate.signal)) {
+          const layer = this.resolveSignalLayer(candidate.signal);
+          if (layer === 'OBI' || layer === 'VS_ENGINE') {
+            this.slotStrategyClaim.set(market.marketId, layer);
+          }
+        }
         await this.executeSignal(
           market,
           orderbook,
@@ -2440,10 +2471,13 @@ export class MarketMakerRuntime {
         }
       }
       // VS Engine entry fills — register position tracking and post-entry MM signals.
+      // Phase 35C: effectiveShares > 0 guard — limit orders often get 0 sync fill;
+      // without this guard we'd create phantom positions and schedule timers for nothing.
       if (
         (executionSignal.signalType === 'VS_ENTRY_BUY' ||
           executionSignal.signalType === 'VS_MOMENTUM_BUY') &&
         executionSignal.action === 'BUY' &&
+        effectiveShares > 0 &&
         config.vsEngine.enabled
       ) {
         const vsPhase = executionSignal.signalType === 'VS_MOMENTUM_BUY' ? 'MOMENTUM' as const : 'MM' as const;
@@ -3414,6 +3448,7 @@ export class MarketMakerRuntime {
         }
       }
       if (fill.signalType === 'OBI_ENTRY_BUY' && config.obiEngine.enabled) {
+        this.slotStrategyClaim.set(fill.marketId, 'OBI'); // Phase 35C: reinforce claim on async fill
         const obiCoin = extractCoinFromObiTitle(market.title);
         this.obiEngine.recordEntryForStats(obiCoin, `${fill.outcome} ${fill.filledShares}sh @${roundTo(fill.fillPrice, 3)}`);
         const obiBook =
@@ -3508,6 +3543,7 @@ export class MarketMakerRuntime {
         (fill.signalType === 'VS_ENTRY_BUY' || fill.signalType === 'VS_MOMENTUM_BUY') &&
         config.vsEngine.enabled
       ) {
+        this.slotStrategyClaim.set(fill.marketId, 'VS_ENGINE'); // Phase 35C: reinforce claim on async fill
         const vsCoin = extractCoinFromTitle(market.title);
         const vsPhase = fill.signalType === 'VS_MOMENTUM_BUY' ? 'MOMENTUM' as const : 'MM' as const;
         this.vsEngine.recordEntryForStats(
@@ -4181,6 +4217,12 @@ export class MarketMakerRuntime {
     if (this.quotingEngine.hasActiveMMMarket(marketId)) {
       layers.add('MM_QUOTE');
     }
+    // Phase 35C: include slot strategy claim — even if positionManager has 0 shares
+    // (e.g. VS limit order pending), the claim blocks the other strategy.
+    const claim = this.slotStrategyClaim.get(marketId);
+    if (claim) {
+      layers.add(claim);
+    }
     return Array.from(layers);
   }
 
@@ -4727,6 +4769,7 @@ export class MarketMakerRuntime {
     this.lotteryEngine.recordExit(marketId, 'NO');
     this.positions.delete(marketId);
     this.latestBooks.delete(marketId);
+    this.slotStrategyClaim.delete(marketId); // Phase 35C
     this.orderBookImbalance.clearState(marketId);
     this.obiEngine.clearState(marketId);
     this.vsEngine.clearState(marketId);
@@ -5327,10 +5370,21 @@ export class MarketMakerRuntime {
     const slotEndMs = new Date(endTime).getTime();
     if (!Number.isFinite(slotEndMs)) return;
 
+    // Phase 35C: cache the MarketCandidate at schedule time.
+    // By the time the timer fires (T-5s), the market may already be removed
+    // from this.markets (slot cleanup runs at ~T-0). Without caching, the
+    // timer silently returns at `if (!exitMarket) return` and never exits.
+    const cachedMarket = this.markets.get(marketId);
+    if (!cachedMarket) return;
+    // Snapshot the fields we need — the object is immutable per slot anyway.
+    const cachedTitle = cachedMarket.title;
+    const cachedYesTokenId = cachedMarket.yesTokenId;
+    const cachedNoTokenId = cachedMarket.noTokenId;
+    const cachedConditionId = cachedMarket.conditionId;
+
     const cfg = config.vsEngine;
     const timeExitDelayMs = (slotEndMs - cfg.timeExitBeforeEndMs) - Date.now();
     if (timeExitDelayMs <= 0) {
-      // Already past time-exit window — fire immediately
       logger.info('Phase 35B: VS time-exit already due, firing immediately', {
         marketId, outcome, remainingMs: slotEndMs - Date.now(),
       });
@@ -5372,8 +5426,15 @@ export class MarketMakerRuntime {
             return;
           }
 
-          const exitMarket = this.markets.get(marketId);
-          if (!exitMarket) return;
+          // Phase 35C: use cached market or fall back to live map (if still available).
+          // Build a minimal MarketCandidate from cached fields for fetcher/executor.
+          const exitMarket = this.markets.get(marketId) ?? {
+            ...cachedMarket,
+            title: cachedTitle,
+            yesTokenId: cachedYesTokenId,
+            noTokenId: cachedNoTokenId,
+            conditionId: cachedConditionId,
+          };
 
           // Fetch fresh orderbook
           let exitBook = this.latestBooks.get(marketId) ?? null;
@@ -5396,7 +5457,7 @@ export class MarketMakerRuntime {
 
           const exitSignal: StrategySignal = {
             marketId,
-            marketTitle: exitMarket.title,
+            marketTitle: cachedTitle,
             signalType: 'VS_TIME_EXIT',
             priority: 980,
             generatedAt: Date.now(),
@@ -5420,19 +5481,20 @@ export class MarketMakerRuntime {
             priceMultiplier: 1,
             urgency: 'cross',
             reduceOnly: true,
-            reason: `Phase 35B: VS time-exit timer fired, ${roundTo((slotEndMs - Date.now()) / 1000, 1)}s left`,
+            reason: `Phase 35C: VS time-exit timer fired, ${roundTo((slotEndMs - Date.now()) / 1000, 1)}s left`,
             strategyLayer: 'VS_ENGINE',
           } as StrategySignal;
 
-          logger.info('Phase 35B: VS time-exit timer executing', {
+          logger.info('Phase 35C: VS time-exit timer executing', {
             marketId, outcome, shares: liveShares, bestBid,
             remainingSec: roundTo((slotEndMs - Date.now()) / 1000, 1),
+            usedCachedMarket: !this.markets.has(marketId),
           });
 
           await this.executeSignal(exitMarket, exitBook, pm, exitSignal, slotKey);
 
           // Record VS exit stats
-          const exitCoin = extractCoinFromTitle(exitMarket.title);
+          const exitCoin = extractCoinFromTitle(cachedTitle);
           const remainingShares = pm.getShares(outcome);
           if (remainingShares <= 0) {
             this.vsEngine.clearState(marketId);
@@ -5443,7 +5505,7 @@ export class MarketMakerRuntime {
           const realizedDelta = (bestBid - entryVwap) * liveShares;
           this.vsEngine.recordExitForStats(exitCoin, realizedDelta, 'VS_TIME_EXIT');
         } catch (error) {
-          logger.warn('Phase 35B: VS time-exit timer failed', {
+          logger.warn('Phase 35C: VS time-exit timer failed', {
             marketId,
             message: error instanceof Error ? error.message : String(error),
           });

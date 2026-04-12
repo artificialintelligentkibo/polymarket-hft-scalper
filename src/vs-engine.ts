@@ -686,7 +686,10 @@ export class VsEngine {
         strikePrice: params.strikePrice,
       });
     }
-    this.lastEntryMs.set(params.marketId, Date.now());
+    // Phase 35C: DON'T reset lastEntryMs here — it's already set on signal
+    // GENERATION (generatePassiveMMSignals / generateMomentumSignals).
+    // Resetting on fill arrival would reopen the cooldown window, allowing
+    // duplicate entries when async fills arrive after the signal-gen lock.
     this.totalEntries += 1;
     if (params.phase === 'MM') this.phase1Entries += 1;
     else this.phase2Entries += 1;
