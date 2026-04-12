@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket HFT Scalper — Архітектура платформи</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --card: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --dim: #8b949e;
+  --green: #3fb950;
+  --red: #f85149;
+  --blue: #58a6ff;
+  --yellow: #d29922;
+  --purple: #bc8cff;
+  --orange: #f0883e;
+  --cyan: #39d353;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; padding: 20px; line-height: 1.6; }
+h1 { font-size: 28px; margin-bottom: 8px; color: var(--blue); }
+h2 { font-size: 22px; margin: 30px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 16px; margin: 16px 0 8px; color: var(--yellow); }
+.subtitle { color: var(--dim); margin-bottom: 24px; font-size: 14px; }
+.overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 20px 0; }
+.strategy-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; cursor: pointer; transition: border-color 0.2s; }
+.strategy-card:hover { border-color: var(--blue); }
+.strategy-card .name { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
+.strategy-card .desc { color: var(--dim); font-size: 13px; margin-bottom: 10px; }
+.strategy-card .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+.strategy-card .stat { font-size: 12px; }
+.stat-label { color: var(--dim); }
+.stat-value { font-weight: 600; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.tag-entry { background: rgba(63,185,80,0.15); color: var(--green); }
+.tag-exit { background: rgba(248,81,73,0.15); color: var(--red); }
+.tag-maker { background: rgba(188,140,255,0.15); color: var(--purple); }
+.tag-taker { background: rgba(240,136,62,0.15); color: var(--orange); }
+.tag-passive { background: rgba(88,166,255,0.15); color: var(--blue); }
+
+.detail-section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin: 16px 0; display: none; }
+.detail-section.active { display: block; }
+.flow { margin: 12px 0; }
+.flow-step { display: flex; align-items: flex-start; margin: 6px 0; padding: 8px 12px; border-left: 3px solid var(--border); font-size: 13px; }
+.flow-step.check { border-left-color: var(--yellow); }
+.flow-step.action { border-left-color: var(--green); }
+.flow-step.reject { border-left-color: var(--red); }
+.flow-step.exit { border-left-color: var(--orange); }
+.flow-step .num { color: var(--dim); font-weight: 700; min-width: 28px; }
+.flow-step .content { flex: 1; }
+.flow-step code { background: rgba(110,118,129,0.2); padding: 1px 6px; border-radius: 4px; font-size: 12px; color: var(--cyan); }
+.flow-step .reject-text { color: var(--red); font-size: 12px; }
+
+.exit-table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+.exit-table th { text-align: left; padding: 8px 10px; background: rgba(110,118,129,0.1); color: var(--dim); border-bottom: 1px solid var(--border); font-size: 12px; text-transform: uppercase; }
+.exit-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.exit-table tr:hover { background: rgba(110,118,129,0.05); }
+
+.config-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 8px; margin: 8px 0; }
+.config-item { font-size: 12px; padding: 4px 0; }
+.config-item code { color: var(--cyan); }
+.config-item .val { color: var(--yellow); }
+
+.pipeline { background: rgba(88,166,255,0.05); border: 1px solid rgba(88,166,255,0.2); border-radius: 8px; padding: 16px; margin: 16px 0; }
+.pipeline h3 { color: var(--blue); margin-top: 0; }
+.pipe-flow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.pipe-box { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 600; }
+.pipe-arrow { color: var(--dim); font-size: 18px; }
+.pipe-box.green { border-color: var(--green); color: var(--green); }
+.pipe-box.yellow { border-color: var(--yellow); color: var(--yellow); }
+.pipe-box.red { border-color: var(--red); color: var(--red); }
+.pipe-box.blue { border-color: var(--blue); color: var(--blue); }
+.pipe-box.purple { border-color: var(--purple); color: var(--purple); }
+
+.tab-bar { display: flex; gap: 4px; margin: 16px 0 0; flex-wrap: wrap; }
+.tab-btn { padding: 8px 16px; border: 1px solid var(--border); border-bottom: none; border-radius: 6px 6px 0 0; background: transparent; color: var(--dim); cursor: pointer; font-size: 13px; font-weight: 600; }
+.tab-btn.active { background: var(--card); color: var(--text); border-color: var(--blue); }
+.tab-btn:hover { color: var(--text); }
+
+.legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 12px 0; font-size: 12px; }
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+</style>
+</head>
+<body>
+
+<h1>Polymarket HFT Scalper</h1>
+<p class="subtitle">Архітектура платформи — Логіка входу/виходу, порядок перевірок, конфіг-пороги &bull; Всі 5 стратегій</p>
+
+<!-- ===== ГОЛОВНИЙ ПАЙПЛАЙН ===== -->
+<div class="pipeline">
+<h3>Головний цикл (кожні 2.5 секунди)</h3>
+<div class="pipe-flow">
+<div class="pipe-box blue">Сканування ринків</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Завантаження ордербуків</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Тік паперових ордерів</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box yellow">Оцінка ризиків</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Binance Edge</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box green">Генерація сигналів</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box purple">Фільтрація і виконання</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box red">Відстеження заповнень</div>
+</div>
+<p style="font-size:12px;color:var(--dim);margin-top:8px;">Пріоритет сигналів: SNIPER (1200) &gt; OBI (900) &gt; VS_MOMENTUM (900) &gt; OBI_MM (850) &gt; VS_MM (800) &gt; LOTTERY (100). Вищий пріоритет виконується першим. Конфлікти шарів блокують дублювання входів на одному ринку.</p>
+</div>
+
+<div class="legend">
+<div class="legend-item"><div class="legend-dot" style="background:var(--yellow)"></div> Перевірка/Захист</div>
+<div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Дія/Сигнал</div>
+<div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Відхилення/Блокування</div>
+<div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div> Тригер виходу</div>
+</div>
+
+<!-- ===== ОГЛЯД СТРАТЕГІЙ ===== -->
+<h2>Огляд стратегій</h2>
+<div class="overview">
+
+<div class="strategy-card" onclick="showDetail('sniper')">
+<div class="name" style="color:var(--green)">SNIPER</div>
+<div class="desc">Вхід на основі руху Binance. Визначає рух ціни на Binance раніше, ніж Polymarket реагує. Тейкер-вхід, швидкий скальп-вихід.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Вхід:</span> <span class="tag tag-taker">TAKER cross</span></div>
+<div class="stat"><span class="stat-label">Вихід:</span> <span class="tag tag-exit">3 тригери</span></div>
+<div class="stat"><span class="stat-label">Пріоритет:</span> <span class="stat-value">1200</span></div>
+</div>
+</div>
+
+<div class="strategy-card" onclick="showDetail('obi')">
+<div class="name" style="color:var(--blue)">OBI ENGINE</div>
+<div class="desc">Дисбаланс ордербуку. Заходить у тонку сторону, коли одна сторона має &lt;20% загальної ліквідності. Чекає на ребаланс для виходу.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Вхід:</span> <span class="tag tag-maker">MAKER passive</span></div>
+<div class="stat"><span class="stat-label">Вихід:</span> <span class="tag tag-exit">6 тригерів</span></div>
+<div class="stat"><span class="stat-label">Пріоритет:</span> <span class="stat-value">900</span></div>
+</div>
+</div>
+
+<div class="strategy-card" onclick="showDetail('vs')">
+<div class="name" style="color:var(--purple)">VS ENGINE</div>
+<div class="desc">Латенсі-арбітраж Binance. Справедлива ціна через CDF від спотової ціни Binance. Фаза 1: пасивний MM. Фаза 2: агресивний моментум останні 30с.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Вхід:</span> <span class="tag tag-passive">MM passive</span> <span class="tag tag-taker">MOM cross</span></div>
+<div class="stat"><span class="stat-label">Вихід:</span> <span class="tag tag-exit">4 тригери</span></div>
+<div class="stat"><span class="stat-label">Пріоритет:</span> <span class="stat-value">800-900</span></div>
+</div>
+</div>
+
+<div class="strategy-card" onclick="showDetail('lottery')">
+<div class="name" style="color:var(--yellow)">LOTTERY</div>
+<div class="desc">Дешевий квиток на протилежну сторону після Sniper-входу. Купує за $0.12-0.18 з надією на розворот. Високий ризик, висока винагорода.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Вхід:</span> <span class="tag tag-maker">MAKER passive</span></div>
+<div class="stat"><span class="stat-label">Вихід:</span> <span class="tag tag-exit">3 тригери</span></div>
+<div class="stat"><span class="stat-label">Пріоритет:</span> <span class="stat-value">100</span></div>
+</div>
+</div>
+
+<div class="strategy-card" onclick="showDetail('mm')">
+<div class="name" style="color:var(--orange)">MARKET MAKER</div>
+<div class="desc">Квотування після входу. Активується після Sniper-входу, виставляє мейкер-котирування навколо позиції. Контролюється OBI-фільтром.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Вхід:</span> <span class="tag tag-maker">MAKER passive</span></div>
+<div class="stat"><span class="stat-label">Вихід:</span> <span class="tag tag-exit">авто</span></div>
+<div class="stat"><span class="stat-label">Пріоритет:</span> <span class="stat-value">реактивний</span></div>
+</div>
+</div>
+
+</div>
+
+<!-- ===== ПАНЕЛЬ ВКЛАДОК ===== -->
+<div class="tab-bar">
+<button class="tab-btn active" onclick="showDetail('sniper')">SNIPER</button>
+<button class="tab-btn" onclick="showDetail('obi')">OBI ENGINE</button>
+<button class="tab-btn" onclick="showDetail('vs')">VS ENGINE</button>
+<button class="tab-btn" onclick="showDetail('lottery')">LOTTERY</button>
+<button class="tab-btn" onclick="showDetail('mm')">MARKET MAKER</button>
+<button class="tab-btn" onclick="showDetail('execution')">ВИКОНАННЯ ОРДЕРІВ</button>
+<button class="tab-btn" onclick="showDetail('paper')">ПАПЕРОВА ТОРГІВЛЯ</button>
+</div>
+
+<!-- ===== SNIPER ДЕТАЛІ ===== -->
+<div id="detail-sniper" class="detail-section active">
+<h2 style="border:none;margin-top:0;">SNIPER — Вхід на моментумі Binance</h2>
+<p style="color:var(--dim);font-size:13px;">Виявляє рух ціни на Binance до того, як Polymarket скоригує ціну. Перетинає спред, щоб купити очікуваного переможця. Швидкий скальп-вихід на профіті або розвороті.</p>
+
+<h3>Вхід: SNIPER_BUY (пріоритет 1200, терміновість: cross)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content">Дані Binance доступні <span class="reject-text">&rarr; відхилення якщо немає даних</span></div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Напрямок не FLAT <span class="reject-text">&rarr; відхилення якщо <code>direction === 'FLAT'</code></span></div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Мінімальний рух Binance <span class="reject-text">&rarr; відхилення якщо <code>movePct &lt; SNIPER_MIN_BINANCE_MOVE_PCT</code> (0.035%)</span></div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">Підтвердження швидкості <span class="reject-text">&rarr; відхилення якщо <code>velocity &lt; SNIPER_MIN_VELOCITY_PCT_PER_SEC</code> (0.002)</span></div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Захист від втечі <span class="reject-text">&rarr; відхилення якщо рух занадто великий (запобігає гонитві за ціною)</span></div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Кулдаун після збитку <span class="reject-text">&rarr; відхилення якщо нещодавній збиток на цій монеті</span></div></div>
+<div class="flow-step check"><span class="num">7</span><div class="content">Ліквідність ордербуку &ge; <code>MIN_LIQUIDITY_USD</code> ($500)</div></div>
+<div class="flow-step check"><span class="num">8</span><div class="content">Перевірка балансу <span class="reject-text">&rarr; відхилення якщо не вистачає коштів</span></div></div>
+<div class="flow-step check"><span class="num">9</span><div class="content">Прогрів слоту пройдений: <code>elapsed &gt; SNIPER_SLOT_WARMUP_MS</code> (5с)</div></div>
+<div class="flow-step check"><span class="num">10</span><div class="content">Не занадто пізно: <code>remaining &gt; SNIPER_EXIT_BEFORE_END_MS</code> (30с)</div></div>
+<div class="flow-step check"><span class="num">11</span><div class="content">Визначено переможця (UP&rarr;YES або DOWN&rarr;NO)</div></div>
+<div class="flow-step check"><span class="num">12</span><div class="content">Кулдаун ринку: <code>elapsed &gt; SNIPER_COOLDOWN_MS</code> (3с)</div></div>
+<div class="flow-step check"><span class="num">13</span><div class="content">Немає існуючої позиції в протилежному напрямку</div></div>
+<div class="flow-step check"><span class="num">14</span><div class="content">Найкращий аск доступний і в діапазоні: <code>SNIPER_MIN_ENTRY_PRICE</code> (0.03) до <code>SNIPER_MAX_ENTRY_PRICE</code> (0.40)</div></div>
+<div class="flow-step check"><span class="num">15</span><div class="content">Edge по справедливій ціні: <code>impliedFV - bestAsk*(1+fee) &ge; SNIPER_MIN_EDGE_AFTER_FEES</code> (0.025)</div></div>
+<div class="flow-step check"><span class="num">16</span><div class="content">Відставання PM: <code>|FV - bestAsk| &ge; SNIPER_MIN_PM_LAG</code> (0.03)</div></div>
+<div class="flow-step check"><span class="num">17</span><div class="content">Ліміт кореляції: <code>sameDirectionEntries &lt; SNIPER_MAX_CONCURRENT_SAME_DIRECTION</code> (2)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>СИГНАЛ: SNIPER_BUY</strong> &mdash; перетнути спред, купити за <code>bestAsk</code>, шари: 6 (базових) або 6 (сильних якщо рух &gt; порогу)</div></div>
+</div>
+
+<h3>Виходи (перевіряються кожен цикл сканування, спрацьовує перший збіг)</h3>
+<table class="exit-table">
+<tr><th>#</th><th>Тип виходу</th><th>Умова</th><th>Ціна</th><th>Терміновість</th></tr>
+<tr><td>1</td><td style="color:var(--red)">Закриття кінця слоту</td><td><code>remaining &le; SNIPER_EXIT_BEFORE_END_MS</code> (30с)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>2</td><td style="color:var(--green)">Скальп-профіт</td><td><code>bestBid - entryPrice &ge; SNIPER_SCALP_EXIT_EDGE</code> (0.06)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>3</td><td style="color:var(--red)">Стоп на розвороті</td><td>Напрямок Binance розвернувся І <code>loss &ge; SNIPER_STOP_LOSS_PCT</code> (6%)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>4</td><td style="color:var(--yellow)">Трейлінг беззбитку</td><td>Піковий edge був &ge; <code>SNIPER_BREAK_EVEN_EDGE</code> (0.04), але впав до 0</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>5</td><td style="color:var(--orange)">Стоп по часу</td><td><code>holdTime &ge; SNIPER_MAX_HOLD_MS</code> (60с)</td><td>bestBid</td><td>cross</td></tr>
+</table>
+</div>
+
+<!-- ===== OBI ДЕТАЛІ ===== -->
+<div id="detail-obi" class="detail-section">
+<h2 style="border:none;margin-top:0;">OBI ENGINE — Дисбаланс ордербуку</h2>
+<p style="color:var(--dim);font-size:13px;">Основна стратегія з аналізу vague-sourdough. Заходить у тонку сторону незбалансованого ордербуку, чекає на ребаланс. Шар 2: виставляє мейкер-аск після входу.</p>
+
+<h3>Вхід: OBI_ENTRY_BUY (пріоритет 900, терміновість: passive/cross)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content"><code>OBI_ENGINE_ENABLED=true</code></div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Прогрів слоту пройдений (5с з початку слоту)</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Не занадто пізно: <code>remaining &gt; OBI_STOP_ENTRY_BEFORE_END_MS</code> (60с)</div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content"><strong>Аналіз дисбалансу:</strong> розраховує <code>thinRatio = thinSideDepth / thickSideDepth</code> для YES і NO</div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Поріг дисбалансу: <code>thinRatio &lt; OBI_ENTRY_IMBALANCE_RATIO</code> (0.20) <span class="reject-text">&rarr; відхилення якщо бук збалансований</span></div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Глибина тонкої сторони &ge; <code>OBI_THIN_THRESHOLD_USD</code> ($8) <span class="reject-text">&rarr; відхилення якщо тонка сторона порожня</span></div></div>
+<div class="flow-step check"><span class="num">7</span><div class="content">Загальна ліквідність &ge; <code>OBI_MIN_LIQUIDITY_USD</code> ($500) <span class="reject-text">&rarr; відхилення якщо неліквідний ринок</span></div></div>
+<div class="flow-step check"><span class="num">8</span><div class="content">Діапазон ціни: bestAsk &le; <code>OBI_MAX_ENTRY_PRICE</code> (0.49)</div></div>
+<div class="flow-step check"><span class="num">9</span><div class="content">Немає існуючої позиції на цьому ринку</div></div>
+<div class="flow-step check"><span class="num">10</span><div class="content"><strong>Binance-ворота:</strong> немає втечі, не проти напрямку, вирівнювання якщо потрібно</div></div>
+<div class="flow-step check"><span class="num">11</span><div class="content">Кулдаун ринку: <code>elapsed &gt; OBI_COOLDOWN_MS</code> (5с)</div></div>
+<div class="flow-step check"><span class="num">12</span><div class="content">Кулдаун після збитку (немає нещодавнього збитку на цій монеті)</div></div>
+<div class="flow-step check"><span class="num">13</span><div class="content">Перевірка балансу</div></div>
+<div class="flow-step check"><span class="num">14</span><div class="content">Перевірка тіньового режиму <span class="reject-text">&rarr; якщо тіньовий, тільки логування, повернути []</span></div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>СИГНАЛ: OBI_ENTRY_BUY</strong> &mdash; купити тонку сторону за <code>bestAsk - 1 тік</code> (вершина біду, мейкер). Шари: 6, макс. позиція: 12</div></div>
+</div>
+
+<h3>Шар 2: OBI MM Котирування (після заповнення входу)</h3>
+<div class="flow">
+<div class="flow-step action"><span class="num">A</span><div class="content"><strong>OBI_MM_QUOTE_ASK</strong> (пріоритет 850) &mdash; виставити мейкер-аск за <code>entryPrice + спред</code>. Обмежений <code>OBI_MM_MIN_EDGE</code></div></div>
+<div class="flow-step action"><span class="num">B</span><div class="content"><strong>OBI_MM_QUOTE_BID</strong> (пріоритет 840, опціонально) &mdash; бід на протилежний результат для хеджування</div></div>
+</div>
+
+<h3>Виходи (за пріоритетом)</h3>
+<table class="exit-table">
+<tr><th>#</th><th>Тип виходу</th><th>Умова</th><th>Сигнал</th><th>Терміновість</th></tr>
+<tr><td>1</td><td style="color:var(--red)">Жорсткий стоп</td><td><code>unrealizedPnl &le; -OBI_HARD_STOP_USD</code> (-$3.00)</td><td>OBI_REBALANCE_EXIT</td><td>cross</td></tr>
+<tr><td>2</td><td style="color:var(--red)">Колапс дисбалансу</td><td>Бук повністю розвернувся проти позиції</td><td>OBI_REBALANCE_EXIT</td><td>cross</td></tr>
+<tr><td>3</td><td style="color:var(--red)">Скасування кінця слоту</td><td><code>remaining &le; cancelAllBeforeEndMs</code></td><td>OBI_REBALANCE_EXIT</td><td>cross</td></tr>
+<tr><td>4</td><td style="color:var(--green)">Вихід на ребалансі</td><td><code>ratio &ge; OBI_EXIT_REBALANCE_RATIO</code> (0.65) І <code>bid &ge; entry</code></td><td>OBI_REBALANCE_EXIT</td><td>cross</td></tr>
+<tr><td>5</td><td style="color:var(--green)">Тейк-профіт по часу</td><td>Тримали достатньо довго І <code>bid &gt; entry + minEdge</code></td><td>OBI_SCALP_EXIT</td><td>cross</td></tr>
+<tr><td>6</td><td style="color:var(--green)">Скальп-профіт</td><td><code>bid &ge; entry * (1 + scalpExitEdge)</code></td><td>OBI_SCALP_EXIT</td><td>cross</td></tr>
+</table>
+</div>
+
+<!-- ===== VS ДЕТАЛІ ===== -->
+<div id="detail-vs" class="detail-section">
+<h2 style="border:none;margin-top:0;">VS ENGINE — Латенсі-арбітраж Binance</h2>
+<p style="color:var(--dim);font-size:13px;">Двофазна стратегія на 5-хв слот. Справедлива ціна через CDF: <code>P(Up) = &Phi;((spot - strike) / (&sigma; &middot; &radic;(t/300)))</code></p>
+
+<div class="pipeline" style="margin:16px 0;">
+<h3 style="font-size:14px;">Таймлайн слоту</h3>
+<div class="pipe-flow">
+<div class="pipe-box" style="border-color:var(--dim)">Початок слоту</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box yellow">Прогрів (5с)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box blue">Фаза 1: Пасивний MM (T-300с до T-30с)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box purple">Фаза 2: Моментум (T-30с до T-5с)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box red">Вікно виходу (T-5с)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box" style="border-color:var(--dim)">Кінець слоту</div>
+</div>
+</div>
+
+<h3>Фаза 1: VS_MM_BID / VS_MM_ASK (пріоритет ~800, терміновість: passive)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content"><code>VS_ENGINE_ENABLED=true</code> і не тіньовий режим</div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Фаза = PASSIVE_MM (між прогрівом і T-30с)</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Розрахувати справедливу ціну: <code>FV = &Phi;((spot - strike) / (&sigma; &middot; &radic;(t/300)))</code></div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">Поріг напрямку: <code>|FV - 0.50| &ge; VS_MIN_DIRECTION_THRESHOLD</code> (0.005) <span class="reject-text">&rarr; відхилення якщо FV занадто плоский</span></div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Немає позиції, нижче макс. шарів (<code>VS_MM_MAX_POSITION_SHARES</code> = 12)</div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Кулдаун: <code>elapsed &gt; VS_COOLDOWN_MS</code> (8с)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>VS_MM_BID</strong> за <code>FV - VS_MM_SPREAD_CENTS</code> (пасивний мейкер-бід)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>VS_MM_ASK</strong> за <code>min(entry + VS_MAKER_ASK_MAX_EDGE, VS_TARGET_EXIT_PRICE)</code></div></div>
+</div>
+
+<h3>Фаза 2: VS_MOMENTUM_BUY (пріоритет ~900, терміновість: cross)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content">Фаза = MOMENTUM (останні 30с слоту)</div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Z-оцінка &ge; <code>VS_MOMENTUM_THRESHOLD_SIGMAS</code> (1.0)</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">bestAsk &le; <code>VS_MOMENTUM_MAX_BUY_PRICE</code> (0.85)</div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">Немає існуючої позиції на цьому результаті</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>СИГНАЛ: VS_MOMENTUM_BUY</strong> &mdash; агресивна тейкер-купівля за bestAsk</div></div>
+</div>
+
+<h3>Виходи</h3>
+<table class="exit-table">
+<tr><th>#</th><th>Тип виходу</th><th>Умова</th><th>Ціна</th><th>Терміновість</th></tr>
+<tr><td>1</td><td style="color:var(--red)">Жорсткий стоп</td><td><code>unrealized &le; -VS_HARD_STOP_USD</code> (-$2.00)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>2</td><td style="color:var(--green)">Скальп-вихід</td><td><code>bestBid &ge; VS_TARGET_EXIT_PRICE</code> (0.60)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>3</td><td style="color:var(--green)">MM Аск заповнений</td><td>Мейкер-аск заповнений за <code>entry + VS_MAKER_ASK_MAX_EDGE</code> (0.02)</td><td>limit</td><td>passive</td></tr>
+<tr><td>4</td><td style="color:var(--red)">Вихід по часу</td><td><code>remaining &le; VS_TIME_EXIT_BEFORE_END_MS</code> (5с) І <code>bid &ge; VS_TIME_EXIT_MIN_PRICE</code> (0.30)</td><td>bestBid</td><td>cross</td></tr>
+</table>
+</div>
+
+<!-- ===== LOTTERY ДЕТАЛІ ===== -->
+<div id="detail-lottery" class="detail-section">
+<h2 style="border:none;margin-top:0;">LOTTERY — Дешевий квиток на розворот</h2>
+<p style="color:var(--dim);font-size:13px;">Після Sniper-входу купує дешевий квиток на протилежний результат. Якщо ринок розвернеться — великий виграш. Макс. ризик $3 за квиток.</p>
+
+<h3>Вхід: LOTTERY_BUY (пріоритет 100, терміновість: passive)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content"><code>LOTTERY_LAYER_ENABLED=true</code></div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Тригер: <code>LOTTERY_ONLY_AFTER_SNIPER=true</code> &rarr; тільки після заповнення SNIPER_BUY</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Результат = протилежний снайперу (снайпер купив YES &rarr; лотерея купує NO)</div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">Немає існуючого лотерейного квитка на цей результат</div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Ліміт слоту: <code>tickets &lt; LOTTERY_MAX_PER_SLOT</code> (1)</div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Ціна в діапазоні: <code>LOTTERY_MIN_CENTS</code> (0.12) до <code>LOTTERY_MAX_CENTS</code> (0.18)</div></div>
+<div class="flow-step check"><span class="num">7</span><div class="content">Перевірка ризику: <code>shares * price &le; LOTTERY_MAX_RISK_USDC</code> ($3)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>СИГНАЛ: LOTTERY_BUY</strong> &mdash; пасивний мейкер-бід за <code>min(targetPrice, bestAsk - тік)</code></div></div>
+</div>
+
+<h3>Виходи</h3>
+<table class="exit-table">
+<tr><th>#</th><th>Тип виходу</th><th>Умова</th><th>Ціна</th><th>Терміновість</th></tr>
+<tr><td>1</td><td style="color:var(--green)">Трейлінг тейк-профіт</td><td><code>bid &ge; max(LOTTERY_TAKE_PROFIT_MIN_CENTS, entry * LOTTERY_TAKE_PROFIT_MULTIPLIER)</code></td><td>bestBid</td><td>cross</td></tr>
+<tr><td>2</td><td style="color:var(--red)">Жорсткий стоп</td><td><code>markPrice &le; entry * (1 - LOTTERY_STOP_LOSS_PCT)</code> (50% збиток)</td><td>markPrice</td><td>cross</td></tr>
+<tr><td>3</td><td style="color:var(--red)">Закриття слоту</td><td><code>holdTime &ge; LOTTERY_MAX_HOLD_MS</code> (150с) АБО <code>remaining &le; LOTTERY_EXIT_BEFORE_END_MS</code> (90с)</td><td>markPrice</td><td>cross</td></tr>
+</table>
+</div>
+
+<!-- ===== MM ДЕТАЛІ ===== -->
+<div id="detail-mm" class="detail-section">
+<h2 style="border:none;margin-top:0;">MARKET MAKER — Квотування після входу</h2>
+<p style="color:var(--dim);font-size:13px;">Реактивний шар. Після заповнення Sniper виставляє мейкер-котирування для покращення ціни виходу. Контролюється OBI-фільтром дисбалансу.</p>
+
+<h3>Потік активації</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content"><code>MARKET_MAKER_MODE=true</code> і <code>DYNAMIC_QUOTING_ENABLED=true</code></div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content"><code>MM_AUTO_ACTIVATE_AFTER_SNIPER=true</code> &rarr; спрацьовує після заповнення SNIPER_BUY</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Грейс-вікно: <code>MM_POST_SNIPER_GRACE_WINDOW_MS</code> (15с) після заповнення</div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">OBI-фільтр: якщо <code>ORDER_BOOK_IMBALANCE_ENABLED</code>, перевіряє чи дисбаланс дозволяє котирування</div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Ліміт одночасних ринків: <code>MM_MAX_CONCURRENT_MARKETS</code> (1)</div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Не занадто пізно: <code>remaining &gt; MM_STOP_NEW_ENTRIES_BEFORE_END_MS</code> (90с)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>MM_QUOTE_BID / MM_QUOTE_ASK</strong> &mdash; виставляє бід/аск навколо позиції з <code>MM_MAKER_MIN_EDGE</code> (0.003)</div></div>
+</div>
+
+<h3>Управління котируваннями</h3>
+<table class="exit-table">
+<tr><th>Параметр</th><th>Конфіг</th><th>Значення</th></tr>
+<tr><td>Розмір котирування</td><td><code>MM_QUOTE_SHARES / MM_MAX_QUOTE_SHARES</code></td><td>6 / 12</td></tr>
+<tr><td>Мін. час життя котирування</td><td><code>MM_MIN_QUOTE_LIFETIME_MS</code></td><td>1500мс</td></tr>
+<tr><td>Мертва зона репрайсу</td><td><code>MM_REPRICE_DEADBAND_TICKS</code></td><td>2 тіки</td></tr>
+<tr><td>Блокування токсичного потоку</td><td><code>MM_TOXIC_FLOW_BLOCK_MOVE_PCT</code></td><td>8% несприятливий рух</td></tr>
+<tr><td>Скасувати всі котирування</td><td><code>MM_CANCEL_ALL_QUOTES_BEFORE_END_MS</code></td><td>15с до кінця слоту</td></tr>
+</table>
+</div>
+
+<!-- ===== ВИКОНАННЯ ОРДЕРІВ ===== -->
+<div id="detail-execution" class="detail-section">
+<h2 style="border:none;margin-top:0;">ВИКОНАННЯ ОРДЕРІВ — Модель ціноутворення</h2>
+<p style="color:var(--dim);font-size:13px;">Як сигнали стають ордерами. Три рівні терміновості визначають ціноутворення та поведінку post-only.</p>
+
+<table class="exit-table">
+<tr><th>Терміновість</th><th>Ціна BUY</th><th>Ціна SELL</th><th>PostOnly</th><th>Комісія</th><th>Використовується</th></tr>
+<tr><td style="color:var(--orange);font-weight:700">cross</td><td><code>bestAsk</code></td><td><code>bestBid</code></td><td>ні</td><td>2% тейкер</td><td>SNIPER, VS_MOMENTUM, всі виходи</td></tr>
+<tr><td style="color:var(--blue);font-weight:700">improve</td><td><code>bestBid + improveTicks</code> (макс: ask-1тік)</td><td><code>bestAsk - improveTicks</code> (мін: bid+1тік)</td><td>так</td><td>0% мейкер</td><td>Повторна спроба мейкера</td></tr>
+<tr><td style="color:var(--purple);font-weight:700">passive</td><td><code>min(bestBid, targetPrice)</code> (макс: ask-1тік)</td><td><code>max(bestAsk, targetPrice)</code> (мін: bid+1тік)</td><td>так</td><td>0% мейкер</td><td>LOTTERY, VS_MM, OBI_MM, MM_QUOTE</td></tr>
+</table>
+
+<h3>Особливі випадки</h3>
+<div class="flow">
+<div class="flow-step action"><span class="num">OBI</span><div class="content"><strong>OBI_ENTRY_BUY + passive:</strong> розміщується за <code>bestAsk - 1 тік</code> (вершина біду). Ніколи нижче середини.</div></div>
+<div class="flow-step action"><span class="num">LOT</span><div class="content"><strong>LOTTERY_BUY:</strong> розміщується за <code>min(targetPrice, bestAsk - 1 тік)</code></div></div>
+<div class="flow-step action"><span class="num">EMG</span><div class="content"><strong>Екстрені виходи</strong> (HARD_STOP, SLOT_FLATTEN): завжди <code>cross</code> незалежно від POST_ONLY_ONLY</div></div>
+</div>
+
+<h3>Формула комісії Polymarket</h3>
+<p style="font-size:13px;margin:8px 0;"><code>fee = feeRate &times; min(price, 1 - price) &times; shares</code></p>
+<div class="config-grid">
+<div class="config-item">Комісія мейкера: <code>0%</code></div>
+<div class="config-item">Стандартна тейкер-комісія: <code>2%</code></div>
+<div class="config-item">Висока тейкер-комісія: <code>3.15%</code></div>
+</div>
+</div>
+
+<!-- ===== ПАПЕРОВА ТОРГІВЛЯ ===== -->
+<div id="detail-paper" class="detail-section">
+<h2 style="border:none;margin-top:0;">ПАПЕРОВА ТОРГІВЛЯ — Реалістична симуляція заповнень</h2>
+<p style="color:var(--dim);font-size:13px;">Переписана у фазі 37. Без реальних ордерів. Мейкер-ордери стоять у черзі поки бук не перетне їхню ціну. Тейкер-ордери заповнюються миттєво через прохід по буку.</p>
+
+<div class="pipeline" style="margin:16px 0;">
+<h3 style="font-size:14px;">Потік ордерів</h3>
+<div class="pipe-flow">
+<div class="pipe-box green">Сигнал згенерований</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box yellow">Тейкер чи Мейкер?</div>
+</div>
+<div class="pipe-flow" style="margin-top:8px;">
+<div class="pipe-box" style="border-color:var(--orange);color:var(--orange)">ТЕЙКЕР (cross)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Прохід по рівнях ордербуку</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box red">Застосувати 2% комісію</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box green">Миттєве заповнення</div>
+</div>
+<div class="pipe-flow" style="margin-top:8px;">
+<div class="pipe-box" style="border-color:var(--purple);color:var(--purple)">МЕЙКЕР (passive)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Додати в чергу очікування</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box blue">Кожні 1.5с: перевірка чи бук перетнув</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box green">Заповнення по ліміту (0% комісія)</div>
+</div>
+<div class="pipe-flow" style="margin-top:8px;">
+<div class="pipe-box" style="opacity:0;pointer-events:none">spacer</div>
+<span class="pipe-arrow" style="opacity:0">&rarr;</span>
+<div class="pipe-box" style="opacity:0;pointer-events:none">spacer</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box" style="border-color:var(--dim);color:var(--dim)">АБО: TTL закінчився (5хв)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box red">Незаповнений / прострочений</div>
+</div>
+</div>
+
+<h3>Умова заповнення мейкера</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">BUY</span><div class="content">Заповнюється коли <code>bestAsk &le; limitPrice</code> (хтось продає за вашою ціною або нижче)</div></div>
+<div class="flow-step check"><span class="num">SELL</span><div class="content">Заповнюється коли <code>bestBid &ge; limitPrice</code> (хтось купує за вашою ціною або вище)</div></div>
+</div>
+
+<h3>Аналітика що відстежується</h3>
+<div class="config-grid">
+<div class="config-item">Віртуальний баланс і PnL</div>
+<div class="config-item">Відсоток виграшів (завершені слоти)</div>
+<div class="config-item">Коефіцієнт Шарпа (денні доходи)</div>
+<div class="config-item">Максимальна просадка</div>
+<div class="config-item">Співвідношення мейкер/тейкер заповнень</div>
+<div class="config-item">Розбивка по стратегіях</div>
+<div class="config-item">Відстеження комісій</div>
+<div class="config-item">Кількість очікуваних ордерів</div>
+</div>
+</div>
+
+<script>
+function showDetail(id) {
+  document.querySelectorAll('.detail-section').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  const detail = document.getElementById('detail-' + id);
+  if (detail) detail.classList.add('active');
+  const tabs = document.querySelectorAll('.tab-btn');
+  const names = { sniper: 'SNIPER', obi: 'OBI ENGINE', vs: 'VS ENGINE', lottery: 'LOTTERY', mm: 'MARKET MAKER', execution: 'ВИКОНАННЯ ОРДЕРІВ', paper: 'ПАПЕРОВА ТОРГІВЛЯ' };
+  tabs.forEach(tab => { if (tab.textContent === names[id]) tab.classList.add('active'); });
+}
+</script>
+
+</body>
+</html>

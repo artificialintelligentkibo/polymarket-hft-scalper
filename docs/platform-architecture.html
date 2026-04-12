@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket HFT Scalper — Platform Architecture</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --card: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --dim: #8b949e;
+  --green: #3fb950;
+  --red: #f85149;
+  --blue: #58a6ff;
+  --yellow: #d29922;
+  --purple: #bc8cff;
+  --orange: #f0883e;
+  --cyan: #39d353;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; padding: 20px; line-height: 1.6; }
+h1 { font-size: 28px; margin-bottom: 8px; color: var(--blue); }
+h2 { font-size: 22px; margin: 30px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 16px; margin: 16px 0 8px; color: var(--yellow); }
+.subtitle { color: var(--dim); margin-bottom: 24px; font-size: 14px; }
+.overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 20px 0; }
+.strategy-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; cursor: pointer; transition: border-color 0.2s; }
+.strategy-card:hover { border-color: var(--blue); }
+.strategy-card .name { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
+.strategy-card .desc { color: var(--dim); font-size: 13px; margin-bottom: 10px; }
+.strategy-card .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+.strategy-card .stat { font-size: 12px; }
+.stat-label { color: var(--dim); }
+.stat-value { font-weight: 600; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.tag-entry { background: rgba(63,185,80,0.15); color: var(--green); }
+.tag-exit { background: rgba(248,81,73,0.15); color: var(--red); }
+.tag-maker { background: rgba(188,140,255,0.15); color: var(--purple); }
+.tag-taker { background: rgba(240,136,62,0.15); color: var(--orange); }
+.tag-passive { background: rgba(88,166,255,0.15); color: var(--blue); }
+
+.detail-section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin: 16px 0; display: none; }
+.detail-section.active { display: block; }
+.flow { margin: 12px 0; }
+.flow-step { display: flex; align-items: flex-start; margin: 6px 0; padding: 8px 12px; border-left: 3px solid var(--border); font-size: 13px; }
+.flow-step.check { border-left-color: var(--yellow); }
+.flow-step.action { border-left-color: var(--green); }
+.flow-step.reject { border-left-color: var(--red); }
+.flow-step.exit { border-left-color: var(--orange); }
+.flow-step .num { color: var(--dim); font-weight: 700; min-width: 28px; }
+.flow-step .content { flex: 1; }
+.flow-step code { background: rgba(110,118,129,0.2); padding: 1px 6px; border-radius: 4px; font-size: 12px; color: var(--cyan); }
+.flow-step .reject-text { color: var(--red); font-size: 12px; }
+
+.exit-table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+.exit-table th { text-align: left; padding: 8px 10px; background: rgba(110,118,129,0.1); color: var(--dim); border-bottom: 1px solid var(--border); font-size: 12px; text-transform: uppercase; }
+.exit-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.exit-table tr:hover { background: rgba(110,118,129,0.05); }
+
+.config-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 8px; margin: 8px 0; }
+.config-item { font-size: 12px; padding: 4px 0; }
+.config-item code { color: var(--cyan); }
+.config-item .val { color: var(--yellow); }
+
+.pipeline { background: rgba(88,166,255,0.05); border: 1px solid rgba(88,166,255,0.2); border-radius: 8px; padding: 16px; margin: 16px 0; }
+.pipeline h3 { color: var(--blue); margin-top: 0; }
+.pipe-flow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.pipe-box { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 600; }
+.pipe-arrow { color: var(--dim); font-size: 18px; }
+.pipe-box.green { border-color: var(--green); color: var(--green); }
+.pipe-box.yellow { border-color: var(--yellow); color: var(--yellow); }
+.pipe-box.red { border-color: var(--red); color: var(--red); }
+.pipe-box.blue { border-color: var(--blue); color: var(--blue); }
+.pipe-box.purple { border-color: var(--purple); color: var(--purple); }
+
+.tab-bar { display: flex; gap: 4px; margin: 16px 0 0; flex-wrap: wrap; }
+.tab-btn { padding: 8px 16px; border: 1px solid var(--border); border-bottom: none; border-radius: 6px 6px 0 0; background: transparent; color: var(--dim); cursor: pointer; font-size: 13px; font-weight: 600; }
+.tab-btn.active { background: var(--card); color: var(--text); border-color: var(--blue); }
+.tab-btn:hover { color: var(--text); }
+
+.legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 12px 0; font-size: 12px; }
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+</style>
+</head>
+<body>
+
+<h1>Polymarket HFT Scalper</h1>
+<p class="subtitle">Platform Architecture — Entry/Exit Logic, Check Order, Config Thresholds &bull; All 5 Strategies</p>
+
+<!-- ===== GLOBAL PIPELINE ===== -->
+<div class="pipeline">
+<h3>Main Loop Pipeline (every 2.5s scan cycle)</h3>
+<div class="pipe-flow">
+<div class="pipe-box blue">Scan Markets</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Fetch Orderbooks</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Tick Paper Orders</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box yellow">Risk Assessment</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Binance Edge</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box green">Generate Signals</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box purple">Filter &amp; Execute</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box red">Track Fills</div>
+</div>
+<p style="font-size:12px;color:var(--dim);margin-top:8px;">Signal priority: SNIPER (1200) &gt; OBI (900) &gt; VS_MOMENTUM (900) &gt; OBI_MM (850) &gt; VS_MM (800) &gt; LOTTERY (100). Higher priority executes first. Layer conflicts block duplicate entries on same market.</p>
+</div>
+
+<div class="legend">
+<div class="legend-item"><div class="legend-dot" style="background:var(--yellow)"></div> Check/Guard</div>
+<div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Action/Signal</div>
+<div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Reject/Block</div>
+<div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div> Exit trigger</div>
+</div>
+
+<!-- ===== OVERVIEW CARDS ===== -->
+<h2>Strategies Overview</h2>
+<div class="overview">
+
+<div class="strategy-card" onclick="showDetail('sniper')">
+<div class="name" style="color:var(--green)">SNIPER</div>
+<div class="desc">Binance-led momentum entry. Detects Binance price move before Polymarket reacts. Taker entry, fast scalp exit.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Entry:</span> <span class="tag tag-taker">TAKER cross</span></div>
+<div class="stat"><span class="stat-label">Exit:</span> <span class="tag tag-exit">3 triggers</span></div>
+<div class="stat"><span class="stat-label">Priority:</span> <span class="stat-value">1200</span></div>
+</div>
+</div>
+
+<div class="strategy-card" onclick="showDetail('obi')">
+<div class="name" style="color:var(--blue)">OBI ENGINE</div>
+<div class="desc">Order Book Imbalance. Enters thin side when one side has &lt;20% of total liquidity. Waits for rebalance to exit.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Entry:</span> <span class="tag tag-maker">MAKER passive</span></div>
+<div class="stat"><span class="stat-label">Exit:</span> <span class="tag tag-exit">6 triggers</span></div>
+<div class="stat"><span class="stat-label">Priority:</span> <span class="stat-value">900</span></div>
+</div>
+</div>
+
+<div class="strategy-card" onclick="showDetail('vs')">
+<div class="name" style="color:var(--purple)">VS ENGINE</div>
+<div class="desc">Binance Latency Arb. CDF fair value from Binance spot. Phase 1: passive MM. Phase 2: aggressive momentum last 30s.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Entry:</span> <span class="tag tag-passive">MM passive</span> <span class="tag tag-taker">MOM cross</span></div>
+<div class="stat"><span class="stat-label">Exit:</span> <span class="tag tag-exit">3 triggers</span></div>
+<div class="stat"><span class="stat-label">Priority:</span> <span class="stat-value">800-900</span></div>
+</div>
+</div>
+
+<div class="strategy-card" onclick="showDetail('lottery')">
+<div class="name" style="color:var(--yellow)">LOTTERY</div>
+<div class="desc">Cheap opposite-side ticket after Sniper fill. Buys at $0.12-0.18 hoping for reversal. High risk, high reward.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Entry:</span> <span class="tag tag-maker">MAKER passive</span></div>
+<div class="stat"><span class="stat-label">Exit:</span> <span class="tag tag-exit">3 triggers</span></div>
+<div class="stat"><span class="stat-label">Priority:</span> <span class="stat-value">100</span></div>
+</div>
+</div>
+
+<div class="strategy-card" onclick="showDetail('mm')">
+<div class="name" style="color:var(--orange)">MARKET MAKER</div>
+<div class="desc">Post-fill quoting. Activates after Sniper entry, posts maker quotes around position. Gated by OBI filter.</div>
+<div class="stats">
+<div class="stat"><span class="stat-label">Entry:</span> <span class="tag tag-maker">MAKER passive</span></div>
+<div class="stat"><span class="stat-label">Exit:</span> <span class="tag tag-exit">auto</span></div>
+<div class="stat"><span class="stat-label">Priority:</span> <span class="stat-value">reactive</span></div>
+</div>
+</div>
+
+</div>
+
+<!-- ===== TAB BAR ===== -->
+<div class="tab-bar">
+<button class="tab-btn active" onclick="showDetail('sniper')">SNIPER</button>
+<button class="tab-btn" onclick="showDetail('obi')">OBI ENGINE</button>
+<button class="tab-btn" onclick="showDetail('vs')">VS ENGINE</button>
+<button class="tab-btn" onclick="showDetail('lottery')">LOTTERY</button>
+<button class="tab-btn" onclick="showDetail('mm')">MARKET MAKER</button>
+<button class="tab-btn" onclick="showDetail('execution')">ORDER EXECUTION</button>
+<button class="tab-btn" onclick="showDetail('paper')">PAPER TRADER</button>
+</div>
+
+<!-- ===== SNIPER DETAIL ===== -->
+<div id="detail-sniper" class="detail-section active">
+<h2 style="border:none;margin-top:0;">SNIPER — Binance-Led Momentum Entry</h2>
+<p style="color:var(--dim);font-size:13px;">Detects Binance price movement before Polymarket adjusts. Crosses the spread to buy the expected winner. Fast scalp exit on profit or reversal.</p>
+
+<h3>Entry: SNIPER_BUY (priority 1200, urgency: cross)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content">Binance data available <span class="reject-text">&rarr; reject if no data</span></div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Direction not FLAT <span class="reject-text">&rarr; reject if <code>direction === 'FLAT'</code></span></div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Minimum Binance move <span class="reject-text">&rarr; reject if <code>movePct &lt; SNIPER_MIN_BINANCE_MOVE_PCT</code> (0.035%)</span></div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">Velocity confirmation <span class="reject-text">&rarr; reject if <code>velocity &lt; SNIPER_MIN_VELOCITY_PCT_PER_SEC</code> (0.002)</span></div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Runaway guard <span class="reject-text">&rarr; reject if move too large (prevents chasing)</span></div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Coin losing cooldown <span class="reject-text">&rarr; reject if recent loss on this coin</span></div></div>
+<div class="flow-step check"><span class="num">7</span><div class="content">Orderbook liquidity &ge; <code>MIN_LIQUIDITY_USD</code> ($500)</div></div>
+<div class="flow-step check"><span class="num">8</span><div class="content">Balance pre-flight <span class="reject-text">&rarr; reject if can't afford entry</span></div></div>
+<div class="flow-step check"><span class="num">9</span><div class="content">Slot warmup passed: <code>elapsed &gt; SNIPER_SLOT_WARMUP_MS</code> (5s)</div></div>
+<div class="flow-step check"><span class="num">10</span><div class="content">Not too late: <code>remaining &gt; SNIPER_EXIT_BEFORE_END_MS</code> (30s)</div></div>
+<div class="flow-step check"><span class="num">11</span><div class="content">Expected winner resolved (UP&rarr;YES or DOWN&rarr;NO)</div></div>
+<div class="flow-step check"><span class="num">12</span><div class="content">Market cooldown: <code>elapsed &gt; SNIPER_COOLDOWN_MS</code> (3s)</div></div>
+<div class="flow-step check"><span class="num">13</span><div class="content">No existing position in opposite direction</div></div>
+<div class="flow-step check"><span class="num">14</span><div class="content">Best ask available and in range: <code>SNIPER_MIN_ENTRY_PRICE</code> (0.03) to <code>SNIPER_MAX_ENTRY_PRICE</code> (0.40)</div></div>
+<div class="flow-step check"><span class="num">15</span><div class="content">Fair value edge: <code>impliedFV - bestAsk*(1+fee) &ge; SNIPER_MIN_EDGE_AFTER_FEES</code> (0.025)</div></div>
+<div class="flow-step check"><span class="num">16</span><div class="content">PM lag: <code>|FV - bestAsk| &ge; SNIPER_MIN_PM_LAG</code> (0.03)</div></div>
+<div class="flow-step check"><span class="num">17</span><div class="content">Correlation limit: <code>sameDirectionEntries &lt; SNIPER_MAX_CONCURRENT_SAME_DIRECTION</code> (2)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>SIGNAL: SNIPER_BUY</strong> &mdash; cross spread, buy at <code>bestAsk</code>, shares: 6 (base) or 6 (strong if move &gt; threshold)</div></div>
+</div>
+
+<h3>Exits (checked every scan cycle, first match fires)</h3>
+<table class="exit-table">
+<tr><th>#</th><th>Exit Type</th><th>Condition</th><th>Price</th><th>Urgency</th></tr>
+<tr><td>1</td><td style="color:var(--red)">Slot-End Flatten</td><td><code>remaining &le; SNIPER_EXIT_BEFORE_END_MS</code> (30s)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>2</td><td style="color:var(--green)">Scalp Profit</td><td><code>bestBid - entryPrice &ge; SNIPER_SCALP_EXIT_EDGE</code> (0.06)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>3</td><td style="color:var(--red)">Reversal Stop</td><td>Binance direction flipped AND <code>loss &ge; SNIPER_STOP_LOSS_PCT</code> (6%)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>4</td><td style="color:var(--yellow)">Break-Even Trail</td><td>Peak edge was &ge; <code>SNIPER_BREAK_EVEN_EDGE</code> (0.04) but fell to 0</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>5</td><td style="color:var(--orange)">Time Stop</td><td><code>holdTime &ge; SNIPER_MAX_HOLD_MS</code> (60s)</td><td>bestBid</td><td>cross</td></tr>
+</table>
+</div>
+
+<!-- ===== OBI DETAIL ===== -->
+<div id="detail-obi" class="detail-section">
+<h2 style="border:none;margin-top:0;">OBI ENGINE — Order Book Imbalance</h2>
+<p style="color:var(--dim);font-size:13px;">Core strategy from vague-sourdough analysis. Enters the thin side of an imbalanced orderbook, waits for rebalance. Layer 2: posts maker ask after entry.</p>
+
+<h3>Entry: OBI_ENTRY_BUY (priority 900, urgency: passive/cross)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content"><code>OBI_ENGINE_ENABLED=true</code></div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Slot warmup passed (5s since slot start)</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Not too late: <code>remaining &gt; OBI_STOP_ENTRY_BEFORE_END_MS</code> (60s)</div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content"><strong>Imbalance analysis:</strong> compute <code>thinRatio = thinSideDepth / thickSideDepth</code> for YES and NO</div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Imbalance threshold: <code>thinRatio &lt; OBI_ENTRY_IMBALANCE_RATIO</code> (0.20) <span class="reject-text">&rarr; reject if book balanced</span></div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Thin side depth &ge; <code>OBI_THIN_THRESHOLD_USD</code> ($8) <span class="reject-text">&rarr; reject if thin side too empty</span></div></div>
+<div class="flow-step check"><span class="num">7</span><div class="content">Total liquidity &ge; <code>OBI_MIN_LIQUIDITY_USD</code> ($500) <span class="reject-text">&rarr; reject if illiquid market</span></div></div>
+<div class="flow-step check"><span class="num">8</span><div class="content">Price range: bestAsk &le; <code>OBI_MAX_ENTRY_PRICE</code> (0.49)</div></div>
+<div class="flow-step check"><span class="num">9</span><div class="content">No existing position on this market</div></div>
+<div class="flow-step check"><span class="num">10</span><div class="content"><strong>Binance gate:</strong> not runaway, not contra-direction, alignment if required</div></div>
+<div class="flow-step check"><span class="num">11</span><div class="content">Market cooldown: <code>elapsed &gt; OBI_COOLDOWN_MS</code> (5s)</div></div>
+<div class="flow-step check"><span class="num">12</span><div class="content">Coin losing cooldown (no recent loss on same coin)</div></div>
+<div class="flow-step check"><span class="num">13</span><div class="content">Balance pre-flight check</div></div>
+<div class="flow-step check"><span class="num">14</span><div class="content">Shadow mode check <span class="reject-text">&rarr; if shadow, log only, return []</span></div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>SIGNAL: OBI_ENTRY_BUY</strong> &mdash; buy thin side at <code>bestAsk - 1 tick</code> (top of bid, maker). Shares: 6, max position: 12</div></div>
+</div>
+
+<h3>Layer 2: OBI MM Quotes (after entry fill)</h3>
+<div class="flow">
+<div class="flow-step action"><span class="num">A</span><div class="content"><strong>OBI_MM_QUOTE_ASK</strong> (priority 850) &mdash; post maker ask at <code>entryPrice + spread</code>. Capped by <code>OBI_MM_MIN_EDGE</code></div></div>
+<div class="flow-step action"><span class="num">B</span><div class="content"><strong>OBI_MM_QUOTE_BID</strong> (priority 840, optional) &mdash; bid opposite outcome for hedging</div></div>
+</div>
+
+<h3>Exits (priority order)</h3>
+<table class="exit-table">
+<tr><th>#</th><th>Exit Type</th><th>Condition</th><th>Signal</th><th>Urgency</th></tr>
+<tr><td>1</td><td style="color:var(--red)">Hard Stop</td><td><code>unrealizedPnl &le; -OBI_HARD_STOP_USD</code> (-$3.00)</td><td>OBI_REBALANCE_EXIT</td><td>cross</td></tr>
+<tr><td>2</td><td style="color:var(--red)">Imbalance Collapse</td><td>Book fully reversed against position</td><td>OBI_REBALANCE_EXIT</td><td>cross</td></tr>
+<tr><td>3</td><td style="color:var(--red)">Slot-End Cancel</td><td><code>remaining &le; cancelAllBeforeEndMs</code></td><td>OBI_REBALANCE_EXIT</td><td>cross</td></tr>
+<tr><td>4</td><td style="color:var(--green)">Rebalance Exit</td><td><code>ratio &ge; OBI_EXIT_REBALANCE_RATIO</code> (0.65) AND <code>bid &ge; entry</code></td><td>OBI_REBALANCE_EXIT</td><td>cross</td></tr>
+<tr><td>5</td><td style="color:var(--green)">Time Take-Profit</td><td>Held long enough AND <code>bid &gt; entry + minEdge</code></td><td>OBI_SCALP_EXIT</td><td>cross</td></tr>
+<tr><td>6</td><td style="color:var(--green)">Scalp Profit</td><td><code>bid &ge; entry * (1 + scalpExitEdge)</code></td><td>OBI_SCALP_EXIT</td><td>cross</td></tr>
+</table>
+</div>
+
+<!-- ===== VS DETAIL ===== -->
+<div id="detail-vs" class="detail-section">
+<h2 style="border:none;margin-top:0;">VS ENGINE — Binance Latency Arbitrage</h2>
+<p style="color:var(--dim);font-size:13px;">Two-phase strategy per 5-min slot. Fair value from CDF: <code>P(Up) = &Phi;((spot - strike) / (&sigma; &middot; &radic;(t/300)))</code></p>
+
+<div class="pipeline" style="margin:16px 0;">
+<h3 style="font-size:14px;">Slot Timeline</h3>
+<div class="pipe-flow">
+<div class="pipe-box" style="border-color:var(--dim)">Slot Start</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box yellow">Warmup (5s)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box blue">Phase 1: Passive MM (T-300s to T-30s)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box purple">Phase 2: Momentum (T-30s to T-5s)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box red">Exit Window (T-5s)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box" style="border-color:var(--dim)">Slot End</div>
+</div>
+</div>
+
+<h3>Phase 1: VS_MM_BID / VS_MM_ASK (priority ~800, urgency: passive)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content"><code>VS_ENGINE_ENABLED=true</code> and not shadow mode</div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Phase = PASSIVE_MM (between warmup and T-30s)</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Calculate fair value: <code>FV = &Phi;((spot - strike) / (&sigma; &middot; &radic;(t/300)))</code></div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">Direction threshold: <code>|FV - 0.50| &ge; VS_MIN_DIRECTION_THRESHOLD</code> (0.005) <span class="reject-text">&rarr; reject if FV too flat</span></div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">No existing position, below max shares (<code>VS_MM_MAX_POSITION_SHARES</code> = 12)</div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Cooldown: <code>elapsed &gt; VS_COOLDOWN_MS</code> (8s)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>VS_MM_BID</strong> at <code>FV - VS_MM_SPREAD_CENTS</code> (passive maker bid)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>VS_MM_ASK</strong> at <code>min(entry + VS_MAKER_ASK_MAX_EDGE, VS_TARGET_EXIT_PRICE)</code></div></div>
+</div>
+
+<h3>Phase 2: VS_MOMENTUM_BUY (priority ~900, urgency: cross)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content">Phase = MOMENTUM (last 30s of slot)</div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Z-score &ge; <code>VS_MOMENTUM_THRESHOLD_SIGMAS</code> (1.0)</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">bestAsk &le; <code>VS_MOMENTUM_MAX_BUY_PRICE</code> (0.85)</div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">No existing position on this outcome</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>SIGNAL: VS_MOMENTUM_BUY</strong> &mdash; aggressive taker buy at bestAsk</div></div>
+</div>
+
+<h3>Exits</h3>
+<table class="exit-table">
+<tr><th>#</th><th>Exit Type</th><th>Condition</th><th>Price</th><th>Urgency</th></tr>
+<tr><td>1</td><td style="color:var(--red)">Hard Stop</td><td><code>unrealized &le; -VS_HARD_STOP_USD</code> (-$2.00)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>2</td><td style="color:var(--green)">Scalp Exit</td><td><code>bestBid &ge; VS_TARGET_EXIT_PRICE</code> (0.60)</td><td>bestBid</td><td>cross</td></tr>
+<tr><td>3</td><td style="color:var(--green)">MM Ask Fill</td><td>Maker ask filled at <code>entry + VS_MAKER_ASK_MAX_EDGE</code> (0.02)</td><td>limit</td><td>passive</td></tr>
+<tr><td>4</td><td style="color:var(--red)">Time Exit</td><td><code>remaining &le; VS_TIME_EXIT_BEFORE_END_MS</code> (5s) AND <code>bid &ge; VS_TIME_EXIT_MIN_PRICE</code> (0.30)</td><td>bestBid</td><td>cross</td></tr>
+</table>
+</div>
+
+<!-- ===== LOTTERY DETAIL ===== -->
+<div id="detail-lottery" class="detail-section">
+<h2 style="border:none;margin-top:0;">LOTTERY — Cheap Reversal Ticket</h2>
+<p style="color:var(--dim);font-size:13px;">After Sniper entry, buys a cheap ticket on the opposite outcome. If market reverses, pays big. Max risk $3 per ticket.</p>
+
+<h3>Entry: LOTTERY_BUY (priority 100, urgency: passive)</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content"><code>LOTTERY_LAYER_ENABLED=true</code></div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content">Trigger: <code>LOTTERY_ONLY_AFTER_SNIPER=true</code> &rarr; only after SNIPER_BUY fill</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Outcome = opposite of sniper entry (sniper bought YES &rarr; lottery buys NO)</div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">No existing lottery ticket on this outcome</div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Slot limit: <code>tickets &lt; LOTTERY_MAX_PER_SLOT</code> (1)</div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Price in range: <code>LOTTERY_MIN_CENTS</code> (0.12) to <code>LOTTERY_MAX_CENTS</code> (0.18)</div></div>
+<div class="flow-step check"><span class="num">7</span><div class="content">Risk check: <code>shares * price &le; LOTTERY_MAX_RISK_USDC</code> ($3)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>SIGNAL: LOTTERY_BUY</strong> &mdash; passive maker bid at <code>min(targetPrice, bestAsk - tick)</code></div></div>
+</div>
+
+<h3>Exits</h3>
+<table class="exit-table">
+<tr><th>#</th><th>Exit Type</th><th>Condition</th><th>Price</th><th>Urgency</th></tr>
+<tr><td>1</td><td style="color:var(--green)">Trailing Take-Profit</td><td><code>bid &ge; max(LOTTERY_TAKE_PROFIT_MIN_CENTS, entry * LOTTERY_TAKE_PROFIT_MULTIPLIER)</code></td><td>bestBid</td><td>cross</td></tr>
+<tr><td>2</td><td style="color:var(--red)">Hard Stop</td><td><code>markPrice &le; entry * (1 - LOTTERY_STOP_LOSS_PCT)</code> (50% loss)</td><td>markPrice</td><td>cross</td></tr>
+<tr><td>3</td><td style="color:var(--red)">Slot Flatten</td><td><code>holdTime &ge; LOTTERY_MAX_HOLD_MS</code> (150s) OR <code>remaining &le; LOTTERY_EXIT_BEFORE_END_MS</code> (90s)</td><td>markPrice</td><td>cross</td></tr>
+</table>
+</div>
+
+<!-- ===== MM DETAIL ===== -->
+<div id="detail-mm" class="detail-section">
+<h2 style="border:none;margin-top:0;">MARKET MAKER — Post-Fill Quoting</h2>
+<p style="color:var(--dim);font-size:13px;">Reactive layer. After Sniper fills, posts maker quotes to improve exit price. Gated by OBI imbalance filter.</p>
+
+<h3>Activation Flow</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">1</span><div class="content"><code>MARKET_MAKER_MODE=true</code> and <code>DYNAMIC_QUOTING_ENABLED=true</code></div></div>
+<div class="flow-step check"><span class="num">2</span><div class="content"><code>MM_AUTO_ACTIVATE_AFTER_SNIPER=true</code> &rarr; triggers on SNIPER_BUY fill</div></div>
+<div class="flow-step check"><span class="num">3</span><div class="content">Grace window: <code>MM_POST_SNIPER_GRACE_WINDOW_MS</code> (15s) after fill</div></div>
+<div class="flow-step check"><span class="num">4</span><div class="content">OBI filter gate: if <code>ORDER_BOOK_IMBALANCE_ENABLED</code>, checks imbalance allows quoting</div></div>
+<div class="flow-step check"><span class="num">5</span><div class="content">Concurrent limit: <code>MM_MAX_CONCURRENT_MARKETS</code> (1)</div></div>
+<div class="flow-step check"><span class="num">6</span><div class="content">Not too late: <code>remaining &gt; MM_STOP_NEW_ENTRIES_BEFORE_END_MS</code> (90s)</div></div>
+<div class="flow-step action"><span class="num">&check;</span><div class="content"><strong>MM_QUOTE_BID / MM_QUOTE_ASK</strong> &mdash; posts bid/ask around position with <code>MM_MAKER_MIN_EDGE</code> (0.003)</div></div>
+</div>
+
+<h3>Quote Management</h3>
+<table class="exit-table">
+<tr><th>Feature</th><th>Config</th><th>Value</th></tr>
+<tr><td>Quote size</td><td><code>MM_QUOTE_SHARES / MM_MAX_QUOTE_SHARES</code></td><td>6 / 12</td></tr>
+<tr><td>Min quote lifetime</td><td><code>MM_MIN_QUOTE_LIFETIME_MS</code></td><td>1500ms</td></tr>
+<tr><td>Reprice deadband</td><td><code>MM_REPRICE_DEADBAND_TICKS</code></td><td>2 ticks</td></tr>
+<tr><td>Toxic flow block</td><td><code>MM_TOXIC_FLOW_BLOCK_MOVE_PCT</code></td><td>8% adverse move</td></tr>
+<tr><td>Cancel all quotes</td><td><code>MM_CANCEL_ALL_QUOTES_BEFORE_END_MS</code></td><td>15s before slot end</td></tr>
+</table>
+</div>
+
+<!-- ===== ORDER EXECUTION DETAIL ===== -->
+<div id="detail-execution" class="detail-section">
+<h2 style="border:none;margin-top:0;">ORDER EXECUTION — Pricing Model</h2>
+<p style="color:var(--dim);font-size:13px;">How signals become orders. Three urgency levels determine pricing and post-only behavior.</p>
+
+<table class="exit-table">
+<tr><th>Urgency</th><th>BUY Price</th><th>SELL Price</th><th>PostOnly</th><th>Fee</th><th>Used By</th></tr>
+<tr><td style="color:var(--orange);font-weight:700">cross</td><td><code>bestAsk</code></td><td><code>bestBid</code></td><td>false</td><td>2% taker</td><td>SNIPER, VS_MOMENTUM, all exits</td></tr>
+<tr><td style="color:var(--blue);font-weight:700">improve</td><td><code>bestBid + improveTicks</code> (cap: ask-1tick)</td><td><code>bestAsk - improveTicks</code> (floor: bid+1tick)</td><td>true</td><td>0% maker</td><td>Maker fallback retry</td></tr>
+<tr><td style="color:var(--purple);font-weight:700">passive</td><td><code>min(bestBid, targetPrice)</code> (cap: ask-1tick)</td><td><code>max(bestAsk, targetPrice)</code> (floor: bid+1tick)</td><td>true</td><td>0% maker</td><td>LOTTERY, VS_MM, OBI_MM, MM_QUOTE</td></tr>
+</table>
+
+<h3>Special Cases</h3>
+<div class="flow">
+<div class="flow-step action"><span class="num">OBI</span><div class="content"><strong>OBI_ENTRY_BUY + passive:</strong> placed at <code>bestAsk - 1 tick</code> (top of bid). Never below mid.</div></div>
+<div class="flow-step action"><span class="num">LOT</span><div class="content"><strong>LOTTERY_BUY:</strong> placed at <code>min(targetPrice, bestAsk - 1 tick)</code></div></div>
+<div class="flow-step action"><span class="num">EMG</span><div class="content"><strong>Emergency exits</strong> (HARD_STOP, SLOT_FLATTEN): always <code>cross</code> regardless of POST_ONLY_ONLY setting</div></div>
+</div>
+
+<h3>Polymarket Fee Formula</h3>
+<p style="font-size:13px;margin:8px 0;"><code>fee = feeRate &times; min(price, 1 - price) &times; shares</code></p>
+<div class="config-grid">
+<div class="config-item">Maker fee: <code>0%</code></div>
+<div class="config-item">Standard taker fee: <code>2%</code></div>
+<div class="config-item">High-fee taker: <code>3.15%</code></div>
+</div>
+</div>
+
+<!-- ===== PAPER TRADER DETAIL ===== -->
+<div id="detail-paper" class="detail-section">
+<h2 style="border:none;margin-top:0;">PAPER TRADER — Realistic Fill Simulation</h2>
+<p style="color:var(--dim);font-size:13px;">Phase 37 rewrite. No real orders. Maker orders queue until book crosses. Taker orders fill instantly via book walk.</p>
+
+<div class="pipeline" style="margin:16px 0;">
+<h3 style="font-size:14px;">Order Flow</h3>
+<div class="pipe-flow">
+<div class="pipe-box green">Signal Generated</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box yellow">Taker or Maker?</div>
+</div>
+<div class="pipe-flow" style="margin-top:8px;">
+<div class="pipe-box" style="border-color:var(--orange);color:var(--orange)">TAKER (cross)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Walk orderbook levels</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box red">Apply 2% fee</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box green">Instant fill</div>
+</div>
+<div class="pipe-flow" style="margin-top:8px;">
+<div class="pipe-box" style="border-color:var(--purple);color:var(--purple)">MAKER (passive)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box">Add to pending queue</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box blue">Every 1.5s: check if book crossed</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box green">Fill at limit (0% fee)</div>
+</div>
+<div class="pipe-flow" style="margin-top:8px;">
+<div class="pipe-box" style="opacity:0;pointer-events:none">spacer</div>
+<span class="pipe-arrow" style="opacity:0">&rarr;</span>
+<div class="pipe-box" style="opacity:0;pointer-events:none">spacer</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box" style="border-color:var(--dim);color:var(--dim)">OR: TTL expires (5min)</div>
+<span class="pipe-arrow">&rarr;</span>
+<div class="pipe-box red">Unfilled / expired</div>
+</div>
+</div>
+
+<h3>Maker Fill Condition</h3>
+<div class="flow">
+<div class="flow-step check"><span class="num">BUY</span><div class="content">Fills when <code>bestAsk &le; limitPrice</code> (someone sells at or below your bid)</div></div>
+<div class="flow-step check"><span class="num">SELL</span><div class="content">Fills when <code>bestBid &ge; limitPrice</code> (someone buys at or above your ask)</div></div>
+</div>
+
+<h3>Analytics Tracked</h3>
+<div class="config-grid">
+<div class="config-item">Virtual balance &amp; PnL</div>
+<div class="config-item">Win rate (resolved slots)</div>
+<div class="config-item">Sharpe ratio (daily returns)</div>
+<div class="config-item">Max drawdown</div>
+<div class="config-item">Maker vs taker fill ratio</div>
+<div class="config-item">Per-strategy breakdown</div>
+<div class="config-item">Fee tracking</div>
+<div class="config-item">Pending order count</div>
+</div>
+</div>
+
+<script>
+function showDetail(id) {
+  document.querySelectorAll('.detail-section').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  const detail = document.getElementById('detail-' + id);
+  if (detail) detail.classList.add('active');
+  const tabs = document.querySelectorAll('.tab-btn');
+  const names = { sniper: 'SNIPER', obi: 'OBI ENGINE', vs: 'VS ENGINE', lottery: 'LOTTERY', mm: 'MARKET MAKER', execution: 'ORDER EXECUTION', paper: 'PAPER TRADER' };
+  tabs.forEach(tab => { if (tab.textContent === names[id]) tab.classList.add('active'); });
+}
+</script>
+
+</body>
+</html>
