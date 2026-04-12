@@ -389,6 +389,8 @@ export function extractCoinFromObiTitle(title: string): string | null {
 export class ObiEngine {
   private readonly positions = new Map<string, ObiPosition>();
   private readonly lastEntryMs = new Map<string, number>();
+  /** Phase 36: last computed imbalance ratio per market (for slot replay). */
+  private readonly lastImbalanceRatios = new Map<string, number>();
   /** Phase 21 diagnostic: throttle "no candidates" log to once per market+slot. */
   private readonly lastDiagLogMs = new Map<string, number>();
   /** Markets where we recently exited at a loss — extra cooldown applies. */
@@ -717,6 +719,11 @@ export class ObiEngine {
       const thinDepth = thinSide === 'bid' ? bidDepth : askDepth;
       const thickDepth = thinSide === 'bid' ? askDepth : bidDepth;
       const ratio = safeRatio(thinDepth, thickDepth);
+      // Phase 36: cache best (lowest) ratio for slot replay
+      const prevRatio = this.lastImbalanceRatios.get(market.marketId);
+      if (prevRatio === undefined || ratio < prevRatio) {
+        this.lastImbalanceRatios.set(market.marketId, ratio);
+      }
 
       if (thinDepth >= config.thinThresholdUsd) {
         skipReasons.push({ outcome, reason: 'not_thin', detail: `thinSide=${thinSide} depth=$${thinDepth.toFixed(2)} threshold=$${config.thinThresholdUsd}` });
@@ -1899,6 +1906,12 @@ export class ObiEngine {
     this.positions.delete(marketId);
     this.lastEntryMs.delete(marketId);
     this.lastOrphanEmitMs.delete(marketId);
+    this.lastImbalanceRatios.delete(marketId);
+  }
+
+  /** Phase 36: last computed imbalance ratio for slot replay tracker. */
+  getLastImbalanceRatio(marketId: string): number | null {
+    return this.lastImbalanceRatios.get(marketId) ?? null;
   }
 
   /** Operational counters for the dashboard. */

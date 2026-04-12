@@ -382,6 +382,9 @@ export interface AppConfig {
   readonly STATE_FILE: string;
   readonly REPORTS_FOLDER: string;
   readonly REPORTS_FILE_PREFIX: string;
+  /** Phase 36: slot replay tracker for post-session analysis */
+  readonly SLOT_REPLAY_ENABLED: boolean;
+  readonly SLOT_REPLAY_SNAPSHOT_INTERVAL_MS: number;
   readonly POLYMARKET_API_KEY: string;
   readonly POLYMARKET_API_KEY_ADDRESS: string;
   readonly POLYMARKET_API_SECRET: string;
@@ -1014,6 +1017,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       `${reportsDir}/state.json`,
     REPORTS_FOLDER: reportsDir,
     REPORTS_FILE_PREFIX: reportsFilePrefix,
+    SLOT_REPLAY_ENABLED: parseBoolean(env.SLOT_REPLAY_ENABLED, true),
+    SLOT_REPLAY_SNAPSHOT_INTERVAL_MS: Math.max(
+      5_000,
+      parseIntOrDefault(env.SLOT_REPLAY_SNAPSHOT_INTERVAL_MS, '30000')
+    ),
     POLYMARKET_API_KEY: (
       env.POLYMARKET_API_KEY ||
       env.RELAYER_API_KEY ||

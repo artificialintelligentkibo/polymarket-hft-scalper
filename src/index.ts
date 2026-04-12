@@ -43,6 +43,7 @@ import { OrderBookImbalanceFilter } from './order-book-imbalance.js';
 import { ObiEngine, extractCoinFromObiTitle } from './obi-engine.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
 import { VsEngine } from './vs-engine.js';
+import { SlotReplayTracker } from './slot-replay-tracker.js';
 import { meetsClobMinimums, resolveMinimumTradableShares, MIN_CLOB_ORDER_SHARES } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
 import { ProductTestModeController } from './product-test-mode.js';
@@ -181,6 +182,10 @@ export class MarketMakerRuntime {
   private readonly orderBookImbalance = new OrderBookImbalanceFilter(config.orderBookImbalance);
   private readonly obiEngine = new ObiEngine();
   private readonly vsEngine = new VsEngine();
+  private readonly slotReplay = new SlotReplayTracker({
+    reportsDir: config.REPORTS_DIR,
+    snapshotIntervalMs: config.SLOT_REPLAY_SNAPSHOT_INTERVAL_MS,
+  });
   private readonly redeemer = new AutoRedeemer();
   private readonly narrator = new TradeNarrator(config.REPORTS_DIR);
   private readonly resolutionChecker = new ResolutionChecker();
@@ -952,6 +957,8 @@ export class MarketMakerRuntime {
       this.settlementCooldowns.clear();
       this.settlementStartedAt.clear();
       this.settlementAttempts.clear();
+      this.slotReplay.clearState(); // Phase 36: clear all pending replay state on reset
+      this.slotStrategyClaim.clear(); // Phase 35C
       for (const timer of this.paperResolutionTimers.values()) {
         clearTimeout(timer);
       }
@@ -1629,6 +1636,34 @@ export class MarketMakerRuntime {
     // flag so OBI exit signals can re-engage instead of waiting for redeem.
     this.recheckDustAbandonmentOnRecovery(market, orderbook);
 
+    // Phase 36: slot replay — track price snapshots for post-session analysis.
+    if (config.SLOT_REPLAY_ENABLED) {
+      const replayCoin = extractCoinFromTitle(market.title);
+      this.slotReplay.ensureSlot({
+        marketId: market.marketId,
+        conditionId: market.conditionId,
+        title: market.title,
+        coin: replayCoin,
+        startTime: market.startTime,
+        endTime: market.endTime,
+      });
+      const replayBinanceSpot = replayCoin
+        ? this.binanceEdge.getLatestPrice(replayCoin)
+        : null;
+      const replayFv = this.vsEngine.getLastFairValue(market.marketId);
+      const replayObiRatio = this.obiEngine.getLastImbalanceRatio(market.marketId);
+      this.slotReplay.recordSnapshot({
+        marketId: market.marketId,
+        yesBid: orderbook.yes.bestBid,
+        yesAsk: orderbook.yes.bestAsk,
+        noBid: orderbook.no.bestBid,
+        noAsk: orderbook.no.bestAsk,
+        binanceSpot: replayBinanceSpot,
+        fairValue: replayFv,
+        obiRatio: replayObiRatio,
+      });
+    }
+
     // Phase 30: Multi-strategy signal generation.
     // In ALL mode, both OBI and Sniper engines generate signals independently.
     // In ORDER_BOOK_IMBALANCE mode, only OBI runs (Sniper is disabled at config level).
@@ -2235,6 +2270,19 @@ export class MarketMakerRuntime {
           obiCoin,
           `${executionSignal.outcome} ${effectiveShares}sh @${roundTo(effectivePrice, 3)}`
         );
+        // Phase 36: slot replay entry
+        if (config.SLOT_REPLAY_ENABLED) {
+          this.slotReplay.recordEntry({
+            marketId: market.marketId,
+            price: effectivePrice,
+            shares: effectiveShares,
+            outcome: executionSignal.outcome,
+            signalType: executionSignal.signalType,
+            binanceSpot: this.binanceEdge.getLatestPrice(obiCoin ?? '') ?? null,
+            fairValue: null,
+            strategy: 'OBI',
+          });
+        }
         const totalLiveShares = positionManager.getShares(executionSignal.outcome);
         const mmSignals = this.obiEngine.onEntryFill({
           marketId: market.marketId,
@@ -2486,6 +2534,20 @@ export class MarketMakerRuntime {
           vsCoin,
           `${executionSignal.outcome} ${effectiveShares}sh @${roundTo(effectivePrice, 3)} [${vsPhase}]`
         );
+        // Phase 36: slot replay entry
+        if (config.SLOT_REPLAY_ENABLED) {
+          this.slotReplay.recordEntry({
+            marketId: market.marketId,
+            price: effectivePrice,
+            shares: effectiveShares,
+            outcome: executionSignal.outcome,
+            signalType: executionSignal.signalType,
+            binanceSpot: this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? null,
+            fairValue: this.vsEngine.getLastFairValue(market.marketId),
+            phase: vsPhase,
+            strategy: 'VS_ENGINE',
+          });
+        }
         const strikePrice = this.binanceEdge.getSlotOpenPrice(
           vsCoin ?? '', market.startTime
         ) ?? this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0;
@@ -2523,6 +2585,25 @@ export class MarketMakerRuntime {
           slotKey
         );
       }
+      // Phase 36: slot replay — record exit fills for post-session analysis.
+      if (
+        config.SLOT_REPLAY_ENABLED &&
+        executionSignal.action === 'SELL' &&
+        effectiveShares > 0
+      ) {
+        const exitCoinReplay = extractCoinFromTitle(market.title);
+        this.slotReplay.recordExit({
+          marketId: market.marketId,
+          price: effectivePrice,
+          shares: effectiveShares,
+          outcome: executionSignal.outcome,
+          reason: executionSignal.reason ?? executionSignal.signalType,
+          signalType: executionSignal.signalType,
+          binanceSpot: this.binanceEdge.getLatestPrice(exitCoinReplay ?? '') ?? null,
+          fairValue: this.vsEngine.getLastFairValue(market.marketId),
+        });
+      }
+
       // Phase 28: synchronous OBI exit fills — record stats and clean up
       // obiEngine.positions so the dead position doesn't linger until wallet
       // reconciliation. Previously only async fills (via fillTracker) did this.
@@ -3451,6 +3532,19 @@ export class MarketMakerRuntime {
         this.slotStrategyClaim.set(fill.marketId, 'OBI'); // Phase 35C: reinforce claim on async fill
         const obiCoin = extractCoinFromObiTitle(market.title);
         this.obiEngine.recordEntryForStats(obiCoin, `${fill.outcome} ${fill.filledShares}sh @${roundTo(fill.fillPrice, 3)}`);
+        // Phase 36: slot replay entry (async path)
+        if (config.SLOT_REPLAY_ENABLED) {
+          this.slotReplay.recordEntry({
+            marketId: fill.marketId,
+            price: fill.fillPrice,
+            shares: fill.filledShares,
+            outcome: fill.outcome,
+            signalType: fill.signalType,
+            binanceSpot: this.binanceEdge.getLatestPrice(obiCoin ?? '') ?? null,
+            fairValue: null,
+            strategy: 'OBI',
+          });
+        }
         const obiBook =
           this.latestBooks.get(fill.marketId) ??
           this.quotingEngine.getContext(fill.marketId)?.orderbook;
@@ -3550,6 +3644,20 @@ export class MarketMakerRuntime {
           vsCoin,
           `${fill.outcome} ${fill.filledShares}sh @${roundTo(fill.fillPrice, 3)} [${vsPhase}]`
         );
+        // Phase 36: slot replay entry (async path)
+        if (config.SLOT_REPLAY_ENABLED) {
+          this.slotReplay.recordEntry({
+            marketId: fill.marketId,
+            price: fill.fillPrice,
+            shares: fill.filledShares,
+            outcome: fill.outcome,
+            signalType: fill.signalType,
+            binanceSpot: this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? null,
+            fairValue: this.vsEngine.getLastFairValue(fill.marketId),
+            phase: vsPhase,
+            strategy: 'VS_ENGINE',
+          });
+        }
         const strikePrice = this.binanceEdge.getSlotOpenPrice(
           vsCoin ?? '', market.startTime
         ) ?? this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0;
@@ -3656,6 +3764,21 @@ export class MarketMakerRuntime {
         market.startTime,
         market.endTime
       );
+    }
+
+    // Phase 36: slot replay — record async exit fills
+    if (config.SLOT_REPLAY_ENABLED && fill.side === 'SELL' && fill.filledShares > 0) {
+      const asyncExitCoin = extractCoinFromTitle(market.title);
+      this.slotReplay.recordExit({
+        marketId: fill.marketId,
+        price: fill.fillPrice,
+        shares: fill.filledShares,
+        outcome: fill.outcome,
+        reason: fill.signalType,
+        signalType: fill.signalType,
+        binanceSpot: this.binanceEdge.getLatestPrice(asyncExitCoin ?? '') ?? null,
+        fairValue: this.vsEngine.getLastFairValue(fill.marketId),
+      });
     }
 
     // OBI exit stats for dashboard — count ALL OBI sell fills, not just taker exits
@@ -4773,6 +4896,22 @@ export class MarketMakerRuntime {
     this.orderBookImbalance.clearState(marketId);
     this.obiEngine.clearState(marketId);
     this.vsEngine.clearState(marketId);
+    // Phase 36: finalize slot replay — write JSONL record and schedule resolution check
+    if (config.SLOT_REPLAY_ENABLED) {
+      this.slotReplay.finalizeSlot(marketId, async (conditionId) => {
+        try {
+          const res = await this.resolutionChecker.checkResolution({ conditionId });
+          if (res.resolved && res.winningOutcome) {
+            const coin = market ? extractCoinFromTitle(market.title) : null;
+            return {
+              winner: res.winningOutcome,
+              binanceFinal: coin ? this.binanceEdge.getLatestPrice(coin) : null,
+            };
+          }
+        } catch { /* best effort */ }
+        return null;
+      });
+    }
     this.marketActions.delete(marketId);
     this.clearDustAbandonmentForMarket(marketId);
     // Variant A4: drop any tracked resting OBI maker orders for this market.

@@ -250,6 +250,8 @@ export class VsEngine {
   /* ── Position tracking ─────────────────────────────────────────── */
   private readonly positions = new Map<string, VsPosition>();
   private readonly lastEntryMs = new Map<string, number>();
+  /** Phase 36: last computed fair value per market (for slot replay). */
+  private readonly lastFairValues = new Map<string, number>();
   private readonly lastLosingExitMs = new Map<string, number>();
   private readonly lastLosingExitMsByCoin = new Map<string, number>();
   private readonly lastOrphanEmitMs = new Map<string, number>();
@@ -291,8 +293,14 @@ export class VsEngine {
     return this.positions;
   }
 
+  /** Phase 36: last computed fair value for slot replay tracker. */
+  getLastFairValue(marketId: string): number | null {
+    return this.lastFairValues.get(marketId) ?? null;
+  }
+
   clearState(marketId: string): void {
     this.positions.delete(marketId);
+    this.lastFairValues.delete(marketId);
     this.lastEntryMs.delete(marketId);
     this.lastOrphanEmitMs.delete(marketId);
   }
@@ -367,6 +375,9 @@ export class VsEngine {
     const timeRemainingSec = (slotEndMs - nowMs) / 1000;
     const fairValueUp = calculatePhiFairValue(spotPrice, strikePrice, vol, timeRemainingSec);
     const fairValueDown = 1 - fairValueUp;
+
+    // Phase 36: cache last FV for slot replay tracker
+    this.lastFairValues.set(market.marketId, fairValueUp);
 
     if (phase === 'PASSIVE_MM') {
       return this.generatePassiveMMSignals(
