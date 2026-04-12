@@ -1600,6 +1600,18 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
+      initialBalanceUsd: parseFloatOrDefault(env.PAPER_TRADING_INITIAL_BALANCE, '100'),
+      tradeLogFile: (
+        env.PAPER_TRADING_TRADE_LOG || `${reportsDir}/paper-trades.jsonl`
+      ).trim() || `${reportsDir}/paper-trades.jsonl`,
+      makerFeeRate: parseFloatOrDefault(env.PAPER_TRADING_MAKER_FEE_RATE, '0'),
+      takerFeeRate: parseFloatOrDefault(env.PAPER_TRADING_TAKER_FEE_RATE, '0.02'),
+      makerOrderTtlMs: Math.max(
+        1000,
+        parseIntOrDefault(env.PAPER_TRADING_MAKER_ORDER_TTL_MS, '300000')
+      ),
+      minOrderNotionalUsd: parseFloatOrDefault(env.PAPER_TRADING_MIN_ORDER_NOTIONAL, '1'),
+      // Legacy fields — kept for backward compat, not used in new fill logic
       simulatedLatencyMinMs: Math.max(
         0,
         parseIntOrDefault(env.PAPER_TRADING_LATENCY_MIN_MS, '400')
@@ -1625,10 +1637,6 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       },
       partialFillEnabled: parseBoolean(env.PAPER_TRADING_PARTIAL_FILLS, true),
       minFillRatio: parseFloatOrDefault(env.PAPER_TRADING_MIN_FILL_RATIO, '0.30'),
-      initialBalanceUsd: parseFloatOrDefault(env.PAPER_TRADING_INITIAL_BALANCE, '100'),
-      tradeLogFile: (
-        env.PAPER_TRADING_TRADE_LOG || `${reportsDir}/paper-trades.jsonl`
-      ).trim() || `${reportsDir}/paper-trades.jsonl`,
     },
     evKelly: {
       enabled: parseBoolean(env.EV_KELLY_ENABLED, false),
@@ -2069,35 +2077,16 @@ export function validateConfig(candidate: AppConfig = config): void {
     throw new Error('SNIPER_VOLATILITY_SCALE must be positive.');
   }
 
-  if (
-    candidate.paperTrading.simulatedLatencyMaxMs <
-    candidate.paperTrading.simulatedLatencyMinMs
-  ) {
-    throw new Error(
-      'PAPER_TRADING_LATENCY_MAX_MS must be greater than or equal to PAPER_TRADING_LATENCY_MIN_MS.'
-    );
-  }
-
-  if (
-    candidate.paperTrading.fillProbability.passive < 0 ||
-    candidate.paperTrading.fillProbability.passive > 1 ||
-    candidate.paperTrading.fillProbability.improve < 0 ||
-    candidate.paperTrading.fillProbability.improve > 1 ||
-    candidate.paperTrading.fillProbability.cross < 0 ||
-    candidate.paperTrading.fillProbability.cross > 1
-  ) {
-    throw new Error('Paper trading fill probabilities must be between 0 and 1.');
-  }
-
-  if (
-    candidate.paperTrading.minFillRatio <= 0 ||
-    candidate.paperTrading.minFillRatio > 1
-  ) {
-    throw new Error('PAPER_TRADING_MIN_FILL_RATIO must be in the range (0, 1].');
-  }
-
   if (candidate.paperTrading.initialBalanceUsd <= 0) {
     throw new Error('PAPER_TRADING_INITIAL_BALANCE must be positive.');
+  }
+
+  if (candidate.paperTrading.makerFeeRate < 0 || candidate.paperTrading.makerFeeRate > 0.1) {
+    throw new Error('PAPER_TRADING_MAKER_FEE_RATE must be between 0 and 0.10.');
+  }
+
+  if (candidate.paperTrading.takerFeeRate < 0 || candidate.paperTrading.takerFeeRate > 0.1) {
+    throw new Error('PAPER_TRADING_TAKER_FEE_RATE must be between 0 and 0.10.');
   }
 
   if (candidate.evKelly.minEVThreshold < 0 || candidate.evKelly.minEVThresholdHighFee < 0) {

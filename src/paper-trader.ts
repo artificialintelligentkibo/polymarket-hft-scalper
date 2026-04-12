@@ -13,24 +13,44 @@ import type { SignalType, SignalUrgency } from './strategy-types.js';
 import type { TradeExecutionResult } from './trader.js';
 import { clamp, roundTo, sleep } from './utils.js';
 
+/* ================================================================
+ * CONFIG
+ * ================================================================ */
+
 export interface PaperTraderConfig {
-  enabled: boolean;
-  simulatedLatencyMinMs: number;
-  simulatedLatencyMaxMs: number;
-  fillProbability: {
-    passive: number;
-    improve: number;
-    cross: number;
+  readonly enabled: boolean;
+  /** Virtual starting balance in USDC */
+  readonly initialBalanceUsd: number;
+  /** Path to JSONL trade log */
+  readonly tradeLogFile: string;
+  /** Maker fee rate (Polymarket: 0% for maker) */
+  readonly makerFeeRate: number;
+  /** Taker fee rate (Polymarket: 2% standard, 3.15% high-fee) */
+  readonly takerFeeRate: number;
+  /** Max seconds a pending maker order lives before expiry */
+  readonly makerOrderTtlMs: number;
+  /** Minimum order notional (Polymarket: $1) */
+  readonly minOrderNotionalUsd: number;
+
+  /* ---- legacy fields kept for backward compat (ignored in new logic) ---- */
+  readonly simulatedLatencyMinMs: number;
+  readonly simulatedLatencyMaxMs: number;
+  readonly fillProbability: {
+    readonly passive: number;
+    readonly improve: number;
+    readonly cross: number;
   };
-  slippageModel: {
-    maxSlippageTicks: number;
-    sizeImpactFactor: number;
+  readonly slippageModel: {
+    readonly maxSlippageTicks: number;
+    readonly sizeImpactFactor: number;
   };
-  partialFillEnabled: boolean;
-  minFillRatio: number;
-  initialBalanceUsd: number;
-  tradeLogFile: string;
+  readonly partialFillEnabled: boolean;
+  readonly minFillRatio: number;
 }
+
+/* ================================================================
+ * TRADE LOG TYPES
+ * ================================================================ */
 
 export interface PaperTrade {
   readonly timestamp: string;
@@ -44,9 +64,10 @@ export interface PaperTrade {
   readonly requestedPrice: number;
   readonly fillPrice: number | null;
   readonly slippage: number;
-  readonly simulatedLatencyMs: number;
-  readonly fillProbabilityUsed: number;
+  readonly fee: number;
+  readonly wasMaker: boolean;
   readonly urgency: SignalUrgency;
+  readonly fillSource: 'INSTANT_TAKER' | 'PENDING_MAKER_CROSSED' | 'PENDING_MAKER_EXPIRED' | 'NONE';
   readonly virtualBalance: number;
   readonly virtualPnl: number;
   readonly paperMode: true;
@@ -54,9 +75,33 @@ export interface PaperTrade {
 
 export interface ResolvedPaperSlot {
   readonly marketId: string;
+  readonly marketTitle: string;
+  readonly winningOutcome: 'YES' | 'NO';
   readonly pnl: number;
   readonly resolvedAtMs: number;
 }
+
+/* ================================================================
+ * PENDING ORDER — sits in queue until book crosses the price
+ * ================================================================ */
+
+interface PendingPaperOrder {
+  readonly orderId: string;
+  readonly marketId: string;
+  readonly marketTitle: string;
+  readonly signalType: SignalType;
+  readonly tokenId: string;
+  readonly outcome: Outcome;
+  readonly side: 'BUY' | 'SELL';
+  readonly shares: number;
+  readonly price: number;
+  readonly createdAtMs: number;
+  readonly expiresAtMs: number;
+}
+
+/* ================================================================
+ * POSITION STATE
+ * ================================================================ */
 
 interface PaperPositionState {
   yes: number;
@@ -64,14 +109,64 @@ interface PaperPositionState {
   yesCost: number;
   noCost: number;
   realizedPnl: number;
+  totalFees: number;
+  entryCount: number;
+  exitCount: number;
 }
+
+/* ================================================================
+ * ANALYTICS
+ * ================================================================ */
+
+export interface PaperTradingStats {
+  readonly enabled: boolean;
+  readonly initialBalance: number;
+  readonly currentBalance: number;
+  readonly totalPnl: number;
+  readonly totalPnlPct: number;
+  readonly totalFees: number;
+  readonly totalTrades: number;
+  readonly totalFills: number;
+  readonly totalExpired: number;
+  readonly makerFills: number;
+  readonly takerFills: number;
+  readonly slotsResolved: number;
+  readonly winRate: number;
+  readonly avgWinUsd: number;
+  readonly avgLossUsd: number;
+  readonly maxDrawdownUsd: number;
+  readonly sharpeRatio: number | null;
+  readonly pendingOrders: number;
+  readonly openPositions: number;
+  readonly strategyBreakdown: readonly PaperStrategyBreakdown[];
+  readonly recentTrades: readonly PaperTrade[];
+  readonly recentResolutions: readonly ResolvedPaperSlot[];
+}
+
+export interface PaperStrategyBreakdown {
+  readonly strategy: string;
+  readonly trades: number;
+  readonly fills: number;
+  readonly expired: number;
+  readonly pnl: number;
+  readonly fillRate: string;
+}
+
+/* ================================================================
+ * MAIN CLASS
+ * ================================================================ */
 
 export class PaperTrader {
   private balance: number;
+  private peakBalance: number;
+  private maxDrawdownUsd = 0;
   private readonly positions = new Map<string, PaperPositionState>();
+  private readonly pendingOrders = new Map<string, PendingPaperOrder[]>();
   private readonly tradeLog: PaperTrade[] = [];
   private readonly resolvedSlots: ResolvedPaperSlot[] = [];
-  private totalPnl = 0;
+  private readonly dailyReturns: number[] = [];
+  private lastDayPnl = 0;
+  private lastDayDate = '';
   private summaryPrinted = false;
 
   constructor(
@@ -79,6 +174,7 @@ export class PaperTrader {
     private readonly orderbookHistory: OrderbookHistory
   ) {
     this.balance = runtimeConfig.initialBalanceUsd;
+    this.peakBalance = this.balance;
   }
 
   async ensureReady(): Promise<void> {
@@ -86,9 +182,11 @@ export class PaperTrader {
     await mkdir(path.dirname(tradeLogPath), { recursive: true });
   }
 
-  /**
-   * Simulates a Polymarket order against the latest known orderbook.
-   */
+  /* ================================================================
+   * SUBMIT ORDER — entry point replacing old simulateOrder
+   * Taker (cross) → instant fill against book
+   * Maker (passive/improve) → queue as pending, wait for cross
+   * ================================================================ */
   async simulateOrder(params: {
     marketId: string;
     marketTitle: string;
@@ -106,202 +204,145 @@ export class PaperTrader {
   }): Promise<TradeExecutionResult> {
     await this.ensureReady();
 
-    const latencyMs = randomInt(
-      this.runtimeConfig.simulatedLatencyMinMs,
-      this.runtimeConfig.simulatedLatencyMaxMs
-    );
-    await sleep(latencyMs);
+    const isTaker = params.urgency === 'cross';
 
-    const targetTimeMs = (params.signalGeneratedAt ?? Date.now()) + latencyMs;
-    const latestBook =
-      this.orderbookHistory.getAt(params.marketId, targetTimeMs) ??
-      this.orderbookHistory.getLatest(params.marketId) ??
-      params.currentOrderbook;
-    const initialBook = resolveBookForOutcome(params.currentOrderbook, params.outcome);
-    const fillBook = resolveBookForOutcome(latestBook, params.outcome);
-
-    let fillProbability = this.resolveFillProbability({
-      urgency: params.urgency,
-      side: params.side,
-      requestedPrice: params.price,
-      initialBook,
-      latestBook: fillBook,
-    });
-
-    let fill = this.buildUnfilledFill(params.side, params.price);
-    if (Math.random() <= fillProbability) {
-      fill =
-        params.urgency === 'cross'
-          ? this.simulateCrossFill({
-              side: params.side,
-              shares: params.shares,
-              requestedPrice: params.price,
-              book: fillBook,
-            })
-          : this.simulatePassiveFill({
-              side: params.side,
-              shares: params.shares,
-              requestedPrice: params.price,
-              urgency: params.urgency,
-              book: fillBook,
-              fillProbability,
-            });
+    if (isTaker) {
+      return this.executeTakerOrder(params);
     }
 
-    if (!this.runtimeConfig.partialFillEnabled && fill.filledShares > 0 && fill.filledShares < params.shares) {
-      fill = this.buildUnfilledFill(params.side, params.price);
-    }
-
-    fill = this.constrainFillByInventoryAndCash(params, fill);
-    fillProbability = clamp(fillProbability, 0, 1);
-
-    if (fill.filledShares > 0 && fill.avgPrice !== null) {
-      this.applySimulatedFill({
-        marketId: params.marketId,
-        outcome: params.outcome,
-        side: params.side,
-        shares: fill.filledShares,
-        price: fill.avgPrice,
-      });
-    }
-
-    this.totalPnl = this.getPnL();
-
-    const trade: PaperTrade = {
-      timestamp: new Date().toISOString(),
-      marketId: params.marketId,
-      marketTitle: params.marketTitle,
-      signalType: params.signalType,
-      outcome: params.outcome,
-      side: params.side,
-      requestedShares: roundTo(params.shares, 4),
-      filledShares: roundTo(fill.filledShares, 4),
-      requestedPrice: roundTo(params.price, 6),
-      fillPrice: fill.avgPrice !== null ? roundTo(fill.avgPrice, 6) : null,
-      slippage: roundTo(fill.slippage, 6),
-      simulatedLatencyMs: latencyMs,
-      fillProbabilityUsed: roundTo(fillProbability, 4),
-      urgency: params.urgency,
-      virtualBalance: roundTo(this.balance, 4),
-      virtualPnl: roundTo(this.totalPnl, 4),
-      paperMode: true,
-    };
-    this.tradeLog.push(trade);
-    await this.appendTradeLog(trade);
-
-    return {
-      orderId: buildPaperOrderId(params.marketId, params.signalType),
-      marketId: params.marketId,
-      tokenId: params.tokenId,
-      outcome: params.outcome,
-      side: params.side,
-      shares: roundTo(params.shares, 4),
-      price: roundTo(params.price, 6),
-      notionalUsd: roundTo(params.shares * params.price, 2),
-      filledShares: roundTo(fill.filledShares, 4),
-      fillPrice: fill.avgPrice !== null ? roundTo(fill.avgPrice, 6) : null,
-      fillConfirmed: fill.filledShares > 0,
-      simulation: true,
-      wasMaker: fill.filledShares > 0 ? params.urgency !== 'cross' : null,
-      postOnly: params.postOnly,
-      orderType: params.orderType,
-      balanceCacheHits: 0,
-      balanceCacheMisses: 0,
-      balanceCacheHitRatePct: null,
-    };
+    // Maker order → add to pending queue
+    return this.enqueueMakerOrder(params);
   }
 
-  resolveSlot(params: {
-    marketId: string;
-    winningOutcome: 'YES' | 'NO';
-  }): { pnl: number; yesValue: number; noValue: number } {
-    const position = this.positions.get(params.marketId);
-    if (!position) {
-      return {
-        pnl: 0,
-        yesValue: 0,
-        noValue: 0,
-      };
+  /* ================================================================
+   * TICK PENDING ORDERS — called every orderbook refresh cycle
+   * Checks all pending maker orders against current book state.
+   * If price has crossed → fill the order (maker fee).
+   * ================================================================ */
+  tickPendingOrders(marketId: string, currentBook: MarketOrderbookSnapshot): void {
+    const pending = this.pendingOrders.get(marketId);
+    if (!pending || pending.length === 0) return;
+
+    const nowMs = Date.now();
+    const remaining: PendingPaperOrder[] = [];
+
+    for (const order of pending) {
+      // Check expiry
+      if (nowMs >= order.expiresAtMs) {
+        this.logExpiredOrder(order);
+        continue;
+      }
+
+      // Check if book has crossed our price
+      const book = order.outcome === 'YES' ? currentBook.yes : currentBook.no;
+      const crossed = this.checkMakerOrderCrossed(order, book);
+
+      if (crossed) {
+        this.fillMakerOrder(order, book);
+      } else {
+        remaining.push(order);
+      }
     }
 
-    const yesValue = params.winningOutcome === 'YES' ? roundTo(position.yes, 4) : 0;
-    const noValue = params.winningOutcome === 'NO' ? roundTo(position.no, 4) : 0;
+    if (remaining.length > 0) {
+      this.pendingOrders.set(marketId, remaining);
+    } else {
+      this.pendingOrders.delete(marketId);
+    }
+  }
+
+  /* ================================================================
+   * EXPIRE ALL PENDING — called on slot end / market cleanup
+   * ================================================================ */
+  expirePendingOrders(marketId: string): void {
+    const pending = this.pendingOrders.get(marketId);
+    if (!pending || pending.length === 0) return;
+
+    for (const order of pending) {
+      this.logExpiredOrder(order);
+    }
+    this.pendingOrders.delete(marketId);
+  }
+
+  /* ================================================================
+   * CANCEL PENDING — cancel a specific pending order by orderId
+   * Returns true if found and cancelled.
+   * ================================================================ */
+  cancelPendingOrder(orderId: string): boolean {
+    for (const [marketId, orders] of this.pendingOrders.entries()) {
+      const idx = orders.findIndex(o => o.orderId === orderId);
+      if (idx !== -1) {
+        const order = orders[idx];
+        orders.splice(idx, 1);
+        if (orders.length === 0) {
+          this.pendingOrders.delete(marketId);
+        }
+        logger.debug('Paper pending order cancelled', {
+          orderId: order.orderId,
+          signalType: order.signalType,
+          price: order.price,
+          shares: order.shares,
+        });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* ================================================================
+   * RESOLVE SLOT — market settles, calculate final PnL
+   * ================================================================ */
+  resolveSlot(params: {
+    marketId: string;
+    marketTitle?: string;
+    winningOutcome: 'YES' | 'NO';
+  }): { pnl: number; yesValue: number; noValue: number } {
+    // First expire any pending orders for this market
+    this.expirePendingOrders(params.marketId);
+
+    const position = this.positions.get(params.marketId);
+    if (!position) {
+      return { pnl: 0, yesValue: 0, noValue: 0 };
+    }
+
+    // Winning shares pay $1 each, losing shares pay $0
+    const yesValue = params.winningOutcome === 'YES' ? position.yes : 0;
+    const noValue = params.winningOutcome === 'NO' ? position.no : 0;
     const payout = yesValue + noValue;
-    const remainingCost = position.yes * position.yesCost + position.no * position.noCost;
+
+    // Remaining cost basis
+    const remainingCost =
+      position.yes * position.yesCost + position.no * position.noCost;
+
     const pnl = roundTo(position.realizedPnl + payout - remainingCost, 4);
 
     this.balance = roundTo(this.balance + payout, 4);
     this.positions.delete(params.marketId);
-    this.totalPnl = this.getPnL();
-    this.resolvedSlots.push({
+    this.updateDrawdown();
+
+    const resolved: ResolvedPaperSlot = {
       marketId: params.marketId,
+      marketTitle: params.marketTitle ?? params.marketId,
+      winningOutcome: params.winningOutcome,
       pnl,
       resolvedAtMs: Date.now(),
+    };
+    this.resolvedSlots.push(resolved);
+    this.trackDailyReturn();
+
+    logger.info('Paper slot resolved', {
+      marketId: params.marketId,
+      winningOutcome: params.winningOutcome,
+      pnl: roundTo(pnl, 4),
+      balance: roundTo(this.balance, 4),
     });
 
-    return {
-      pnl,
-      yesValue,
-      noValue,
-    };
+    return { pnl: roundTo(pnl, 4), yesValue: roundTo(yesValue, 4), noValue: roundTo(noValue, 4) };
   }
 
-  printSummary(): void {
-    if (this.summaryPrinted) {
-      return;
-    }
-    this.summaryPrinted = true;
-
-    const durationMs =
-      this.tradeLog.length >= 2
-        ? Date.parse(this.tradeLog.at(-1)?.timestamp ?? '') -
-          Date.parse(this.tradeLog[0].timestamp)
-        : 0;
-    const wins = this.resolvedSlots.filter((entry) => entry.pnl > 0);
-    const losses = this.resolvedSlots.filter((entry) => entry.pnl < 0);
-    const fillStats = summarizeFillRates(this.tradeLog);
-    const strategySummary = summarizeStrategies(this.tradeLog);
-    const endingBalance = roundTo(this.balance, 4);
-    const endingPnl = roundTo(this.getPnL(), 4);
-
-    console.log('=== PAPER TRADING SUMMARY ===');
-    console.log(
-      `Duration: ${formatDuration(durationMs)} | Slots: ${this.resolvedSlots.length} | Trades: ${this.tradeLog.length}`
-    );
-    console.log(
-      `Balance: $${this.runtimeConfig.initialBalanceUsd.toFixed(2)} -> $${endingBalance.toFixed(2)} (${formatSignedPercent(
-        this.runtimeConfig.initialBalanceUsd,
-        endingBalance
-      )})`
-    );
-    console.log(
-      `Win rate: ${wins.length}/${this.resolvedSlots.length || 0} slots (${formatWinRate(
-        wins.length,
-        this.resolvedSlots.length
-      )})`
-    );
-    console.log(
-      `Avg profit per winning slot: ${formatSignedUsd(averagePnl(wins))}`
-    );
-    console.log(`Avg loss per losing slot: ${formatSignedUsd(averagePnl(losses))}`);
-    console.log(
-      `Biggest win: ${formatSignedUsd(maxPnl(wins))} | Biggest loss: ${formatSignedUsd(minPnl(losses))}`
-    );
-    console.log('Strategy breakdown:');
-    for (const entry of strategySummary) {
-      console.log(
-        `  ${entry.label.padEnd(18)} ${entry.trades} trades | ${formatSignedUsd(entry.pnl)} | fill ${entry.fillRate}`
-      );
-    }
-    console.log(
-      `Fill rate: cross=${fillStats.cross} | improve=${fillStats.improve} | passive=${fillStats.passive}`
-    );
-    console.log(
-      `Avg simulated latency: ${Math.round(averageLatency(this.tradeLog))}ms | Net PnL: ${formatSignedUsd(
-        endingPnl
-      )}`
-    );
-  }
+  /* ================================================================
+   * GETTERS
+   * ================================================================ */
 
   getBalance(): number {
     return roundTo(this.balance, 4);
@@ -315,196 +356,485 @@ export class PaperTrader {
       const noMark = book?.no.midPrice ?? book?.no.bestBid ?? book?.no.lastTradePrice ?? 0;
       markedValue += position.yes * yesMark + position.no * noMark;
     }
-
     return roundTo(this.balance + markedValue - this.runtimeConfig.initialBalanceUsd, 4);
   }
 
   hasOpenPosition(marketId: string): boolean {
     const position = this.positions.get(marketId);
-    if (!position) {
-      return false;
-    }
-
+    if (!position) return false;
     return position.yes > 0 || position.no > 0;
   }
 
-  private resolveFillProbability(params: {
-    urgency: SignalUrgency;
-    side: 'BUY' | 'SELL';
-    requestedPrice: number;
-    initialBook: TokenBookSnapshot;
-    latestBook: TokenBookSnapshot;
-  }): number {
-    const base = this.runtimeConfig.fillProbability[params.urgency];
-    const initialReference =
-      params.side === 'BUY'
-        ? params.initialBook.bestAsk ?? params.initialBook.midPrice ?? params.requestedPrice
-        : params.initialBook.bestBid ?? params.initialBook.midPrice ?? params.requestedPrice;
-    const latestReference =
-      params.side === 'BUY'
-        ? params.latestBook.bestAsk ?? params.latestBook.midPrice ?? initialReference
-        : params.latestBook.bestBid ?? params.latestBook.midPrice ?? initialReference;
-
-    if (!Number.isFinite(initialReference) || !Number.isFinite(latestReference)) {
-      return clamp(base, 0.05, 0.99);
-    }
-
-    const adverseMove =
-      params.side === 'BUY'
-        ? Math.max(0, latestReference - initialReference)
-        : Math.max(0, initialReference - latestReference);
-    const favorableMove =
-      params.side === 'BUY'
-        ? Math.max(0, initialReference - latestReference)
-        : Math.max(0, latestReference - initialReference);
-    const driftPenalty = adverseMove * 3;
-    const driftBoost = favorableMove * 1.5;
-
-    return clamp(base - driftPenalty + driftBoost, 0.05, 0.99);
+  hasPendingOrders(marketId: string): boolean {
+    const pending = this.pendingOrders.get(marketId);
+    return !!pending && pending.length > 0;
   }
 
-  private simulateCrossFill(params: {
-    side: 'BUY' | 'SELL';
-    shares: number;
-    requestedPrice: number;
-    book: TokenBookSnapshot;
-  }): {
-    filledShares: number;
-    avgPrice: number | null;
-    slippage: number;
-  } {
-    const levels = params.side === 'BUY' ? params.book.asks : params.book.bids;
-    const walked = simulateOrderbookWalk(levels, params.shares, params.side);
-    if (walked.filledShares <= 0) {
-      return this.buildUnfilledFill(params.side, params.requestedPrice);
+  getPendingOrderCount(): number {
+    let count = 0;
+    for (const orders of this.pendingOrders.values()) {
+      count += orders.length;
     }
+    return count;
+  }
 
-    const topPrice =
-      params.side === 'BUY'
-        ? params.book.bestAsk ?? walked.avgPrice
-        : params.book.bestBid ?? walked.avgPrice;
-    const sizeRatio = params.shares / Math.max(params.shares, totalBookShares(levels));
-    const extraTicks = Math.floor(
-      Math.random() *
-        (this.runtimeConfig.slippageModel.maxSlippageTicks + 1) *
-        clamp(sizeRatio / Math.max(0.01, this.runtimeConfig.slippageModel.sizeImpactFactor), 0.25, 1)
-    );
-    const tickSize = inferTickSize(params.book, params.requestedPrice);
-    const extraSlippage = extraTicks * tickSize;
-    const avgPrice =
-      params.side === 'BUY'
-        ? walked.avgPrice + extraSlippage
-        : Math.max(0.001, walked.avgPrice - extraSlippage);
+  /* ================================================================
+   * STATS — comprehensive analytics for dashboard
+   * ================================================================ */
+  getStats(): PaperTradingStats {
+    const fills = this.tradeLog.filter(t => t.filledShares > 0);
+    const expired = this.tradeLog.filter(t => t.fillSource === 'PENDING_MAKER_EXPIRED');
+    const makerFills = fills.filter(t => t.wasMaker);
+    const takerFills = fills.filter(t => !t.wasMaker);
+    const wins = this.resolvedSlots.filter(r => r.pnl > 0);
+    const losses = this.resolvedSlots.filter(r => r.pnl < 0);
+    const totalPnl = this.getPnL();
+    const totalFees = this.tradeLog.reduce((sum, t) => sum + t.fee, 0);
 
     return {
-      filledShares: walked.filledShares,
-      avgPrice: roundTo(avgPrice, 6),
-      slippage: roundTo(
-        params.side === 'BUY'
-          ? Math.max(0, avgPrice - topPrice)
-          : Math.max(0, topPrice - avgPrice),
-        6
-      ),
+      enabled: this.runtimeConfig.enabled,
+      initialBalance: this.runtimeConfig.initialBalanceUsd,
+      currentBalance: roundTo(this.balance, 4),
+      totalPnl: roundTo(totalPnl, 4),
+      totalPnlPct: this.runtimeConfig.initialBalanceUsd > 0
+        ? roundTo((totalPnl / this.runtimeConfig.initialBalanceUsd) * 100, 2)
+        : 0,
+      totalFees: roundTo(totalFees, 4),
+      totalTrades: this.tradeLog.length,
+      totalFills: fills.length,
+      totalExpired: expired.length,
+      makerFills: makerFills.length,
+      takerFills: takerFills.length,
+      slotsResolved: this.resolvedSlots.length,
+      winRate: this.resolvedSlots.length > 0
+        ? roundTo((wins.length / this.resolvedSlots.length) * 100, 1)
+        : 0,
+      avgWinUsd: wins.length > 0
+        ? roundTo(wins.reduce((s, w) => s + w.pnl, 0) / wins.length, 4)
+        : 0,
+      avgLossUsd: losses.length > 0
+        ? roundTo(losses.reduce((s, l) => s + l.pnl, 0) / losses.length, 4)
+        : 0,
+      maxDrawdownUsd: roundTo(this.maxDrawdownUsd, 4),
+      sharpeRatio: this.computeSharpe(),
+      pendingOrders: this.getPendingOrderCount(),
+      openPositions: this.positions.size,
+      strategyBreakdown: this.computeStrategyBreakdown(),
+      recentTrades: this.tradeLog.slice(-20),
+      recentResolutions: this.resolvedSlots.slice(-10),
     };
   }
 
-  private simulatePassiveFill(params: {
-    side: 'BUY' | 'SELL';
-    shares: number;
-    requestedPrice: number;
-    urgency: SignalUrgency;
-    book: TokenBookSnapshot;
-    fillProbability: number;
-  }): {
-    filledShares: number;
-    avgPrice: number | null;
-    slippage: number;
-  } {
-    const bookCrossed =
-      params.side === 'BUY'
-        ? (params.book.bestAsk ?? Number.POSITIVE_INFINITY) <= params.requestedPrice
-        : (params.book.bestBid ?? 0) >= params.requestedPrice;
-    const queuePenalty = params.urgency === 'passive' ? 0.65 : 0.85;
-    const effectiveProbability = clamp(
-      params.fillProbability * (bookCrossed ? 1 : queuePenalty),
-      0,
-      0.99
+  /* ================================================================
+   * PRINT SUMMARY — for graceful shutdown
+   * ================================================================ */
+  printSummary(): void {
+    if (this.summaryPrinted) return;
+    this.summaryPrinted = true;
+
+    const stats = this.getStats();
+    const durationMs =
+      this.tradeLog.length >= 2
+        ? Date.parse(this.tradeLog.at(-1)?.timestamp ?? '') -
+          Date.parse(this.tradeLog[0].timestamp)
+        : 0;
+
+    console.log('');
+    console.log('=== PAPER TRADING SUMMARY ===');
+    console.log(
+      `Duration: ${formatDuration(durationMs)} | Slots: ${stats.slotsResolved} | Trades: ${stats.totalTrades} | Fills: ${stats.totalFills} | Expired: ${stats.totalExpired}`
     );
-
-    if (Math.random() > effectiveProbability) {
-      return this.buildUnfilledFill(params.side, params.requestedPrice);
+    console.log(
+      `Balance: $${stats.initialBalance.toFixed(2)} -> $${stats.currentBalance.toFixed(2)} (${stats.totalPnlPct >= 0 ? '+' : ''}${stats.totalPnlPct.toFixed(2)}%)`
+    );
+    console.log(
+      `Fees paid: $${stats.totalFees.toFixed(4)} | Max drawdown: $${stats.maxDrawdownUsd.toFixed(2)}`
+    );
+    console.log(
+      `Win rate: ${stats.winRate.toFixed(1)}% (${this.resolvedSlots.filter(r => r.pnl > 0).length}W / ${this.resolvedSlots.filter(r => r.pnl < 0).length}L)`
+    );
+    console.log(
+      `Avg win: ${formatSignedUsd(stats.avgWinUsd)} | Avg loss: ${formatSignedUsd(stats.avgLossUsd)}`
+    );
+    console.log(
+      `Maker fills: ${stats.makerFills} | Taker fills: ${stats.takerFills} | Fill rate: ${stats.totalTrades > 0 ? roundTo((stats.totalFills / stats.totalTrades) * 100, 1) : 0}%`
+    );
+    if (stats.sharpeRatio !== null) {
+      console.log(`Sharpe ratio: ${stats.sharpeRatio.toFixed(2)}`);
     }
 
-    const fillRatio = this.runtimeConfig.partialFillEnabled
-      ? clamp(
-          this.runtimeConfig.minFillRatio +
-            Math.random() * (1 - this.runtimeConfig.minFillRatio),
-          this.runtimeConfig.minFillRatio,
-          1
-        )
-      : 1;
-
-    return {
-      filledShares: roundTo(params.shares * fillRatio, 4),
-      avgPrice: roundTo(params.requestedPrice, 6),
-      slippage: 0,
-    };
-  }
-
-  private constrainFillByInventoryAndCash(
-    params: {
-      marketId: string;
-      outcome: Outcome;
-      side: 'BUY' | 'SELL';
-      shares: number;
-      price: number;
-    },
-    fill: {
-      filledShares: number;
-      avgPrice: number | null;
-      slippage: number;
-    }
-  ): {
-    filledShares: number;
-    avgPrice: number | null;
-    slippage: number;
-  } {
-    if (fill.filledShares <= 0 || fill.avgPrice === null) {
-      return fill;
-    }
-
-    if (params.side === 'BUY') {
-      const maxAffordableShares = this.balance / Math.max(fill.avgPrice, 0.0001);
-      const affordableShares = roundTo(Math.min(fill.filledShares, maxAffordableShares), 4);
-      if (affordableShares <= 0) {
-        return this.buildUnfilledFill(params.side, params.price);
+    if (stats.strategyBreakdown.length > 0) {
+      console.log('Strategy breakdown:');
+      for (const entry of stats.strategyBreakdown) {
+        console.log(
+          `  ${entry.strategy.padEnd(22)} ${entry.fills}/${entry.trades} fills | ${formatSignedUsd(entry.pnl)} | expired: ${entry.expired}`
+        );
       }
+    }
+    console.log('');
+  }
 
-      return {
-        ...fill,
-        filledShares: affordableShares,
-      };
+  /* ================================================================
+   * PRIVATE: TAKER (CROSS) EXECUTION — instant fill against book
+   * ================================================================ */
+  private async executeTakerOrder(params: {
+    marketId: string;
+    marketTitle: string;
+    signalType: SignalType;
+    tokenId: string;
+    outcome: Outcome;
+    side: 'BUY' | 'SELL';
+    shares: number;
+    price: number;
+    orderType: OrderMode;
+    postOnly: boolean;
+    urgency: SignalUrgency;
+    currentOrderbook: MarketOrderbookSnapshot;
+  }): Promise<TradeExecutionResult> {
+    const book = params.outcome === 'YES'
+      ? params.currentOrderbook.yes
+      : params.currentOrderbook.no;
+
+    // Walk the book to find realistic fill
+    const levels = params.side === 'BUY' ? book.asks : book.bids;
+    const walked = simulateOrderbookWalk(levels, params.shares, params.side);
+
+    // Constrain by balance/inventory
+    let filledShares = walked.filledShares;
+    let avgPrice = walked.avgPrice;
+
+    if (filledShares > 0 && avgPrice > 0) {
+      if (params.side === 'BUY') {
+        // Calculate fee: Polymarket fee = feeRate * min(price, 1-price) * shares
+        const feePerShare = this.runtimeConfig.takerFeeRate * Math.min(avgPrice, 1 - avgPrice);
+        const totalCost = filledShares * avgPrice + filledShares * feePerShare;
+        if (totalCost > this.balance) {
+          // Reduce to what we can afford
+          const costPerShare = avgPrice + feePerShare;
+          filledShares = costPerShare > 0 ? Math.floor(this.balance / costPerShare) : 0;
+        }
+      } else {
+        // SELL: constrain to held shares
+        const position = this.positions.get(params.marketId);
+        const heldShares = params.outcome === 'YES'
+          ? (position?.yes ?? 0)
+          : (position?.no ?? 0);
+        filledShares = Math.min(filledShares, heldShares);
+      }
     }
 
-    const position = this.positions.get(params.marketId) ?? createEmptyPaperPosition();
-    const availableShares = params.outcome === 'YES' ? position.yes : position.no;
-    const sellableShares = roundTo(Math.min(fill.filledShares, availableShares), 4);
-    if (sellableShares <= 0) {
-      return this.buildUnfilledFill(params.side, params.price);
+    // Apply fee
+    const fee = filledShares > 0 && avgPrice > 0
+      ? roundTo(this.runtimeConfig.takerFeeRate * Math.min(avgPrice, 1 - avgPrice) * filledShares, 6)
+      : 0;
+
+    // Apply fill to position state
+    if (filledShares > 0 && avgPrice > 0) {
+      this.applyFill({
+        marketId: params.marketId,
+        outcome: params.outcome,
+        side: params.side,
+        shares: filledShares,
+        price: avgPrice,
+        fee,
+        isMaker: false,
+      });
     }
 
+    // Log trade
+    const trade: PaperTrade = {
+      timestamp: new Date().toISOString(),
+      marketId: params.marketId,
+      marketTitle: params.marketTitle,
+      signalType: params.signalType,
+      outcome: params.outcome,
+      side: params.side,
+      requestedShares: roundTo(params.shares, 4),
+      filledShares: roundTo(filledShares, 4),
+      requestedPrice: roundTo(params.price, 6),
+      fillPrice: filledShares > 0 ? roundTo(avgPrice, 6) : null,
+      slippage: roundTo(walked.slippage, 6),
+      fee: roundTo(fee, 6),
+      wasMaker: false,
+      urgency: params.urgency,
+      fillSource: filledShares > 0 ? 'INSTANT_TAKER' : 'NONE',
+      virtualBalance: roundTo(this.balance, 4),
+      virtualPnl: roundTo(this.getPnL(), 4),
+      paperMode: true,
+    };
+    this.tradeLog.push(trade);
+    await this.appendTradeLog(trade);
+
+    return this.buildTradeResult(params, filledShares, avgPrice, fee, true);
+  }
+
+  /* ================================================================
+   * PRIVATE: MAKER ORDER ENQUEUE
+   * ================================================================ */
+  private async enqueueMakerOrder(params: {
+    marketId: string;
+    marketTitle: string;
+    signalType: SignalType;
+    tokenId: string;
+    outcome: Outcome;
+    side: 'BUY' | 'SELL';
+    shares: number;
+    price: number;
+    orderType: OrderMode;
+    postOnly: boolean;
+    urgency: SignalUrgency;
+    currentOrderbook: MarketOrderbookSnapshot;
+  }): Promise<TradeExecutionResult> {
+    await this.ensureReady();
+
+    const book = params.outcome === 'YES'
+      ? params.currentOrderbook.yes
+      : params.currentOrderbook.no;
+
+    // Check if the order would cross the book immediately
+    // (e.g. BUY at 0.50 when bestAsk is 0.49 → instant fill as taker)
+    const wouldCross = params.side === 'BUY'
+      ? (book.bestAsk !== null && params.price >= book.bestAsk)
+      : (book.bestBid !== null && params.price <= book.bestBid);
+
+    if (wouldCross) {
+      // Post-only would be rejected in real Polymarket. Log and return unfilled.
+      if (params.postOnly) {
+        logger.debug('Paper maker order would cross book (post-only rejected)', {
+          signalType: params.signalType,
+          side: params.side,
+          price: params.price,
+          bestBid: book.bestBid,
+          bestAsk: book.bestAsk,
+        });
+
+        const trade: PaperTrade = {
+          timestamp: new Date().toISOString(),
+          marketId: params.marketId,
+          marketTitle: params.marketTitle,
+          signalType: params.signalType,
+          outcome: params.outcome,
+          side: params.side,
+          requestedShares: roundTo(params.shares, 4),
+          filledShares: 0,
+          requestedPrice: roundTo(params.price, 6),
+          fillPrice: null,
+          slippage: 0,
+          fee: 0,
+          wasMaker: true,
+          urgency: params.urgency,
+          fillSource: 'NONE',
+          virtualBalance: roundTo(this.balance, 4),
+          virtualPnl: roundTo(this.getPnL(), 4),
+          paperMode: true,
+        };
+        this.tradeLog.push(trade);
+        await this.appendTradeLog(trade);
+
+        return this.buildTradeResult(params, 0, 0, 0, false);
+      }
+    }
+
+    const orderId = buildPaperOrderId(params.marketId, params.signalType);
+    const nowMs = Date.now();
+
+    const pendingOrder: PendingPaperOrder = {
+      orderId,
+      marketId: params.marketId,
+      marketTitle: params.marketTitle,
+      signalType: params.signalType,
+      tokenId: params.tokenId,
+      outcome: params.outcome,
+      side: params.side,
+      shares: params.shares,
+      price: params.price,
+      createdAtMs: nowMs,
+      expiresAtMs: nowMs + this.runtimeConfig.makerOrderTtlMs,
+    };
+
+    const existing = this.pendingOrders.get(params.marketId) ?? [];
+    existing.push(pendingOrder);
+    this.pendingOrders.set(params.marketId, existing);
+
+    logger.debug('Paper maker order queued', {
+      orderId,
+      signalType: params.signalType,
+      side: params.side,
+      outcome: params.outcome,
+      price: params.price,
+      shares: params.shares,
+      ttlMs: this.runtimeConfig.makerOrderTtlMs,
+    });
+
+    // Return "pending" result — not yet filled
+    // The main loop should treat this as fillConfirmed=false
     return {
-      ...fill,
-      filledShares: sellableShares,
+      orderId,
+      marketId: params.marketId,
+      tokenId: params.tokenId,
+      outcome: params.outcome,
+      side: params.side,
+      shares: roundTo(params.shares, 4),
+      price: roundTo(params.price, 6),
+      notionalUsd: roundTo(params.shares * params.price, 2),
+      filledShares: 0,
+      fillPrice: null,
+      fillConfirmed: false,
+      simulation: true,
+      wasMaker: true,
+      postOnly: params.postOnly,
+      orderType: params.orderType,
+      balanceCacheHits: 0,
+      balanceCacheMisses: 0,
+      balanceCacheHitRatePct: null,
     };
   }
 
-  private applySimulatedFill(params: {
+  /* ================================================================
+   * PRIVATE: CHECK IF MAKER ORDER IS CROSSED
+   * BUY at price P fills when someone sells at P or lower (bestAsk <= P)
+   * SELL at price P fills when someone buys at P or higher (bestBid >= P)
+   * ================================================================ */
+  private checkMakerOrderCrossed(order: PendingPaperOrder, book: TokenBookSnapshot): boolean {
+    if (order.side === 'BUY') {
+      // Our buy limit sits at `order.price`. It fills when the ask side
+      // has resting liquidity at or below our price.
+      return book.bestAsk !== null && book.bestAsk <= order.price;
+    }
+    // Our sell limit sits at `order.price`. It fills when bid >= our price.
+    return book.bestBid !== null && book.bestBid >= order.price;
+  }
+
+  /* ================================================================
+   * PRIVATE: FILL A MAKER ORDER (crossed)
+   * ================================================================ */
+  private fillMakerOrder(order: PendingPaperOrder, book: TokenBookSnapshot): void {
+    // Maker fills at the limit price (not the crossing price)
+    const fillPrice = order.price;
+
+    // Constrain by balance (BUY) or inventory (SELL)
+    let filledShares = order.shares;
+
+    if (order.side === 'BUY') {
+      // Maker fee = 0% on Polymarket
+      const fee = this.runtimeConfig.makerFeeRate * Math.min(fillPrice, 1 - fillPrice) * filledShares;
+      const totalCost = filledShares * fillPrice + fee;
+      if (totalCost > this.balance) {
+        const costPerShare = fillPrice + this.runtimeConfig.makerFeeRate * Math.min(fillPrice, 1 - fillPrice);
+        filledShares = costPerShare > 0 ? Math.floor(this.balance / costPerShare) : 0;
+      }
+    } else {
+      const position = this.positions.get(order.marketId);
+      const held = order.outcome === 'YES' ? (position?.yes ?? 0) : (position?.no ?? 0);
+      filledShares = Math.min(filledShares, held);
+    }
+
+    if (filledShares <= 0) {
+      this.logExpiredOrder(order);
+      return;
+    }
+
+    const fee = roundTo(
+      this.runtimeConfig.makerFeeRate * Math.min(fillPrice, 1 - fillPrice) * filledShares,
+      6
+    );
+
+    this.applyFill({
+      marketId: order.marketId,
+      outcome: order.outcome,
+      side: order.side,
+      shares: filledShares,
+      price: fillPrice,
+      fee,
+      isMaker: true,
+    });
+
+    const latencyMs = Date.now() - order.createdAtMs;
+
+    const trade: PaperTrade = {
+      timestamp: new Date().toISOString(),
+      marketId: order.marketId,
+      marketTitle: order.marketTitle,
+      signalType: order.signalType,
+      outcome: order.outcome,
+      side: order.side,
+      requestedShares: roundTo(order.shares, 4),
+      filledShares: roundTo(filledShares, 4),
+      requestedPrice: roundTo(order.price, 6),
+      fillPrice: roundTo(fillPrice, 6),
+      slippage: 0, // Maker always fills at limit price
+      fee: roundTo(fee, 6),
+      wasMaker: true,
+      urgency: 'passive',
+      fillSource: 'PENDING_MAKER_CROSSED',
+      virtualBalance: roundTo(this.balance, 4),
+      virtualPnl: roundTo(this.getPnL(), 4),
+      paperMode: true,
+    };
+    this.tradeLog.push(trade);
+    void this.appendTradeLog(trade);
+
+    logger.info('Paper maker order FILLED', {
+      orderId: order.orderId,
+      signalType: order.signalType,
+      side: order.side,
+      outcome: order.outcome,
+      price: fillPrice,
+      shares: filledShares,
+      fee: roundTo(fee, 6),
+      waitMs: latencyMs,
+      balance: roundTo(this.balance, 4),
+    });
+  }
+
+  /* ================================================================
+   * PRIVATE: LOG EXPIRED ORDER
+   * ================================================================ */
+  private logExpiredOrder(order: PendingPaperOrder): void {
+    const trade: PaperTrade = {
+      timestamp: new Date().toISOString(),
+      marketId: order.marketId,
+      marketTitle: order.marketTitle,
+      signalType: order.signalType,
+      outcome: order.outcome,
+      side: order.side,
+      requestedShares: roundTo(order.shares, 4),
+      filledShares: 0,
+      requestedPrice: roundTo(order.price, 6),
+      fillPrice: null,
+      slippage: 0,
+      fee: 0,
+      wasMaker: true,
+      urgency: 'passive',
+      fillSource: 'PENDING_MAKER_EXPIRED',
+      virtualBalance: roundTo(this.balance, 4),
+      virtualPnl: roundTo(this.getPnL(), 4),
+      paperMode: true,
+    };
+    this.tradeLog.push(trade);
+    void this.appendTradeLog(trade);
+
+    logger.debug('Paper maker order expired unfilled', {
+      orderId: order.orderId,
+      signalType: order.signalType,
+      side: order.side,
+      price: order.price,
+      shares: order.shares,
+      livedMs: Date.now() - order.createdAtMs,
+    });
+  }
+
+  /* ================================================================
+   * PRIVATE: APPLY FILL TO POSITION + BALANCE
+   * ================================================================ */
+  private applyFill(params: {
     marketId: string;
     outcome: Outcome;
     side: 'BUY' | 'SELL';
     shares: number;
     price: number;
+    fee: number;
+    isMaker: boolean;
   }): void {
     const position = this.positions.get(params.marketId) ?? createEmptyPaperPosition();
     const key = params.outcome === 'YES' ? 'yes' : 'no';
@@ -513,61 +843,167 @@ export class PaperTrader {
     if (params.side === 'BUY') {
       const previousShares = position[key];
       const nextShares = roundTo(previousShares + params.shares, 4);
-      const nextCost =
-        nextShares > 0
-          ? (position[costKey] * previousShares + params.price * params.shares) / nextShares
-          : 0;
+      // VWAP cost basis
+      const nextCost = nextShares > 0
+        ? (position[costKey] * previousShares + params.price * params.shares) / nextShares
+        : 0;
       position[key] = nextShares;
       position[costKey] = roundTo(nextCost, 6);
-      this.balance = roundTo(this.balance - params.shares * params.price, 4);
-      this.positions.set(params.marketId, position);
-      return;
+      // Deduct cost + fee from balance
+      this.balance = roundTo(this.balance - params.shares * params.price - params.fee, 4);
+      position.totalFees = roundTo(position.totalFees + params.fee, 6);
+      position.entryCount += 1;
+    } else {
+      const previousShares = position[key];
+      const closedShares = Math.min(previousShares, params.shares);
+      // Realized PnL = (sell price - cost basis) * shares - fee
+      position.realizedPnl = roundTo(
+        position.realizedPnl + (params.price - position[costKey]) * closedShares - params.fee,
+        4
+      );
+      position[key] = roundTo(Math.max(0, previousShares - closedShares), 4);
+      if (position[key] <= 0) {
+        position[key] = 0;
+        position[costKey] = 0;
+      }
+      // Add proceeds to balance (fee already deducted from realizedPnl)
+      this.balance = roundTo(this.balance + closedShares * params.price - params.fee, 4);
+      position.totalFees = roundTo(position.totalFees + params.fee, 6);
+      position.exitCount += 1;
     }
 
-    const previousShares = position[key];
-    const closedShares = Math.min(previousShares, params.shares);
-    position.realizedPnl = roundTo(
-      position.realizedPnl + (params.price - position[costKey]) * closedShares,
-      4
-    );
-    position[key] = roundTo(Math.max(0, previousShares - closedShares), 4);
-    if (position[key] <= 0) {
-      position[key] = 0;
-      position[costKey] = 0;
-    }
-    this.balance = roundTo(this.balance + closedShares * params.price, 4);
-    if (position.yes <= 0 && position.no <= 0 && position.realizedPnl === 0) {
+    if (position.yes <= 0 && position.no <= 0 && Math.abs(position.realizedPnl) < 0.0001) {
       this.positions.delete(params.marketId);
-      return;
+    } else {
+      this.positions.set(params.marketId, position);
     }
 
-    this.positions.set(params.marketId, position);
+    this.updateDrawdown();
   }
 
-  private buildUnfilledFill(
-    _side: 'BUY' | 'SELL',
-    _requestedPrice: number
-  ): {
-    filledShares: number;
-    avgPrice: number | null;
-    slippage: number;
-  } {
+  /* ================================================================
+   * PRIVATE: BUILD TRADE RESULT for order-executor compatibility
+   * ================================================================ */
+  private buildTradeResult(
+    params: {
+      marketId: string;
+      tokenId: string;
+      outcome: Outcome;
+      side: 'BUY' | 'SELL';
+      shares: number;
+      price: number;
+      orderType: OrderMode;
+      postOnly: boolean;
+    },
+    filledShares: number,
+    avgPrice: number,
+    fee: number,
+    wasMaker: boolean
+  ): TradeExecutionResult {
     return {
-      filledShares: 0,
-      avgPrice: null,
-      slippage: 0,
+      orderId: buildPaperOrderId(params.marketId, 'PAPER' as SignalType),
+      marketId: params.marketId,
+      tokenId: params.tokenId,
+      outcome: params.outcome,
+      side: params.side,
+      shares: roundTo(params.shares, 4),
+      price: roundTo(params.price, 6),
+      notionalUsd: roundTo(params.shares * params.price, 2),
+      filledShares: roundTo(filledShares, 4),
+      fillPrice: filledShares > 0 ? roundTo(avgPrice, 6) : null,
+      fillConfirmed: filledShares > 0,
+      simulation: true,
+      wasMaker: filledShares > 0 ? wasMaker : null,
+      postOnly: params.postOnly,
+      orderType: params.orderType,
+      balanceCacheHits: 0,
+      balanceCacheMisses: 0,
+      balanceCacheHitRatePct: null,
     };
   }
 
+  /* ================================================================
+   * PRIVATE: ANALYTICS HELPERS
+   * ================================================================ */
+  private updateDrawdown(): void {
+    if (this.balance > this.peakBalance) {
+      this.peakBalance = this.balance;
+    }
+    const drawdown = this.peakBalance - this.balance;
+    if (drawdown > this.maxDrawdownUsd) {
+      this.maxDrawdownUsd = drawdown;
+    }
+  }
+
+  private trackDailyReturn(): void {
+    const today = new Date().toISOString().slice(0, 10);
+    if (this.lastDayDate !== today) {
+      if (this.lastDayDate !== '') {
+        this.dailyReturns.push(this.getPnL() - this.lastDayPnl);
+      }
+      this.lastDayPnl = this.getPnL();
+      this.lastDayDate = today;
+    }
+  }
+
+  private computeSharpe(): number | null {
+    if (this.dailyReturns.length < 3) return null;
+    const mean = this.dailyReturns.reduce((s, r) => s + r, 0) / this.dailyReturns.length;
+    const variance = this.dailyReturns.reduce((s, r) => s + (r - mean) ** 2, 0) / this.dailyReturns.length;
+    const stdDev = Math.sqrt(variance);
+    if (stdDev < 0.0001) return null;
+    // Annualized Sharpe (assume ~365 trading days for crypto)
+    return roundTo((mean / stdDev) * Math.sqrt(365), 2);
+  }
+
+  private computeStrategyBreakdown(): PaperStrategyBreakdown[] {
+    const buckets = new Map<string, { trades: number; fills: number; expired: number; pnl: number }>();
+
+    for (const trade of this.tradeLog) {
+      const key = classifySignal(trade.signalType);
+      const bucket = buckets.get(key) ?? { trades: 0, fills: 0, expired: 0, pnl: 0 };
+      bucket.trades += 1;
+      if (trade.filledShares > 0) {
+        bucket.fills += 1;
+        const signedNotional = trade.side === 'BUY'
+          ? -(trade.fillPrice ?? 0) * trade.filledShares - trade.fee
+          : (trade.fillPrice ?? 0) * trade.filledShares - trade.fee;
+        bucket.pnl = roundTo(bucket.pnl + signedNotional, 4);
+      }
+      if (trade.fillSource === 'PENDING_MAKER_EXPIRED') {
+        bucket.expired += 1;
+      }
+      buckets.set(key, bucket);
+    }
+
+    return Array.from(buckets.entries())
+      .map(([strategy, b]) => ({
+        strategy,
+        trades: b.trades,
+        fills: b.fills,
+        expired: b.expired,
+        pnl: roundTo(b.pnl, 4),
+        fillRate: b.trades > 0 ? `${roundTo((b.fills / b.trades) * 100, 1)}%` : '0%',
+      }))
+      .sort((a, b) => b.trades - a.trades);
+  }
+
+  /* ================================================================
+   * PRIVATE: TRADE LOG
+   * ================================================================ */
   private async appendTradeLog(trade: PaperTrade): Promise<void> {
-    const tradeLogPath = path.resolve(process.cwd(), this.runtimeConfig.tradeLogFile);
-    await appendFile(tradeLogPath, `${JSON.stringify(trade)}\n`, 'utf8');
+    try {
+      const tradeLogPath = path.resolve(process.cwd(), this.runtimeConfig.tradeLogFile);
+      await appendFile(tradeLogPath, `${JSON.stringify(trade)}\n`, 'utf8');
+    } catch {
+      // Non-critical
+    }
   }
 }
 
-function resolveBookForOutcome(snapshot: MarketOrderbookSnapshot, outcome: Outcome): TokenBookSnapshot {
-  return outcome === 'YES' ? snapshot.yes : snapshot.no;
-}
+/* ================================================================
+ * PURE FUNCTIONS — orderbook walk, helpers
+ * ================================================================ */
 
 export function simulateOrderbookWalk(
   levels: OrderbookLevel[],
@@ -584,14 +1020,9 @@ export function simulateOrderbookWalk(
   let totalNotional = 0;
 
   for (const level of orderedLevels) {
-    if (remainingShares <= 0) {
-      break;
-    }
-
+    if (remainingShares <= 0) break;
     const availableShares = Math.max(0, level.size);
-    if (availableShares <= 0) {
-      continue;
-    }
+    if (availableShares <= 0) continue;
 
     const consumedShares = Math.min(remainingShares, availableShares);
     filledShares += consumedShares;
@@ -600,11 +1031,7 @@ export function simulateOrderbookWalk(
   }
 
   if (filledShares <= 0) {
-    return {
-      filledShares: 0,
-      avgPrice: 0,
-      slippage: 0,
-    };
+    return { filledShares: 0, avgPrice: 0, slippage: 0 };
   }
 
   const avgPrice = totalNotional / filledShares;
@@ -621,26 +1048,6 @@ export function simulateOrderbookWalk(
   };
 }
 
-function inferTickSize(book: TokenBookSnapshot, fallbackPrice: number): number {
-  const prices = [...book.bids, ...book.asks]
-    .map((level) => level.price)
-    .filter((value) => Number.isFinite(value) && value > 0)
-    .sort((left, right) => left - right);
-
-  for (let index = 1; index < prices.length; index += 1) {
-    const difference = roundTo(Math.abs(prices[index] - prices[index - 1]), 6);
-    if (difference > 0) {
-      return difference;
-    }
-  }
-
-  return fallbackPrice >= 0.5 ? 0.01 : 0.005;
-}
-
-function totalBookShares(levels: readonly OrderbookLevel[]): number {
-  return levels.reduce((sum, level) => sum + Math.max(0, level.size), 0);
-}
-
 function createEmptyPaperPosition(): PaperPositionState {
   return {
     yes: 0,
@@ -648,123 +1055,27 @@ function createEmptyPaperPosition(): PaperPositionState {
     yesCost: 0,
     noCost: 0,
     realizedPnl: 0,
+    totalFees: 0,
+    entryCount: 0,
+    exitCount: 0,
   };
 }
 
-function buildPaperOrderId(marketId: string, signalType: SignalType): string {
-  return `paper-${signalType.toLowerCase()}-${marketId}-${Date.now()}`;
-}
-
-function randomInt(min: number, max: number): number {
-  const lower = Math.max(0, Math.floor(Math.min(min, max)));
-  const upper = Math.max(lower, Math.floor(Math.max(min, max)));
-  return lower + Math.floor(Math.random() * (upper - lower + 1));
-}
-
-function summarizeStrategies(trades: readonly PaperTrade[]): Array<{
-  label: string;
-  trades: number;
-  pnl: number;
-  fillRate: string;
-}> {
-  const buckets = new Map<string, { trades: number; filled: number; pnl: number }>();
-
-  for (const trade of trades) {
-    const key = classifySignal(trade.signalType);
-    const bucket = buckets.get(key) ?? { trades: 0, filled: 0, pnl: 0 };
-    bucket.trades += 1;
-    if (trade.filledShares > 0) {
-      bucket.filled += 1;
-    }
-    if (trade.fillPrice !== null) {
-      const signedNotional =
-        trade.side === 'BUY'
-          ? -trade.fillPrice * trade.filledShares
-          : trade.fillPrice * trade.filledShares;
-      bucket.pnl = roundTo(bucket.pnl + signedNotional, 4);
-    }
-    buckets.set(key, bucket);
-  }
-
-  return Array.from(buckets.entries())
-    .map(([label, bucket]) => ({
-      label,
-      trades: bucket.trades,
-      pnl: roundTo(bucket.pnl, 4),
-      fillRate: formatWinRate(bucket.filled, bucket.trades),
-    }))
-    .sort((left, right) => right.trades - left.trades);
-}
-
-function summarizeFillRates(trades: readonly PaperTrade[]): Record<SignalUrgency, string> {
-  const stats: Record<SignalUrgency, { total: number; filled: number }> = {
-    passive: { total: 0, filled: 0 },
-    improve: { total: 0, filled: 0 },
-    cross: { total: 0, filled: 0 },
-  };
-
-  for (const trade of trades) {
-    stats[trade.urgency].total += 1;
-    if (trade.filledShares > 0) {
-      stats[trade.urgency].filled += 1;
-    }
-  }
-
-  return {
-    passive: formatWinRate(stats.passive.filled, stats.passive.total),
-    improve: formatWinRate(stats.improve.filled, stats.improve.total),
-    cross: formatWinRate(stats.cross.filled, stats.cross.total),
-  };
-}
-
-function averageLatency(trades: readonly PaperTrade[]): number {
-  if (trades.length === 0) {
-    return 0;
-  }
-
-  const total = trades.reduce((sum, trade) => sum + trade.simulatedLatencyMs, 0);
-  return total / trades.length;
+function buildPaperOrderId(marketId: string, signalType: SignalType | string): string {
+  return `paper-${signalType.toLowerCase()}-${marketId.slice(0, 8)}-${Date.now()}`;
 }
 
 function classifySignal(signalType: SignalType): string {
-  if (signalType.startsWith('PAIRED_ARB')) {
-    return 'PAIRED_ARB';
-  }
-  if (signalType.startsWith('LATENCY_MOMENTUM')) {
-    return 'LATENCY_MOMENTUM';
-  }
-  if (signalType.startsWith('FAIR_VALUE')) {
-    return 'FAIR_VALUE';
-  }
-  if (signalType.startsWith('EXTREME')) {
-    return 'EXTREME';
-  }
+  if (signalType.startsWith('OBI_')) return 'OBI';
+  if (signalType.startsWith('VS_')) return 'VS_ENGINE';
+  if (signalType.startsWith('PAIRED_ARB')) return 'PAIRED_ARB';
+  if (signalType.startsWith('LATENCY_MOMENTUM')) return 'LATENCY_MOMENTUM';
+  if (signalType.startsWith('LOTTERY')) return 'LOTTERY';
+  if (signalType.startsWith('SNIPER')) return 'SNIPER';
+  if (signalType.startsWith('MM_')) return 'MARKET_MAKER';
+  if (signalType.startsWith('FAIR_VALUE')) return 'FAIR_VALUE';
+  if (signalType.startsWith('EXTREME')) return 'EXTREME';
   return signalType;
-}
-
-function averagePnl(entries: readonly ResolvedPaperSlot[]): number {
-  if (entries.length === 0) {
-    return 0;
-  }
-
-  const total = entries.reduce((sum, entry) => sum + entry.pnl, 0);
-  return total / entries.length;
-}
-
-function maxPnl(entries: readonly ResolvedPaperSlot[]): number {
-  if (entries.length === 0) {
-    return 0;
-  }
-
-  return Math.max(...entries.map((entry) => entry.pnl));
-}
-
-function minPnl(entries: readonly ResolvedPaperSlot[]): number {
-  if (entries.length === 0) {
-    return 0;
-  }
-
-  return Math.min(...entries.map((entry) => entry.pnl));
 }
 
 function formatSignedUsd(value: number): string {
@@ -772,33 +1083,10 @@ function formatSignedUsd(value: number): string {
   return `${rounded >= 0 ? '+' : ''}$${rounded.toFixed(2)}`;
 }
 
-function formatWinRate(filled: number, total: number): string {
-  if (total <= 0) {
-    return '0%';
-  }
-
-  return `${roundTo((filled / total) * 100, 1)}%`;
-}
-
-function formatSignedPercent(start: number, end: number): string {
-  if (start <= 0) {
-    return '0.0%';
-  }
-
-  const pct = ((end - start) / start) * 100;
-  return `${pct >= 0 ? '+' : ''}${roundTo(pct, 2).toFixed(2)}%`;
-}
-
 function formatDuration(durationMs: number): string {
-  if (!Number.isFinite(durationMs) || durationMs <= 0) {
-    return '0m';
-  }
-
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return '0m';
   const totalSeconds = Math.floor(durationMs / 1000);
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`;
-  }
-  return `${minutes}m`;
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 }

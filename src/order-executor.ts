@@ -354,6 +354,7 @@ export class OrderExecutor {
 
   resolvePaperSlot(params: {
     marketId: string;
+    marketTitle?: string;
     winningOutcome: 'YES' | 'NO';
   }): { pnl: number; yesValue: number; noValue: number } | null {
     if (!isPaperTradingEnabled(this.runtimeConfig) || !this.paperTrader.hasOpenPosition(params.marketId)) {
@@ -361,6 +362,35 @@ export class OrderExecutor {
     }
 
     return this.paperTrader.resolveSlot(params);
+  }
+
+  /**
+   * Tick pending maker orders against fresh orderbook snapshot.
+   * Called every scan cycle when paper trading is enabled.
+   */
+  tickPaperPendingOrders(marketId: string, currentBook: MarketOrderbookSnapshot): void {
+    this.paperTrader.tickPendingOrders(marketId, currentBook);
+  }
+
+  /**
+   * Expire all pending maker orders for a market (slot ended / cleanup).
+   */
+  expirePaperPendingOrders(marketId: string): void {
+    this.paperTrader.expirePendingOrders(marketId);
+  }
+
+  /**
+   * Get paper trading stats for dashboard / runtime status.
+   */
+  getPaperStats(): import('./paper-trader.js').PaperTradingStats {
+    return this.paperTrader.getStats();
+  }
+
+  /**
+   * Get paper trading virtual balance for compounding / sizing.
+   */
+  getPaperBalance(): number {
+    return this.paperTrader.getBalance();
   }
 
   async close(): Promise<void> {

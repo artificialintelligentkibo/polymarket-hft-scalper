@@ -746,6 +746,15 @@ export class MarketMakerRuntime {
         }
       }
 
+      // Paper trading: seed virtual balance into compounder
+      if (isPaperTradingEnabled(config)) {
+        const paperBalance = this.executor.getPaperBalance();
+        this.compounder.recalculate(paperBalance);
+        logger.info('Compounding: paper trading balance seeded', {
+          balance: roundTo(paperBalance, 2),
+        });
+      }
+
       // Phase 19: standalone wallet funds refresh timer so drawdown guard
       // sees balance changes between slot ticks (not only when runCycle runs).
       if (!isDryRunMode(config) && !isPaperTradingEnabled(config)) {
@@ -1508,6 +1517,10 @@ export class MarketMakerRuntime {
         const orderbook = await this.fetcher.getMarketSnapshot(market);
         this.latestBooks.set(market.marketId, orderbook);
         this.executor.recordOrderbookSnapshot(orderbook);
+        // Paper trading: tick pending maker orders against fresh book
+        if (isPaperTradingEnabled(config)) {
+          this.executor.tickPaperPendingOrders(market.marketId, orderbook);
+        }
         const positionManager = this.getPositionManager(market);
         const riskAssessment = this.riskManager.checkRiskLimits({
           market,
@@ -4796,6 +4809,9 @@ export class MarketMakerRuntime {
         vsStats: config.vsEngine.enabled
           ? this.vsEngine.getSessionStats(config.vsEngine)
           : null,
+        paperStats: isPaperTradingEnabled(config)
+          ? this.executor.getPaperStats()
+          : null,
         ...overrides,
       },
       config
@@ -4903,6 +4919,10 @@ export class MarketMakerRuntime {
     this.orderBookImbalance.clearState(marketId);
     this.obiEngine.clearState(marketId);
     this.vsEngine.clearState(marketId);
+    // Paper trading: expire any pending maker orders for this market
+    if (isPaperTradingEnabled(config)) {
+      this.executor.expirePaperPendingOrders(marketId);
+    }
     // Phase 36: finalize slot replay — write JSONL record and schedule resolution check
     if (config.SLOT_REPLAY_ENABLED) {
       this.slotReplay.finalizeSlot(marketId, async (conditionId) => {
@@ -6811,6 +6831,7 @@ export class MarketMakerRuntime {
     const winningOutcome: 'YES' | 'NO' = settlementPrice >= slotOpenPrice ? 'YES' : 'NO';
     const resolution = this.executor.resolvePaperSlot({
       marketId: market.marketId,
+      marketTitle: market.title,
       winningOutcome,
     });
     if (!resolution) {

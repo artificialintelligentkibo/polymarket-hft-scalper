@@ -308,6 +308,29 @@ export interface RuntimeStatusSnapshot {
   readonly lastSlotReport: RuntimeSlotSnapshot | null;
   readonly obiStats: ObiSessionStats | null;
   readonly vsStats: VsSessionStats | null;
+  readonly paperStats: PaperTradingStatsSnapshot | null;
+}
+
+export interface PaperTradingStatsSnapshot {
+  readonly enabled: boolean;
+  readonly initialBalance: number;
+  readonly currentBalance: number;
+  readonly totalPnl: number;
+  readonly totalPnlPct: number;
+  readonly totalFees: number;
+  readonly totalTrades: number;
+  readonly totalFills: number;
+  readonly totalExpired: number;
+  readonly makerFills: number;
+  readonly takerFills: number;
+  readonly slotsResolved: number;
+  readonly winRate: number;
+  readonly avgWinUsd: number;
+  readonly avgLossUsd: number;
+  readonly maxDrawdownUsd: number;
+  readonly sharpeRatio: number | null;
+  readonly pendingOrders: number;
+  readonly openPositions: number;
 }
 
 export function resolveRuntimeMode(runtimeConfig: AppConfig = config): RuntimeMode {
@@ -391,6 +414,7 @@ export function createRuntimeStatusSnapshot(
     lastSlotReport: null,
     obiStats: null,
     vsStats: null,
+    paperStats: null,
     ...overrides,
   };
 }
@@ -582,6 +606,9 @@ function normalizeRuntimeStatus(
       : null,
     vsStats: value.vsStats && typeof value.vsStats === 'object'
       ? (value.vsStats as VsSessionStats)
+      : null,
+    paperStats: value.paperStats && typeof value.paperStats === 'object'
+      ? (value.paperStats as PaperTradingStatsSnapshot)
       : null,
   };
 }

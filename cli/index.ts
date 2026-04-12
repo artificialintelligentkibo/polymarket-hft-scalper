@@ -30,6 +30,7 @@ import {
   type RuntimeStatusSnapshot,
   type ObiSessionStats,
   type VsSessionStats,
+  type PaperTradingStatsSnapshot,
 } from '../src/runtime-status.js';
 import { checkPolymarketStatus, writeStatusControlCommand } from '../src/status-monitor.js';
 import { resetSlotReporterState } from '../src/slot-reporter.js';
@@ -646,6 +647,34 @@ function renderVsRecentDecisions(stats: VsSessionStats): string {
   );
 }
 
+function renderPaperTradingStats(stats: PaperTradingStatsSnapshot): string {
+  const pnlColor = stats.totalPnl >= 0 ? color.green : color.red;
+  const pnlStr = `${stats.totalPnl >= 0 ? '+' : ''}$${stats.totalPnl.toFixed(2)} (${stats.totalPnlPct >= 0 ? '+' : ''}${stats.totalPnlPct.toFixed(1)}%)`;
+  const winRateStr = stats.slotsResolved > 0
+    ? `${stats.winRate.toFixed(0)}%`
+    : 'n/a';
+  const fillRate = stats.totalTrades > 0
+    ? `${((stats.totalFills / stats.totalTrades) * 100).toFixed(0)}%`
+    : 'n/a';
+
+  const lines: string[] = [
+    `  ${color.dim('Balance:')} $${stats.initialBalance.toFixed(2)} ${color.dim('->')} ${color.bold(`$${stats.currentBalance.toFixed(2)}`)}  ${color.dim('PnL:')} ${pnlColor(pnlStr)}`,
+    `  ${color.dim('Trades:')} ${stats.totalTrades}  ${color.dim('Fills:')} ${stats.totalFills}  ${color.dim('Expired:')} ${stats.totalExpired}  ${color.dim('Fill rate:')} ${fillRate}`,
+    `  ${color.dim('Maker fills:')} ${stats.makerFills}  ${color.dim('Taker fills:')} ${stats.takerFills}  ${color.dim('Fees:')} $${stats.totalFees.toFixed(4)}`,
+    `  ${color.dim('Slots:')} ${stats.slotsResolved}  ${color.dim('Win rate:')} ${winRateStr}  ${color.dim('Avg win:')} ${formatPaperUsd(stats.avgWinUsd)}  ${color.dim('Avg loss:')} ${formatPaperUsd(stats.avgLossUsd)}`,
+    `  ${color.dim('Max drawdown:')} $${stats.maxDrawdownUsd.toFixed(2)}  ${color.dim('Sharpe:')} ${stats.sharpeRatio !== null ? stats.sharpeRatio.toFixed(2) : 'n/a'}`,
+    `  ${color.dim('Pending orders:')} ${stats.pendingOrders}  ${color.dim('Open positions:')} ${stats.openPositions}`,
+  ];
+  return lines.join('\n');
+}
+
+function formatPaperUsd(value: number): string {
+  if (value === 0) return '$0.00';
+  const sign = value >= 0 ? '+' : '';
+  const colorFn = value >= 0 ? color.green : color.red;
+  return colorFn(`${sign}$${value.toFixed(2)}`);
+}
+
 function renderDashboardFrame(runtimeConfig: AppConfig): string {
   const inspection = inspectBot(runtimeConfig);
   const runtimeStatus = inspection.runtimeStatus;
@@ -833,6 +862,18 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
       renderSection(
         'RECENT VS DECISIONS',
         renderVsRecentDecisions(vsStats)
+      )
+    );
+  }
+
+  // Paper Trading section — shown when paper trading is active
+  const paperStats = runtimeStatus?.paperStats;
+  if (paperStats?.enabled) {
+    lines.push('');
+    lines.push(
+      renderSection(
+        'PAPER TRADING  -  VIRTUAL PERFORMANCE',
+        renderPaperTradingStats(paperStats)
       )
     );
   }
