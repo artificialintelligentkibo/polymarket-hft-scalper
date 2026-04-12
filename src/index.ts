@@ -1591,7 +1591,32 @@ export class MarketMakerRuntime {
         this.executor.recordOrderbookSnapshot(orderbook);
         // Paper trading: tick pending maker orders against fresh book
         if (isPaperTradingEnabled(config)) {
-          this.executor.tickPaperPendingOrders(market.marketId, orderbook);
+          const paperFills = this.executor.tickPaperPendingOrders(market.marketId, orderbook);
+          // Sync paper maker fills into positionManager so exit signals
+          // (lottery, OBI, VS) can see the shares and generate exits.
+          const pm = this.getPositionManager(market);
+          for (const pf of paperFills) {
+            pm.applyFill({
+              outcome: pf.outcome,
+              side: pf.side,
+              shares: pf.shares,
+              price: pf.price,
+              timestamp: new Date().toISOString(),
+              orderId: `paper-maker-${Date.now()}`,
+              strategyLayer: pf.strategyLayer,
+            });
+            // Register lottery fills so lotteryEngine tracks the position
+            if (pf.signalType === 'LOTTERY_BUY' && pf.side === 'BUY') {
+              this.lotteryEngine.recordExecution({
+                marketId: pf.marketId,
+                outcome: pf.outcome,
+                filledShares: pf.shares,
+                fillPrice: pf.price,
+                signalType: pf.signalType,
+                slotKey: getSlotKey(market),
+              });
+            }
+          }
         }
         const positionManager = this.getPositionManager(market);
         const riskAssessment = this.riskManager.checkRiskLimits({

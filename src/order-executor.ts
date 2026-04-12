@@ -11,7 +11,7 @@ import type { MarketOrderbookSnapshot, OrderbookLevel, TokenBookSnapshot } from 
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import { OrderbookHistory } from './orderbook-history.js';
-import { PaperTrader } from './paper-trader.js';
+import { PaperTrader, type PaperMakerFill } from './paper-trader.js';
 import { resolveProductTestUrgency } from './product-test-mode.js';
 import type { StrategySignal } from './strategy-types.js';
 import {
@@ -368,8 +368,8 @@ export class OrderExecutor {
    * Tick pending maker orders against fresh orderbook snapshot.
    * Called every scan cycle when paper trading is enabled.
    */
-  tickPaperPendingOrders(marketId: string, currentBook: MarketOrderbookSnapshot): void {
-    this.paperTrader.tickPendingOrders(marketId, currentBook);
+  tickPaperPendingOrders(marketId: string, currentBook: MarketOrderbookSnapshot): PaperMakerFill[] {
+    return this.paperTrader.tickPendingOrders(marketId, currentBook);
   }
 
   /**

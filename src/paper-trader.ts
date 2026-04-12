@@ -9,7 +9,7 @@ import type {
 import { logger } from './logger.js';
 import type { OrderMode } from './config.js';
 import type { OrderbookHistory } from './orderbook-history.js';
-import type { SignalType, SignalUrgency } from './strategy-types.js';
+import type { SignalType, SignalUrgency, StrategyLayer } from './strategy-types.js';
 import type { TradeExecutionResult } from './trader.js';
 import { clamp, roundTo, sleep } from './utils.js';
 
@@ -51,6 +51,16 @@ export interface PaperTraderConfig {
 /* ================================================================
  * TRADE LOG TYPES
  * ================================================================ */
+
+export interface PaperMakerFill {
+  readonly marketId: string;
+  readonly outcome: Outcome;
+  readonly side: 'BUY' | 'SELL';
+  readonly shares: number;
+  readonly price: number;
+  readonly signalType: SignalType;
+  readonly strategyLayer: StrategyLayer;
+}
 
 export interface PaperTrade {
   readonly timestamp: string;
@@ -219,12 +229,13 @@ export class PaperTrader {
    * Checks all pending maker orders against current book state.
    * If price has crossed → fill the order (maker fee).
    * ================================================================ */
-  tickPendingOrders(marketId: string, currentBook: MarketOrderbookSnapshot): void {
+  tickPendingOrders(marketId: string, currentBook: MarketOrderbookSnapshot): PaperMakerFill[] {
     const pending = this.pendingOrders.get(marketId);
-    if (!pending || pending.length === 0) return;
+    if (!pending || pending.length === 0) return [];
 
     const nowMs = Date.now();
     const remaining: PendingPaperOrder[] = [];
+    const fills: PaperMakerFill[] = [];
 
     for (const order of pending) {
       // Check expiry
@@ -239,6 +250,18 @@ export class PaperTrader {
 
       if (crossed) {
         this.fillMakerOrder(order, book);
+        fills.push({
+          marketId: order.marketId,
+          outcome: order.outcome,
+          side: order.side,
+          shares: order.shares,
+          price: order.price,
+          signalType: order.signalType,
+          strategyLayer: order.signalType === 'LOTTERY_BUY' ? 'LOTTERY' as const
+            : order.signalType === 'OBI_ENTRY_BUY' ? 'OBI' as const
+            : order.signalType.startsWith('VS_') ? 'VS_ENGINE' as const
+            : 'SNIPER' as const,
+        });
       } else {
         remaining.push(order);
       }
@@ -249,6 +272,8 @@ export class PaperTrader {
     } else {
       this.pendingOrders.delete(marketId);
     }
+
+    return fills;
   }
 
   /* ================================================================
