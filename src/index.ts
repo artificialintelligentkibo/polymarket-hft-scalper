@@ -1616,6 +1616,14 @@ export class MarketMakerRuntime {
                 slotKey: getSlotKey(market),
               });
             }
+            // Phase 39: set slotStrategyClaim for paper maker fills so Phase 32
+            // zombie sweep doesn't re-register them as OBI positions.
+            if (pf.side === 'BUY') {
+              const layer = resolveStrategyLayer(pf.signalType);
+              if (layer === 'OBI' || layer === 'VS_ENGINE' || layer === 'SNIPER' || layer === 'LOTTERY') {
+                this.slotStrategyClaim.set(pf.marketId, layer);
+              }
+            }
           }
         }
         const positionManager = this.getPositionManager(market);
@@ -2324,6 +2332,46 @@ export class MarketMakerRuntime {
     const effectiveNotionalUsd = execution.fillConfirmed
       ? roundTo(effectiveShares * effectivePrice, 2)
       : 0;
+
+    // Phase 39: Paper mode — when a SELL gets 0 fills and the slot has ended,
+    // the book is empty (market resolved). Abandon position as a total loss
+    // instead of retrying SLOT_FLATTEN/HARD_STOP every 3s forever.
+    if (
+      paperTradingEnabled &&
+      effectiveShares === 0 &&
+      executionSignal.action === 'SELL' &&
+      (executionSignal.signalType === 'SLOT_FLATTEN' || executionSignal.signalType === 'HARD_STOP')
+    ) {
+      const slotEndMs = market.endTime ? new Date(market.endTime).getTime() : 0;
+      if (slotEndMs > 0 && Date.now() > slotEndMs) {
+        const abandonShares = positionManager.getShares(executionSignal.outcome);
+        if (abandonShares > 0) {
+          // Force-clear at price 0 — total loss of the cost basis
+          positionManager.applyFill({
+            outcome: executionSignal.outcome,
+            side: 'SELL',
+            shares: abandonShares,
+            price: 0,
+            timestamp: new Date().toISOString(),
+            orderId: `paper-abandon-${Date.now()}`,
+            strategyLayer: executionSignal.strategyLayer ?? resolveStrategyLayer(executionSignal.signalType),
+          });
+          // Clear engine state so orphan sweeps stop
+          this.lotteryEngine.recordExit(market.marketId, executionSignal.outcome);
+          this.obiEngine.clearState(market.marketId);
+          this.vsEngine.clearState(market.marketId);
+          this.slotStrategyClaim.delete(market.marketId);
+          logger.warn('Phase 39: paper position abandoned — slot ended, book empty', {
+            marketId: market.marketId,
+            outcome: executionSignal.outcome,
+            abandonedShares: roundTo(abandonShares, 4),
+            signalType: executionSignal.signalType,
+          });
+          return null;
+        }
+      }
+    }
+
     const afterSnapshot =
       effectiveShares > 0
         ? positionManager.applyFill({
