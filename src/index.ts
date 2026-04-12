@@ -3698,7 +3698,7 @@ export class MarketMakerRuntime {
           });
         }
       }
-      if (fill.signalType === 'OBI_ENTRY_BUY' && config.obiEngine.enabled) {
+      if (fill.signalType === 'OBI_ENTRY_BUY' && fill.filledShares > 0 && config.obiEngine.enabled) {
         this.slotStrategyClaim.set(fill.marketId, 'OBI'); // Phase 35C: reinforce claim on async fill
         const obiCoin = extractCoinFromObiTitle(market.title);
         this.obiEngine.recordEntryForStats(obiCoin, `${fill.outcome} ${fill.filledShares}sh @${roundTo(fill.fillPrice, 3)}`);
@@ -3803,8 +3803,12 @@ export class MarketMakerRuntime {
         }
       }
       // VS Engine entry fill (async path) — register position tracking
+      // Phase 39: filledShares > 0 guard — without this, cancelled/expired maker
+      // orders with 0 fills create phantom VS positions that show unrealized P&L
+      // in the dashboard but have no on-chain shares (BTC phantom fill 2026-04-12).
       if (
         (fill.signalType === 'VS_ENTRY_BUY' || fill.signalType === 'VS_MOMENTUM_BUY') &&
+        fill.filledShares > 0 &&
         config.vsEngine.enabled
       ) {
         this.slotStrategyClaim.set(fill.marketId, 'VS_ENGINE'); // Phase 35C: reinforce claim on async fill
