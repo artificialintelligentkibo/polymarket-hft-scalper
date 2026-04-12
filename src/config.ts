@@ -1527,6 +1527,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0.50,
         0.995
       ),
+      makerAskMaxEdge: clamp(
+        parseFloatOrDefault(env.VS_MAKER_ASK_MAX_EDGE, '0.02'),
+        0.005,
+        0.10
+      ),
       timeExitBeforeEndMs: Math.max(
         1000,
         parseIntOrDefault(env.VS_TIME_EXIT_BEFORE_END_MS, '5000')

@@ -1452,8 +1452,15 @@ export class MarketMakerRuntime {
             });
           }
 
-          // (A) Re-register zombie positions that lost OBI engine tracking
-          if (!this.obiEngine.hasPosition(marketId)) {
+          // (A) Re-register zombie positions that lost OBI engine tracking.
+          // Phase 35C: skip if VS engine owns this position or the slot is
+          // claimed by VS_ENGINE — otherwise OBI hard-stop sweep would fire
+          // exit signals on VS positions (caused -$2.82 loss on 2026-04-12).
+          if (
+            !this.obiEngine.hasPosition(marketId) &&
+            !this.vsEngine.hasPosition(marketId) &&
+            this.slotStrategyClaim.get(marketId) !== 'VS_ENGINE'
+          ) {
             const book = this.latestBooks.get(marketId);
             if (!book) continue;
 

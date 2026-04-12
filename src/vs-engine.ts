@@ -67,6 +67,9 @@ export interface VsEngineConfig {
   readonly momentumMaxPositionShares: number;
   // Exit
   readonly targetExitPrice: number;
+  /** Phase 35D: max edge (in price units) for VS MM ASK above entry VWAP.
+   *  Prevents absurd ask prices like entry=0.49 ask=0.58 (+18% edge). */
+  readonly makerAskMaxEdge: number;
   readonly timeExitBeforeEndMs: number;
   readonly timeExitMinPrice: number;
   // Timing
@@ -636,9 +639,19 @@ export class VsEngine {
       })];
     }
 
-    // MM ask: place resting sell above entry to capture profit
+    // MM ask: place resting sell above entry to capture profit.
+    // Phase 35D: cap the ask at entry + makerAskMaxEdge (default 0.02).
+    // Without this cap, when bestBid jumps (e.g. 0.49→0.57), the ask
+    // lands at 0.58 (+18% edge) — nobody fills that on a 5-min market.
+    // Vague-sourdough average edge is ~3.4%, so 1-2¢ is realistic.
     if (bestBid && bestBid > position.entryVwap) {
-      const askPrice = roundTo(Math.min(bestBid + 0.01, config.targetExitPrice), 2);
+      const maxAskByEdge = position.entryVwap + config.makerAskMaxEdge;
+      const askPrice = roundTo(
+        Math.min(bestBid + 0.01, maxAskByEdge, config.targetExitPrice),
+        2
+      );
+      // Don't place ask below entry (would lock in a loss as maker)
+      if (askPrice <= position.entryVwap) return [];
       this.totalExitSignals += 1;
       return [this.buildSignal({
         market,
@@ -650,7 +663,7 @@ export class VsEngine {
         targetPrice: askPrice,
         fairValue: null,
         urgency: 'passive',
-        reason: `VS maker-ask: @${askPrice} (entry=${roundTo(position.entryVwap, 3)})`,
+        reason: `VS maker-ask: @${askPrice} (entry=${roundTo(position.entryVwap, 3)}, maxEdge=${config.makerAskMaxEdge})`,
         reduceOnly: true,
         priority: 850,
         edgeAmount: askPrice - position.entryVwap,
