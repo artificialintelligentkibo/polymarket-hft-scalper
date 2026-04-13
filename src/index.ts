@@ -1616,6 +1616,44 @@ export class MarketMakerRuntime {
                 slotKey: getSlotKey(market),
               });
             }
+            // Phase 42: notify OBI engine of paper BUY fills so it tracks position
+            // and enforces OBI_MAX_POSITION_SHARES (prevents runaway accumulation).
+            if (pf.signalType === 'OBI_ENTRY_BUY' && pf.side === 'BUY') {
+              const totalLiveShares = pm.getShares(pf.outcome);
+              this.obiEngine.onEntryFill({
+                marketId: pf.marketId,
+                marketTitle: market.title,
+                outcome: pf.outcome,
+                fillPrice: pf.price,
+                filledShares: pf.shares,
+                orderbook,
+                config: config.obiEngine,
+                totalLiveShares,
+                slotEndTime: market.endTime ?? null,
+              });
+            }
+            // Phase 42: notify VS engine of paper BUY fills so it tracks position
+            // and enforces VS_MM_MAX_POSITION_SHARES.
+            if (
+              (pf.signalType === 'VS_ENTRY_BUY' || pf.signalType === 'VS_MOMENTUM_BUY') &&
+              pf.side === 'BUY'
+            ) {
+              const vsCoin = extractCoinFromTitle(market.title);
+              const strikePrice = this.binanceEdge.getSlotOpenPrice(
+                vsCoin ?? '', market.startTime
+              ) ?? this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0;
+              this.vsEngine.onEntryFill({
+                marketId: pf.marketId,
+                marketTitle: market.title,
+                outcome: pf.outcome,
+                fillPrice: pf.price,
+                filledShares: pf.shares,
+                slotEndTime: market.endTime ?? null,
+                slotStartTime: market.startTime ?? null,
+                strikePrice,
+                phase: pf.signalType === 'VS_MOMENTUM_BUY' ? 'MOMENTUM' : 'MM',
+              });
+            }
             // Phase 39: set slotStrategyClaim for paper maker fills so Phase 32
             // zombie sweep doesn't re-register them as OBI positions.
             if (pf.side === 'BUY') {
