@@ -585,9 +585,37 @@ function renderVsSessionStats(stats: VsSessionStats): string {
       ['Wins', color.green(String(stats.wins)), 'Losses', color.red(String(stats.losses))],
       ['Win Rate', color.bold(winRate), 'Realized PnL', formatSignedCurrency(stats.realizedPnl)],
       ['Phase 1 (MM)', color.cyan(String(stats.phase1Entries)), 'Phase 1 PnL', formatSignedCurrency(stats.phase1Pnl)],
-      ['Phase 2 (MOM)', color.cyan(String(stats.phase2Entries)), 'Phase 2 PnL', formatSignedCurrency(stats.phase2Pnl)],
-      ['Exit Target', color.bold(stats.targetExitPrice.toFixed(2)), 'Mom Max Buy', color.bold(stats.momentumMaxBuyPrice.toFixed(2))],
+      ['Phase 2 (AGG)', color.yellow(String(stats.phase2Entries)), 'Phase 2 PnL', formatSignedCurrency(stats.phase2Pnl)],
+      ['MM Spread', color.bold(`${(stats.mmSpreadCents ?? 0.02).toFixed(2)}¢`), 'MM Tilt Max', color.bold(`${(stats.mmTiltMaxCents ?? 0.01).toFixed(2)}¢`)],
+      ['Agg Vol Floor', color.bold((stats.aggressorVolFloor ?? 0.02).toFixed(3)), 'Agg Min Edge', color.bold((stats.aggressorMinEdge ?? 0.03).toFixed(3))],
+      ['Exit Target', color.bold(stats.targetExitPrice.toFixed(2)), 'Agg Max Buy', color.bold(stats.momentumMaxBuyPrice.toFixed(2))],
+      ['Signals Gen', color.dim(String(stats.totalSignalsGenerated ?? 0)), 'Active Pos', color.bold(String((stats.activePositions ?? []).length))],
     ]
+  );
+}
+
+function renderVsActivePositions(stats: VsSessionStats): string {
+  const positions = stats.activePositions ?? [];
+  if (positions.length === 0) {
+    return color.dim('No active VS positions.');
+  }
+  const rows: string[][] = [];
+  for (const p of positions) {
+    const ageSec = Math.round(p.ageMs / 1000);
+    const phaseStr = p.phase === 'MOMENTUM' ? color.yellow('AGG') : color.cyan('MM');
+    rows.push([
+      color.bold(p.coin),
+      p.outcome === 'YES' ? color.green('YES') : color.red('NO'),
+      color.bold(String(p.shares)),
+      color.dim(p.entryVwap.toFixed(3)),
+      phaseStr,
+      color.dim(`${ageSec}s`),
+    ]);
+  }
+  return renderTable(
+    ['COIN', 'SIDE', 'SHARES', 'VWAP', 'PHASE', 'AGE'],
+    [6, 6, 8, 8, 7, 8],
+    rows
   );
 }
 
@@ -624,16 +652,18 @@ function renderVsRecentDecisions(stats: VsSessionStats): string {
     return color.dim('No VS decisions recorded yet.');
   }
   const rows: string[][] = [];
-  const decisions = [...stats.recentDecisions].reverse().slice(0, 3);
+  const decisions = [...stats.recentDecisions].reverse().slice(0, 5);
   for (const d of decisions) {
     const time = d.timestamp.slice(11, 19);
     const coin = d.coin ?? '?';
-    const phase = d.phase === 'MOMENTUM' ? color.yellow('MOM') : color.cyan('MM');
+    const phase = d.phase === 'MOMENTUM' ? color.yellow('AGG') : color.cyan('MM');
     let actionStr: string;
     if (d.action.includes('ENTRY') || d.action.includes('BUY')) {
       actionStr = color.green(d.action);
     } else if (d.action.includes('EXIT') || d.action.includes('SELL')) {
       actionStr = color.cyan(d.action);
+    } else if (d.action === 'SKIP') {
+      actionStr = color.yellow(d.action);
     } else {
       actionStr = color.dim(d.action);
     }
@@ -828,8 +858,15 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   if (vsStats?.enabled) {
     lines.push(
       renderSection(
-        `VS ENGINE  -  BINANCE LATENCY ARB ${vsStats.shadowMode ? color.yellow('[SHADOW]') : ''}`,
+        `VS ENGINE  -  TWO-SIDED MM + AGGRESSOR ${vsStats.shadowMode ? color.yellow('[SHADOW]') : ''}`,
         renderVsSessionStats(vsStats)
+      )
+    );
+    // Active positions — always show (helpful to see empty = no open risk)
+    lines.push(
+      renderSection(
+        'VS ACTIVE POSITIONS',
+        renderVsActivePositions(vsStats)
       )
     );
     if (vsStats.entries > 0) {

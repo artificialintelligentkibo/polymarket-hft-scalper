@@ -229,6 +229,15 @@ export interface VsDecisionRecord {
   readonly fairValue: number | null;
 }
 
+export interface VsActivePosition {
+  readonly coin: string;
+  readonly outcome: 'YES' | 'NO';
+  readonly shares: number;
+  readonly entryVwap: number;
+  readonly phase: 'MM' | 'MOMENTUM';
+  readonly ageMs: number;
+}
+
 export interface VsSessionStats {
   readonly enabled: boolean;
   readonly shadowMode: boolean;
@@ -246,6 +255,13 @@ export interface VsSessionStats {
   readonly targetExitPrice: number;
   readonly momentumMaxBuyPrice: number;
   readonly defaultVolatility: number;
+  // Phase 45a: two-sided MM + aggressor config & active positions
+  readonly aggressorVolFloor: number;
+  readonly aggressorMinEdge: number;
+  readonly mmTiltMaxCents: number;
+  readonly mmSpreadCents: number;
+  readonly activePositions: readonly VsActivePosition[];
+  readonly totalSignalsGenerated: number;
 }
 
 export interface RuntimeStatusSnapshot {

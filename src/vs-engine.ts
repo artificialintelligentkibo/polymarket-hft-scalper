@@ -975,6 +975,21 @@ export class VsEngine {
       };
     }
 
+    // Phase 45a: expose active positions for dashboard
+    const nowMs = Date.now();
+    const activePositions: Array<VsSessionStats['activePositions'][number]> = [];
+    for (const [, pos] of this.positions) {
+      const coin = extractCoin(pos.marketTitle) ?? '?';
+      activePositions.push({
+        coin,
+        outcome: pos.outcome,
+        shares: roundTo(pos.totalShares, 2),
+        entryVwap: roundTo(pos.entryVwap, 4),
+        phase: pos.phase,
+        ageMs: nowMs - pos.enteredAtMs,
+      });
+    }
+
     return {
       enabled: config.enabled,
       shadowMode: config.shadowMode,
@@ -992,6 +1007,12 @@ export class VsEngine {
       targetExitPrice: config.targetExitPrice,
       momentumMaxBuyPrice: config.momentumMaxBuyPrice,
       defaultVolatility: config.defaultVolatility,
+      aggressorVolFloor: config.aggressorVolFloor,
+      aggressorMinEdge: config.aggressorMinEdge,
+      mmTiltMaxCents: config.mmTiltMaxCents,
+      mmSpreadCents: config.mmSpreadCents,
+      activePositions,
+      totalSignalsGenerated: this.totalExitSignals + this.totalEntries,
     };
   }
 
