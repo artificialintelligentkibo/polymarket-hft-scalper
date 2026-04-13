@@ -2840,9 +2840,11 @@ export class MarketMakerRuntime {
       // Phase 28: synchronous OBI exit fills — record stats and clean up
       // obiEngine.positions so the dead position doesn't linger until wallet
       // reconciliation. Previously only async fills (via fillTracker) did this.
+      // Phase 44: also handles OBI_MM_QUOTE_ASK (MM cycle sell) same as VS_MM_ASK pattern.
       if (
         (executionSignal.signalType === 'OBI_REBALANCE_EXIT' ||
-          executionSignal.signalType === 'OBI_SCALP_EXIT') &&
+          executionSignal.signalType === 'OBI_SCALP_EXIT' ||
+          executionSignal.signalType === 'OBI_MM_QUOTE_ASK') &&
         executionSignal.action === 'SELL' &&
         config.obiEngine.enabled
       ) {
@@ -2964,11 +2966,13 @@ export class MarketMakerRuntime {
         }
       }
       // VS Engine exit fills — clear position tracking.
-      // Also handles SLOT_FLATTEN that exits a VS-tracked position (belt-and-suspenders).
+      // Handles VS_SCALP_EXIT, VS_TIME_EXIT, VS_MM_ASK (MM cycle sell), and
+      // SLOT_FLATTEN that exits a VS-tracked position (belt-and-suspenders).
       if (
         executionSignal.action === 'SELL' &&
         config.vsEngine.enabled &&
         (isVsExitSignal(executionSignal.signalType) ||
+         executionSignal.signalType === 'VS_MM_ASK' ||
          (executionSignal.signalType === 'SLOT_FLATTEN' && this.vsEngine.hasPosition(market.marketId)))
       ) {
         const remainingShares = positionManager.getShares(executionSignal.outcome);
@@ -4023,7 +4027,7 @@ export class MarketMakerRuntime {
       });
     }
 
-    // OBI exit stats for dashboard — count ALL OBI sell fills, not just taker exits
+    // OBI exit stats + position clearing for async fills
     if (
       config.obiEngine.enabled &&
       fill.side === 'SELL' &&
@@ -4031,9 +4035,20 @@ export class MarketMakerRuntime {
     ) {
       const exitCoin = extractCoinFromObiTitle(market.title);
       this.obiEngine.recordExitForStats(exitCoin, realizedDelta, fill.signalType);
+      // Phase 44: clear OBI position state when fully exited (prevents ghost positions)
+      const obiRemaining = positionManager.getShares(fill.outcome);
+      if (obiRemaining <= 0) {
+        this.obiEngine.clearState(fill.marketId);
+        logger.info('Phase 44: OBI async exit fill — cleared position tracking', {
+          marketId: fill.marketId,
+          signalType: fill.signalType,
+          soldShares: fill.filledShares,
+          exitPrice: fill.fillPrice,
+        });
+      }
     }
 
-    // VS exit stats for dashboard
+    // VS exit stats + position clearing for async fills
     if (
       config.vsEngine.enabled &&
       fill.side === 'SELL' &&
@@ -4041,6 +4056,17 @@ export class MarketMakerRuntime {
     ) {
       const exitCoin = extractCoinFromTitle(market.title);
       this.vsEngine.recordExitForStats(exitCoin, realizedDelta, fill.signalType);
+      // Phase 44: clear VS position state when fully exited (prevents ghost positions)
+      const vsRemaining = positionManager.getShares(fill.outcome);
+      if (vsRemaining <= 0) {
+        this.vsEngine.clearState(fill.marketId);
+        logger.info('Phase 44: VS async exit fill — cleared position tracking', {
+          marketId: fill.marketId,
+          signalType: fill.signalType,
+          soldShares: fill.filledShares,
+          exitPrice: fill.fillPrice,
+        });
+      }
     }
 
     if (fill.signalType === 'HARD_STOP' && fill.side === 'SELL') {
@@ -5881,17 +5907,16 @@ export class MarketMakerRuntime {
 
           await this.executeSignal(exitMarket, exitBook, pm, exitSignal, slotKey);
 
-          // Record VS exit stats
+          // Record VS exit stats — read entryVwap BEFORE clearState (Phase 44 fix)
           const exitCoin = extractCoinFromTitle(cachedTitle);
-          const remainingShares = pm.getShares(outcome);
-          if (remainingShares <= 0) {
-            this.vsEngine.clearState(marketId);
-          }
-          // Estimate PnL from this exit
           const vsPos = this.vsEngine.getActivePositions().get(marketId);
           const entryVwap = vsPos?.entryVwap ?? bestBid;
           const realizedDelta = (bestBid - entryVwap) * liveShares;
           this.vsEngine.recordExitForStats(exitCoin, realizedDelta, 'VS_TIME_EXIT');
+          const remainingShares = pm.getShares(outcome);
+          if (remainingShares <= 0) {
+            this.vsEngine.clearState(marketId);
+          }
         } catch (error) {
           logger.warn('Phase 35C: VS time-exit timer failed', {
             marketId,

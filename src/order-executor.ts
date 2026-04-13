@@ -585,7 +585,11 @@ function resolveExecutionUrgency(
       signal.signalType === 'SLOT_FLATTEN' ||
       signal.signalType === 'TRAILING_TAKE_PROFIT' ||
       signal.signalType === 'OBI_REBALANCE_EXIT' ||
-      signal.signalType === 'OBI_SCALP_EXIT')
+      signal.signalType === 'OBI_SCALP_EXIT' ||
+      // Phase 44: VS exits MUST cross the spread in live, otherwise
+      // POST_ONLY_ONLY=true turns them into resting makers that never fill.
+      signal.signalType === 'VS_SCALP_EXIT' ||
+      signal.signalType === 'VS_TIME_EXIT')
   ) {
     return urgency;
   }
