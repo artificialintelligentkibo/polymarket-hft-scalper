@@ -829,6 +829,16 @@ export class MarketMakerRuntime {
     });
     this.statusMonitor.start();
     this.binanceEdge.start();
+
+    // Phase 48b: register Binance WS price update callback for real-time
+    // stale quote cancellation. When Binance price moves >threshold from
+    // quote placement price, cancel the stale order within ~50-100ms.
+    if (config.vsEngine.enabled && config.vsEngine.staleCancelThresholdPct > 0) {
+      this.binanceEdge.onPriceUpdate((coin, price) => {
+        this.handleBinancePriceUpdateForVs(coin, price);
+      });
+    }
+
     this.deepBinance.start();
     if (isDynamicQuotingEnabled(config)) {
       this.quotingEngine.start(async (plan) => {
@@ -5947,6 +5957,44 @@ export class MarketMakerRuntime {
       }
     }
     return cancelledCount;
+  }
+
+  /**
+   * Phase 48b: Handle real-time Binance price update from WS callback.
+   * Runs on every WS tick (~100ms). Must be fast and non-blocking.
+   * Checks if any VS quotes for this coin are stale and cancels them.
+   */
+  private handleBinancePriceUpdateForVs(coin: string, price: number): void {
+    const threshold = config.vsEngine.staleCancelThresholdPct;
+    if (threshold <= 0) return;
+
+    const staleQuotes = this.vsEngine.getStaleQuotesForCoin(coin, price, threshold);
+    if (staleQuotes.length === 0) return;
+
+    for (const sq of staleQuotes) {
+      // Clear quoteMeta immediately (sync) to prevent re-triggering on next tick
+      this.vsEngine.clearQuoteMeta(sq.marketId, sq.outcome);
+
+      logger.info('Phase 48b: WS stale cancel — Binance moved, cancelling VS quote', {
+        coin,
+        marketId: sq.marketId,
+        outcome: sq.outcome,
+        quoteAgeMs: sq.quoteAgeMs,
+        binanceDeltaPct: roundTo(sq.binanceDeltaPct, 4),
+        thresholdPct: threshold,
+        bidPrice: sq.bidPrice,
+        currentBinancePrice: price,
+      });
+
+      // Fire-and-forget the actual cancel (async for live, sync for paper)
+      this.cancelStaleVsBuyQuotes(sq.marketId, sq.outcome).catch((err) => {
+        logger.warn('Phase 48b: WS stale cancel failed', {
+          marketId: sq.marketId,
+          outcome: sq.outcome,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
   }
 
   /**

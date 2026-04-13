@@ -439,6 +439,50 @@ export class VsEngine {
     this.staleCancels += 1;
   }
 
+  /**
+   * Phase 48b: Check stale quotes for a specific coin at a given Binance price.
+   * Called from the Binance WS callback on every price tick (~100ms).
+   * Returns stale entries to cancel. Caller handles actual cancellation.
+   */
+  getStaleQuotesForCoin(
+    coin: string,
+    currentPrice: number,
+    thresholdPct: number
+  ): Array<{
+    marketId: string;
+    outcome: Outcome;
+    quoteAgeMs: number;
+    binanceDeltaPct: number;
+    bidPrice: number;
+  }> {
+    if (thresholdPct <= 0) return [];
+    const stale: Array<{
+      marketId: string; outcome: Outcome;
+      quoteAgeMs: number; binanceDeltaPct: number; bidPrice: number;
+    }> = [];
+    const now = Date.now();
+
+    for (const [key, meta] of this.quoteMeta) {
+      if (meta.coin !== coin) continue;
+
+      const deltaPct = Math.abs(
+        ((currentPrice - meta.binancePriceAtPlace) / meta.binancePriceAtPlace) * 100
+      );
+      if (deltaPct >= thresholdPct) {
+        const sepIdx = key.lastIndexOf(':');
+        const marketId = sepIdx > 0 ? key.substring(0, sepIdx) : key;
+        stale.push({
+          marketId,
+          outcome: meta.outcome,
+          quoteAgeMs: now - meta.placedAtMs,
+          binanceDeltaPct: deltaPct,
+          bidPrice: meta.bidPrice,
+        });
+      }
+    }
+    return stale;
+  }
+
   /** Get slot summary and clean up. Call at slot end. */
   getSlotDiagnostics(marketId: string): {
     quotesPosted: number; fillsMaker: number; fillsTaker: number;

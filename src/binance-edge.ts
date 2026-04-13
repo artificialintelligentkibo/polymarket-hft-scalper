@@ -45,6 +45,14 @@ export const COIN_TO_BINANCE: Record<string, string> = {
   LINK: 'linkusdt',
 };
 
+/** Phase 48b: reverse lookup — Binance symbol → coin name (e.g. 'btcusdt' → 'BTC') */
+const BINANCE_TO_COIN: Record<string, string> = Object.fromEntries(
+  Object.entries(COIN_TO_BINANCE).map(([coin, sym]) => [sym, coin])
+);
+
+/** Phase 48b: callback type for real-time price update listeners */
+export type BinancePriceUpdateCallback = (coin: string, price: number) => void;
+
 export class BinanceEdgeProvider {
   private ws: WebSocket | undefined;
   private reconnectAttempts = 0;
@@ -55,6 +63,8 @@ export class BinanceEdgeProvider {
   private readonly lastPriceUpdatedAt = new Map<string, number>();
   private readonly slotOpenPrices = new Map<string, SlotOpenReference>();
   private readonly priceHistory = new Map<string, BinancePriceSample[]>();
+  /** Phase 48b: registered listeners for real-time price updates */
+  private readonly priceUpdateListeners: BinancePriceUpdateCallback[] = [];
 
   constructor(private readonly runtimeConfig: AppConfig = config) {}
 
@@ -65,6 +75,16 @@ export class BinanceEdgeProvider {
 
     this.startHeartbeat();
     this.connect();
+  }
+
+  /**
+   * Phase 48b: Register a callback that fires on every Binance WS price update.
+   * Used by VS Engine to cancel stale quotes within ~50-100ms of a price move.
+   * Callbacks receive (coin: 'BTC'|'ETH'|..., price: number).
+   * Callbacks MUST be fast and non-throwing — they run on the WS message path.
+   */
+  onPriceUpdate(callback: BinancePriceUpdateCallback): void {
+    this.priceUpdateListeners.push(callback);
   }
 
   stop(): void {
@@ -340,6 +360,20 @@ export class BinanceEdgeProvider {
     }
     this.priceHistory.set(normalizedSymbol, history);
     this.prunePriceHistory();
+
+    // Phase 48b: fire real-time price update callbacks
+    if (this.priceUpdateListeners.length > 0) {
+      const coin = BINANCE_TO_COIN[normalizedSymbol];
+      if (coin) {
+        for (const cb of this.priceUpdateListeners) {
+          try {
+            cb(coin, price);
+          } catch {
+            // Callbacks must not crash the WS message handler
+          }
+        }
+      }
+    }
   }
 
   private connect(): void {
