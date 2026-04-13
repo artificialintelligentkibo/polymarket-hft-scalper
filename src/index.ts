@@ -1611,6 +1611,14 @@ export class MarketMakerRuntime {
                 continue;
               }
             }
+            // Phase 43b: guard SELL fills — skip if no shares to sell
+            // (position may have been exited by hard-stop before this maker fill arrived)
+            if (pf.side === 'SELL') {
+              const currentShares = pm.getShares(pf.outcome);
+              if (currentShares <= 0) {
+                continue;
+              }
+            }
             pm.applyFill({
               outcome: pf.outcome,
               side: pf.side,

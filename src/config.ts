@@ -1608,7 +1608,10 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       takerFeeRate: parseFloatOrDefault(env.PAPER_TRADING_TAKER_FEE_RATE, '0.02'),
       makerOrderTtlMs: Math.max(
         1000,
-        parseIntOrDefault(env.PAPER_TRADING_MAKER_ORDER_TTL_MS, '300000')
+        // Phase 43b: reduced default from 300s (entire slot!) to 60s.
+        // Stale maker orders that sit 2-3 minutes fill at terrible prices
+        // and immediately hit hard-stop, causing unnecessary losses.
+        parseIntOrDefault(env.PAPER_TRADING_MAKER_ORDER_TTL_MS, '60000')
       ),
       minOrderNotionalUsd: parseFloatOrDefault(env.PAPER_TRADING_MIN_ORDER_NOTIONAL, '1'),
       // Legacy fields — kept for backward compat, not used in new fill logic
