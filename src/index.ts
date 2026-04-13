@@ -1596,6 +1596,21 @@ export class MarketMakerRuntime {
           // (lottery, OBI, VS) can see the shares and generate exits.
           const pm = this.getPositionManager(market);
           for (const pf of paperFills) {
+            // Phase 43: cap BUY fills at MAX_POSITION_SHARES — don't accumulate
+            // beyond the engine limit even when many pending orders fill at once.
+            if (pf.side === 'BUY') {
+              const currentShares = pm.getShares(pf.outcome);
+              const maxShares = pf.strategyLayer === 'VS_ENGINE'
+                ? config.vsEngine.mmMaxPositionShares
+                : pf.strategyLayer === 'OBI'
+                  ? config.obiEngine.maxPositionShares
+                  : 999;
+              if (currentShares >= maxShares) {
+                // Already at limit — expire remaining pending BUY orders and skip
+                this.executor.expirePaperPendingOrders(pf.marketId);
+                continue;
+              }
+            }
             pm.applyFill({
               outcome: pf.outcome,
               side: pf.side,
@@ -1863,8 +1878,11 @@ export class MarketMakerRuntime {
     // OBI engine signals (gated by obiEngine.enabled in config)
     if (config.obiEngine.enabled) {
       // Phase 35C: skip OBI entries if VS already claimed this market
+      // Phase 43: skip OBI entries if paper pending BUY orders already exist
+      const obiPaperPendingBlock = isPaperTradingEnabled(config) &&
+        this.executor.getPaperPendingBuyShares(market.marketId) > 0;
       const obiClaimBlocked = existingClaim === 'VS_ENGINE';
-      if (!obiClaimBlocked) {
+      if (!obiClaimBlocked && !obiPaperPendingBlock) {
         // Phase 21: OBI compounding — scale entry/max shares with bankroll growth.
         const obiMult = this.compounder.enabled
           ? this.compounder.getObiSizeMultiplier(config.obiEngine.obiCompoundThresholdUsd)
@@ -1898,8 +1916,12 @@ export class MarketMakerRuntime {
         this.binanceEdge.recordSlotOpen(vsCoin, market.startTime);
       }
       // Phase 35C: skip VS entries if OBI already claimed this market
+      // Phase 43: skip VS entries if paper pending BUY orders already exist
+      //   (prevents accumulating maker orders while previous ones haven't filled)
+      const vsPaperPendingBlock = isPaperTradingEnabled(config) &&
+        this.executor.getPaperPendingBuyShares(market.marketId) > 0;
       const vsClaimBlocked = existingClaim === 'OBI';
-      if (!vsClaimBlocked) {
+      if (!vsClaimBlocked && !vsPaperPendingBlock) {
         const vsEntrySignals = this.vsEngine.generateSignals({
           market,
           orderbook,

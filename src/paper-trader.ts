@@ -395,6 +395,15 @@ export class PaperTrader {
     return !!pending && pending.length > 0;
   }
 
+  /** Phase 43: total pending BUY shares for a market (prevents duplicate entries). */
+  getPendingBuyShares(marketId: string): number {
+    const pending = this.pendingOrders.get(marketId);
+    if (!pending) return 0;
+    return pending
+      .filter(o => o.side === 'BUY')
+      .reduce((sum, o) => sum + o.shares, 0);
+  }
+
   getPendingOrderCount(): number {
     let count = 0;
     for (const orders of this.pendingOrders.values()) {

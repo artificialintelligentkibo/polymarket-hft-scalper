@@ -379,6 +379,11 @@ export class OrderExecutor {
     this.paperTrader.expirePendingOrders(marketId);
   }
 
+  /** Phase 43: total pending BUY shares for a market. */
+  getPaperPendingBuyShares(marketId: string): number {
+    return this.paperTrader.getPendingBuyShares(marketId);
+  }
+
   /**
    * Get paper trading stats for dashboard / runtime status.
    */
