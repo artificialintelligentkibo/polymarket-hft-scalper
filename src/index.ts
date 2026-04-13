@@ -243,6 +243,8 @@ export class MarketMakerRuntime {
   private readonly settlementStartedAt = new Map<string, number>();
   private readonly settlementAttempts = new Map<string, number>();
   private readonly paperResolutionTimers = new Map<string, NodeJS.Timeout>();
+  /** Phase 46b: track VS time-exit timers to prevent duplication */
+  private readonly vsTimeExitTimers = new Map<string, { exitTimer: NodeJS.Timeout; cancelTimer: NodeJS.Timeout }>();
   private walletPositionSnapshots = new Map<string, RuntimePositionSnapshot>();
   private lastWalletPositionRefreshAtMs = 0;
   private walletFundsSnapshot: RuntimeWalletFundsSnapshot = {
@@ -5207,6 +5209,16 @@ export class MarketMakerRuntime {
     this.orderBookImbalance.clearState(marketId);
     this.obiEngine.clearState(marketId);
     this.vsEngine.clearState(marketId);
+    // Phase 46b: cancel any pending VS time-exit timers for this market
+    for (const outcome of ['YES', 'NO'] as const) {
+      const timerKey = `${marketId}:${outcome}`;
+      const timers = this.vsTimeExitTimers.get(timerKey);
+      if (timers) {
+        clearTimeout(timers.exitTimer);
+        clearTimeout(timers.cancelTimer);
+        this.vsTimeExitTimers.delete(timerKey);
+      }
+    }
     // Paper trading: expire any pending maker orders for this market
     if (isPaperTradingEnabled(config)) {
       this.executor.expirePaperPendingOrders(marketId);
@@ -5846,9 +5858,19 @@ export class MarketMakerRuntime {
 
     const effectiveDelayMs = Math.max(0, timeExitDelayMs);
 
+    // Phase 46b: cancel any existing timer for this market+outcome before scheduling new one.
+    // Without this, each fill creates a new timer → N timers fire simultaneously at T-15s.
+    const timerKey = `${marketId}:${outcome}`;
+    const existingTimers = this.vsTimeExitTimers.get(timerKey);
+    if (existingTimers) {
+      clearTimeout(existingTimers.cancelTimer);
+      clearTimeout(existingTimers.exitTimer);
+      this.vsTimeExitTimers.delete(timerKey);
+    }
+
     // Schedule cancel-all 2s before time-exit (mirrors OBI pattern)
     const cancelDelayMs = Math.max(0, effectiveDelayMs - 2000);
-    setTimeout(() => {
+    const cancelTimer = setTimeout(() => {
       this.scheduleBackgroundTask(async () => {
         try {
           const cancelCount = await this.cancelPendingVsMakerQuotes(marketId, outcome);
@@ -5866,7 +5888,8 @@ export class MarketMakerRuntime {
     }, cancelDelayMs);
 
     // Schedule the actual time-exit
-    setTimeout(() => {
+    const exitTimer = setTimeout(() => {
+      this.vsTimeExitTimers.delete(timerKey);
       this.scheduleBackgroundTask(async () => {
         try {
           // Re-check: does VS engine still have a position?
@@ -5965,6 +5988,9 @@ export class MarketMakerRuntime {
         }
       });
     }, effectiveDelayMs);
+
+    // Phase 46b: store both timers so they can be cancelled on re-entry
+    this.vsTimeExitTimers.set(timerKey, { exitTimer, cancelTimer });
 
     logger.info('Phase 35B: scheduled VS time-exit timer', {
       marketId, outcome,
