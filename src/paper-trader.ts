@@ -993,7 +993,11 @@ export class PaperTrader {
       position[key] = roundTo(Math.max(0, previousShares - closedShares), 4);
       if (position[key] <= 0) {
         position[key] = 0;
-        position[costKey] = 0;
+        // Phase 44e: preserve costKey (VWAP) even when shares reach 0.
+        // revertMakerFill needs the original cost basis to correctly
+        // undo realized PnL. Previously zeroed here, causing SELL
+        // reverts after full close to read costBasis=0, producing
+        // wildly wrong PnL (e.g. -1.00 instead of +1.00).
       }
       // Add proceeds to balance (fee already deducted from realizedPnl)
       this.balance = roundTo(this.balance + closedShares * params.price - params.fee, 4);
