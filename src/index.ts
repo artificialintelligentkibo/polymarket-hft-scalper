@@ -1596,8 +1596,10 @@ export class MarketMakerRuntime {
           // (lottery, OBI, VS) can see the shares and generate exits.
           const pm = this.getPositionManager(market);
           for (const pf of paperFills) {
-            // Phase 43: cap BUY fills at MAX_POSITION_SHARES — don't accumulate
-            // beyond the engine limit even when many pending orders fill at once.
+            // Phase 44c: cap BUY fills at MAX_POSITION_SHARES with partial fill support.
+            // PaperTrader already applied the fill internally, so if we must skip or cap,
+            // we revert the excess in PaperTrader to keep balance in sync.
+            let effectiveFillShares = pf.shares;
             if (pf.side === 'BUY') {
               const currentShares = pm.getShares(pf.outcome);
               const maxShares = pf.strategyLayer === 'VS_ENGINE'
@@ -1605,24 +1607,40 @@ export class MarketMakerRuntime {
                 : pf.strategyLayer === 'OBI'
                   ? config.obiEngine.maxPositionShares
                   : 999;
-              if (currentShares >= maxShares) {
-                // Already at limit — expire remaining pending BUY orders and skip
+              const remaining = Math.max(0, maxShares - currentShares);
+              if (remaining <= 0) {
+                // Fully blocked — revert PaperTrader state and expire pending orders
+                this.executor.revertPaperFill(pf.marketId, pf.outcome, pf.side, pf.shares, pf.price);
                 this.executor.expirePaperPendingOrders(pf.marketId);
                 continue;
               }
+              if (pf.shares > remaining) {
+                // Partial cap — revert excess from PaperTrader, apply only remaining
+                const excess = pf.shares - remaining;
+                this.executor.revertPaperFill(pf.marketId, pf.outcome, pf.side, excess, pf.price);
+                effectiveFillShares = remaining;
+                this.executor.expirePaperPendingOrders(pf.marketId);
+              }
             }
-            // Phase 43b: guard SELL fills — skip if no shares to sell
-            // (position may have been exited by hard-stop before this maker fill arrived)
+            // Phase 43b: guard SELL fills — skip if no shares to sell.
+            // Revert PaperTrader state to keep balance in sync.
             if (pf.side === 'SELL') {
               const currentShares = pm.getShares(pf.outcome);
               if (currentShares <= 0) {
+                this.executor.revertPaperFill(pf.marketId, pf.outcome, pf.side, pf.shares, pf.price);
                 continue;
+              }
+              // Cap SELL to what positionManager actually has
+              if (pf.shares > currentShares) {
+                const excess = pf.shares - currentShares;
+                this.executor.revertPaperFill(pf.marketId, pf.outcome, pf.side, excess, pf.price);
+                effectiveFillShares = currentShares;
               }
             }
             pm.applyFill({
               outcome: pf.outcome,
               side: pf.side,
-              shares: pf.shares,
+              shares: effectiveFillShares,
               price: pf.price,
               timestamp: new Date().toISOString(),
               orderId: `paper-maker-${Date.now()}`,
@@ -1633,7 +1651,7 @@ export class MarketMakerRuntime {
               this.lotteryEngine.recordExecution({
                 marketId: pf.marketId,
                 outcome: pf.outcome,
-                filledShares: pf.shares,
+                filledShares: effectiveFillShares,
                 fillPrice: pf.price,
                 signalType: pf.signalType,
                 slotKey: getSlotKey(market),
@@ -1648,7 +1666,7 @@ export class MarketMakerRuntime {
                 marketTitle: market.title,
                 outcome: pf.outcome,
                 fillPrice: pf.price,
-                filledShares: pf.shares,
+                filledShares: effectiveFillShares,
                 orderbook,
                 config: config.obiEngine,
                 totalLiveShares,
@@ -1658,7 +1676,7 @@ export class MarketMakerRuntime {
               const obiCoin = extractCoinFromObiTitle(market.title);
               this.obiEngine.recordEntryForStats(
                 obiCoin,
-                `${pf.outcome} ${pf.shares}sh @${roundTo(pf.price, 3)} [paper]`
+                `${pf.outcome} ${effectiveFillShares}sh @${roundTo(pf.price, 3)} [paper]`
               );
             }
             // Phase 42: notify VS engine of paper BUY fills so it tracks position
@@ -1676,7 +1694,7 @@ export class MarketMakerRuntime {
                 marketTitle: market.title,
                 outcome: pf.outcome,
                 fillPrice: pf.price,
-                filledShares: pf.shares,
+                filledShares: effectiveFillShares,
                 slotEndTime: market.endTime ?? null,
                 slotStartTime: market.startTime ?? null,
                 strikePrice,
@@ -1685,7 +1703,7 @@ export class MarketMakerRuntime {
               // Phase 44: record per-coin entry stats (paper path missed this)
               this.vsEngine.recordEntryForStats(
                 vsCoin,
-                `${pf.outcome} ${pf.shares}sh @${roundTo(pf.price, 3)} [paper]`
+                `${pf.outcome} ${effectiveFillShares}sh @${roundTo(pf.price, 3)} [paper]`
               );
               // Phase 44: schedule VS time-exit timer (paper path missed this —
               // without it, paper positions hold to resolution instead of exiting at T-5s)

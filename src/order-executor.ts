@@ -384,6 +384,11 @@ export class OrderExecutor {
     return this.paperTrader.getPendingBuyShares(marketId);
   }
 
+  /** Phase 44c: revert a paper fill when runtime guard blocks it. */
+  revertPaperFill(marketId: string, outcome: 'YES' | 'NO', side: 'BUY' | 'SELL', shares: number, price: number): void {
+    this.paperTrader.revertMakerFill(marketId, outcome, side, shares, price);
+  }
+
   /**
    * Get paper trading stats for dashboard / runtime status.
    */

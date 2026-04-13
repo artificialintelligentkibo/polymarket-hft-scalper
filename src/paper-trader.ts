@@ -249,19 +249,24 @@ export class PaperTrader {
       const crossed = this.checkMakerOrderCrossed(order, book);
 
       if (crossed) {
-        this.fillMakerOrder(order, book);
-        fills.push({
-          marketId: order.marketId,
-          outcome: order.outcome,
-          side: order.side,
-          shares: order.shares,
-          price: order.price,
-          signalType: order.signalType,
-          strategyLayer: order.signalType === 'LOTTERY_BUY' ? 'LOTTERY' as const
-            : order.signalType === 'OBI_ENTRY_BUY' ? 'OBI' as const
-            : order.signalType.startsWith('VS_') ? 'VS_ENGINE' as const
-            : 'SNIPER' as const,
-        });
+        const actualFilled = this.fillMakerOrder(order, book);
+        // Phase 44c: only report fills with actual shares (Bug 1 fix —
+        // previously used order.shares which is the REQUESTED amount,
+        // not the actual filled amount after balance/inventory clamping).
+        if (actualFilled > 0) {
+          fills.push({
+            marketId: order.marketId,
+            outcome: order.outcome,
+            side: order.side,
+            shares: actualFilled,
+            price: order.price,
+            signalType: order.signalType,
+            strategyLayer: order.signalType === 'LOTTERY_BUY' ? 'LOTTERY' as const
+              : order.signalType === 'OBI_ENTRY_BUY' ? 'OBI' as const
+              : order.signalType.startsWith('VS_') ? 'VS_ENGINE' as const
+              : 'SNIPER' as const,
+          });
+        }
       } else {
         remaining.push(order);
       }
@@ -274,6 +279,44 @@ export class PaperTrader {
     }
 
     return fills;
+  }
+
+  /* ================================================================
+   * REVERT A MAKER FILL — Phase 44c: undo PaperTrader state when
+   * runtime guard blocks a fill (e.g. max position exceeded).
+   * Without this, PaperTrader balance diverges from positionManager.
+   * ================================================================ */
+  revertMakerFill(marketId: string, outcome: Outcome, side: 'BUY' | 'SELL', shares: number, price: number): void {
+    const position = this.positions.get(marketId) ?? createEmptyPaperPosition();
+    const key = outcome === 'YES' ? 'yes' : 'no';
+    const costKey = outcome === 'YES' ? 'yesCost' : 'noCost';
+
+    if (side === 'BUY') {
+      // Undo: remove shares, refund balance
+      position[key] = roundTo(Math.max(0, position[key] - shares), 4);
+      if (position[key] <= 0) {
+        position[key] = 0;
+        position[costKey] = 0;
+      }
+      this.balance = roundTo(this.balance + shares * price, 4);
+      position.entryCount = Math.max(0, position.entryCount - 1);
+    } else {
+      // Undo: add shares back, deduct proceeds
+      position[key] = roundTo(position[key] + shares, 4);
+      this.balance = roundTo(this.balance - shares * price, 4);
+      position.exitCount = Math.max(0, position.exitCount - 1);
+    }
+
+    if (position.yes <= 0 && position.no <= 0 && Math.abs(position.realizedPnl) < 0.0001) {
+      this.positions.delete(marketId);
+    } else {
+      this.positions.set(marketId, position);
+    }
+
+    logger.info('Paper maker fill REVERTED (runtime guard)', {
+      marketId, outcome, side, shares, price,
+      balance: roundTo(this.balance, 4),
+    });
   }
 
   /* ================================================================
@@ -599,7 +642,8 @@ export class PaperTrader {
     this.tradeLog.push(trade);
     await this.appendTradeLog(trade);
 
-    return this.buildTradeResult(params, filledShares, avgPrice, fee, true);
+    // Phase 44c: fix wasMaker — taker fills should report false (Bug 3)
+    return this.buildTradeResult(params, filledShares, avgPrice, fee, false);
   }
 
   /* ================================================================
@@ -742,7 +786,7 @@ export class PaperTrader {
   /* ================================================================
    * PRIVATE: FILL A MAKER ORDER (crossed)
    * ================================================================ */
-  private fillMakerOrder(order: PendingPaperOrder, book: TokenBookSnapshot): void {
+  private fillMakerOrder(order: PendingPaperOrder, book: TokenBookSnapshot): number {
     // Maker fills at the limit price (not the crossing price)
     const fillPrice = order.price;
 
@@ -765,7 +809,7 @@ export class PaperTrader {
 
     if (filledShares <= 0) {
       this.logExpiredOrder(order);
-      return;
+      return 0;
     }
 
     const fee = roundTo(
@@ -819,6 +863,8 @@ export class PaperTrader {
       waitMs: latencyMs,
       balance: roundTo(this.balance, 4),
     });
+
+    return filledShares;
   }
 
   /* ================================================================
