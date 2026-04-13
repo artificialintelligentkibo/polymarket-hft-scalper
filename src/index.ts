@@ -1692,6 +1692,23 @@ export class MarketMakerRuntime {
               const strikePrice = this.binanceEdge.getSlotOpenPrice(
                 vsCoin ?? '', market.startTime
               ) ?? this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0;
+              // Phase 47c: compute adverse selection diagnostics BEFORE onEntryFill
+              if (pf.signalType === 'VS_MM_BID') {
+                const currentBinance = this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0;
+                const diag = this.vsEngine.computeFillDiagnostics(
+                  pf.marketId, pf.outcome, pf.price, currentBinance, true
+                );
+                if (diag) {
+                  logger.info('Phase 47c: VS fill diagnostics', {
+                    marketId: pf.marketId, outcome: pf.outcome,
+                    fillPrice: pf.price,
+                    quoteAgeMs: diag.quoteAgeMs,
+                    binanceDeltaPct: roundTo(diag.binanceDeltaPct, 4),
+                    staleQuote: diag.stale,
+                    wasMaker: true, // paper fills are always maker
+                  });
+                }
+              }
               this.vsEngine.onEntryFill({
                 marketId: pf.marketId,
                 marketTitle: market.title,
@@ -3024,6 +3041,17 @@ export class MarketMakerRuntime {
           const realizedDelta = (effectivePrice - entryVwap) * effectiveShares;
           const exitCoin = extractCoinFromTitle(market.title);
           this.vsEngine.recordExitForStats(exitCoin, realizedDelta, executionSignal.signalType);
+          // Phase 47c: track for slot diagnostics
+          if (executionSignal.signalType === 'VS_MM_ASK') {
+            this.vsEngine.recordMakerAskFill(market.marketId, realizedDelta);
+          }
+        }
+        // Phase 47c: track price-stops (sync path)
+        if (executionSignal.signalType === 'VS_SCALP_EXIT') {
+          const vsPos2 = this.vsEngine.getPosition(market.marketId, executionSignal.outcome);
+          if (vsPos2 && effectivePrice < vsPos2.entryVwap) {
+            this.vsEngine.recordPriceStopForDiag(market.marketId);
+          }
         }
         if (remainingShares <= 0) {
           this.vsEngine.clearState(market.marketId, executionSignal.outcome);
@@ -4098,6 +4126,13 @@ export class MarketMakerRuntime {
     ) {
       const exitCoin = extractCoinFromTitle(market.title);
       this.vsEngine.recordExitForStats(exitCoin, realizedDelta, fill.signalType);
+      // Phase 47c: track maker-ask spread and price-stop for slot diagnostics
+      if (fill.signalType === 'VS_MM_ASK') {
+        this.vsEngine.recordMakerAskFill(fill.marketId, realizedDelta);
+      }
+      if (fill.signalType === 'VS_SCALP_EXIT' && realizedDelta < 0) {
+        this.vsEngine.recordPriceStopForDiag(fill.marketId);
+      }
       // Phase 44: clear VS position state when fully exited (prevents ghost positions)
       const vsRemaining = positionManager.getShares(fill.outcome);
       if (vsRemaining <= 0) {
@@ -5208,6 +5243,23 @@ export class MarketMakerRuntime {
     this.slotStrategyClaim.delete(marketId); // Phase 35C
     this.orderBookImbalance.clearState(marketId);
     this.obiEngine.clearState(marketId);
+    // Phase 47c: emit slot diagnostics BEFORE clearing VS state
+    const slotDiag = this.vsEngine.getSlotDiagnostics(marketId);
+    if (slotDiag && (slotDiag.fillsMaker + slotDiag.fillsTaker) > 0) {
+      const coin = market ? extractCoinFromTitle(market.title) : '?';
+      logger.info('Phase 47c: VS SLOT SUMMARY', {
+        marketId: marketId.slice(0, 10),
+        coin,
+        quotesPosted: slotDiag.quotesPosted,
+        fillsMaker: slotDiag.fillsMaker,
+        fillsTaker: slotDiag.fillsTaker,
+        avgQuoteAgeMs: slotDiag.avgQuoteAgeMs,
+        avgBinanceDeltaPct: slotDiag.avgBinanceDeltaPct,
+        priceStops: slotDiag.priceStops,
+        makerAskFills: slotDiag.makerAskFills,
+        spreadCaptured: slotDiag.spreadCaptured,
+      });
+    }
     this.vsEngine.clearState(marketId);
     // Phase 46b: cancel any pending VS time-exit timers for this market
     for (const outcome of ['YES', 'NO'] as const) {

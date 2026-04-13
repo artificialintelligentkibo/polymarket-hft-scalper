@@ -290,10 +290,137 @@ export class VsEngine {
   }>();
   private recentDecisions: VsDecisionRecord[] = [];
 
+  /* ── Phase 47c: Adverse selection diagnostics ───────────────────── */
+  /** Track when each quote was placed and what Binance price was at that moment */
+  private readonly quoteMeta = new Map<string, {
+    placedAtMs: number;
+    binancePriceAtPlace: number;
+    bidPrice: number;
+    outcome: Outcome;
+    coin: string;
+  }>();
+  /** Per-slot diagnostic accumulators (keyed by marketId) */
+  private readonly slotDiagnostics = new Map<string, {
+    quotesPosted: number;
+    fillsMaker: number;
+    fillsTaker: number;
+    quoteAgesMs: number[];
+    binanceDeltas: number[];  // % move between quote placement and fill
+    priceStops: number;
+    makerAskFills: number;
+    spreadCaptured: number;
+  }>();
+
   /* ── Public API ─────────────────────────────────────────────────── */
 
   setAvailableUsdcBalance(usdc: number): void {
     this.availableUsdcBalance = usdc;
+  }
+
+  /* ── Phase 47c: diagnostic tracking ──────────────────────────────── */
+
+  /** Call when a VS_MM_BID signal is generated — records quote placement metadata */
+  trackQuotePlacement(
+    marketId: string, outcome: Outcome, bidPrice: number,
+    binancePrice: number, coin: string
+  ): void {
+    const key = this.positionKey(marketId, outcome);
+    this.quoteMeta.set(key, {
+      placedAtMs: Date.now(),
+      binancePriceAtPlace: binancePrice,
+      bidPrice,
+      outcome,
+      coin,
+    });
+    // Increment slot diagnostics
+    const diag = this.getOrCreateSlotDiag(marketId);
+    diag.quotesPosted += 1;
+  }
+
+  /** Call when a VS_MM_BID fill is detected — computes adverse selection metrics */
+  computeFillDiagnostics(
+    marketId: string, outcome: Outcome, fillPrice: number,
+    currentBinancePrice: number, wasMaker: boolean
+  ): { quoteAgeMs: number; binanceDeltaPct: number; stale: boolean } | null {
+    const key = this.positionKey(marketId, outcome);
+    const meta = this.quoteMeta.get(key);
+    if (!meta) return null;
+
+    const quoteAgeMs = Date.now() - meta.placedAtMs;
+    const binanceDeltaPct = ((currentBinancePrice - meta.binancePriceAtPlace)
+      / meta.binancePriceAtPlace) * 100;
+
+    // Record in slot diagnostics
+    const diag = this.getOrCreateSlotDiag(marketId);
+    diag.quoteAgesMs.push(quoteAgeMs);
+    diag.binanceDeltas.push(binanceDeltaPct);
+    if (wasMaker) diag.fillsMaker += 1;
+    else diag.fillsTaker += 1;
+
+    this.quoteMeta.delete(key);
+    return {
+      quoteAgeMs,
+      binanceDeltaPct,
+      stale: quoteAgeMs > 500,
+    };
+  }
+
+  /** Record a maker-ask fill for slot diagnostics */
+  recordMakerAskFill(marketId: string, spread: number): void {
+    const diag = this.getOrCreateSlotDiag(marketId);
+    diag.makerAskFills += 1;
+    diag.spreadCaptured += spread;
+  }
+
+  /** Record a price-stop for slot diagnostics */
+  recordPriceStopForDiag(marketId: string): void {
+    const diag = this.getOrCreateSlotDiag(marketId);
+    diag.priceStops += 1;
+  }
+
+  /** Get slot summary and clean up. Call at slot end. */
+  getSlotDiagnostics(marketId: string): {
+    quotesPosted: number; fillsMaker: number; fillsTaker: number;
+    avgQuoteAgeMs: number; avgBinanceDeltaPct: number;
+    priceStops: number; makerAskFills: number; spreadCaptured: number;
+  } | null {
+    const diag = this.slotDiagnostics.get(marketId);
+    if (!diag) return null;
+
+    const avgAge = diag.quoteAgesMs.length > 0
+      ? diag.quoteAgesMs.reduce((a, b) => a + b, 0) / diag.quoteAgesMs.length : 0;
+    const avgDelta = diag.binanceDeltas.length > 0
+      ? diag.binanceDeltas.reduce((a, b) => a + b, 0) / diag.binanceDeltas.length : 0;
+
+    this.slotDiagnostics.delete(marketId);
+    // Clean up any lingering quote metadata for this market
+    for (const [k] of this.quoteMeta) {
+      if (k.startsWith(marketId)) this.quoteMeta.delete(k);
+    }
+
+    return {
+      quotesPosted: diag.quotesPosted,
+      fillsMaker: diag.fillsMaker,
+      fillsTaker: diag.fillsTaker,
+      avgQuoteAgeMs: Math.round(avgAge),
+      avgBinanceDeltaPct: roundTo(avgDelta, 4),
+      priceStops: diag.priceStops,
+      makerAskFills: diag.makerAskFills,
+      spreadCaptured: roundTo(diag.spreadCaptured, 4),
+    };
+  }
+
+  private getOrCreateSlotDiag(marketId: string) {
+    let d = this.slotDiagnostics.get(marketId);
+    if (!d) {
+      d = {
+        quotesPosted: 0, fillsMaker: 0, fillsTaker: 0,
+        quoteAgesMs: [], binanceDeltas: [],
+        priceStops: 0, makerAskFills: 0, spreadCaptured: 0,
+      };
+      this.slotDiagnostics.set(marketId, d);
+    }
+    return d;
   }
 
   /** Phase 45a: composite key for per-outcome position tracking. */
@@ -557,6 +684,9 @@ export class VsEngine {
 
       // Lock cooldown on signal GENERATION
       this.lastEntryMs.set(market.marketId, nowMs);
+
+      // Phase 47c: track quote placement for adverse selection diagnostics
+      this.trackQuotePlacement(market.marketId, outcome, bidPrice, spotPrice, coin);
 
       // Deduct from running budget
       budgetRemaining -= shares * bidPrice;
