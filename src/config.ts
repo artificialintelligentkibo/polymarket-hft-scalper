@@ -1468,6 +1468,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0.01,
         parseFloatOrDefault(env.VS_DEFAULT_VOLATILITY, '0.60')
       ),
+      // Phase 44f: floor on vol to prevent CDF saturation when realized vol is near 0
+      minVolatility: Math.max(
+        0.005,
+        parseFloatOrDefault(env.VS_MIN_VOLATILITY, '0.05')
+      ),
       volLookbackMs: Math.max(
         10_000,
         parseIntOrDefault(env.VS_VOL_LOOKBACK_MS, '300000')

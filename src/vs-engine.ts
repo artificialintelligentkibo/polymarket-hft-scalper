@@ -51,6 +51,7 @@ export interface VsEngineConfig {
   readonly shadowMode: boolean;
   // Fair value calculation
   readonly defaultVolatility: number;
+  readonly minVolatility: number;
   readonly volLookbackMs: number;
   readonly minVolSamples: number;
   // Phase 1: Passive MM
@@ -367,12 +368,17 @@ export class VsEngine {
       return [];
     }
 
-    // Realized volatility
+    // Realized volatility — with floor to prevent CDF saturation.
+    // Phase 44f: when realized vol is extremely low (e.g. 0.01), the CDF
+    // pushes FV to ~1.00 for any meaningful price move, causing bidPrice
+    // to exceed maxEntryPrice and block ALL entries. Floor at minVolatility
+    // (default 0.05) ensures FV stays in a tradeable range.
     const priceHistory = binanceFeed.getPriceHistory(coin);
     const realizedVol = estimateRealizedVolatility(
       priceHistory, config.volLookbackMs, config.minVolSamples
     );
-    const vol = realizedVol ?? config.defaultVolatility;
+    const rawVol = realizedVol ?? config.defaultVolatility;
+    const vol = Math.max(rawVol, config.minVolatility);
 
     // Fair value
     const timeRemainingSec = (slotEndMs - nowMs) / 1000;
