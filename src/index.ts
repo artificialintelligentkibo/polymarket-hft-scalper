@@ -2465,7 +2465,7 @@ export class MarketMakerRuntime {
           // Clear engine state so orphan sweeps stop
           this.lotteryEngine.recordExit(market.marketId, executionSignal.outcome);
           this.obiEngine.clearState(market.marketId);
-          this.vsEngine.clearState(market.marketId);
+          this.vsEngine.clearState(market.marketId, executionSignal.outcome);
           this.slotStrategyClaim.delete(market.marketId);
           logger.warn('Phase 39: paper position abandoned — slot ended, book empty', {
             marketId: market.marketId,
@@ -3012,7 +3012,7 @@ export class MarketMakerRuntime {
         config.vsEngine.enabled &&
         (isVsExitSignal(executionSignal.signalType) ||
          executionSignal.signalType === 'VS_MM_ASK' ||
-         (executionSignal.signalType === 'SLOT_FLATTEN' && this.vsEngine.hasPosition(market.marketId)))
+         (executionSignal.signalType === 'SLOT_FLATTEN' && this.vsEngine.hasPositionForOutcome(market.marketId, executionSignal.outcome)))
       ) {
         const remainingShares = positionManager.getShares(executionSignal.outcome);
         // Record exit stats for VS when not already recorded by timer
