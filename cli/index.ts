@@ -814,13 +814,16 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
       )
     );
   } else {
-    // Legacy sniper/MM sections
-    lines.push(
-      renderSection(
-        'MM QUOTES  -  ACTIVE QUOTING AND INVENTORY',
-        renderMmQuotes(runtimeStatus)
-      )
-    );
+    // Legacy sniper/MM sections — only show active components
+    const hasMmQuotes = (runtimeStatus?.mmQuotes ?? []).length > 0;
+    if (hasMmQuotes) {
+      lines.push(
+        renderSection(
+          'MM QUOTES  -  ACTIVE QUOTING AND INVENTORY',
+          renderMmQuotes(runtimeStatus)
+        )
+      );
+    }
     lines.push(
       renderSection(
         'BOT PERFORMANCE STATS',
@@ -833,24 +836,32 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
         renderStrategyLayers(runtimeStatus)
       )
     );
-    lines.push(
-      renderSection(
-        'SNIPER ENGINE  -  BINANCE-LED SIGNAL STATUS',
-        renderSniperStats(runtimeStatus?.sniperStats)
-      )
-    );
-    lines.push(
-      renderSection(
-        'LOTTERY LAYER',
-        renderLotteryStats(runtimeStatus)
-      )
-    );
-    lines.push(
-      renderSection(
-        'RECENT SIGNALS',
-        renderRecentSignals(runtimeStatus?.lastSignals ?? [])
-      )
-    );
+    // Only show engine sections when they're actually enabled
+    if (runtimeStatus?.sniperStats?.enabled) {
+      lines.push(
+        renderSection(
+          'SNIPER ENGINE  -  BINANCE-LED SIGNAL STATUS',
+          renderSniperStats(runtimeStatus.sniperStats)
+        )
+      );
+    }
+    if (runtimeStatus?.lotteryStats?.enabled) {
+      lines.push(
+        renderSection(
+          'LOTTERY LAYER',
+          renderLotteryStats(runtimeStatus)
+        )
+      );
+    }
+    const recentSignals = runtimeStatus?.lastSignals ?? [];
+    if (recentSignals.length > 0) {
+      lines.push(
+        renderSection(
+          'RECENT SIGNALS',
+          renderRecentSignals(recentSignals)
+        )
+      );
+    }
   }
 
   // VS Engine section — shown when vsStats is present (parallel to OBI)
