@@ -1149,18 +1149,18 @@ export class MarketMakerRuntime {
           suppressedMarkets: new Set<string>(),
         };
 
-    // Feed the OBI engine the latest USDC balance so its pre-flight check
-    // can refuse entries when we cannot afford them, instead of generating
-    // signals the executor will reject.
+    // Feed the OBI / VS engines the latest USDC balance so pre-flight checks
+    // can refuse entries when we cannot afford them.
+    // Phase 41: In paper mode, feed paper balance instead of live wallet (which is null/0).
+    const engineBalance = isPaperTradingEnabled(config)
+      ? this.executor.getPaperBalance()
+      : (this.walletFundsSnapshot.walletCashUsd ?? 0);
+
     if (config.obiEngine.enabled) {
-      this.obiEngine.setAvailableUsdcBalance(
-        this.walletFundsSnapshot.walletCashUsd ?? null
-      );
+      this.obiEngine.setAvailableUsdcBalance(engineBalance);
     }
     if (config.vsEngine.enabled) {
-      this.vsEngine.setAvailableUsdcBalance(
-        this.walletFundsSnapshot.walletCashUsd ?? 0
-      );
+      this.vsEngine.setAvailableUsdcBalance(engineBalance);
     }
 
     const preparedMarketIds = new Set<string>(
