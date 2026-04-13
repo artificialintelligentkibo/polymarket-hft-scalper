@@ -586,7 +586,7 @@ function renderVsSessionStats(stats: VsSessionStats): string {
       ['Win Rate', color.bold(winRate), 'Realized PnL', formatSignedCurrency(stats.realizedPnl)],
       ['Phase 1 (MM)', color.cyan(String(stats.phase1Entries)), 'Phase 1 PnL', formatSignedCurrency(stats.phase1Pnl)],
       ['Phase 2 (AGG)', color.yellow(String(stats.phase2Entries)), 'Phase 2 PnL', formatSignedCurrency(stats.phase2Pnl)],
-      ['MM Spread', color.bold(`${(stats.mmSpreadCents ?? 0.02).toFixed(2)}¢`), 'MM Tilt Max', color.bold(`${(stats.mmTiltMaxCents ?? 0.01).toFixed(2)}¢`)],
+      ['MM Spread', color.bold(`${(stats.mmSpreadCents ?? 0.02).toFixed(2)}¢`), 'Price Stop', color.bold(`${((stats.priceStopCents ?? 0.05) * 100).toFixed(0)}¢`)],
       ['Agg Vol Floor', color.bold((stats.aggressorVolFloor ?? 0.02).toFixed(3)), 'Agg Min Edge', color.bold((stats.aggressorMinEdge ?? 0.03).toFixed(3))],
       ['Exit Target', color.bold(stats.targetExitPrice.toFixed(2)), 'Agg Max Buy', color.bold(stats.momentumMaxBuyPrice.toFixed(2))],
       ['Signals Gen', color.dim(String(stats.totalSignalsGenerated ?? 0)), 'Active Pos', color.bold(String((stats.activePositions ?? []).length))],
@@ -869,7 +869,7 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   if (vsStats?.enabled) {
     lines.push(
       renderSection(
-        `VS ENGINE  -  TWO-SIDED MM + AGGRESSOR ${vsStats.shadowMode ? color.yellow('[SHADOW]') : ''}`,
+        `VS ENGINE  -  SINGLE-SIDE MM + AGGRESSOR ${vsStats.shadowMode ? color.yellow('[SHADOW]') : ''}`,
         renderVsSessionStats(vsStats)
       )
     );

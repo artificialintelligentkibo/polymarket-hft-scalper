@@ -1564,6 +1564,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseIntOrDefault(env.VS_MOMENTUM_PHASE_MS, '30000')
       ),
       // Safety
+      priceStopCents: clamp(
+        parseFloatOrDefault(env.VS_PRICE_STOP_CENTS, '0.05'),
+        0, // 0 = disabled
+        0.20
+      ),
       hardStopUsd: Math.max(
         0.5,
         parseFloatOrDefault(env.VS_HARD_STOP_USD, '3.0')

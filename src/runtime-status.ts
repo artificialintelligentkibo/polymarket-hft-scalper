@@ -260,6 +260,7 @@ export interface VsSessionStats {
   readonly aggressorMinEdge: number;
   readonly mmTiltMaxCents: number;
   readonly mmSpreadCents: number;
+  readonly priceStopCents: number;
   readonly activePositions: readonly VsActivePosition[];
   readonly totalSignalsGenerated: number;
 }

@@ -80,6 +80,9 @@ export interface VsEngineConfig {
   readonly momentumPhaseMs: number;
   // Safety
   readonly hardStopUsd: number;
+  /** Phase 47: price-stop — if position is N cents underwater, market-out immediately.
+   *  VS median hold < 60s. Holding losers 4+ min until time-exit@0.10 is fatal. */
+  readonly priceStopCents: number;
   readonly cooldownMs: number;
   readonly losingExitCooldownMs: number;
   readonly losingExitCooldownByCoinMs: number;
@@ -466,18 +469,25 @@ export class VsEngine {
     const binanceDown = movePct < 0;
     const binanceFlat = absMove < 0.01; // < 0.01% = essentially flat
 
-    // Phase 46: Inventory skew — favor Binance direction side.
-    // Flat → quote both sides equally (spread farming).
-    // Directional → only quote the favored side (inventory accumulation).
-    // This matches vague-sourdough's 4:1 BUY skew toward winning direction.
-    let sidesToQuote: readonly Outcome[];
+    // Phase 47: Single-outcome MM — quote bid+ask on ONE side, not BUY both.
+    // Buying YES+NO simultaneously = complete set purchase (arbitrage at best,
+    // guaranteed loss at worst). Real MM = bid+ask on same outcome, capture spread.
+    //
+    // Directional → only the Binance-favored side.
+    // Flat → pick the side closer to 0.50 (most liquid, tightest spread).
+    //   This avoids the complete-set trap while staying active on FLAT markets.
+    let sideToQuote: Outcome;
     if (binanceFlat) {
-      sidesToQuote = ['YES', 'NO'] as const;
+      // Pick the side whose mid is closer to 0.50 (most balanced = best for MM)
+      const yesDist = Math.abs(yesMid - 0.50);
+      const noDist = Math.abs(noMid - 0.50);
+      sideToQuote = yesDist <= noDist ? 'YES' : 'NO';
     } else if (binanceUp) {
-      sidesToQuote = ['YES'] as const;
+      sideToQuote = 'YES';
     } else {
-      sidesToQuote = ['NO'] as const;
+      sideToQuote = 'NO';
     }
+    const sidesToQuote: readonly Outcome[] = [sideToQuote];
 
     // Bid pricing: anchor on Polymarket mid with spread below
     const yesBaseBid = yesMid - config.mmSpreadCents;
@@ -723,6 +733,33 @@ export class VsEngine {
 
       const slotEndMs = market.endTime ? new Date(market.endTime).getTime() : position.slotEndMs;
       const remaining = slotEndMs - nowMs;
+
+      // Phase 47: Price-stop — if position is N¢ underwater, market-out NOW.
+      // VS median hold < 60s. Holding losers 4+ min until time-exit@0.10 is fatal.
+      // A 5¢ stop on 6 shares = $0.30 loss, vs $2.40 at time-exit.
+      if (config.priceStopCents > 0 && bestBid) {
+        const stopPrice = position.entryVwap - config.priceStopCents;
+        if (bestBid <= stopPrice) {
+          this.totalExitSignals += 1;
+          const loss = roundTo((bestBid - position.entryVwap) * liveShares, 2);
+          signals.push(this.buildSignal({
+            market,
+            orderbook,
+            signalType: 'VS_SCALP_EXIT',
+            action: 'SELL',
+            outcome: position.outcome,
+            shares: liveShares,
+            targetPrice: bestBid,
+            fairValue: null,
+            urgency: 'cross',
+            reason: `VS price-stop: ${outcome} bid=${bestBid} <= stop=${roundTo(stopPrice, 3)} (entry=${roundTo(position.entryVwap, 3)} loss=${loss})`,
+            reduceOnly: true,
+            priority: 970,
+            edgeAmount: bestBid - position.entryVwap,
+          }));
+          continue;
+        }
+      }
 
       // Time exit: forced flatten at T-5s
       if (remaining <= config.timeExitBeforeEndMs) {
@@ -1049,6 +1086,7 @@ export class VsEngine {
       aggressorMinEdge: config.aggressorMinEdge,
       mmTiltMaxCents: config.mmTiltMaxCents,
       mmSpreadCents: config.mmSpreadCents,
+      priceStopCents: config.priceStopCents,
       activePositions,
       totalSignalsGenerated: this.totalExitSignals + this.totalEntries,
     };
