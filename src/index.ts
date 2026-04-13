@@ -1609,9 +1609,10 @@ export class MarketMakerRuntime {
                   : 999;
               const remaining = Math.max(0, maxShares - currentShares);
               if (remaining <= 0) {
-                // Fully blocked — revert PaperTrader state and expire pending orders
+                // Fully blocked — revert PaperTrader state and expire pending BUY orders only
+                // (Phase 44d: keep SELL/exit orders alive so position can still exit)
                 this.executor.revertPaperFill(pf.marketId, pf.outcome, pf.side, pf.shares, pf.price);
-                this.executor.expirePaperPendingOrders(pf.marketId);
+                this.executor.expirePaperPendingBuyOrders(pf.marketId);
                 continue;
               }
               if (pf.shares > remaining) {
@@ -1619,7 +1620,7 @@ export class MarketMakerRuntime {
                 const excess = pf.shares - remaining;
                 this.executor.revertPaperFill(pf.marketId, pf.outcome, pf.side, excess, pf.price);
                 effectiveFillShares = remaining;
-                this.executor.expirePaperPendingOrders(pf.marketId);
+                this.executor.expirePaperPendingBuyOrders(pf.marketId);
               }
             }
             // Phase 43b: guard SELL fills — skip if no shares to sell.

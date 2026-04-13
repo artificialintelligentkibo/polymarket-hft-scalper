@@ -9,7 +9,7 @@ import type {
 import { logger } from './logger.js';
 import type { OrderMode } from './config.js';
 import type { OrderbookHistory } from './orderbook-history.js';
-import type { SignalType, SignalUrgency, StrategyLayer } from './strategy-types.js';
+import { resolveStrategyLayer, type SignalType, type SignalUrgency, type StrategyLayer } from './strategy-types.js';
 import type { TradeExecutionResult } from './trader.js';
 import { clamp, roundTo, sleep } from './utils.js';
 
@@ -261,10 +261,9 @@ export class PaperTrader {
             shares: actualFilled,
             price: order.price,
             signalType: order.signalType,
-            strategyLayer: order.signalType === 'LOTTERY_BUY' ? 'LOTTERY' as const
-              : order.signalType === 'OBI_ENTRY_BUY' ? 'OBI' as const
-              : order.signalType.startsWith('VS_') ? 'VS_ENGINE' as const
-              : 'SNIPER' as const,
+            // Phase 44d: use canonical resolveStrategyLayer instead of manual mapping
+            // (previously OBI_MM_QUOTE_ASK → SNIPER, now correctly → OBI)
+            strategyLayer: resolveStrategyLayer(order.signalType),
           });
         }
       } else {
@@ -282,28 +281,53 @@ export class PaperTrader {
   }
 
   /* ================================================================
-   * REVERT A MAKER FILL — Phase 44c: undo PaperTrader state when
+   * REVERT A MAKER FILL — Phase 44d: undo PaperTrader state when
    * runtime guard blocks a fill (e.g. max position exceeded).
    * Without this, PaperTrader balance diverges from positionManager.
+   *
+   * Must properly restore: shares, balance, VWAP cost basis,
+   * realizedPnl (for SELL reverts), and totalFees.
    * ================================================================ */
   revertMakerFill(marketId: string, outcome: Outcome, side: 'BUY' | 'SELL', shares: number, price: number): void {
     const position = this.positions.get(marketId) ?? createEmptyPaperPosition();
     const key = outcome === 'YES' ? 'yes' : 'no';
     const costKey = outcome === 'YES' ? 'yesCost' : 'noCost';
 
+    // Maker fee for the reverted portion (same formula as fillMakerOrder)
+    const fee = roundTo(
+      this.runtimeConfig.makerFeeRate * Math.min(price, 1 - price) * shares,
+      6
+    );
+
     if (side === 'BUY') {
-      // Undo: remove shares, refund balance
-      position[key] = roundTo(Math.max(0, position[key] - shares), 4);
-      if (position[key] <= 0) {
+      // Undo BUY: remove shares, refund balance, recalculate VWAP
+      const prevShares = position[key];
+      const prevCost = position[costKey]; // current VWAP
+      const newShares = roundTo(Math.max(0, prevShares - shares), 4);
+
+      if (newShares <= 0) {
         position[key] = 0;
         position[costKey] = 0;
+      } else {
+        position[key] = newShares;
+        // Recalculate VWAP: remove the reverted portion's contribution.
+        // totalCost = prevCost * prevShares; remove shares * price → newCost / newShares
+        const totalCostBefore = prevCost * prevShares;
+        const totalCostAfter = totalCostBefore - price * shares;
+        position[costKey] = roundTo(Math.max(0, totalCostAfter / newShares), 6);
       }
-      this.balance = roundTo(this.balance + shares * price, 4);
+      this.balance = roundTo(this.balance + shares * price + fee, 4);
+      position.totalFees = roundTo(Math.max(0, position.totalFees - fee), 6);
       position.entryCount = Math.max(0, position.entryCount - 1);
     } else {
-      // Undo: add shares back, deduct proceeds
+      // Undo SELL: add shares back, deduct proceeds, revert realizedPnl
+      const costBasis = position[costKey]; // may be 0 if position was fully closed
       position[key] = roundTo(position[key] + shares, 4);
-      this.balance = roundTo(this.balance - shares * price, 4);
+      this.balance = roundTo(this.balance - shares * price + fee, 4);
+      // Revert realized PnL: the original SELL added (price - costBasis) * shares - fee
+      const revertedPnl = (price - costBasis) * shares - fee;
+      position.realizedPnl = roundTo(position.realizedPnl - revertedPnl, 4);
+      position.totalFees = roundTo(Math.max(0, position.totalFees - fee), 6);
       position.exitCount = Math.max(0, position.exitCount - 1);
     }
 
@@ -314,7 +338,7 @@ export class PaperTrader {
     }
 
     logger.info('Paper maker fill REVERTED (runtime guard)', {
-      marketId, outcome, side, shares, price,
+      marketId, outcome, side, shares, price, fee,
       balance: roundTo(this.balance, 4),
     });
   }
@@ -330,6 +354,31 @@ export class PaperTrader {
       this.logExpiredOrder(order);
     }
     this.pendingOrders.delete(marketId);
+  }
+
+  /* ================================================================
+   * EXPIRE PENDING BUY ONLY — Phase 44d: when position cap is hit,
+   * only expire BUY orders. Keep SELL/exit orders alive so the
+   * position can still exit via pending maker asks.
+   * ================================================================ */
+  expirePendingBuyOrders(marketId: string): void {
+    const pending = this.pendingOrders.get(marketId);
+    if (!pending || pending.length === 0) return;
+
+    const remaining: PendingPaperOrder[] = [];
+    for (const order of pending) {
+      if (order.side === 'BUY') {
+        this.logExpiredOrder(order);
+      } else {
+        remaining.push(order);
+      }
+    }
+
+    if (remaining.length > 0) {
+      this.pendingOrders.set(marketId, remaining);
+    } else {
+      this.pendingOrders.delete(marketId);
+    }
   }
 
   /* ================================================================

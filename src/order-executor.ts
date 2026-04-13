@@ -389,6 +389,11 @@ export class OrderExecutor {
     this.paperTrader.revertMakerFill(marketId, outcome, side, shares, price);
   }
 
+  /** Phase 44d: expire only BUY pending orders — keep SELL/exit orders alive. */
+  expirePaperPendingBuyOrders(marketId: string): void {
+    this.paperTrader.expirePendingBuyOrders(marketId);
+  }
+
   /**
    * Get paper trading stats for dashboard / runtime status.
    */
