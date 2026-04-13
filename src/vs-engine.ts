@@ -586,66 +586,71 @@ export class VsEngine {
     sizeMultiplier: number,
     nowMs: number
   ): StrategySignal[] {
+    // Phase 46: Aggressor MUST follow Binance direction.
+    // vague-sourdough insight: in final 30s, Binance "already knows the answer".
+    // Only buy the side Binance favors. Never bet against Binance.
+    const movePct = ((spotPrice - strikePrice) / strikePrice) * 100;
+    const absMove = Math.abs(movePct);
+    const binanceUp = movePct > 0;
+
+    // Phase 46: Require minimum move to aggress. If flat, no momentum signal.
+    // Aggressor needs clear direction — flat = no edge, just noise.
+    if (absMove < 0.01) {
+      this.recordDecision(coin, 'SKIP', 'MOMENTUM',
+        `flat_market move=${roundTo(movePct, 4)}% — no direction`, fairValueUp);
+      return [];
+    }
+
+    // Phase 46: Only aggress in Binance direction
+    const outcome: Outcome = binanceUp ? 'YES' : 'NO';
+
     // Phase 45a: Aggressor mode — use tighter vol floor for near-expiry CDF edge.
     // Near expiry (T-10s), even a +0.3% BTC move with σ=0.02 gives meaningful edge.
     const aggressorVol = Math.max(vol, config.aggressorVolFloor);
     const timeRemainingSec = (slotEndMs - nowMs) / 1000;
     const aggressorFV = calculatePhiFairValue(spotPrice, strikePrice, aggressorVol, timeRemainingSec);
 
-    // Determine which side has edge
-    const yesEdge = aggressorFV - (orderbook.yes.bestAsk ?? 1);
-    const noEdge = (1 - aggressorFV) - (orderbook.no.bestAsk ?? 1);
-
-    // Pick the side with more edge
-    let outcome: Outcome;
-    let edge: number;
-    let bestAsk: number | null;
-    let fairValue: number;
-
-    if (yesEdge >= noEdge) {
-      outcome = 'YES';
-      edge = yesEdge;
-      bestAsk = orderbook.yes.bestAsk;
-      fairValue = aggressorFV;
-    } else {
-      outcome = 'NO';
-      edge = noEdge;
-      bestAsk = orderbook.no.bestAsk;
-      fairValue = 1 - aggressorFV;
-    }
+    // Edge for the Binance-indicated side only
+    const outcomeFV = outcome === 'YES' ? aggressorFV : (1 - aggressorFV);
+    const bestAsk = outcome === 'YES' ? orderbook.yes.bestAsk : orderbook.no.bestAsk;
+    const edge = outcomeFV - (bestAsk ?? 1);
 
     // Need minimum edge to aggress
     if (edge < config.aggressorMinEdge) {
       this.recordDecision(coin, 'SKIP', 'MOMENTUM',
-        `edge=${roundTo(edge, 4)} < min=${config.aggressorMinEdge} (FV=${roundTo(aggressorFV, 3)} vol=${roundTo(aggressorVol, 4)})`, aggressorFV);
+        `edge=${roundTo(edge, 4)} < min=${config.aggressorMinEdge} (${outcome} FV=${roundTo(outcomeFV, 3)} vol=${roundTo(aggressorVol, 4)} move=${roundTo(movePct, 3)}%)`, outcomeFV);
       return [];
     }
 
-    // Phase 45c: sanity check — if market price diverges >0.20 from CDF FV,
+    // Phase 45c + 46 fix: sanity check — if market price diverges >0.20 from CDF FV,
     // the market has information the CDF doesn't capture (e.g. outcome nearly decided).
-    // Trust the market, not our stale CDF model.
-    const marketMid = outcome === 'YES'
-      ? (orderbook.yes.midPrice ?? 0.50)
-      : (orderbook.no.midPrice ?? 0.50);
-    const fvForOutcome = outcome === 'YES' ? aggressorFV : (1 - aggressorFV);
-    if (Math.abs(fvForOutcome - marketMid) > 0.20) {
+    // CRITICAL: when midPrice is null (no bids on this side), use bestAsk as proxy.
+    // Fallback to 0.50 was hiding the divergence when one side had no liquidity.
+    const book = outcome === 'YES' ? orderbook.yes : orderbook.no;
+    const marketMid = book.midPrice ?? book.bestAsk ?? book.bestBid ?? null;
+    if (marketMid === null) {
       this.recordDecision(coin, 'SKIP', 'MOMENTUM',
-        `fv_market_divergence FV=${roundTo(fvForOutcome, 3)} mid=${roundTo(marketMid, 3)} gap=${roundTo(Math.abs(fvForOutcome - marketMid), 3)}`,
-        aggressorFV);
+        `no_market_data_${outcome}`, outcomeFV);
+      return [];
+    }
+    if (Math.abs(outcomeFV - marketMid) > 0.20) {
+      this.recordDecision(coin, 'SKIP', 'MOMENTUM',
+        `fv_market_divergence ${outcome} FV=${roundTo(outcomeFV, 3)} mid=${roundTo(marketMid, 3)} gap=${roundTo(Math.abs(outcomeFV - marketMid), 3)}`,
+        outcomeFV);
       return [];
     }
 
     // Don't buy above max price
     if (!bestAsk || bestAsk > config.momentumMaxBuyPrice) {
       this.recordDecision(coin, 'SKIP', 'MOMENTUM',
-        `ask=${bestAsk ?? 'null'} > max=${config.momentumMaxBuyPrice}`, fairValue);
+        `ask=${bestAsk ?? 'null'} > max=${config.momentumMaxBuyPrice}`, outcomeFV);
       return [];
     }
 
     // Position capacity
     const currentShares = positionManager.getShares(outcome);
     if (currentShares >= config.momentumMaxPositionShares) {
-      this.recordDecision(coin, 'SKIP', 'MOMENTUM', 'max_position_reached', fairValue);
+      this.recordDecision(coin, 'SKIP', 'MOMENTUM', 'max_position_reached', outcomeFV);
       return [];
     }
 
@@ -655,16 +660,14 @@ export class VsEngine {
     if (config.preflightBalanceCheck && this.availableUsdcBalance !== null) {
       const cost = shares * bestAsk;
       if (cost > this.availableUsdcBalance * 0.9) {
-        this.recordDecision(coin, 'SKIP', 'MOMENTUM', 'insufficient_balance', fairValue);
+        this.recordDecision(coin, 'SKIP', 'MOMENTUM', 'insufficient_balance', outcomeFV);
         return [];
       }
     }
 
-    // Phase 45d: use outcome-correct FV for telemetry and signal payload
-    const outcomeFV = outcome === 'YES' ? aggressorFV : (1 - aggressorFV);
-
+    const skewLabel = binanceUp ? 'UP' : 'DOWN';
     this.recordDecision(coin, 'ENTRY', 'MOMENTUM',
-      `edge=${roundTo(edge, 4)} FV=${roundTo(outcomeFV, 3)} ask=${bestAsk} vol=${roundTo(aggressorVol, 4)}`,
+      `${outcome} edge=${roundTo(edge, 4)} FV=${roundTo(outcomeFV, 3)} ask=${bestAsk} ${skewLabel} ${roundTo(movePct, 3)}% vol=${roundTo(aggressorVol, 4)}`,
       outcomeFV);
 
     if (config.shadowMode) return [];
@@ -682,7 +685,7 @@ export class VsEngine {
       targetPrice: bestAsk,
       fairValue: outcomeFV,
       urgency: 'cross',
-      reason: `VS Phase2 Aggressor: edge=${roundTo(edge, 4)} FV=${roundTo(outcomeFV, 3)} buying ${outcome}@${bestAsk}`,
+      reason: `VS Aggressor: ${outcome} edge=${roundTo(edge, 4)} FV=${roundTo(outcomeFV, 3)} @${bestAsk} ${skewLabel} ${roundTo(movePct, 3)}%`,
       reduceOnly: false,
       priority: 950,
       edgeAmount: edge,
