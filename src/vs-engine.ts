@@ -406,6 +406,13 @@ export class VsEngine {
     const now = Date.now();
 
     for (const [key, meta] of this.quoteMeta) {
+      // Phase 48c: auto-expire entries older than 60s (paper order TTL cleanup)
+      const ageMs = now - meta.placedAtMs;
+      if (ageMs > 60_000) {
+        this.quoteMeta.delete(key);
+        continue;
+      }
+
       const currentPrice = binanceFeed.getLatestPrice(meta.coin);
       if (currentPrice === null) continue;
 
@@ -420,7 +427,7 @@ export class VsEngine {
           marketId,
           outcome: meta.outcome,
           coin: meta.coin,
-          quoteAgeMs: now - meta.placedAtMs,
+          quoteAgeMs: ageMs,
           binanceDeltaPct: deltaPct,
           bidPrice: meta.bidPrice,
         });
@@ -465,6 +472,15 @@ export class VsEngine {
     for (const [key, meta] of this.quoteMeta) {
       if (meta.coin !== coin) continue;
 
+      // Phase 48c: auto-expire quoteMeta entries older than 60s.
+      // Paper orders expire after TTL (default 120s), but quoteMeta was never
+      // cleaned on expiry — entries lingered forever causing phantom stale cancels.
+      const ageMs = now - meta.placedAtMs;
+      if (ageMs > 60_000) {
+        this.quoteMeta.delete(key);
+        continue;
+      }
+
       const deltaPct = Math.abs(
         ((currentPrice - meta.binancePriceAtPlace) / meta.binancePriceAtPlace) * 100
       );
@@ -474,7 +490,7 @@ export class VsEngine {
         stale.push({
           marketId,
           outcome: meta.outcome,
-          quoteAgeMs: now - meta.placedAtMs,
+          quoteAgeMs: ageMs,
           binanceDeltaPct: deltaPct,
           bidPrice: meta.bidPrice,
         });
@@ -748,10 +764,13 @@ export class VsEngine {
         continue;
       }
 
-      // Don't double up — if already holding this outcome, let exit handle it
-      if (this.hasPositionForOutcome(market.marketId, outcome)) {
+      // Phase 48c: Don't buy ANY side if already holding ANY position on this market.
+      // Previously only checked same outcome — allowed buying YES when holding NO
+      // = complete set trap ($1.03 paid for $1 payout = guaranteed loss).
+      if (this.hasPosition(market.marketId)) {
+        const heldSide = this.hasPositionForOutcome(market.marketId, 'YES') ? 'YES' : 'NO';
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-          `already_holding_${outcome}`, outcomeFV);
+          `already_holding_${heldSide}_block_${outcome}`, outcomeFV);
         continue;
       }
 
@@ -892,6 +911,14 @@ export class VsEngine {
     if (!bestAsk || bestAsk > config.momentumMaxBuyPrice) {
       this.recordDecision(coin, 'SKIP', 'MOMENTUM',
         `ask=${bestAsk ?? 'null'} > max=${config.momentumMaxBuyPrice}`, outcomeFV);
+      return [];
+    }
+
+    // Phase 48c: Block momentum if already holding ANY side on this market (complete set protection)
+    if (this.hasPosition(market.marketId)) {
+      const heldSide = this.hasPositionForOutcome(market.marketId, 'YES') ? 'YES' : 'NO';
+      this.recordDecision(coin, 'SKIP', 'MOMENTUM',
+        `already_holding_${heldSide}_block_${outcome}`, outcomeFV);
       return [];
     }
 
