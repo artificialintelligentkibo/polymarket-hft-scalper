@@ -1564,8 +1564,12 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseIntOrDefault(env.VS_MOMENTUM_PHASE_MS, '30000')
       ),
       // Safety
+      // Phase 49b: default changed from 0.05 to 0 (disabled).
+      // 5-min binary markets oscillate ±15-20¢ naturally near 0.50.
+      // Price-stop at 10¢ killed every position before maker-ask could fill.
+      // Time-exit at T-15s is the real safety net. Re-enable via .env if needed.
       priceStopCents: clamp(
-        parseFloatOrDefault(env.VS_PRICE_STOP_CENTS, '0.05'),
+        parseFloatOrDefault(env.VS_PRICE_STOP_CENTS, '0'),
         0, // 0 = disabled
         0.20
       ),

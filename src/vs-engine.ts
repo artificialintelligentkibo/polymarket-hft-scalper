@@ -789,13 +789,13 @@ export class VsEngine {
         continue;
       }
 
-      // Phase 49: FV-market divergence guard for MM.
-      // If market mid diverges >0.15 from CDF fair value, the market has information
+      // Phase 49b: FV-market divergence guard for MM.
+      // If market mid diverges >0.10 from CDF fair value, the market has information
       // the CDF doesn't capture (e.g. outcome nearly decided, large Binance move).
-      // Buying at 0.17 when FV=0.50 means trusting a model the market disagrees with.
-      // This was the primary cause of catastrophic price-stop losses (-$0.84 to -$1.32).
+      // Tightened from 0.15 to 0.10: SOL YES@0.34 (gap=0.11) still passed and lost -$0.60.
+      // Near 0.50 entries only — that's where MM spread capture actually works.
       const fvMarketGap = Math.abs(outcomeFV - mid);
-      if (fvMarketGap > 0.15) {
+      if (fvMarketGap > 0.10) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
           `fv_market_divergence_${outcome} FV=${roundTo(outcomeFV, 3)} mid=${roundTo(mid, 3)} gap=${roundTo(fvMarketGap, 3)}`, outcomeFV);
         continue;
