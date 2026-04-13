@@ -52,6 +52,7 @@ export class BinanceEdgeProvider {
   private heartbeatTimer: NodeJS.Timeout | undefined;
   private connected = false;
   private readonly lastPrices = new Map<string, number>();
+  private readonly lastPriceUpdatedAt = new Map<string, number>();
   private readonly slotOpenPrices = new Map<string, SlotOpenReference>();
   private readonly priceHistory = new Map<string, BinancePriceSample[]>();
 
@@ -105,6 +106,14 @@ export class BinanceEdgeProvider {
   getLatestPrice(coin: string): number | null {
     const symbol = COIN_TO_BINANCE[coin.toUpperCase()];
     if (!symbol) {
+      return null;
+    }
+
+    // Phase 40: return null if price is stale — prevents VS Engine and other
+    // consumers from using outdated prices after WebSocket disconnect.
+    const STALE_PRICE_THRESHOLD_MS = 30_000;
+    const lastUpdate = this.lastPriceUpdatedAt.get(symbol);
+    if (lastUpdate && Date.now() - lastUpdate > STALE_PRICE_THRESHOLD_MS) {
       return null;
     }
 
@@ -199,6 +208,16 @@ export class BinanceEdgeProvider {
       return createUnavailableAssessment(coin, params.pmUpMid, 'no_binance_price');
     }
 
+    // Phase 40: Stale price guard — if the last Binance price update is older
+    // than 30s, the WebSocket likely disconnected. Using a stale price inflates
+    // binanceMovePct to 10-20% (fake), causing false SNIPER entries.
+    // Observed 2026-04-12: overnight BTC "moves" of 10-20% were stale data.
+    const STALE_PRICE_THRESHOLD_MS = 30_000;
+    const lastUpdateMs = this.lastPriceUpdatedAt.get(symbol);
+    if (lastUpdateMs && Date.now() - lastUpdateMs > STALE_PRICE_THRESHOLD_MS) {
+      return createUnavailableAssessment(coin, params.pmUpMid, 'stale_price');
+    }
+
     if (slotOpenPrice === null) {
       return createUnavailableAssessment(coin, params.pmUpMid, 'no_slot_open_price');
     }
@@ -276,6 +295,15 @@ export class BinanceEdgeProvider {
       return;
     }
 
+    // Phase 40: Don't record slot open from stale prices — a disconnected
+    // WebSocket would lock in an old price as the slot reference, inflating
+    // all subsequent binanceMovePct calculations for this slot.
+    const STALE_PRICE_THRESHOLD_MS = 30_000;
+    const lastUpdate = this.lastPriceUpdatedAt.get(symbol);
+    if (lastUpdate && Date.now() - lastUpdate > STALE_PRICE_THRESHOLD_MS) {
+      return;
+    }
+
     this.slotOpenPrices.set(key, {
       openPrice: price,
       createdAt: Date.now(),
@@ -301,6 +329,7 @@ export class BinanceEdgeProvider {
     const normalizedSymbol = symbol.toLowerCase();
     this.connected = true;
     this.lastPrices.set(normalizedSymbol, price);
+    this.lastPriceUpdatedAt.set(normalizedSymbol, Date.now());
     const history = this.priceHistory.get(normalizedSymbol) ?? [];
     history.push({
       price,
