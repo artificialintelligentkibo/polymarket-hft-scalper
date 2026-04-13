@@ -96,6 +96,8 @@ export interface VsEngineConfig {
   readonly aggressorVolFloor: number;
   readonly aggressorMinEdge: number;
   readonly mmTiltMaxCents: number;
+  // Phase 48: cancel-on-Binance-move — cancel stale quotes when Binance moves
+  readonly staleCancelThresholdPct: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -278,6 +280,7 @@ export class VsEngine {
   private phase1Entries = 0;
   private phase1Pnl = 0;
   private phase2Entries = 0;
+  private staleCancels = 0;
   private phase2Pnl = 0;
   private readonly coinStats = new Map<string, {
     entries: number;
@@ -376,6 +379,64 @@ export class VsEngine {
   recordPriceStopForDiag(marketId: string): void {
     const diag = this.getOrCreateSlotDiag(marketId);
     diag.priceStops += 1;
+  }
+
+  /* ── Phase 48: cancel-on-Binance-move ────────────────────────────── */
+
+  /**
+   * Check all open quotes and return those whose Binance price has moved
+   * beyond the threshold since placement. Caller should cancel these orders.
+   */
+  getStaleQuotes(
+    binanceFeed: VsBinanceFeed,
+    thresholdPct: number
+  ): Array<{
+    marketId: string;
+    outcome: Outcome;
+    coin: string;
+    quoteAgeMs: number;
+    binanceDeltaPct: number;
+    bidPrice: number;
+  }> {
+    if (thresholdPct <= 0) return [];
+    const stale: Array<{
+      marketId: string; outcome: Outcome; coin: string;
+      quoteAgeMs: number; binanceDeltaPct: number; bidPrice: number;
+    }> = [];
+    const now = Date.now();
+
+    for (const [key, meta] of this.quoteMeta) {
+      const currentPrice = binanceFeed.getLatestPrice(meta.coin);
+      if (currentPrice === null) continue;
+
+      const deltaPct = Math.abs(
+        ((currentPrice - meta.binancePriceAtPlace) / meta.binancePriceAtPlace) * 100
+      );
+      if (deltaPct >= thresholdPct) {
+        // Parse marketId from composite key: "marketId:outcome"
+        const sepIdx = key.lastIndexOf(':');
+        const marketId = sepIdx > 0 ? key.substring(0, sepIdx) : key;
+        stale.push({
+          marketId,
+          outcome: meta.outcome,
+          coin: meta.coin,
+          quoteAgeMs: now - meta.placedAtMs,
+          binanceDeltaPct: deltaPct,
+          bidPrice: meta.bidPrice,
+        });
+      }
+    }
+    return stale;
+  }
+
+  /**
+   * Remove quoteMeta entry after cancellation so it's not re-checked.
+   * Increments staleCancels counter for dashboard stats.
+   */
+  clearQuoteMeta(marketId: string, outcome: Outcome): void {
+    const key = this.positionKey(marketId, outcome);
+    this.quoteMeta.delete(key);
+    this.staleCancels += 1;
   }
 
   /** Get slot summary and clean up. Call at slot end. */
@@ -1231,6 +1292,8 @@ export class VsEngine {
       mmTiltMaxCents: config.mmTiltMaxCents,
       mmSpreadCents: config.mmSpreadCents,
       priceStopCents: config.priceStopCents,
+      staleCancelThresholdPct: config.staleCancelThresholdPct,
+      staleCancels: this.staleCancels,
       activePositions,
       totalSignalsGenerated: this.totalExitSignals + this.totalEntries,
     };

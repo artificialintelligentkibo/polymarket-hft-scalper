@@ -1980,6 +1980,37 @@ export class MarketMakerRuntime {
       if (vsCoin) {
         this.binanceEdge.recordSlotOpen(vsCoin, market.startTime);
       }
+
+      // Phase 48: cancel-on-Binance-move — before generating new signals,
+      // check if any existing VS maker BUY quotes are stale (Binance moved
+      // beyond threshold since placement). Cancel them to avoid adverse selection.
+      if (config.vsEngine.staleCancelThresholdPct > 0) {
+        const staleQuotes = this.vsEngine.getStaleQuotes(
+          this.binanceEdge,
+          config.vsEngine.staleCancelThresholdPct
+        );
+        for (const sq of staleQuotes) {
+          if (sq.marketId === market.marketId) {
+            const cancelled = await this.cancelStaleVsBuyQuotes(
+              sq.marketId, sq.outcome
+            );
+            if (cancelled > 0) {
+              this.vsEngine.clearQuoteMeta(sq.marketId, sq.outcome);
+              logger.info('Phase 48: cancelled stale VS quote (Binance moved)', {
+                marketId: sq.marketId,
+                outcome: sq.outcome,
+                coin: sq.coin,
+                quoteAgeMs: sq.quoteAgeMs,
+                binanceDeltaPct: roundTo(sq.binanceDeltaPct, 4),
+                thresholdPct: config.vsEngine.staleCancelThresholdPct,
+                bidPrice: sq.bidPrice,
+                cancelled,
+              });
+            }
+          }
+        }
+      }
+
       // Phase 35C: skip VS entries if OBI already claimed this market
       // Phase 43: skip VS entries if paper pending BUY orders already exist
       //   (prevents accumulating maker orders while previous ones haven't filled)
@@ -5864,6 +5895,56 @@ export class MarketMakerRuntime {
     }
     if (cancelledCount > 0) {
       await sleep(500);
+    }
+    return cancelledCount;
+  }
+
+  /**
+   * Phase 48: Cancel stale VS_MM_BID (BUY) orders when Binance has moved.
+   * Unlike cancelPendingVsMakerQuotes (which cancels SELL/ASK quotes before exit),
+   * this cancels BUY quotes that are sitting at outdated prices.
+   */
+  private async cancelStaleVsBuyQuotes(
+    marketId: string,
+    outcome: StrategySignal['outcome']
+  ): Promise<number> {
+    // Paper trading: expire pending BUY orders via paper executor
+    if (isPaperTradingEnabled(config)) {
+      const beforeShares = this.executor.getPaperPendingBuyShares(marketId);
+      if (beforeShares > 0) {
+        this.executor.expirePaperPendingBuyOrders(marketId);
+        return 1; // at least one cancelled
+      }
+      return 0;
+    }
+
+    // Live trading: cancel via fillTracker pending orders
+    const pending = this.fillTracker
+      .getPendingOrders()
+      .filter(
+        (order) =>
+          order.marketId === marketId &&
+          order.outcome === outcome &&
+          order.side === 'BUY' &&
+          order.signalType === 'VS_MM_BID'
+      );
+    if (pending.length === 0) return 0;
+
+    let cancelledCount = 0;
+    for (const order of pending) {
+      try {
+        await this.executor.cancelOrder(order.orderId);
+        this.fillTracker.forgetPendingOrder(order.orderId);
+        this.clearPendingLiveOrder(this.getPendingOrderKey(marketId, outcome));
+        cancelledCount += 1;
+      } catch (error) {
+        logger.warn('Failed to cancel stale VS BUY quote', {
+          marketId,
+          outcome,
+          orderId: order.orderId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     return cancelledCount;
   }

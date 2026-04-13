@@ -261,6 +261,8 @@ export interface VsSessionStats {
   readonly mmTiltMaxCents: number;
   readonly mmSpreadCents: number;
   readonly priceStopCents: number;
+  readonly staleCancelThresholdPct: number;
+  readonly staleCancels: number;
   readonly activePositions: readonly VsActivePosition[];
   readonly totalSignalsGenerated: number;
 }

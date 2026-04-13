@@ -1620,6 +1620,13 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.VS_MM_TILT_MAX_CENTS, '0.01')
       ),
+      // Phase 48: cancel-on-Binance-move — if Binance moves > N% from quote
+      // placement price, cancel stale maker quotes to avoid adverse selection.
+      // 0.03 = 0.03% (~$20 on BTC@67k, ~$1 on ETH@3.4k)
+      staleCancelThresholdPct: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_STALE_CANCEL_THRESHOLD_PCT, '0.03')
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
