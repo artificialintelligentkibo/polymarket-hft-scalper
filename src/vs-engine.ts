@@ -489,6 +489,14 @@ export class VsEngine {
       const bidPrice = side === 'YES' ? yesBidPrice : noBidPrice;
       const mid = side === 'YES' ? yesMid : noMid;
 
+      // Phase 45c: skip near-resolved markets (mid < 0.10 or mid > 0.90)
+      // When one side is nearly decided, MM has no edge — only lottery risk.
+      if (mid < 0.10 || mid > 0.90) {
+        this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+          `market_resolved_${outcome} mid=${roundTo(mid, 3)}`, fairValueUp);
+        continue;
+      }
+
       // Inventory management: if already holding this outcome, skip (let exit handle it)
       if (this.hasPositionForOutcome(market.marketId, outcome)) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
@@ -603,6 +611,20 @@ export class VsEngine {
       return [];
     }
 
+    // Phase 45c: sanity check — if market price diverges >0.20 from CDF FV,
+    // the market has information the CDF doesn't capture (e.g. outcome nearly decided).
+    // Trust the market, not our stale CDF model.
+    const marketMid = outcome === 'YES'
+      ? (orderbook.yes.midPrice ?? 0.50)
+      : (orderbook.no.midPrice ?? 0.50);
+    const fvForOutcome = outcome === 'YES' ? aggressorFV : (1 - aggressorFV);
+    if (Math.abs(fvForOutcome - marketMid) > 0.20) {
+      this.recordDecision(coin, 'SKIP', 'MOMENTUM',
+        `fv_market_divergence FV=${roundTo(fvForOutcome, 3)} mid=${roundTo(marketMid, 3)} gap=${roundTo(Math.abs(fvForOutcome - marketMid), 3)}`,
+        aggressorFV);
+      return [];
+    }
+
     // Don't buy above max price
     if (!bestAsk || bestAsk > config.momentumMaxBuyPrice) {
       this.recordDecision(coin, 'SKIP', 'MOMENTUM',
@@ -709,8 +731,8 @@ export class VsEngine {
         continue;
       }
 
-      // Scalp exit: bid >= target (0.97)
-      if (bestBid && bestBid >= config.targetExitPrice) {
+      // Scalp exit: bid >= target AND bid > entry (never sell at a loss via scalp)
+      if (bestBid && bestBid >= config.targetExitPrice && bestBid > position.entryVwap) {
         this.totalExitSignals += 1;
         signals.push(this.buildSignal({
           market,
@@ -722,7 +744,7 @@ export class VsEngine {
           targetPrice: bestBid,
           fairValue: null,
           urgency: 'cross',
-          reason: `VS scalp-exit: ${outcome} bid=${bestBid} >= target=${config.targetExitPrice}`,
+          reason: `VS scalp-exit: ${outcome} bid=${bestBid} >= target=${config.targetExitPrice} entry=${roundTo(position.entryVwap, 3)}`,
           reduceOnly: true,
           priority: 960,
           edgeAmount: bestBid - position.entryVwap,
