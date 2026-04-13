@@ -434,7 +434,7 @@ export class VsEngine {
     return [];
   }
 
-  /* ── Phase 1: Passive MM (two-sided quoting around Polymarket mid) ── */
+  /* ── Phase 1: Passive MM (Binance-skewed inventory accumulation) ─── */
 
   private generatePassiveMMSignals(
     market: MarketCandidate,
@@ -453,58 +453,57 @@ export class VsEngine {
   ): StrategySignal[] {
     const signals: StrategySignal[] = [];
 
-    // Phase 45a: Anchor on Polymarket mid-price, NOT CDF FV.
-    // Two-sided MM earns spread, not direction.
+    // Phase 46: vague-sourdough insight — MM phase accumulates inventory
+    // toward Binance direction (BUY:SELL = 4:1 at open). Not equal two-sided.
+    // Use CDF FV as anchor (like vague-sourdough), with Binance skew.
     const yesMid = orderbook.yes.midPrice ?? 0.50;
     const noMid = orderbook.no.midPrice ?? 0.50;
 
-    // Binance tilt: small price adjustment based on spot direction
+    // Binance direction determines which side to favor
     const movePct = ((spotPrice - strikePrice) / strikePrice) * 100;
-    const tiltCents = Math.min(Math.abs(movePct) * 0.5, config.mmTiltMaxCents);
+    const absMove = Math.abs(movePct);
     const binanceUp = movePct > 0;
+    const binanceDown = movePct < 0;
+    const binanceFlat = absMove < 0.01; // < 0.01% = essentially flat
 
-    // YES side: bid below yesMid, tilt if Binance is moving up
+    // Phase 46: Inventory skew — favor Binance direction side.
+    // Flat → quote both sides equally (spread farming).
+    // Directional → only quote the favored side (inventory accumulation).
+    // This matches vague-sourdough's 4:1 BUY skew toward winning direction.
+    let sidesToQuote: readonly Outcome[];
+    if (binanceFlat) {
+      sidesToQuote = ['YES', 'NO'] as const;
+    } else if (binanceUp) {
+      sidesToQuote = ['YES'] as const;
+    } else {
+      sidesToQuote = ['NO'] as const;
+    }
+
+    // Bid pricing: anchor on Polymarket mid with spread below
     const yesBaseBid = yesMid - config.mmSpreadCents;
-    const yesBidPrice = roundTo(
-      Math.max(
-        yesBaseBid + (binanceUp ? tiltCents : -tiltCents * 0.5),
-        config.mmMinPrice
-      ),
-      2
-    );
-
-    // NO side: bid below noMid, tilt if Binance is moving down
+    const yesBidPrice = roundTo(Math.max(yesBaseBid, config.mmMinPrice), 2);
     const noBaseBid = noMid - config.mmSpreadCents;
-    const noBidPrice = roundTo(
-      Math.max(
-        noBaseBid + (!binanceUp ? tiltCents : -tiltCents * 0.5),
-        config.mmMinPrice
-      ),
-      2
-    );
+    const noBidPrice = roundTo(Math.max(noBaseBid, config.mmMinPrice), 2);
 
     const shares = Math.round(config.mmShares * sizeMultiplier);
 
-    // Phase 45d: track running budget so two-sided quotes don't exceed balance
+    // Track running budget so quotes don't exceed balance
     let budgetRemaining = (this.availableUsdcBalance ?? Infinity) * 0.9;
 
-    // Emit up to TWO signals — one for YES, one for NO
-    for (const side of ['YES', 'NO'] as const) {
+    for (const side of sidesToQuote) {
       const outcome: Outcome = side;
       const bidPrice = side === 'YES' ? yesBidPrice : noBidPrice;
       const mid = side === 'YES' ? yesMid : noMid;
-      // Phase 45d: outcome-correct fair value for signal payload
       const outcomeFV = side === 'YES' ? fairValueUp : fairValueDown;
 
-      // Phase 45c: skip near-resolved markets (mid < 0.10 or mid > 0.90)
-      // When one side is nearly decided, MM has no edge — only lottery risk.
+      // Skip near-resolved markets (mid < 0.10 or mid > 0.90)
       if (mid < 0.10 || mid > 0.90) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
           `market_resolved_${outcome} mid=${roundTo(mid, 3)}`, outcomeFV);
         continue;
       }
 
-      // Inventory management: if already holding this outcome, skip (let exit handle it)
+      // Don't double up — if already holding this outcome, let exit handle it
       if (this.hasPositionForOutcome(market.marketId, outcome)) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
           `already_holding_${outcome}`, outcomeFV);
@@ -526,7 +525,7 @@ export class VsEngine {
         continue;
       }
 
-      // Balance check — cumulative across both sides
+      // Balance check — cumulative
       if (config.preflightBalanceCheck && this.availableUsdcBalance !== null) {
         const cost = shares * bidPrice;
         if (cost > budgetRemaining) {
@@ -536,8 +535,9 @@ export class VsEngine {
         }
       }
 
+      const skewLabel = binanceFlat ? 'FLAT' : (binanceUp ? 'UP' : 'DOWN');
       this.recordDecision(coin, 'ENTRY', 'PASSIVE_MM',
-        `${outcome} mid=${roundTo(mid, 3)} bid=${bidPrice} tilt=${roundTo(tiltCents, 4)} move=${roundTo(movePct, 3)}%`,
+        `${outcome} mid=${roundTo(mid, 3)} bid=${bidPrice} skew=${skewLabel} move=${roundTo(movePct, 3)}%`,
         outcomeFV);
 
       if (config.shadowMode) continue;
@@ -558,10 +558,10 @@ export class VsEngine {
         targetPrice: bidPrice,
         fairValue: outcomeFV,
         urgency: 'passive',
-        reason: `VS Phase1 MM: ${outcome} mid=${roundTo(mid, 3)} bid@${bidPrice} move=${roundTo(movePct, 3)}%`,
+        reason: `VS MM: ${outcome} mid=${roundTo(mid, 3)} bid@${bidPrice} ${skewLabel} ${roundTo(movePct, 3)}%`,
         reduceOnly: false,
         priority: 800,
-        edgeAmount: Math.abs(movePct),
+        edgeAmount: absMove,
       }));
     }
 
