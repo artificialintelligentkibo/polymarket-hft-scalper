@@ -1602,6 +1602,19 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.VS_MIN_DIRECTION_THRESHOLD, '0.03')
       ),
+      // Phase 45a: two-sided MM + aggressor mode
+      aggressorVolFloor: Math.max(
+        0.005,
+        parseFloatOrDefault(env.VS_AGGRESSOR_VOL_FLOOR, '0.02')
+      ),
+      aggressorMinEdge: Math.max(
+        0.005,
+        parseFloatOrDefault(env.VS_AGGRESSOR_MIN_EDGE, '0.03')
+      ),
+      mmTiltMaxCents: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_MM_TILT_MAX_CENTS, '0.01')
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),

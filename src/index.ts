@@ -1683,7 +1683,7 @@ export class MarketMakerRuntime {
             // Phase 42: notify VS engine of paper BUY fills so it tracks position
             // and enforces VS_MM_MAX_POSITION_SHARES.
             if (
-              (pf.signalType === 'VS_ENTRY_BUY' || pf.signalType === 'VS_MOMENTUM_BUY') &&
+              (pf.signalType === 'VS_ENTRY_BUY' || pf.signalType === 'VS_MOMENTUM_BUY' || pf.signalType === 'VS_MM_BID') &&
               pf.side === 'BUY'
             ) {
               const vsCoin = extractCoinFromTitle(market.title);
@@ -2794,7 +2794,8 @@ export class MarketMakerRuntime {
       // without this guard we'd create phantom positions and schedule timers for nothing.
       if (
         (executionSignal.signalType === 'VS_ENTRY_BUY' ||
-          executionSignal.signalType === 'VS_MOMENTUM_BUY') &&
+          executionSignal.signalType === 'VS_MOMENTUM_BUY' ||
+          executionSignal.signalType === 'VS_MM_BID') &&
         executionSignal.action === 'BUY' &&
         effectiveShares > 0 &&
         config.vsEngine.enabled
@@ -3016,14 +3017,14 @@ export class MarketMakerRuntime {
         const remainingShares = positionManager.getShares(executionSignal.outcome);
         // Record exit stats for VS when not already recorded by timer
         if (!isVsExitSignal(executionSignal.signalType)) {
-          const vsPos = this.vsEngine.getActivePositions().get(market.marketId);
+          const vsPos = this.vsEngine.getPosition(market.marketId, executionSignal.outcome);
           const entryVwap = vsPos?.entryVwap ?? effectivePrice;
           const realizedDelta = (effectivePrice - entryVwap) * effectiveShares;
           const exitCoin = extractCoinFromTitle(market.title);
           this.vsEngine.recordExitForStats(exitCoin, realizedDelta, executionSignal.signalType);
         }
         if (remainingShares <= 0) {
-          this.vsEngine.clearState(market.marketId);
+          this.vsEngine.clearState(market.marketId, executionSignal.outcome);
           logger.info('VS exit fill — cleared position tracking', {
             marketId: market.marketId,
             signalType: executionSignal.signalType,
@@ -3045,6 +3046,7 @@ export class MarketMakerRuntime {
         executionSignal.signalType !== 'OBI_ENTRY_BUY' && // OBI has Phase 29 timers
         executionSignal.signalType !== 'VS_ENTRY_BUY' && // VS has Phase 35B timers
         executionSignal.signalType !== 'VS_MOMENTUM_BUY' && // VS has Phase 35B timers
+        executionSignal.signalType !== 'VS_MM_BID' && // VS has Phase 35B timers
         market.endTime
       ) {
         const universalSlotEndMs = new Date(market.endTime).getTime();
@@ -3917,7 +3919,7 @@ export class MarketMakerRuntime {
       // orders with 0 fills create phantom VS positions that show unrealized P&L
       // in the dashboard but have no on-chain shares (BTC phantom fill 2026-04-12).
       if (
-        (fill.signalType === 'VS_ENTRY_BUY' || fill.signalType === 'VS_MOMENTUM_BUY') &&
+        (fill.signalType === 'VS_ENTRY_BUY' || fill.signalType === 'VS_MOMENTUM_BUY' || fill.signalType === 'VS_MM_BID') &&
         fill.filledShares > 0 &&
         config.vsEngine.enabled
       ) {
@@ -4097,7 +4099,7 @@ export class MarketMakerRuntime {
       // Phase 44: clear VS position state when fully exited (prevents ghost positions)
       const vsRemaining = positionManager.getShares(fill.outcome);
       if (vsRemaining <= 0) {
-        this.vsEngine.clearState(fill.marketId);
+        this.vsEngine.clearState(fill.marketId, fill.outcome);
         logger.info('Phase 44: VS async exit fill — cleared position tracking', {
           marketId: fill.marketId,
           signalType: fill.signalType,
@@ -5874,7 +5876,7 @@ export class MarketMakerRuntime {
           if (!pm) return;
           const liveShares = pm.getShares(outcome);
           if (liveShares <= 0) {
-            this.vsEngine.clearState(marketId);
+            this.vsEngine.clearState(marketId, outcome);
             return;
           }
 
@@ -5947,13 +5949,13 @@ export class MarketMakerRuntime {
 
           // Record VS exit stats — read entryVwap BEFORE clearState (Phase 44 fix)
           const exitCoin = extractCoinFromTitle(cachedTitle);
-          const vsPos = this.vsEngine.getActivePositions().get(marketId);
+          const vsPos = this.vsEngine.getPosition(marketId, outcome);
           const entryVwap = vsPos?.entryVwap ?? bestBid;
           const realizedDelta = (bestBid - entryVwap) * liveShares;
           this.vsEngine.recordExitForStats(exitCoin, realizedDelta, 'VS_TIME_EXIT');
           const remainingShares = pm.getShares(outcome);
           if (remainingShares <= 0) {
-            this.vsEngine.clearState(marketId);
+            this.vsEngine.clearState(marketId, outcome);
           }
         } catch (error) {
           logger.warn('Phase 35C: VS time-exit timer failed', {

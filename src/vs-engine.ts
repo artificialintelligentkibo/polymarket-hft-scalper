@@ -89,6 +89,10 @@ export interface VsEngineConfig {
   readonly maxEntryPrice: number;
   // Direction filter — prevent YES/NO flipping when FV ≈ 0.50
   readonly minDirectionThreshold: number;
+  // Phase 45a: two-sided MM + aggressor mode
+  readonly aggressorVolFloor: number;
+  readonly aggressorMinEdge: number;
+  readonly mmTiltMaxCents: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -289,12 +293,29 @@ export class VsEngine {
     this.availableUsdcBalance = usdc;
   }
 
+  /** Phase 45a: composite key for per-outcome position tracking. */
+  private positionKey(marketId: string, outcome: Outcome): string {
+    return `${marketId}:${outcome}`;
+  }
+
   hasPosition(marketId: string): boolean {
-    return this.positions.has(marketId);
+    return (
+      this.positions.has(this.positionKey(marketId, 'YES')) ||
+      this.positions.has(this.positionKey(marketId, 'NO'))
+    );
+  }
+
+  hasPositionForOutcome(marketId: string, outcome: Outcome): boolean {
+    return this.positions.has(this.positionKey(marketId, outcome));
   }
 
   getActivePositions(): ReadonlyMap<string, VsPosition> {
     return this.positions;
+  }
+
+  /** Phase 45a: get position by marketId and outcome (composite key lookup). */
+  getPosition(marketId: string, outcome: Outcome): VsPosition | undefined {
+    return this.positions.get(this.positionKey(marketId, outcome));
   }
 
   /** Phase 36: last computed fair value for slot replay tracker. */
@@ -302,8 +323,15 @@ export class VsEngine {
     return this.lastFairValues.get(marketId) ?? null;
   }
 
-  clearState(marketId: string): void {
-    this.positions.delete(marketId);
+  clearState(marketId: string, outcome?: Outcome): void {
+    if (outcome) {
+      // Phase 45a: clear specific outcome position
+      this.positions.delete(this.positionKey(marketId, outcome));
+    } else {
+      // Clear both outcomes
+      this.positions.delete(this.positionKey(marketId, 'YES'));
+      this.positions.delete(this.positionKey(marketId, 'NO'));
+    }
     this.lastFairValues.delete(marketId);
     this.lastEntryMs.delete(marketId);
     this.lastOrphanEmitMs.delete(marketId);
@@ -338,9 +366,6 @@ export class VsEngine {
       config.momentumPhaseMs, config.timeExitBeforeEndMs
     );
     if (phase === 'NONE' || phase === 'EXIT') return [];
-
-    // Already positioned? Don't enter more (for now)
-    if (this.positions.has(market.marketId)) return [];
 
     // Cooldown
     const lastEntry = this.lastEntryMs.get(market.marketId);
@@ -392,7 +417,7 @@ export class VsEngine {
       return this.generatePassiveMMSignals(
         market, orderbook, positionManager, config, coin, fairValueUp,
         fairValueDown, spotPrice, strikePrice, slotEndMs, slotStartMs,
-        params.vsSizeMultiplier ?? 1
+        params.vsSizeMultiplier ?? 1, nowMs
       );
     }
 
@@ -400,14 +425,14 @@ export class VsEngine {
       return this.generateMomentumSignals(
         market, orderbook, positionManager, config, coin, fairValueUp,
         fairValueDown, vol, spotPrice, strikePrice, slotEndMs, slotStartMs,
-        params.vsSizeMultiplier ?? 1
+        params.vsSizeMultiplier ?? 1, nowMs
       );
     }
 
     return [];
   }
 
-  /* ── Phase 1: Passive MM ────────────────────────────────────────── */
+  /* ── Phase 1: Passive MM (two-sided quoting around Polymarket mid) ── */
 
   private generatePassiveMMSignals(
     market: MarketCandidate,
@@ -421,78 +446,111 @@ export class VsEngine {
     strikePrice: number,
     slotEndMs: number,
     slotStartMs: number,
-    sizeMultiplier: number
+    sizeMultiplier: number,
+    nowMs: number
   ): StrategySignal[] {
     const signals: StrategySignal[] = [];
 
-    // Determine which side to favor based on Binance direction
+    // Phase 45a: Anchor on Polymarket mid-price, NOT CDF FV.
+    // Two-sided MM earns spread, not direction.
+    const yesMid = orderbook.yes.midPrice ?? 0.50;
+    const noMid = orderbook.no.midPrice ?? 0.50;
+
+    // Binance tilt: small price adjustment based on spot direction
     const movePct = ((spotPrice - strikePrice) / strikePrice) * 100;
-    const favorUp = movePct > 0;
+    const tiltCents = Math.min(Math.abs(movePct) * 0.5, config.mmTiltMaxCents);
+    const binanceUp = movePct > 0;
 
-    // Direction threshold — prevent YES/NO flipping when FV ≈ 0.50
-    if (Math.abs(fairValueUp - 0.50) < config.minDirectionThreshold) {
-      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-        `FV_too_flat |FV-0.50|=${roundTo(Math.abs(fairValueUp - 0.50), 4)} < ${config.minDirectionThreshold}`, fairValueUp);
-      return [];
-    }
+    // YES side: bid below yesMid, tilt if Binance is moving up
+    const yesBaseBid = yesMid - config.mmSpreadCents;
+    const yesBidPrice = roundTo(
+      Math.max(
+        yesBaseBid + (binanceUp ? tiltCents : -tiltCents * 0.5),
+        config.mmMinPrice
+      ),
+      2
+    );
 
-    // Quote on the favored side only (accumulate inventory in Binance direction)
-    const outcome: Outcome = favorUp ? 'YES' : 'NO';
-    const fairValue = favorUp ? fairValueUp : fairValueDown;
-    const book: TokenBookSnapshot = favorUp ? orderbook.yes : orderbook.no;
+    // NO side: bid below noMid, tilt if Binance is moving down
+    const noBaseBid = noMid - config.mmSpreadCents;
+    const noBidPrice = roundTo(
+      Math.max(
+        noBaseBid + (!binanceUp ? tiltCents : -tiltCents * 0.5),
+        config.mmMinPrice
+      ),
+      2
+    );
 
-    // Price guard
-    const bidPrice = roundTo(Math.max(fairValue - config.mmSpreadCents, config.mmMinPrice), 2);
-    if (bidPrice < config.minEntryPrice || bidPrice > config.maxEntryPrice) {
-      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM', `price_out_of_range bid=${bidPrice}`, fairValue);
-      return [];
-    }
-
-    // Position capacity check
-    const currentShares = positionManager.getShares(outcome);
-    if (currentShares >= config.mmMaxPositionShares) {
-      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM', 'max_position_reached', fairValue);
-      return [];
-    }
-
-    // Balance check
     const shares = Math.round(config.mmShares * sizeMultiplier);
-    if (config.preflightBalanceCheck && this.availableUsdcBalance !== null) {
-      const cost = shares * bidPrice;
-      if (cost > this.availableUsdcBalance * 0.9) {
-        this.recordDecision(coin, 'SKIP', 'PASSIVE_MM', 'insufficient_balance', fairValue);
-        return [];
+
+    // Emit up to TWO signals — one for YES, one for NO
+    for (const side of ['YES', 'NO'] as const) {
+      const outcome: Outcome = side;
+      const bidPrice = side === 'YES' ? yesBidPrice : noBidPrice;
+      const mid = side === 'YES' ? yesMid : noMid;
+
+      // Inventory management: if already holding this outcome, skip (let exit handle it)
+      if (this.hasPositionForOutcome(market.marketId, outcome)) {
+        this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+          `already_holding_${outcome}`, fairValueUp);
+        continue;
       }
+
+      // Position capacity check per outcome
+      const currentShares = positionManager.getShares(outcome);
+      if (currentShares >= config.mmMaxPositionShares) {
+        this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+          `max_position_${outcome}`, fairValueUp);
+        continue;
+      }
+
+      // Price guard
+      if (bidPrice < config.minEntryPrice || bidPrice > config.maxEntryPrice) {
+        this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+          `price_out_of_range_${outcome} bid=${bidPrice}`, fairValueUp);
+        continue;
+      }
+
+      // Balance check
+      if (config.preflightBalanceCheck && this.availableUsdcBalance !== null) {
+        const cost = shares * bidPrice;
+        if (cost > this.availableUsdcBalance * 0.9) {
+          this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+            `insufficient_balance_${outcome}`, fairValueUp);
+          continue;
+        }
+      }
+
+      this.recordDecision(coin, 'ENTRY', 'PASSIVE_MM',
+        `${outcome} mid=${roundTo(mid, 3)} bid=${bidPrice} tilt=${roundTo(tiltCents, 4)} move=${roundTo(movePct, 3)}%`,
+        fairValueUp);
+
+      if (config.shadowMode) continue;
+
+      // Lock cooldown on signal GENERATION
+      this.lastEntryMs.set(market.marketId, nowMs);
+
+      signals.push(this.buildSignal({
+        market,
+        orderbook,
+        signalType: 'VS_MM_BID',
+        action: 'BUY',
+        outcome,
+        shares,
+        targetPrice: bidPrice,
+        fairValue: fairValueUp,
+        urgency: 'passive',
+        reason: `VS Phase1 MM: ${outcome} mid=${roundTo(mid, 3)} bid@${bidPrice} move=${roundTo(movePct, 3)}%`,
+        reduceOnly: false,
+        priority: 800,
+        edgeAmount: Math.abs(movePct),
+      }));
     }
-
-    this.recordDecision(coin, 'ENTRY', 'PASSIVE_MM',
-      `FV=${roundTo(fairValue, 3)} bid=${bidPrice} move=${roundTo(movePct, 3)}%`, fairValue);
-
-    if (config.shadowMode) return [];
-
-    // Lock cooldown on signal GENERATION to prevent duplicates before fill confirms
-    this.lastEntryMs.set(market.marketId, Date.now());
-
-    signals.push(this.buildSignal({
-      market,
-      orderbook,
-      signalType: 'VS_ENTRY_BUY',
-      action: 'BUY',
-      outcome,
-      shares,
-      targetPrice: bidPrice,
-      fairValue,
-      urgency: 'passive',
-      reason: `VS Phase1: FV=${roundTo(fairValue, 3)} bid@${bidPrice} move=${roundTo(movePct, 3)}%`,
-      reduceOnly: false,
-      priority: 800,
-      edgeAmount: Math.abs(movePct),
-    }));
 
     return signals;
   }
 
-  /* ── Phase 2: Aggressive Momentum ───────────────────────────────── */
+  /* ── Phase 2: Aggressor (market edge near expiry) ────────────────── */
 
   private generateMomentumSignals(
     market: MarketCandidate,
@@ -507,26 +565,45 @@ export class VsEngine {
     strikePrice: number,
     slotEndMs: number,
     slotStartMs: number,
-    sizeMultiplier: number
+    sizeMultiplier: number,
+    nowMs: number
   ): StrategySignal[] {
-    // Calculate z-score: how many sigmas away from strike
-    const sqrtT = Math.sqrt(Math.max((slotEndMs - Date.now()) / 1000, 0.1) / 300);
-    const zScore = ((spotPrice - strikePrice) / strikePrice) / (vol * sqrtT);
+    // Phase 45a: Aggressor mode — use tighter vol floor for near-expiry CDF edge.
+    // Near expiry (T-10s), even a +0.3% BTC move with σ=0.02 gives meaningful edge.
+    const aggressorVol = Math.max(vol, config.aggressorVolFloor);
+    const timeRemainingSec = (slotEndMs - nowMs) / 1000;
+    const aggressorFV = calculatePhiFairValue(spotPrice, strikePrice, aggressorVol, timeRemainingSec);
 
-    // Need strong directional signal
-    if (Math.abs(zScore) < config.momentumThresholdSigmas) {
+    // Determine which side has edge
+    const yesEdge = aggressorFV - (orderbook.yes.bestAsk ?? 1);
+    const noEdge = (1 - aggressorFV) - (orderbook.no.bestAsk ?? 1);
+
+    // Pick the side with more edge
+    let outcome: Outcome;
+    let edge: number;
+    let bestAsk: number | null;
+    let fairValue: number;
+
+    if (yesEdge >= noEdge) {
+      outcome = 'YES';
+      edge = yesEdge;
+      bestAsk = orderbook.yes.bestAsk;
+      fairValue = aggressorFV;
+    } else {
+      outcome = 'NO';
+      edge = noEdge;
+      bestAsk = orderbook.no.bestAsk;
+      fairValue = 1 - aggressorFV;
+    }
+
+    // Need minimum edge to aggress
+    if (edge < config.aggressorMinEdge) {
       this.recordDecision(coin, 'SKIP', 'MOMENTUM',
-        `zScore=${roundTo(zScore, 2)} < threshold=${config.momentumThresholdSigmas}`, null);
+        `edge=${roundTo(edge, 4)} < min=${config.aggressorMinEdge} (FV=${roundTo(aggressorFV, 3)} vol=${roundTo(aggressorVol, 4)})`, aggressorFV);
       return [];
     }
 
-    // Determine winning outcome
-    const outcome: Outcome = zScore > 0 ? 'YES' : 'NO';
-    const fairValue = zScore > 0 ? fairValueUp : fairValueDown;
-    const book: TokenBookSnapshot = zScore > 0 ? orderbook.yes : orderbook.no;
-
     // Don't buy above max price
-    const bestAsk = book.bestAsk;
     if (!bestAsk || bestAsk > config.momentumMaxBuyPrice) {
       this.recordDecision(coin, 'SKIP', 'MOMENTUM',
         `ask=${bestAsk ?? 'null'} > max=${config.momentumMaxBuyPrice}`, fairValue);
@@ -552,12 +629,13 @@ export class VsEngine {
     }
 
     this.recordDecision(coin, 'ENTRY', 'MOMENTUM',
-      `zScore=${roundTo(zScore, 2)} FV=${roundTo(fairValue, 3)} ask=${bestAsk}`, fairValue);
+      `edge=${roundTo(edge, 4)} FV=${roundTo(aggressorFV, 3)} ask=${bestAsk} vol=${roundTo(aggressorVol, 4)}`,
+      aggressorFV);
 
     if (config.shadowMode) return [];
 
-    // Lock cooldown on signal GENERATION to prevent duplicates before fill confirms
-    this.lastEntryMs.set(market.marketId, Date.now());
+    // Lock cooldown on signal GENERATION
+    this.lastEntryMs.set(market.marketId, nowMs);
 
     return [this.buildSignal({
       market,
@@ -567,12 +645,12 @@ export class VsEngine {
       outcome,
       shares,
       targetPrice: bestAsk,
-      fairValue,
+      fairValue: aggressorFV,
       urgency: 'cross',
-      reason: `VS Phase2: zScore=${roundTo(zScore, 2)} FV=${roundTo(fairValue, 3)} buying ${outcome}@${bestAsk}`,
+      reason: `VS Phase2 Aggressor: edge=${roundTo(edge, 4)} FV=${roundTo(aggressorFV, 3)} buying ${outcome}@${bestAsk}`,
       reduceOnly: false,
       priority: 950,
-      edgeAmount: Math.abs(zScore),
+      edgeAmount: edge,
     })];
   }
 
@@ -587,96 +665,101 @@ export class VsEngine {
   }): StrategySignal[] {
     const { market, orderbook, positionManager, config } = params;
     const nowMs = params.nowMs ?? Date.now();
-    const position = this.positions.get(market.marketId);
-    if (!position) return [];
+    const signals: StrategySignal[] = [];
 
-    const liveShares = positionManager.getShares(position.outcome);
-    if (liveShares < 1) {
-      this.clearState(market.marketId);
-      return [];
+    // Phase 45a: iterate both YES and NO positions for this market
+    for (const outcome of ['YES', 'NO'] as const) {
+      const key = this.positionKey(market.marketId, outcome);
+      const position = this.positions.get(key);
+      if (!position) continue;
+
+      const liveShares = positionManager.getShares(position.outcome);
+      if (liveShares < 1) {
+        this.clearState(market.marketId, outcome);
+        continue;
+      }
+
+      const book: TokenBookSnapshot =
+        position.outcome === 'YES' ? orderbook.yes : orderbook.no;
+      const bestBid = book.bestBid;
+
+      const slotEndMs = market.endTime ? new Date(market.endTime).getTime() : position.slotEndMs;
+      const remaining = slotEndMs - nowMs;
+
+      // Time exit: forced flatten at T-5s
+      if (remaining <= config.timeExitBeforeEndMs) {
+        if (!bestBid || bestBid < config.timeExitMinPrice) continue;
+
+        this.totalExitSignals += 1;
+        signals.push(this.buildSignal({
+          market,
+          orderbook,
+          signalType: 'VS_TIME_EXIT',
+          action: 'SELL',
+          outcome: position.outcome,
+          shares: liveShares,
+          targetPrice: bestBid,
+          fairValue: null,
+          urgency: 'cross',
+          reason: `VS time-exit: ${roundTo(remaining / 1000, 1)}s left, selling ${outcome}@${bestBid}`,
+          reduceOnly: true,
+          priority: 980,
+          edgeAmount: 0,
+        }));
+        continue;
+      }
+
+      // Scalp exit: bid >= target (0.97)
+      if (bestBid && bestBid >= config.targetExitPrice) {
+        this.totalExitSignals += 1;
+        signals.push(this.buildSignal({
+          market,
+          orderbook,
+          signalType: 'VS_SCALP_EXIT',
+          action: 'SELL',
+          outcome: position.outcome,
+          shares: liveShares,
+          targetPrice: bestBid,
+          fairValue: null,
+          urgency: 'cross',
+          reason: `VS scalp-exit: ${outcome} bid=${bestBid} >= target=${config.targetExitPrice}`,
+          reduceOnly: true,
+          priority: 960,
+          edgeAmount: bestBid - position.entryVwap,
+        }));
+        continue;
+      }
+
+      // MM ask: place resting sell above entry to capture profit.
+      // Phase 35D: cap the ask at entry + makerAskMaxEdge (default 0.02).
+      if (bestBid && bestBid > position.entryVwap) {
+        const maxAskByEdge = position.entryVwap + config.makerAskMaxEdge;
+        const askPrice = roundTo(
+          Math.min(bestBid + 0.01, maxAskByEdge, config.targetExitPrice),
+          2
+        );
+        // Don't place ask below entry (would lock in a loss as maker)
+        if (askPrice <= position.entryVwap) continue;
+        this.totalExitSignals += 1;
+        signals.push(this.buildSignal({
+          market,
+          orderbook,
+          signalType: 'VS_MM_ASK',
+          action: 'SELL',
+          outcome: position.outcome,
+          shares: liveShares,
+          targetPrice: askPrice,
+          fairValue: null,
+          urgency: 'passive',
+          reason: `VS maker-ask: ${outcome}@${askPrice} (entry=${roundTo(position.entryVwap, 3)}, maxEdge=${config.makerAskMaxEdge})`,
+          reduceOnly: true,
+          priority: 850,
+          edgeAmount: askPrice - position.entryVwap,
+        }));
+      }
     }
 
-    const book: TokenBookSnapshot =
-      position.outcome === 'YES' ? orderbook.yes : orderbook.no;
-    const bestBid = book.bestBid;
-
-    const slotEndMs = market.endTime ? new Date(market.endTime).getTime() : position.slotEndMs;
-    const remaining = slotEndMs - nowMs;
-
-    // Time exit: forced flatten at T-5s
-    if (remaining <= config.timeExitBeforeEndMs) {
-      if (!bestBid || bestBid < config.timeExitMinPrice) return [];
-
-      this.totalExitSignals += 1;
-      return [this.buildSignal({
-        market,
-        orderbook,
-        signalType: 'VS_TIME_EXIT',
-        action: 'SELL',
-        outcome: position.outcome,
-        shares: liveShares,
-        targetPrice: bestBid,
-        fairValue: null,
-        urgency: 'cross',
-        reason: `VS time-exit: ${roundTo(remaining / 1000, 1)}s left, selling @${bestBid}`,
-        reduceOnly: true,
-        priority: 980,
-        edgeAmount: 0,
-      })];
-    }
-
-    // Scalp exit: bid >= target (0.97)
-    if (bestBid && bestBid >= config.targetExitPrice) {
-      this.totalExitSignals += 1;
-      return [this.buildSignal({
-        market,
-        orderbook,
-        signalType: 'VS_SCALP_EXIT',
-        action: 'SELL',
-        outcome: position.outcome,
-        shares: liveShares,
-        targetPrice: bestBid,
-        fairValue: null,
-        urgency: 'cross',
-        reason: `VS scalp-exit: bid=${bestBid} >= target=${config.targetExitPrice}`,
-        reduceOnly: true,
-        priority: 960,
-        edgeAmount: bestBid - position.entryVwap,
-      })];
-    }
-
-    // MM ask: place resting sell above entry to capture profit.
-    // Phase 35D: cap the ask at entry + makerAskMaxEdge (default 0.02).
-    // Without this cap, when bestBid jumps (e.g. 0.49→0.57), the ask
-    // lands at 0.58 (+18% edge) — nobody fills that on a 5-min market.
-    // Vague-sourdough average edge is ~3.4%, so 1-2¢ is realistic.
-    if (bestBid && bestBid > position.entryVwap) {
-      const maxAskByEdge = position.entryVwap + config.makerAskMaxEdge;
-      const askPrice = roundTo(
-        Math.min(bestBid + 0.01, maxAskByEdge, config.targetExitPrice),
-        2
-      );
-      // Don't place ask below entry (would lock in a loss as maker)
-      if (askPrice <= position.entryVwap) return [];
-      this.totalExitSignals += 1;
-      return [this.buildSignal({
-        market,
-        orderbook,
-        signalType: 'VS_MM_ASK',
-        action: 'SELL',
-        outcome: position.outcome,
-        shares: liveShares,
-        targetPrice: askPrice,
-        fairValue: null,
-        urgency: 'passive',
-        reason: `VS maker-ask: @${askPrice} (entry=${roundTo(position.entryVwap, 3)}, maxEdge=${config.makerAskMaxEdge})`,
-        reduceOnly: true,
-        priority: 850,
-        edgeAmount: askPrice - position.entryVwap,
-      })];
-    }
-
-    return [];
+    return signals;
   }
 
   /* ── Fill handling ──────────────────────────────────────────────── */
@@ -692,7 +775,9 @@ export class VsEngine {
     strikePrice: number;
     phase: 'MM' | 'MOMENTUM';
   }): StrategySignal[] {
-    const existing = this.positions.get(params.marketId);
+    // Phase 45a: composite key for per-outcome position tracking
+    const key = this.positionKey(params.marketId, params.outcome);
+    const existing = this.positions.get(key);
     if (existing) {
       // Average in
       const totalShares = existing.totalShares + params.filledShares;
@@ -703,7 +788,7 @@ export class VsEngine {
       existing.entryVwap = newVwap;
       existing.totalShares = totalShares;
     } else {
-      this.positions.set(params.marketId, {
+      this.positions.set(key, {
         marketId: params.marketId,
         marketTitle: params.marketTitle,
         outcome: params.outcome,
@@ -736,16 +821,16 @@ export class VsEngine {
     config: VsEngineConfig;
   }): StrategySignal[] {
     const signals: StrategySignal[] = [];
-    for (const [marketId, position] of this.positions) {
-      const pm = params.getPositionManager(marketId);
+    for (const [posKey, position] of this.positions) {
+      const pm = params.getPositionManager(position.marketId);
       if (!pm) continue;
       const liveShares = pm.getShares(position.outcome);
       if (liveShares < 1) {
-        this.clearState(marketId);
+        this.clearState(position.marketId, position.outcome);
         continue;
       }
-      const orderbook = params.getOrderbook(marketId);
-      const market = params.getMarket(marketId);
+      const orderbook = params.getOrderbook(position.marketId);
+      const market = params.getMarket(position.marketId);
       if (!orderbook || !market) continue;
 
       const book = position.outcome === 'YES' ? orderbook.yes : orderbook.no;
@@ -786,31 +871,31 @@ export class VsEngine {
     const nowMs = params.nowMs ?? Date.now();
     const signals: StrategySignal[] = [];
 
-    for (const [marketId, position] of this.positions) {
+    for (const [posKey, position] of this.positions) {
       const remaining = position.slotEndMs - nowMs;
       if (remaining > 0) continue; // slot still active
 
-      const pm = params.getPositionManager(marketId);
+      const pm = params.getPositionManager(position.marketId);
       if (!pm) continue;
       const liveShares = pm.getShares(position.outcome);
       if (liveShares < 1) {
-        this.clearState(marketId);
+        this.clearState(position.marketId, position.outcome);
         continue;
       }
 
       // Give up after ORPHAN_GIVE_UP_AFTER_MS
       if (remaining < -ORPHAN_GIVE_UP_AFTER_MS) {
-        const lastLog = this.lastOrphanEmitMs.get(marketId);
+        const lastLog = this.lastOrphanEmitMs.get(position.marketId);
         if (!lastLog || nowMs - lastLog > 30_000) {
           logger.warn('VS orphan: slot ended, position still has shares — continuing exit attempts', {
-            marketId, outcome: position.outcome, liveShares: roundTo(liveShares, 4),
+            marketId: position.marketId, outcome: position.outcome, liveShares: roundTo(liveShares, 4),
           });
-          this.lastOrphanEmitMs.set(marketId, nowMs);
+          this.lastOrphanEmitMs.set(position.marketId, nowMs);
         }
       }
 
-      const orderbook = params.getOrderbook(marketId);
-      const market = params.getMarket(marketId);
+      const orderbook = params.getOrderbook(position.marketId);
+      const market = params.getMarket(position.marketId);
       if (!orderbook || !market) continue;
 
       const book = position.outcome === 'YES' ? orderbook.yes : orderbook.no;
