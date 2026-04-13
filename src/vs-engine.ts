@@ -336,7 +336,10 @@ export class VsEngine {
       this.positions.delete(this.positionKey(marketId, 'NO'));
     }
     this.lastFairValues.delete(marketId);
-    this.lastEntryMs.delete(marketId);
+    // Phase 47b: do NOT delete lastEntryMs or lastLosingExitMs here.
+    // clearState is called after exits (including price-stop). Deleting cooldowns
+    // allows immediate re-entry on the same market → cascade losses.
+    // Cooldowns naturally expire via their timeout or get cleaned up at slot end.
     this.lastOrphanEmitMs.delete(marketId);
   }
 
@@ -742,6 +745,16 @@ export class VsEngine {
         if (bestBid <= stopPrice) {
           this.totalExitSignals += 1;
           const loss = roundTo((bestBid - position.entryVwap) * liveShares, 2);
+
+          // Phase 47b: block re-entry on this market for rest of slot.
+          // Without this, price-stop → clearState → immediate re-entry → cascade.
+          // Set BOTH cooldown maps to prevent re-entry from any path.
+          this.lastLosingExitMs.set(market.marketId, nowMs);
+          const coin = extractCoin(market.title);
+          if (coin) {
+            this.lastLosingExitMsByCoin.set(coin, nowMs);
+          }
+
           signals.push(this.buildSignal({
             market,
             orderbook,
@@ -1022,8 +1035,9 @@ export class VsEngine {
     }
 
     if (pnl < 0) {
-      // Record losing exit for cooldown
-      // We don't know marketId here, so skip per-market cooldown
+      // Phase 47: record losing exit for cooldown — BOTH per-coin and per-market.
+      // Without per-market cooldown, price-stop → clearState → immediate re-entry
+      // on same losing side creates cascade losses ($0.30 × 4 = same as old $2.40).
       if (coin) {
         this.lastLosingExitMsByCoin.set(coin, Date.now());
       }
