@@ -785,7 +785,19 @@ export class VsEngine {
       // Price guard
       if (bidPrice < config.minEntryPrice || bidPrice > config.maxEntryPrice) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-          `price_out_of_range_${outcome} bid=${bidPrice}`, outcomeFV);
+          `price_out_of_range_${outcome} bid=${bidPrice} fv=${roundTo(outcomeFV, 3)}`, outcomeFV);
+        continue;
+      }
+
+      // Phase 49: FV-market divergence guard for MM.
+      // If market mid diverges >0.15 from CDF fair value, the market has information
+      // the CDF doesn't capture (e.g. outcome nearly decided, large Binance move).
+      // Buying at 0.17 when FV=0.50 means trusting a model the market disagrees with.
+      // This was the primary cause of catastrophic price-stop losses (-$0.84 to -$1.32).
+      const fvMarketGap = Math.abs(outcomeFV - mid);
+      if (fvMarketGap > 0.15) {
+        this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+          `fv_market_divergence_${outcome} FV=${roundTo(outcomeFV, 3)} mid=${roundTo(mid, 3)} gap=${roundTo(fvMarketGap, 3)}`, outcomeFV);
         continue;
       }
 
