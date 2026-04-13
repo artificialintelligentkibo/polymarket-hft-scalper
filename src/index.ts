@@ -1654,6 +1654,12 @@ export class MarketMakerRuntime {
                 totalLiveShares,
                 slotEndTime: market.endTime ?? null,
               });
+              // Phase 44: record per-coin entry stats (paper path missed this)
+              const obiCoin = extractCoinFromObiTitle(market.title);
+              this.obiEngine.recordEntryForStats(
+                obiCoin,
+                `${pf.outcome} ${pf.shares}sh @${roundTo(pf.price, 3)} [paper]`
+              );
             }
             // Phase 42: notify VS engine of paper BUY fills so it tracks position
             // and enforces VS_MM_MAX_POSITION_SHARES.
@@ -1676,6 +1682,19 @@ export class MarketMakerRuntime {
                 strikePrice,
                 phase: pf.signalType === 'VS_MOMENTUM_BUY' ? 'MOMENTUM' : 'MM',
               });
+              // Phase 44: record per-coin entry stats (paper path missed this)
+              this.vsEngine.recordEntryForStats(
+                vsCoin,
+                `${pf.outcome} ${pf.shares}sh @${roundTo(pf.price, 3)} [paper]`
+              );
+              // Phase 44: schedule VS time-exit timer (paper path missed this —
+              // without it, paper positions hold to resolution instead of exiting at T-5s)
+              this.scheduleVsTimeExitTimer(
+                pf.marketId,
+                pf.outcome,
+                market.endTime,
+                getSlotKey(market)
+              );
             }
             // Phase 39: set slotStrategyClaim for paper maker fills so Phase 32
             // zombie sweep doesn't re-register them as OBI positions.

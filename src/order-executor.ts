@@ -503,6 +503,25 @@ export class OrderExecutor {
       };
     }
 
+    // Phase 44: VS_MM_ASK and OBI_MM_QUOTE_ASK should sit at their target price
+    // (entry + edge), not at best ask. The standard passive SELL logic pushes price
+    // UP to bestAsk, which makes the order unfillable when bestAsk > targetPrice.
+    // These MM asks want to be inside the spread to attract fills.
+    if (
+      (signal.signalType === 'VS_MM_ASK' || signal.signalType === 'OBI_MM_QUOTE_ASK') &&
+      effectiveUrgency !== 'cross' &&
+      bestBid !== null
+    ) {
+      const makerFloor = bestBid + tick;
+      const desired = signal.targetPrice ?? makerFloor;
+      return {
+        price: roundTo(Math.max(desired, makerFloor), 6),
+        postOnly: true,
+        orderType: resolveOrderType(signal, this.runtimeConfig),
+        urgency: effectiveUrgency,
+      };
+    }
+
     if (effectiveUrgency === 'cross') {
       return {
         price: bestBid ?? fallbackPrice,
