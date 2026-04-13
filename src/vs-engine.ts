@@ -422,9 +422,11 @@ export class VsEngine {
     }
 
     if (phase === 'MOMENTUM') {
+      // Phase 45d: pass rawVol (not clamped vol) so aggressor can apply its
+      // own aggressorVolFloor (0.02) independently of the global minVolatility (0.05).
       return this.generateMomentumSignals(
         market, orderbook, positionManager, config, coin, fairValueUp,
-        fairValueDown, vol, spotPrice, strikePrice, slotEndMs, slotStartMs,
+        fairValueDown, rawVol, spotPrice, strikePrice, slotEndMs, slotStartMs,
         params.vsSizeMultiplier ?? 1, nowMs
       );
     }
@@ -483,24 +485,29 @@ export class VsEngine {
 
     const shares = Math.round(config.mmShares * sizeMultiplier);
 
+    // Phase 45d: track running budget so two-sided quotes don't exceed balance
+    let budgetRemaining = (this.availableUsdcBalance ?? Infinity) * 0.9;
+
     // Emit up to TWO signals — one for YES, one for NO
     for (const side of ['YES', 'NO'] as const) {
       const outcome: Outcome = side;
       const bidPrice = side === 'YES' ? yesBidPrice : noBidPrice;
       const mid = side === 'YES' ? yesMid : noMid;
+      // Phase 45d: outcome-correct fair value for signal payload
+      const outcomeFV = side === 'YES' ? fairValueUp : fairValueDown;
 
       // Phase 45c: skip near-resolved markets (mid < 0.10 or mid > 0.90)
       // When one side is nearly decided, MM has no edge — only lottery risk.
       if (mid < 0.10 || mid > 0.90) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-          `market_resolved_${outcome} mid=${roundTo(mid, 3)}`, fairValueUp);
+          `market_resolved_${outcome} mid=${roundTo(mid, 3)}`, outcomeFV);
         continue;
       }
 
       // Inventory management: if already holding this outcome, skip (let exit handle it)
       if (this.hasPositionForOutcome(market.marketId, outcome)) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-          `already_holding_${outcome}`, fairValueUp);
+          `already_holding_${outcome}`, outcomeFV);
         continue;
       }
 
@@ -508,35 +515,38 @@ export class VsEngine {
       const currentShares = positionManager.getShares(outcome);
       if (currentShares >= config.mmMaxPositionShares) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-          `max_position_${outcome}`, fairValueUp);
+          `max_position_${outcome}`, outcomeFV);
         continue;
       }
 
       // Price guard
       if (bidPrice < config.minEntryPrice || bidPrice > config.maxEntryPrice) {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-          `price_out_of_range_${outcome} bid=${bidPrice}`, fairValueUp);
+          `price_out_of_range_${outcome} bid=${bidPrice}`, outcomeFV);
         continue;
       }
 
-      // Balance check
+      // Balance check — cumulative across both sides
       if (config.preflightBalanceCheck && this.availableUsdcBalance !== null) {
         const cost = shares * bidPrice;
-        if (cost > this.availableUsdcBalance * 0.9) {
+        if (cost > budgetRemaining) {
           this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-            `insufficient_balance_${outcome}`, fairValueUp);
+            `insufficient_balance_${outcome} cost=${roundTo(cost, 2)} budget=${roundTo(budgetRemaining, 2)}`, outcomeFV);
           continue;
         }
       }
 
       this.recordDecision(coin, 'ENTRY', 'PASSIVE_MM',
         `${outcome} mid=${roundTo(mid, 3)} bid=${bidPrice} tilt=${roundTo(tiltCents, 4)} move=${roundTo(movePct, 3)}%`,
-        fairValueUp);
+        outcomeFV);
 
       if (config.shadowMode) continue;
 
       // Lock cooldown on signal GENERATION
       this.lastEntryMs.set(market.marketId, nowMs);
+
+      // Deduct from running budget
+      budgetRemaining -= shares * bidPrice;
 
       signals.push(this.buildSignal({
         market,
@@ -546,7 +556,7 @@ export class VsEngine {
         outcome,
         shares,
         targetPrice: bidPrice,
-        fairValue: fairValueUp,
+        fairValue: outcomeFV,
         urgency: 'passive',
         reason: `VS Phase1 MM: ${outcome} mid=${roundTo(mid, 3)} bid@${bidPrice} move=${roundTo(movePct, 3)}%`,
         reduceOnly: false,
@@ -650,9 +660,12 @@ export class VsEngine {
       }
     }
 
+    // Phase 45d: use outcome-correct FV for telemetry and signal payload
+    const outcomeFV = outcome === 'YES' ? aggressorFV : (1 - aggressorFV);
+
     this.recordDecision(coin, 'ENTRY', 'MOMENTUM',
-      `edge=${roundTo(edge, 4)} FV=${roundTo(aggressorFV, 3)} ask=${bestAsk} vol=${roundTo(aggressorVol, 4)}`,
-      aggressorFV);
+      `edge=${roundTo(edge, 4)} FV=${roundTo(outcomeFV, 3)} ask=${bestAsk} vol=${roundTo(aggressorVol, 4)}`,
+      outcomeFV);
 
     if (config.shadowMode) return [];
 
@@ -667,9 +680,9 @@ export class VsEngine {
       outcome,
       shares,
       targetPrice: bestAsk,
-      fairValue: aggressorFV,
+      fairValue: outcomeFV,
       urgency: 'cross',
-      reason: `VS Phase2 Aggressor: edge=${roundTo(edge, 4)} FV=${roundTo(aggressorFV, 3)} buying ${outcome}@${bestAsk}`,
+      reason: `VS Phase2 Aggressor: edge=${roundTo(edge, 4)} FV=${roundTo(outcomeFV, 3)} buying ${outcome}@${bestAsk}`,
       reduceOnly: false,
       priority: 950,
       edgeAmount: edge,
