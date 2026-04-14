@@ -265,6 +265,8 @@ export interface VsSessionStats {
   readonly staleCancels: number;
   readonly dynamicExitThresholdPct: number;
   readonly dynamicExits: number;
+  readonly pmExitThresholdCents: number;
+  readonly pmExits: number;
   readonly activePositions: readonly VsActivePosition[];
   readonly totalSignalsGenerated: number;
 }

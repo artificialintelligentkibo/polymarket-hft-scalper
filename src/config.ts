@@ -1638,7 +1638,13 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // until time-exit@0.01 — the single biggest source of losses.
       dynamicExitThresholdPct: Math.max(
         0,
-        parseFloatOrDefault(env.VS_DYNAMIC_EXIT_THRESHOLD_PCT, '0.03')
+        parseFloatOrDefault(env.VS_DYNAMIC_EXIT_THRESHOLD_PCT, '0.02')
+      ),
+      // Phase 51b: PM price guard — exit when PM bestBid drops below entry - N cents.
+      // Tiered: 0.40-0.60 → 5¢, 0.30-0.40 → 4¢, 0.20-0.30 → 3¢, <0.20 → no guard.
+      pmExitThresholdCents: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_PM_EXIT_THRESHOLD_CENTS, '0.05')
       ),
     },
     paperTrading: {

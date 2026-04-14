@@ -100,6 +100,10 @@ export interface VsEngineConfig {
   readonly staleCancelThresholdPct: number;
   // Phase 51: dynamic Binance-based position exit — exit when Binance moves against position
   readonly dynamicExitThresholdPct: number;
+  // Phase 51b: PM price guard — exit when PM bestBid drops below entry - N cents.
+  // Binary options have extreme gamma near 0.50: tiny Binance moves cause huge PM drops.
+  // This catches fast PM crashes that Binance threshold misses.
+  readonly pmExitThresholdCents: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -288,6 +292,7 @@ export class VsEngine {
   private phase2Entries = 0;
   private staleCancels = 0;
   private dynamicExits = 0;
+  private pmExits = 0;
   private phase2Pnl = 0;
   private readonly coinStats = new Map<string, {
     entries: number;
@@ -1134,6 +1139,58 @@ export class VsEngine {
         }
       }
 
+      // Phase 51b: PM price guard — exit when bestBid drops below entry - tiered threshold.
+      // Binary option gamma near 0.50 is extreme: 1bp of spot = 3-5¢ on PM.
+      // Binance threshold (0.02%) catches slow impulses but is always late for PM crashes.
+      // PM guard catches fast PM crashes directly. Tiered by entry price:
+      //   0.40-0.60 → 5¢ | 0.30-0.40 → 4¢ | 0.20-0.30 → 3¢ | <0.20 → no guard
+      if (config.pmExitThresholdCents > 0 && bestBid) {
+        const entryPrice = position.entryVwap;
+        let pmThreshold: number;
+        if (entryPrice >= 0.40) {
+          pmThreshold = config.pmExitThresholdCents;         // default 0.05
+        } else if (entryPrice >= 0.30) {
+          pmThreshold = config.pmExitThresholdCents - 0.01;  // 0.04
+        } else if (entryPrice >= 0.20) {
+          pmThreshold = config.pmExitThresholdCents - 0.02;  // 0.03
+        } else {
+          pmThreshold = 0; // no PM guard for deep OTM entries
+        }
+
+        if (pmThreshold > 0) {
+          const pmStopPrice = entryPrice - pmThreshold;
+          if (bestBid <= pmStopPrice) {
+            this.totalExitSignals += 1;
+            this.pmExits += 1;
+            const loss = roundTo((bestBid - entryPrice) * liveShares, 2);
+
+            // Set cooldowns to prevent cascade re-entry (same as price-stop)
+            this.lastLosingExitMs.set(market.marketId, nowMs);
+            const coin = extractCoin(market.title);
+            if (coin) {
+              this.lastLosingExitMsByCoin.set(coin, nowMs);
+            }
+
+            signals.push(this.buildSignal({
+              market,
+              orderbook,
+              signalType: 'VS_DYNAMIC_EXIT',
+              action: 'SELL',
+              outcome: position.outcome,
+              shares: liveShares,
+              targetPrice: bestBid,
+              fairValue: null,
+              urgency: 'cross',
+              reason: `VS PM-guard: ${outcome} bid=${bestBid} <= stop=${roundTo(pmStopPrice, 3)} (entry=${roundTo(entryPrice, 3)} thresh=${pmThreshold} loss=${loss})`,
+              reduceOnly: true,
+              priority: 975,
+              edgeAmount: bestBid - entryPrice,
+            }));
+            continue;
+          }
+        }
+      }
+
       // Time exit: forced flatten at T-15s
       // Phase 50: ALWAYS exit — even at 0.01. Holding to resolution = $0.00.
       // Selling at 0.01 × 6 = $0.06 recovered vs $0.00 at resolution.
@@ -1471,6 +1528,8 @@ export class VsEngine {
       staleCancels: this.staleCancels,
       dynamicExitThresholdPct: config.dynamicExitThresholdPct,
       dynamicExits: this.dynamicExits,
+      pmExitThresholdCents: config.pmExitThresholdCents,
+      pmExits: this.pmExits,
       activePositions,
       totalSignalsGenerated: this.totalExitSignals + this.totalEntries,
     };

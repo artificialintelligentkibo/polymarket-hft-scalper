@@ -590,7 +590,8 @@ function renderVsSessionStats(stats: VsSessionStats): string {
       ['Agg Vol Floor', color.bold((stats.aggressorVolFloor ?? 0.02).toFixed(3)), 'Agg Min Edge', color.bold((stats.aggressorMinEdge ?? 0.03).toFixed(3))],
       ['Exit Target', color.bold(stats.targetExitPrice.toFixed(2)), 'Agg Max Buy', color.bold(stats.momentumMaxBuyPrice.toFixed(2))],
       ['Stale Cancel', color.bold(`${(stats.staleCancelThresholdPct ?? 0.02).toFixed(2)}%`), 'Stale Cancels', color.yellow(String(stats.staleCancels ?? 0))],
-      ['Dyn Exit', color.bold(`${(stats.dynamicExitThresholdPct ?? 0.03).toFixed(2)}%`), 'Dyn Exits', color.yellow(String(stats.dynamicExits ?? 0))],
+      ['Dyn Exit', color.bold(`${(stats.dynamicExitThresholdPct ?? 0.02).toFixed(2)}%`), 'Dyn Exits', color.yellow(String(stats.dynamicExits ?? 0))],
+      ['PM Guard', color.bold(`${(stats.pmExitThresholdCents ?? 0.05).toFixed(2)}¢`), 'PM Exits', color.yellow(String(stats.pmExits ?? 0))],
       ['Signals Gen', color.dim(String(stats.totalSignalsGenerated ?? 0)), 'Active Pos', color.bold(String((stats.activePositions ?? []).length))],
     ]
   );
