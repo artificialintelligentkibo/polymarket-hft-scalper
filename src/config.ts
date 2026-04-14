@@ -1482,6 +1482,9 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseIntOrDefault(env.VS_MIN_VOL_SAMPLES, '10')
       ),
       // Phase 1: Passive MM
+      // Phase 52: disable MM phase when latency makes maker quotes toxic.
+      // With 180ms avg latency, 100% of fills are staleQuote=true.
+      mmPhaseEnabled: parseBoolean(env.VS_MM_PHASE_ENABLED, true),
       mmSpreadCents: Math.max(
         0.005,
         parseFloatOrDefault(env.VS_MM_SPREAD_CENTS, '0.02')

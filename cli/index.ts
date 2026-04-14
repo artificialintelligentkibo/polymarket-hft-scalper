@@ -580,7 +580,7 @@ function renderVsSessionStats(stats: VsSessionStats): string {
     ['METRIC', 'VALUE', 'METRIC', 'VALUE'],
     [20, 12, 20, 12],
     [
-      ['Mode', modeStr, 'Volatility σ', color.bold(stats.defaultVolatility.toFixed(2))],
+      ['Mode', modeStr, 'MM Phase', stats.mmPhaseEnabled === false ? color.red('OFF') : color.green('ON')],
       ['Entries', color.bold(String(stats.entries)), 'Exits', color.bold(String(stats.exits))],
       ['Wins', color.green(String(stats.wins)), 'Losses', color.red(String(stats.losses))],
       ['Win Rate', color.bold(winRate), 'Realized PnL', formatSignedCurrency(stats.realizedPnl)],

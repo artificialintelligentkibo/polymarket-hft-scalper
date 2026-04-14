@@ -259,6 +259,7 @@ export interface VsSessionStats {
   readonly aggressorVolFloor: number;
   readonly aggressorMinEdge: number;
   readonly mmTiltMaxCents: number;
+  readonly mmPhaseEnabled: boolean;
   readonly mmSpreadCents: number;
   readonly priceStopCents: number;
   readonly staleCancelThresholdPct: number;

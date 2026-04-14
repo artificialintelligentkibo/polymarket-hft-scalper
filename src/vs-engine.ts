@@ -55,6 +55,10 @@ export interface VsEngineConfig {
   readonly volLookbackMs: number;
   readonly minVolSamples: number;
   // Phase 1: Passive MM
+  /** Phase 52: disable MM phase entirely. With 180ms latency, maker quotes
+   *  are 100% adversely selected (staleQuote=true on every fill). Aggressor-only
+   *  mode eliminates the toxic flow problem. */
+  readonly mmPhaseEnabled: boolean;
   readonly mmSpreadCents: number;
   readonly mmMinPrice: number;
   readonly mmMaxPrice: number;
@@ -759,6 +763,9 @@ export class VsEngine {
     this.lastFairValues.set(market.marketId, fairValueUp);
 
     if (phase === 'PASSIVE_MM') {
+      // Phase 52: skip MM entirely when disabled. With 180ms latency,
+      // 100% of maker fills are staleQuote=true → toxic flow.
+      if (!config.mmPhaseEnabled) return [];
       return this.generatePassiveMMSignals(
         market, orderbook, positionManager, config, coin, fairValueUp,
         fairValueDown, spotPrice, strikePrice, slotEndMs, slotStartMs,
@@ -1522,6 +1529,7 @@ export class VsEngine {
       aggressorVolFloor: config.aggressorVolFloor,
       aggressorMinEdge: config.aggressorMinEdge,
       mmTiltMaxCents: config.mmTiltMaxCents,
+      mmPhaseEnabled: config.mmPhaseEnabled,
       mmSpreadCents: config.mmSpreadCents,
       priceStopCents: config.priceStopCents,
       staleCancelThresholdPct: config.staleCancelThresholdPct,
