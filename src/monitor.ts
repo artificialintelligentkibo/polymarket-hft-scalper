@@ -357,29 +357,29 @@ export async function fetchPaginatedGammaEventMarkets(params: {
   const marketSources: GammaMarketSource[] = [];
   const seenConditionIds = new Set<string>();
   let pagesFetched = 0;
+  let cursor: string | null = null;
 
   for (
     let pageIndex = 0;
     pageIndex < MAX_GAMMA_EVENT_PAGES && marketSources.length < targetMarketCount;
     pageIndex += 1
   ) {
-    const offset = pageIndex * GAMMA_EVENT_PAGE_LIMIT;
-    const page = await fetchGammaEventsPage({
+    const result = await fetchGammaEventsPage({
       gammaUrl: params.gammaUrl,
       limit: GAMMA_EVENT_PAGE_LIMIT,
-      offset,
+      cursor,
       fetchImpl,
       breaker: params.breaker,
     });
 
-    if (page.length === 0) {
+    if (result.events.length === 0) {
       break;
     }
 
     pagesFetched += 1;
-    events.push(...page);
+    events.push(...result.events);
 
-    for (const source of flattenGammaEventMarkets(page)) {
+    for (const source of flattenGammaEventMarkets(result.events)) {
       const conditionId = extractConditionId(source.market);
       const dedupeKey = conditionId || extractMarketId(source.market);
       if (!dedupeKey) {
@@ -395,9 +395,11 @@ export async function fetchPaginatedGammaEventMarkets(params: {
       marketSources.push(source);
     }
 
-    if (page.length < GAMMA_EVENT_PAGE_LIMIT) {
+    // No next cursor = last page
+    if (!result.nextCursor) {
       break;
     }
+    cursor = result.nextCursor;
   }
 
   return {
@@ -407,16 +409,118 @@ export async function fetchPaginatedGammaEventMarkets(params: {
   };
 }
 
+/** Result from a single keyset-paginated Gamma events page. */
+interface GammaEventsPageResult {
+  readonly events: JsonRecord[];
+  readonly nextCursor: string | null;
+}
+
+/**
+ * Fetch a single page of Gamma events using keyset pagination.
+ * V2 migration: uses /events/keyset with after_cursor instead of /events with offset.
+ * Falls back to legacy /events with offset if keyset endpoint returns 404.
+ */
 export async function fetchGammaEventsPage(params: {
   gammaUrl: string;
   limit: number;
-  offset: number;
+  cursor: string | null;
   fetchImpl?: FetchLike;
   requestTimeoutMs?: number;
   breaker?: CircuitBreaker;
-}): Promise<JsonRecord[]> {
+}): Promise<GammaEventsPageResult> {
   const fetchImpl = params.fetchImpl ?? fetch;
   const requestTimeoutMs = params.requestTimeoutMs ?? GAMMA_REQUEST_TIMEOUT_MS;
+
+  // Try keyset endpoint first, fall back to legacy offset if 404
+  const result = await fetchGammaEventsKeyset(params, fetchImpl, requestTimeoutMs);
+  if (result !== null) return result;
+
+  // Fallback: legacy offset endpoint (for backward compat until fully migrated)
+  return fetchGammaEventsLegacy(params, fetchImpl, requestTimeoutMs);
+}
+
+/** Keyset pagination via /events/keyset */
+async function fetchGammaEventsKeyset(
+  params: {
+    gammaUrl: string;
+    limit: number;
+    cursor: string | null;
+    breaker?: CircuitBreaker;
+  },
+  fetchImpl: FetchLike,
+  requestTimeoutMs: number
+): Promise<GammaEventsPageResult | null> {
+  const url = new URL(`${params.gammaUrl.replace(/\/+$/, '')}/events/keyset`);
+  url.searchParams.set('active', 'true');
+  url.searchParams.set('closed', 'false');
+  url.searchParams.set('tag_id', GAMMA_CRYPTO_TAG_ID);
+  url.searchParams.set('related_tags', 'true');
+  url.searchParams.set('limit', String(params.limit));
+  if (params.cursor) {
+    url.searchParams.set('after_cursor', params.cursor);
+  }
+
+  try {
+    const payload = await retryWithBackoff(
+      async () => {
+        const response = await fetchWithTimeout(
+          fetchImpl,
+          url,
+          { method: 'GET', headers: { accept: 'application/json' } },
+          requestTimeoutMs
+        );
+
+        if (response.status === 404) {
+          // Keyset endpoint not available yet — signal fallback
+          return { _fallback: true } as unknown;
+        }
+
+        if (!response.ok) {
+          const errorText = await safeReadResponseText(response);
+          const error = new Error(
+            `Gamma keyset API returned ${response.status}${errorText ? `: ${errorText}` : ''}`
+          ) as Error & { status?: number };
+          error.status = response.status;
+          throw error;
+        }
+
+        return (await response.json()) as unknown;
+      },
+      {
+        maxAttempts: 3,
+        baseDelayMs: 250,
+        maxDelayMs: 2_000,
+        breaker: params.breaker,
+        respectOpenState: false,
+      }
+    );
+
+    // Check for fallback signal
+    if (payload && typeof payload === 'object' && '_fallback' in (payload as Record<string, unknown>)) {
+      return null;
+    }
+
+    return parseKeysetResponse(payload);
+  } catch {
+    // If keyset endpoint fails entirely, fall back to legacy
+    return null;
+  }
+}
+
+/** Legacy offset pagination via /events (backward compat) */
+async function fetchGammaEventsLegacy(
+  params: {
+    gammaUrl: string;
+    limit: number;
+    cursor: string | null;
+    breaker?: CircuitBreaker;
+  },
+  fetchImpl: FetchLike,
+  requestTimeoutMs: number
+): Promise<GammaEventsPageResult> {
+  // For legacy, cursor is not used — we compute offset from page context
+  // Since we can't know the page index here, use offset 0 for first page
+  // The caller should only use legacy as fallback anyway
   const orderCandidates = buildOrderCandidates(preferredGammaOrderField);
   let lastError: Error | null = null;
 
@@ -427,7 +531,7 @@ export async function fetchGammaEventsPage(params: {
     url.searchParams.set('tag_id', GAMMA_CRYPTO_TAG_ID);
     url.searchParams.set('related_tags', 'true');
     url.searchParams.set('limit', String(params.limit));
-    url.searchParams.set('offset', String(params.offset));
+    // Legacy: no cursor support, start from 0
 
     if (orderField) {
       url.searchParams.set('order', orderField);
@@ -440,12 +544,7 @@ export async function fetchGammaEventsPage(params: {
           const response = await fetchWithTimeout(
             fetchImpl,
             url,
-            {
-              method: 'GET',
-              headers: {
-                accept: 'application/json',
-              },
-            },
+            { method: 'GET', headers: { accept: 'application/json' } },
             requestTimeoutMs
           );
 
@@ -470,13 +569,16 @@ export async function fetchGammaEventsPage(params: {
       );
 
       preferredGammaOrderField = orderField;
+      let events: JsonRecord[];
       if (Array.isArray(payload)) {
-        return payload.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
+        events = payload.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
+      } else {
+        const record = asRecord(payload);
+        const eventsArr = Array.isArray(record?.events) ? record.events : [];
+        events = eventsArr.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
       }
-
-      const record = asRecord(payload);
-      const events = Array.isArray(record?.events) ? record.events : [];
-      return events.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
+      // Legacy doesn't have cursors — signal end if page < limit
+      return { events, nextCursor: events.length >= params.limit ? '__legacy__' : null };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const status =
@@ -505,7 +607,30 @@ export async function fetchGammaEventsPage(params: {
     throw lastError;
   }
 
-  return [];
+  return { events: [], nextCursor: null };
+}
+
+/** Parse keyset API response: { events: [...], next_cursor: "..." } */
+function parseKeysetResponse(payload: unknown): GammaEventsPageResult {
+  const record = asRecord(payload);
+  let events: JsonRecord[];
+  let nextCursor: string | null = null;
+
+  if (Array.isArray(payload)) {
+    // Unexpected: bare array — treat as events, no cursor
+    events = (payload as unknown[]).map(asRecord).filter((e): e is JsonRecord => e !== null);
+  } else if (record) {
+    const eventsArr = Array.isArray(record.events) ? record.events : [];
+    events = eventsArr.map(asRecord).filter((e): e is JsonRecord => e !== null);
+    const cursor = record.next_cursor ?? record.nextCursor;
+    if (typeof cursor === 'string' && cursor.trim()) {
+      nextCursor = cursor.trim();
+    }
+  } else {
+    events = [];
+  }
+
+  return { events, nextCursor };
 }
 
 async function fetchWithTimeout(

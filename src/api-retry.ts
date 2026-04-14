@@ -145,7 +145,9 @@ export function isRetryableApiError(error: unknown): boolean {
     if ([400, 401, 403].includes(status)) {
       return false;
     }
-    if ([429, 502, 503, 504].includes(status)) {
+    // 425 Too Early = Polymarket matching engine restart / maintenance window.
+    // Treat as temporary — back off and retry.
+    if ([425, 429, 502, 503, 504].includes(status)) {
       return true;
     }
   }
@@ -177,7 +179,9 @@ export function isRetryableApiError(error: unknown): boolean {
     message.includes('service unavailable') ||
     message.includes('timeout') ||
     message.includes('temporarily unavailable') ||
-    message.includes('socket hang up')
+    message.includes('socket hang up') ||
+    message.includes('matching engine') ||
+    message.includes('maintenance')
   );
 }
 

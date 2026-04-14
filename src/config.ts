@@ -1058,11 +1058,13 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       funderAddress: (env.FUNDER_ADDRESS || '').trim(),
     },
     contracts: {
-      exchange: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
-      ctf: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
-      usdc: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
-      negRiskAdapter: '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296',
-      negRiskExchange: '0xC5d563A36AE78145C45a50134d48A1215220f80a',
+      exchange: (env.POLY_EXCHANGE_ADDRESS || '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E').trim(),
+      ctf: (env.POLY_CTF_ADDRESS || '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045').trim(),
+      // V2 migration: collateral token — currently USDC.e, will migrate to "Polymarket USD".
+      // Override via env when official new address is published.
+      usdc: (env.POLY_COLLATERAL_ADDRESS || '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174').trim(),
+      negRiskAdapter: (env.POLY_NEG_RISK_ADAPTER_ADDRESS || '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296').trim(),
+      negRiskExchange: (env.POLY_NEG_RISK_EXCHANGE_ADDRESS || '0xC5d563A36AE78145C45a50134d48A1215220f80a').trim(),
     },
     clob: {
       host: (env.CLOB_HOST || 'https://clob.polymarket.com').trim(),

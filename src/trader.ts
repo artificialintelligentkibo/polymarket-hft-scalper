@@ -515,6 +515,8 @@ export class Trader {
   }
 
   private createAuthenticatedClient(creds: ApiCredentials): ClobClient {
+    // V2 migration: builder attribution is wired synchronously for now.
+    // When v6 ships, this will go through the async adapter path.
     return new ClobClient(
       this.runtimeConfig.clob.host,
       this.runtimeConfig.chainId as ClobChainId,
@@ -675,7 +677,7 @@ export class Trader {
         continue;
       }
 
-      logger.info('Approving USDC.e spender', spender);
+      logger.info('Approving collateral token spender', spender);
       const tx = await usdc.approve(spender.address, approvalAmount, gasOverrides);
       await tx.wait();
       this.invalidateBalanceValidationCache();
@@ -771,7 +773,7 @@ export class Trader {
 
     if (balance.lt(params.required)) {
       throw new Error(
-        `Insufficient USDC.e balance for ${params.owner}: ${ethers.utils.formatUnits(
+        `Insufficient collateral balance for ${params.owner}: ${ethers.utils.formatUnits(
           balance,
           params.decimals
         )} < ${params.requiredAmount}`
@@ -779,12 +781,12 @@ export class Trader {
     }
 
     if (allowanceToCtf.lt(params.required)) {
-      throw new Error('USDC.e allowance to CTF is below the required order amount.');
+      throw new Error('Collateral allowance to CTF is below the required order amount.');
     }
 
     if (allowanceToExchange.lt(params.required)) {
       throw new Error(
-        `USDC.e allowance to ${params.spender} is below the required order amount.`
+        `Collateral allowance to ${params.spender} is below the required order amount.`
       );
     }
 

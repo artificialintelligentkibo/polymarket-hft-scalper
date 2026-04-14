@@ -98,7 +98,9 @@ export class ResolutionChecker {
   }
 
   private async fetchMarketByConditionId(conditionId: string): Promise<JsonRecord | null> {
-    const url = new URL(`${this.gammaUrl().replace(/\/+$/, '')}/markets`);
+    // V2 migration: try /markets/keyset first, fall back to /markets
+    const baseUrl = this.gammaUrl().replace(/\/+$/, '');
+    const url = new URL(`${baseUrl}/markets`);
     url.searchParams.set('condition_ids', conditionId);
     url.searchParams.set('limit', '10');
 

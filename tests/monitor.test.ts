@@ -236,10 +236,11 @@ test('selectEligibleMarkets drops stale slots even when Gamma still marks them a
   assert.equal(selection.summary.rejectionCounts['outside-slot-window'], 1);
 });
 
-test('fetchPaginatedGammaEventMarkets paginates ordered crypto /events and flattens nested markets', async () => {
+test('fetchPaginatedGammaEventMarkets paginates with keyset cursors and flattens nested markets', async () => {
   const firstPage = Array.from({ length: 200 }, (_, index) => createEvent(index));
   const secondPage = [createEvent(999)];
   const requestedUrls: URL[] = [];
+  let callCount = 0;
 
   const fetchImpl: typeof fetch = async (input) => {
     const url =
@@ -248,14 +249,27 @@ test('fetchPaginatedGammaEventMarkets paginates ordered crypto /events and flatt
         : typeof input === 'string'
           ? new URL(input)
           : new URL(input.url);
-    const offset = Number(url.searchParams.get('offset') ?? '0');
     requestedUrls.push(url);
-    const payload = offset === 0 ? firstPage : secondPage;
-    return new Response(JSON.stringify(payload), {
+    callCount += 1;
+
+    // Keyset endpoint: return { events, next_cursor } wrapper
+    if (url.pathname.includes('/events/keyset')) {
+      const cursor = url.searchParams.get('after_cursor');
+      const events = cursor ? secondPage : firstPage;
+      const payload = {
+        events,
+        next_cursor: cursor ? null : 'cursor_page2',
+      };
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    // Fallback: legacy endpoint (shouldn't be hit in this test)
+    return new Response(JSON.stringify([]), {
       status: 200,
-      headers: {
-        'content-type': 'application/json',
-      },
+      headers: { 'content-type': 'application/json' },
     });
   };
 
@@ -265,14 +279,12 @@ test('fetchPaginatedGammaEventMarkets paginates ordered crypto /events and flatt
     fetchImpl,
   });
 
-  assert.deepEqual(
-    requestedUrls.map((url) => Number(url.searchParams.get('offset') ?? '0')),
-    [0, 200]
-  );
+  // Verify keyset endpoint used
+  assert.ok(requestedUrls[0]?.pathname.includes('/events/keyset'));
   assert.equal(requestedUrls[0]?.searchParams.get('tag_id'), '21');
   assert.equal(requestedUrls[0]?.searchParams.get('related_tags'), 'true');
-  assert.equal(requestedUrls[0]?.searchParams.get('order'), 'endDate');
-  assert.equal(requestedUrls[0]?.searchParams.get('ascending'), 'true');
+  // Second request should have cursor
+  assert.equal(requestedUrls[1]?.searchParams.get('after_cursor'), 'cursor_page2');
   assert.equal(result.pagesFetched, 2);
   assert.equal(result.events.length, 201);
   assert.equal(result.marketSources.length, 201);
@@ -339,7 +351,7 @@ test('fetchGammaEventsPage aborts hung Gamma requests with a timeout', async () 
       fetchGammaEventsPage({
         gammaUrl: 'https://gamma-api.polymarket.com',
         limit: 10,
-        offset: 0,
+        cursor: null,
         fetchImpl: hangingFetch,
         requestTimeoutMs: 5,
       }),
