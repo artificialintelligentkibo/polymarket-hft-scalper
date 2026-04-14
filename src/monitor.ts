@@ -518,9 +518,11 @@ async function fetchGammaEventsLegacy(
   fetchImpl: FetchLike,
   requestTimeoutMs: number
 ): Promise<GammaEventsPageResult> {
-  // For legacy, cursor is not used — we compute offset from page context
-  // Since we can't know the page index here, use offset 0 for first page
-  // The caller should only use legacy as fallback anyway
+  // Parse legacy offset from cursor: '__legacy__:N' or null → 0
+  let legacyOffset = 0;
+  if (params.cursor && params.cursor.startsWith('__legacy__:')) {
+    legacyOffset = parseInt(params.cursor.split(':')[1], 10) || 0;
+  }
   const orderCandidates = buildOrderCandidates(preferredGammaOrderField);
   let lastError: Error | null = null;
 
@@ -531,7 +533,7 @@ async function fetchGammaEventsLegacy(
     url.searchParams.set('tag_id', GAMMA_CRYPTO_TAG_ID);
     url.searchParams.set('related_tags', 'true');
     url.searchParams.set('limit', String(params.limit));
-    // Legacy: no cursor support, start from 0
+    url.searchParams.set('offset', String(legacyOffset));
 
     if (orderField) {
       url.searchParams.set('order', orderField);
@@ -577,8 +579,9 @@ async function fetchGammaEventsLegacy(
         const eventsArr = Array.isArray(record?.events) ? record.events : [];
         events = eventsArr.map(asRecord).filter((entry): entry is JsonRecord => entry !== null);
       }
-      // Legacy doesn't have cursors — signal end if page < limit
-      return { events, nextCursor: events.length >= params.limit ? '__legacy__' : null };
+      // Legacy: encode next offset into cursor for subsequent pages
+      const nextOffset = legacyOffset + events.length;
+      return { events, nextCursor: events.length >= params.limit ? `__legacy__:${nextOffset}` : null };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const status =
