@@ -6105,13 +6105,9 @@ export class MarketMakerRuntime {
           const outcomeBook = outcome === 'YES' ? exitBook.yes : exitBook.no;
           const bestBid = outcomeBook.bestBid ?? 0.01;
 
-          // Skip if bid too low (would be a guaranteed loss)
-          if (bestBid < cfg.timeExitMinPrice) {
-            logger.info('Phase 35B: VS time-exit skipped — bid too low', {
-              marketId, outcome, bestBid, minPrice: cfg.timeExitMinPrice,
-            });
-            return;
-          }
+          // Phase 50: ALWAYS exit at time-exit. Even $0.01 × 6 = $0.06 is better
+          // than holding to resolution = $0.00. The old min_price guard caused
+          // 135 stuck positions overnight → slot resolution losses of -$99.
 
           const exitSignal: StrategySignal = {
             marketId,

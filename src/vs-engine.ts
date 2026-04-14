@@ -1048,9 +1048,12 @@ export class VsEngine {
         }
       }
 
-      // Time exit: forced flatten at T-5s
+      // Time exit: forced flatten at T-15s
+      // Phase 50: ALWAYS exit — even at 0.01. Holding to resolution = $0.00.
+      // Selling at 0.01 × 6 = $0.06 recovered vs $0.00 at resolution.
+      // The old min_price guard at 0.05 caused 135 stuck positions overnight.
       if (remaining <= config.timeExitBeforeEndMs) {
-        if (!bestBid || bestBid < config.timeExitMinPrice) continue;
+        if (!bestBid) continue;
 
         this.totalExitSignals += 1;
         signals.push(this.buildSignal({
