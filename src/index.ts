@@ -830,10 +830,10 @@ export class MarketMakerRuntime {
     this.statusMonitor.start();
     this.binanceEdge.start();
 
-    // Phase 48b: register Binance WS price update callback for real-time
-    // stale quote cancellation. When Binance price moves >threshold from
-    // quote placement price, cancel the stale order within ~50-100ms.
-    if (config.vsEngine.enabled && config.vsEngine.staleCancelThresholdPct > 0) {
+    // Phase 48b+51: register Binance WS price update callback for:
+    // 1. Phase 48b: real-time stale quote cancellation (~50-100ms reaction)
+    // 2. Phase 51: dynamic position exit when Binance moves against us
+    if (config.vsEngine.enabled && (config.vsEngine.staleCancelThresholdPct > 0 || config.vsEngine.dynamicExitThresholdPct > 0)) {
       this.binanceEdge.onPriceUpdate((coin, price) => {
         this.handleBinancePriceUpdateForVs(coin, price);
       });
@@ -1729,6 +1729,7 @@ export class MarketMakerRuntime {
                 slotStartTime: market.startTime ?? null,
                 strikePrice,
                 phase: pf.signalType === 'VS_MOMENTUM_BUY' ? 'MOMENTUM' : 'MM',
+                binancePriceAtEntry: this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0,
               });
               // Phase 44: record per-coin entry stats (paper path missed this)
               this.vsEngine.recordEntryForStats(
@@ -2893,6 +2894,7 @@ export class MarketMakerRuntime {
           slotStartTime: market.startTime,
           strikePrice,
           phase: vsPhase,
+          binancePriceAtEntry: this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0,
         });
         for (const vsSig of mmSignals) {
           this.scheduleBackgroundTask(async () => {
@@ -4028,6 +4030,7 @@ export class MarketMakerRuntime {
           slotStartTime: market.startTime,
           strikePrice,
           phase: vsPhase,
+          binancePriceAtEntry: this.binanceEdge.getLatestPrice(vsCoin ?? '') ?? 0,
         });
         const vsBook =
           this.latestBooks.get(fill.marketId) ??
@@ -5960,40 +5963,161 @@ export class MarketMakerRuntime {
   }
 
   /**
-   * Phase 48b: Handle real-time Binance price update from WS callback.
+   * Phase 48b + 51: Handle real-time Binance price update from WS callback.
    * Runs on every WS tick (~100ms). Must be fast and non-blocking.
-   * Checks if any VS quotes for this coin are stale and cancels them.
+   *
+   * Two responsibilities:
+   * 1. Phase 48b: Cancel stale quotes when Binance moves from quote placement price
+   * 2. Phase 51: Dynamic exit — sell position immediately when Binance moves AGAINST it
    */
   private handleBinancePriceUpdateForVs(coin: string, price: number): void {
-    const threshold = config.vsEngine.staleCancelThresholdPct;
-    if (threshold <= 0) return;
+    // Phase 48b: stale quote cancellation
+    const staleThreshold = config.vsEngine.staleCancelThresholdPct;
+    if (staleThreshold > 0) {
+      const staleQuotes = this.vsEngine.getStaleQuotesForCoin(coin, price, staleThreshold);
+      for (const sq of staleQuotes) {
+        this.vsEngine.clearQuoteMeta(sq.marketId, sq.outcome);
 
-    const staleQuotes = this.vsEngine.getStaleQuotesForCoin(coin, price, threshold);
-    if (staleQuotes.length === 0) return;
+        logger.info('Phase 48b: WS stale cancel — Binance moved, cancelling VS quote', {
+          coin,
+          marketId: sq.marketId,
+          outcome: sq.outcome,
+          quoteAgeMs: sq.quoteAgeMs,
+          binanceDeltaPct: roundTo(sq.binanceDeltaPct, 4),
+          thresholdPct: staleThreshold,
+          bidPrice: sq.bidPrice,
+          currentBinancePrice: price,
+        });
 
-    for (const sq of staleQuotes) {
-      // Clear quoteMeta immediately (sync) to prevent re-triggering on next tick
-      this.vsEngine.clearQuoteMeta(sq.marketId, sq.outcome);
+        this.cancelStaleVsBuyQuotes(sq.marketId, sq.outcome).catch((err) => {
+          logger.warn('Phase 48b: WS stale cancel failed', {
+            marketId: sq.marketId,
+            outcome: sq.outcome,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+    }
 
-      logger.info('Phase 48b: WS stale cancel — Binance moved, cancelling VS quote', {
+    // Phase 51: dynamic Binance-based position exit
+    const exitThreshold = config.vsEngine.dynamicExitThresholdPct;
+    if (exitThreshold <= 0) return;
+
+    const positionsToExit = this.vsEngine.getDynamicExitPositions(coin, price, exitThreshold);
+    if (positionsToExit.length === 0) return;
+
+    for (const pos of positionsToExit) {
+      // Mark for exit immediately (sync) — prevent re-triggering on next WS tick
+      this.vsEngine.markPendingDynamicExit(pos.marketId, pos.outcome);
+      this.vsEngine.incrementDynamicExits();
+
+      logger.info('Phase 51: WS dynamic exit — Binance moved against position', {
         coin,
-        marketId: sq.marketId,
-        outcome: sq.outcome,
-        quoteAgeMs: sq.quoteAgeMs,
-        binanceDeltaPct: roundTo(sq.binanceDeltaPct, 4),
-        thresholdPct: threshold,
-        bidPrice: sq.bidPrice,
+        marketId: pos.marketId,
+        outcome: pos.outcome,
+        entryVwap: roundTo(pos.entryVwap, 4),
+        shares: pos.shares,
+        binanceDeltaPct: roundTo(pos.binanceDeltaPct, 4),
+        thresholdPct: exitThreshold,
+        holdAgeMs: pos.holdAgeMs,
         currentBinancePrice: price,
       });
 
-      // Fire-and-forget the actual cancel (async for live, sync for paper)
-      this.cancelStaleVsBuyQuotes(sq.marketId, sq.outcome).catch((err) => {
-        logger.warn('Phase 48b: WS stale cancel failed', {
-          marketId: sq.marketId,
-          outcome: sq.outcome,
+      // Fire-and-forget async exit
+      this.executeDynamicExit(pos.marketId, pos.outcome, pos.entryVwap, pos.shares, pos.binanceDeltaPct).catch((err) => {
+        logger.warn('Phase 51: dynamic exit execution failed', {
+          marketId: pos.marketId,
+          outcome: pos.outcome,
           error: err instanceof Error ? err.message : String(err),
         });
       });
+    }
+  }
+
+  /**
+   * Phase 51: Execute a dynamic exit — sell position at best bid when Binance
+   * moves against us. Called from WS callback as fire-and-forget.
+   */
+  private async executeDynamicExit(
+    marketId: string,
+    outcome: 'YES' | 'NO',
+    entryVwap: number,
+    shares: number,
+    binanceDeltaPct: number
+  ): Promise<void> {
+    try {
+      // Look up market data
+      const market = this.markets.get(marketId);
+      if (!market) return;
+
+      const pm = this.positions.get(marketId);
+      if (!pm) return;
+      const liveShares = pm.getShares(outcome);
+      if (liveShares <= 0) {
+        this.vsEngine.clearState(marketId, outcome);
+        return;
+      }
+
+      // Get orderbook (prefer cached to avoid rate-limiting the CLOB on every WS tick)
+      let exitBook = this.latestBooks.get(marketId) ?? null;
+      try {
+        exitBook = await this.fetcher.getMarketSnapshot(market);
+        this.latestBooks.set(marketId, exitBook);
+      } catch { /* use cached */ }
+      if (!exitBook) return;
+
+      const outcomeBook = outcome === 'YES' ? exitBook.yes : exitBook.no;
+      const bestBid = outcomeBook.bestBid ?? 0.01;
+
+      const slotKey = getSlotKey(market);
+      const exitSignal: StrategySignal = {
+        marketId,
+        marketTitle: market.title,
+        signalType: 'VS_DYNAMIC_EXIT',
+        priority: 975,
+        generatedAt: Date.now(),
+        action: 'SELL',
+        outcome,
+        outcomeIndex: outcome === 'YES' ? 0 : 1,
+        shares: liveShares,
+        targetPrice: bestBid,
+        referencePrice: bestBid,
+        tokenPrice: outcomeBook.midPrice,
+        midPrice: outcomeBook.midPrice,
+        fairValue: null,
+        edgeAmount: bestBid - entryVwap,
+        combinedBid: exitBook.combined.combinedBid,
+        combinedAsk: exitBook.combined.combinedAsk,
+        combinedMid: exitBook.combined.combinedMid,
+        combinedDiscount: exitBook.combined.combinedDiscount,
+        combinedPremium: exitBook.combined.combinedPremium,
+        fillRatio: 1,
+        capitalClamp: 1,
+        priceMultiplier: 1,
+        urgency: 'cross',
+        reduceOnly: true,
+        reason: `Phase 51: dynamic exit — Binance moved ${roundTo(binanceDeltaPct, 3)}% against ${outcome}, selling @${bestBid}`,
+        strategyLayer: 'VS_ENGINE',
+      } as StrategySignal;
+
+      // Cancel any pending maker quotes first
+      await this.cancelPendingVsMakerQuotes(marketId, outcome);
+
+      await this.executeSignal(market, exitBook, pm, exitSignal, slotKey);
+
+      // Record VS exit stats
+      const exitCoin = extractCoinFromTitle(market.title);
+      const vsPos = this.vsEngine.getPosition(marketId, outcome);
+      const realEntryVwap = vsPos?.entryVwap ?? entryVwap;
+      const realizedDelta = (bestBid - realEntryVwap) * liveShares;
+      this.vsEngine.recordExitForStats(exitCoin, realizedDelta, 'VS_DYNAMIC_EXIT');
+      const remainingShares = pm.getShares(outcome);
+      if (remainingShares <= 0) {
+        this.vsEngine.clearState(marketId, outcome);
+      }
+    } finally {
+      // Always clear pending flag so position can be re-evaluated
+      this.vsEngine.clearPendingDynamicExit(marketId, outcome);
     }
   }
 

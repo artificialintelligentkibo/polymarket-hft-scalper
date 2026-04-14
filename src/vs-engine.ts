@@ -98,6 +98,8 @@ export interface VsEngineConfig {
   readonly mmTiltMaxCents: number;
   // Phase 48: cancel-on-Binance-move — cancel stale quotes when Binance moves
   readonly staleCancelThresholdPct: number;
+  // Phase 51: dynamic Binance-based position exit — exit when Binance moves against position
+  readonly dynamicExitThresholdPct: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -229,6 +231,8 @@ interface VsPosition {
   readonly slotEndMs: number;
   readonly slotStartMs: number;
   readonly strikePrice: number;
+  /** Phase 51: Binance price at the moment of fill — used for dynamic exit trigger */
+  readonly binancePriceAtEntry: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -268,6 +272,8 @@ export class VsEngine {
   private readonly lastLosingExitMs = new Map<string, number>();
   private readonly lastLosingExitMsByCoin = new Map<string, number>();
   private readonly lastOrphanEmitMs = new Map<string, number>();
+  /** Phase 51: positions currently being exited by dynamic exit (prevents re-trigger) */
+  private readonly pendingDynamicExits = new Set<string>();
   private availableUsdcBalance: number | null = null;
 
   /* ── Session stats ─────────────────────────────────────────────── */
@@ -281,6 +287,7 @@ export class VsEngine {
   private phase1Pnl = 0;
   private phase2Entries = 0;
   private staleCancels = 0;
+  private dynamicExits = 0;
   private phase2Pnl = 0;
   private readonly coinStats = new Map<string, {
     entries: number;
@@ -499,6 +506,82 @@ export class VsEngine {
     return stale;
   }
 
+  /**
+   * Phase 51: Check positions for a specific coin against current Binance price.
+   * Returns positions where Binance moved AGAINST the position by more than threshold.
+   *
+   * Logic:
+   * - Holding YES: Binance DOWN = against (sell), Binance UP = for (hold/widen)
+   * - Holding NO:  Binance UP = against (sell), Binance DOWN = for (hold/widen)
+   *
+   * Called from Binance WS callback on every price tick (~100ms).
+   */
+  getDynamicExitPositions(
+    coin: string,
+    currentBinancePrice: number,
+    thresholdPct: number
+  ): Array<{
+    marketId: string;
+    outcome: Outcome;
+    entryVwap: number;
+    shares: number;
+    binanceDeltaPct: number;
+    holdAgeMs: number;
+  }> {
+    if (thresholdPct <= 0) return [];
+    const toExit: Array<{
+      marketId: string; outcome: Outcome; entryVwap: number;
+      shares: number; binanceDeltaPct: number; holdAgeMs: number;
+    }> = [];
+    const now = Date.now();
+
+    for (const [key, pos] of this.positions) {
+      const posCoin = extractCoin(pos.marketTitle);
+      if (posCoin !== coin) continue;
+      if (pos.binancePriceAtEntry <= 0) continue;
+      // Skip if already pending dynamic exit (async execution in flight)
+      if (this.pendingDynamicExits.has(key)) continue;
+
+      // Signed delta: positive = price went UP, negative = price went DOWN
+      const signedDeltaPct = ((currentBinancePrice - pos.binancePriceAtEntry)
+        / pos.binancePriceAtEntry) * 100;
+
+      // Determine if move is AGAINST our position
+      // YES holder: DOWN is against (signedDelta < 0)
+      // NO holder: UP is against (signedDelta > 0)
+      const isAgainst = pos.outcome === 'YES'
+        ? signedDeltaPct < -thresholdPct
+        : signedDeltaPct > thresholdPct;
+
+      if (isAgainst) {
+        toExit.push({
+          marketId: pos.marketId,
+          outcome: pos.outcome,
+          entryVwap: pos.entryVwap,
+          shares: pos.totalShares,
+          binanceDeltaPct: signedDeltaPct,
+          holdAgeMs: now - pos.enteredAtMs,
+        });
+      }
+    }
+    return toExit;
+  }
+
+  /** Phase 51: increment dynamic exit counter for dashboard stats */
+  incrementDynamicExits(): void {
+    this.dynamicExits += 1;
+  }
+
+  /** Phase 51: mark position as pending dynamic exit (prevents re-trigger from WS ticks) */
+  markPendingDynamicExit(marketId: string, outcome: Outcome): void {
+    this.pendingDynamicExits.add(this.positionKey(marketId, outcome));
+  }
+
+  /** Phase 51: clear pending dynamic exit flag (call after exit completes or fails) */
+  clearPendingDynamicExit(marketId: string, outcome: Outcome): void {
+    this.pendingDynamicExits.delete(this.positionKey(marketId, outcome));
+  }
+
   /** Get slot summary and clean up. Call at slot end. */
   getSlotDiagnostics(marketId: string): {
     quotesPosted: number; fillsMaker: number; fillsTaker: number;
@@ -578,10 +661,13 @@ export class VsEngine {
     if (outcome) {
       // Phase 45a: clear specific outcome position
       this.positions.delete(this.positionKey(marketId, outcome));
+      this.pendingDynamicExits.delete(this.positionKey(marketId, outcome));
     } else {
       // Clear both outcomes
       this.positions.delete(this.positionKey(marketId, 'YES'));
       this.positions.delete(this.positionKey(marketId, 'NO'));
+      this.pendingDynamicExits.delete(this.positionKey(marketId, 'YES'));
+      this.pendingDynamicExits.delete(this.positionKey(marketId, 'NO'));
     }
     this.lastFairValues.delete(marketId);
     // Phase 47b: do NOT delete lastEntryMs or lastLosingExitMs here.
@@ -1139,6 +1225,8 @@ export class VsEngine {
     slotStartTime: string | null;
     strikePrice: number;
     phase: 'MM' | 'MOMENTUM';
+    /** Phase 51: Binance price at fill time — for dynamic exit trigger */
+    binancePriceAtEntry: number;
   }): StrategySignal[] {
     // Phase 45a: composite key for per-outcome position tracking
     const key = this.positionKey(params.marketId, params.outcome);
@@ -1164,6 +1252,7 @@ export class VsEngine {
         slotEndMs: params.slotEndTime ? new Date(params.slotEndTime).getTime() : Date.now() + 300_000,
         slotStartMs: params.slotStartTime ? new Date(params.slotStartTime).getTime() : Date.now(),
         strikePrice: params.strikePrice,
+        binancePriceAtEntry: params.binancePriceAtEntry,
       });
     }
     // Phase 35C: DON'T reset lastEntryMs here — it's already set on signal
@@ -1380,6 +1469,8 @@ export class VsEngine {
       priceStopCents: config.priceStopCents,
       staleCancelThresholdPct: config.staleCancelThresholdPct,
       staleCancels: this.staleCancels,
+      dynamicExitThresholdPct: config.dynamicExitThresholdPct,
+      dynamicExits: this.dynamicExits,
       activePositions,
       totalSignalsGenerated: this.totalExitSignals + this.totalEntries,
     };

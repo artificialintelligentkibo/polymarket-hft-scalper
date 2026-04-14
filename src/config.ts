@@ -1626,10 +1626,19 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ),
       // Phase 48: cancel-on-Binance-move — if Binance moves > N% from quote
       // placement price, cancel stale maker quotes to avoid adverse selection.
-      // 0.03 = 0.03% (~$20 on BTC@67k, ~$1 on ETH@3.4k)
+      // Phase 51: lowered from 0.03 to 0.02 — logs showed 100% of fills had
+      // staleQuote=true with ages up to 52s. 0.02% is closer to VS's 0.015-0.02%.
       staleCancelThresholdPct: Math.max(
         0,
-        parseFloatOrDefault(env.VS_STALE_CANCEL_THRESHOLD_PCT, '0.03')
+        parseFloatOrDefault(env.VS_STALE_CANCEL_THRESHOLD_PCT, '0.02')
+      ),
+      // Phase 51: dynamic Binance-based position exit — when Binance moves against
+      // a filled position by > N%, exit immediately at market (best bid).
+      // 0.03 = 0.03% (~$20 on BTC@67k). This prevents holding losers 4+ min
+      // until time-exit@0.01 — the single biggest source of losses.
+      dynamicExitThresholdPct: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_DYNAMIC_EXIT_THRESHOLD_PCT, '0.03')
       ),
     },
     paperTrading: {

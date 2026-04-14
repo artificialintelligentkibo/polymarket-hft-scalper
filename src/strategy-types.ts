@@ -36,6 +36,7 @@ export type SignalType =
   | 'VS_MM_ASK'
   | 'VS_MOMENTUM_BUY'
   | 'VS_SCALP_EXIT'
+  | 'VS_DYNAMIC_EXIT'
   | 'VS_TIME_EXIT';
 
 export const QUOTING_SIGNAL_TYPES = [
@@ -73,7 +74,7 @@ export function isObiExitSignal(signalType: SignalType): boolean {
  * before executing, same pattern as OBI exits.
  */
 export function isVsExitSignal(signalType: SignalType): boolean {
-  return signalType === 'VS_SCALP_EXIT' || signalType === 'VS_TIME_EXIT';
+  return signalType === 'VS_SCALP_EXIT' || signalType === 'VS_TIME_EXIT' || signalType === 'VS_DYNAMIC_EXIT';
 }
 
 export function bypassesBinanceEdge(signalType: SignalType): boolean {
@@ -97,6 +98,7 @@ export function bypassesBinanceEdge(signalType: SignalType): boolean {
     signalType === 'VS_MM_ASK' ||
     signalType === 'VS_MOMENTUM_BUY' ||
     signalType === 'VS_SCALP_EXIT' ||
+    signalType === 'VS_DYNAMIC_EXIT' ||
     signalType === 'VS_TIME_EXIT'
   );
 }
@@ -140,6 +142,7 @@ export function resolveStrategyLayer(signalType: SignalType): StrategyLayer {
     case 'VS_MM_ASK':
     case 'VS_MOMENTUM_BUY':
     case 'VS_SCALP_EXIT':
+    case 'VS_DYNAMIC_EXIT':
     case 'VS_TIME_EXIT':
       return 'VS_ENGINE';
     default:

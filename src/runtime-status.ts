@@ -263,6 +263,8 @@ export interface VsSessionStats {
   readonly priceStopCents: number;
   readonly staleCancelThresholdPct: number;
   readonly staleCancels: number;
+  readonly dynamicExitThresholdPct: number;
+  readonly dynamicExits: number;
   readonly activePositions: readonly VsActivePosition[];
   readonly totalSignalsGenerated: number;
 }
