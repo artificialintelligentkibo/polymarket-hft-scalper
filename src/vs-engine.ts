@@ -79,6 +79,10 @@ export interface VsEngineConfig {
   readonly timeExitMinPrice: number;
   // Timing
   readonly slotWarmupMs: number;
+  /** Phase 53: minimum Binance ticks before first signal. Time-based warmup
+   *  alone doesn't guarantee Binance WS has delivered enough data. Without ≥3
+   *  ticks, volatility estimate is noise and entry direction is random. */
+  readonly minWarmupTicks: number;
   readonly stopEntryBeforeEndMs: number;
   readonly cancelAllBeforeEndMs: number;
   readonly momentumPhaseMs: number;
@@ -108,6 +112,12 @@ export interface VsEngineConfig {
   // Binary options have extreme gamma near 0.50: tiny Binance moves cause huge PM drops.
   // This catches fast PM crashes that Binance threshold misses.
   readonly pmExitThresholdCents: number;
+  // Phase 53: position reversal — on dynamic exit, BUY opposite outcome if Binance
+  // move exceeds this threshold. 0 = disabled. When enabled, exit YES@loss → BUY NO
+  // immediately, riding the Binance momentum in correct direction.
+  readonly reversalEnabled: boolean;
+  readonly reversalMinBinanceMovePct: number;
+  readonly reversalMaxBuyPrice: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -297,6 +307,7 @@ export class VsEngine {
   private staleCancels = 0;
   private dynamicExits = 0;
   private pmExits = 0;
+  private reversals = 0;
   private phase2Pnl = 0;
   private readonly coinStats = new Map<string, {
     entries: number;
@@ -334,6 +345,10 @@ export class VsEngine {
 
   setAvailableUsdcBalance(usdc: number): void {
     this.availableUsdcBalance = usdc;
+  }
+
+  getAvailableBalance(): number | null {
+    return this.availableUsdcBalance;
   }
 
   /* ── Phase 47c: diagnostic tracking ──────────────────────────────── */
@@ -581,6 +596,11 @@ export class VsEngine {
     this.dynamicExits += 1;
   }
 
+  /** Phase 53: increment reversal counter for dashboard stats */
+  incrementReversals(): void {
+    this.reversals += 1;
+  }
+
   /** Phase 51: mark position as pending dynamic exit (prevents re-trigger from WS ticks) */
   markPendingDynamicExit(marketId: string, outcome: Outcome): void {
     this.pendingDynamicExits.add(this.positionKey(marketId, outcome));
@@ -589,6 +609,39 @@ export class VsEngine {
   /** Phase 51: clear pending dynamic exit flag (call after exit completes or fails) */
   clearPendingDynamicExit(marketId: string, outcome: Outcome): void {
     this.pendingDynamicExits.delete(this.positionKey(marketId, outcome));
+  }
+
+  /**
+   * Phase 53: should we reverse into opposite outcome after dynamic exit?
+   * Returns the opposite outcome if conditions are met, null otherwise.
+   *
+   * Logic: if we exit YES because Binance went DOWN, Binance momentum suggests
+   * NO is the winning side. Reverse into NO if:
+   * - reversalEnabled is true
+   * - |binanceMovePct| >= reversalMinBinanceMovePct
+   * - enough time remaining (not in EXIT phase)
+   * - no existing position on opposite outcome
+   */
+  shouldReverse(
+    config: VsEngineConfig,
+    marketId: string,
+    exitedOutcome: Outcome,
+    absBinanceMovePct: number,
+    slotEndMs: number,
+    nowMs: number
+  ): Outcome | null {
+    if (!config.reversalEnabled) return null;
+    if (absBinanceMovePct < config.reversalMinBinanceMovePct) return null;
+
+    // Don't reverse if too close to slot end
+    const remaining = slotEndMs - nowMs;
+    if (remaining < config.stopEntryBeforeEndMs) return null;
+
+    const oppositeOutcome: Outcome = exitedOutcome === 'YES' ? 'NO' : 'YES';
+    // Don't reverse if already holding opposite
+    if (this.hasPositionForOutcome(marketId, oppositeOutcome)) return null;
+
+    return oppositeOutcome;
   }
 
   /** Get slot summary and clean up. Call at slot end. */
@@ -742,6 +795,19 @@ export class VsEngine {
       return [];
     }
 
+    // Phase 53: tick warmup — require N Binance ticks before first signal.
+    // Time-based warmup alone doesn't guarantee WS delivered enough data.
+    if (config.minWarmupTicks > 0) {
+      const history = binanceFeed.getPriceHistory(coin);
+      const slotStartMs = market.startTime ? new Date(market.startTime).getTime() : 0;
+      const ticksSinceSlotStart = history.filter(t => t.recordedAtMs >= slotStartMs).length;
+      if (ticksSinceSlotStart < config.minWarmupTicks) {
+        this.recordDecision(coin, 'SKIP', phase,
+          `tick_warmup(${ticksSinceSlotStart}/${config.minWarmupTicks})`, null);
+        return [];
+      }
+    }
+
     // Realized volatility — with floor to prevent CDF saturation.
     // Phase 44f: when realized vol is extremely low (e.g. 0.01), the CDF
     // pushes FV to ~1.00 for any meaningful price move, causing bidPrice
@@ -838,10 +904,19 @@ export class VsEngine {
     }
     const sidesToQuote: readonly Outcome[] = [sideToQuote];
 
-    // Bid pricing: anchor on Polymarket mid with spread below
-    const yesBaseBid = yesMid - config.mmSpreadCents;
+    // Phase 53: directional tilt — asymmetric quoting based on Binance move.
+    // Tighten bid in Binance direction (attract fills), widen ask against.
+    // On FLAT: symmetric (no tilt). Tilt scales linearly with |movePct|, capped.
+    const tiltCents = binanceFlat ? 0 : Math.min(absMove * 2, config.mmTiltMaxCents);
+    // YES side: Binance UP → tighten YES bid (less spread), widen YES ask
+    //           Binance DOWN → widen YES bid (more spread), tighten YES ask
+    const yesBidTilt = binanceUp ? tiltCents : -tiltCents;
+    const noBidTilt = binanceDown ? tiltCents : -tiltCents;
+
+    // Bid pricing: anchor on Polymarket mid with spread + directional tilt
+    const yesBaseBid = yesMid - config.mmSpreadCents + yesBidTilt;
     const yesBidPrice = roundTo(Math.max(yesBaseBid, config.mmMinPrice), 2);
-    const noBaseBid = noMid - config.mmSpreadCents;
+    const noBaseBid = noMid - config.mmSpreadCents + noBidTilt;
     const noBidPrice = roundTo(Math.max(noBaseBid, config.mmMinPrice), 2);
 
     const shares = Math.round(config.mmShares * sizeMultiplier);
@@ -1538,6 +1613,9 @@ export class VsEngine {
       dynamicExits: this.dynamicExits,
       pmExitThresholdCents: config.pmExitThresholdCents,
       pmExits: this.pmExits,
+      reversalEnabled: config.reversalEnabled,
+      reversals: this.reversals,
+      minWarmupTicks: config.minWarmupTicks,
       activePositions,
       totalSignalsGenerated: this.totalExitSignals + this.totalEntries,
     };

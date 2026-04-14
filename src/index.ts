@@ -6125,6 +6125,68 @@ export class MarketMakerRuntime {
       if (remainingShares <= 0) {
         this.vsEngine.clearState(marketId, outcome);
       }
+
+      // Phase 53: position reversal — after exit, BUY opposite outcome if
+      // Binance move is strong enough. Ride the momentum in correct direction.
+      const slotEndMs = market.endTime ? new Date(market.endTime).getTime() : 0;
+      const reverseOutcome = this.vsEngine.shouldReverse(
+        config.vsEngine, marketId, outcome,
+        Math.abs(binanceDeltaPct), slotEndMs, Date.now()
+      );
+      if (reverseOutcome && exitBook) {
+        const reverseBook = reverseOutcome === 'YES' ? exitBook.yes : exitBook.no;
+        const reverseBestAsk = reverseBook.bestAsk;
+        if (reverseBestAsk && reverseBestAsk <= config.vsEngine.reversalMaxBuyPrice) {
+          const reverseShares = Math.min(
+            config.vsEngine.momentumShares,
+            Math.floor((this.vsEngine.getAvailableBalance() ?? 0) * 0.9 / reverseBestAsk)
+          );
+          if (reverseShares >= 1) {
+            this.vsEngine.incrementReversals();
+            logger.info('Phase 53: position reversal — buying opposite outcome', {
+              coin: exitCoin,
+              marketId,
+              exitedOutcome: outcome,
+              reverseOutcome,
+              reverseBestAsk,
+              reverseShares,
+              binanceDeltaPct: roundTo(binanceDeltaPct, 3),
+            });
+
+            const reversalSignal: StrategySignal = {
+              marketId,
+              marketTitle: market.title,
+              signalType: 'VS_MOMENTUM_BUY',
+              priority: 950,
+              generatedAt: Date.now(),
+              action: 'BUY',
+              outcome: reverseOutcome,
+              outcomeIndex: reverseOutcome === 'YES' ? 0 : 1,
+              shares: reverseShares,
+              targetPrice: reverseBestAsk,
+              referencePrice: reverseBestAsk,
+              tokenPrice: reverseBook.midPrice,
+              midPrice: reverseBook.midPrice,
+              fairValue: null,
+              edgeAmount: 0,
+              combinedBid: exitBook.combined.combinedBid,
+              combinedAsk: exitBook.combined.combinedAsk,
+              combinedMid: exitBook.combined.combinedMid,
+              combinedDiscount: exitBook.combined.combinedDiscount,
+              combinedPremium: exitBook.combined.combinedPremium,
+              fillRatio: 1,
+              capitalClamp: 1,
+              priceMultiplier: 1,
+              urgency: 'cross',
+              reduceOnly: false,
+              reason: `Phase 53: reversal — Binance ${roundTo(binanceDeltaPct, 3)}% against ${outcome}, buying ${reverseOutcome} @${reverseBestAsk}`,
+              strategyLayer: 'VS_ENGINE',
+            } as StrategySignal;
+
+            await this.executeSignal(market, exitBook, pm, reversalSignal, slotKey);
+          }
+        }
+      }
     } finally {
       // Always clear pending flag so position can be re-evaluated
       this.vsEngine.clearPendingDynamicExit(marketId, outcome);

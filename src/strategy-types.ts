@@ -194,6 +194,10 @@ export function isLayerConflict(
     // VS_ENGINE + SNIPER allowed (different edges)
     'VS_ENGINE:SNIPER',
     'SNIPER:VS_ENGINE',
+    // Phase 53: OBI + VS_ENGINE allowed — different signals (book imbalance vs Binance arb)
+    // They naturally avoid collision: OBI enters on thin-side rebalance, VS on Binance momentum.
+    'OBI:VS_ENGINE',
+    'VS_ENGINE:OBI',
   ]);
 
   return !ALLOWED_PAIRS.has(`${existingLayer}:${newLayer}`);

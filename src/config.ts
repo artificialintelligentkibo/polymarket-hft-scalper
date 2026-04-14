@@ -1651,6 +1651,21 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.VS_PM_EXIT_THRESHOLD_CENTS, '0.05')
       ),
+      // Phase 53: position reversal — on dynamic exit, BUY opposite outcome
+      reversalEnabled: parseBoolean(env.VS_REVERSAL_ENABLED, false),
+      reversalMinBinanceMovePct: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_REVERSAL_MIN_BINANCE_MOVE_PCT, '0.04')
+      ),
+      reversalMaxBuyPrice: Math.max(
+        0.01,
+        parseFloatOrDefault(env.VS_REVERSAL_MAX_BUY_PRICE, '0.85')
+      ),
+      // Phase 53: Binance tick warmup — require N ticks before first signal
+      minWarmupTicks: Math.max(
+        0,
+        parseIntOrDefault(env.VS_MIN_WARMUP_TICKS, '3')
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),

@@ -268,6 +268,9 @@ export interface VsSessionStats {
   readonly dynamicExits: number;
   readonly pmExitThresholdCents: number;
   readonly pmExits: number;
+  readonly reversalEnabled: boolean;
+  readonly reversals: number;
+  readonly minWarmupTicks: number;
   readonly activePositions: readonly VsActivePosition[];
   readonly totalSignalsGenerated: number;
 }
