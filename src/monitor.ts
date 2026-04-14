@@ -427,15 +427,21 @@ export async function fetchGammaEventsPage(params: {
   fetchImpl?: FetchLike;
   requestTimeoutMs?: number;
   breaker?: CircuitBreaker;
+  useKeysetPagination?: boolean;
 }): Promise<GammaEventsPageResult> {
   const fetchImpl = params.fetchImpl ?? fetch;
   const requestTimeoutMs = params.requestTimeoutMs ?? GAMMA_REQUEST_TIMEOUT_MS;
 
-  // Try keyset endpoint first, fall back to legacy offset if 404
-  const result = await fetchGammaEventsKeyset(params, fetchImpl, requestTimeoutMs);
-  if (result !== null) return result;
+  // V2 keyset pagination — opt-in only (GAMMA_USE_KEYSET_PAGINATION=true)
+  // The /events/keyset endpoint exists but returns different ordering/filtering
+  // than legacy /events, which breaks 5-min crypto market discovery.
+  // Keep legacy as default until Polymarket fully migrates.
+  if (params.useKeysetPagination) {
+    const result = await fetchGammaEventsKeyset(params, fetchImpl, requestTimeoutMs);
+    if (result !== null) return result;
+  }
 
-  // Fallback: legacy offset endpoint (for backward compat until fully migrated)
+  // Default: legacy offset-based /events endpoint (proven to work)
   return fetchGammaEventsLegacy(params, fetchImpl, requestTimeoutMs);
 }
 

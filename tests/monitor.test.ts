@@ -252,22 +252,10 @@ test('fetchPaginatedGammaEventMarkets paginates with keyset cursors and flattens
     requestedUrls.push(url);
     callCount += 1;
 
-    // Keyset endpoint: return { events, next_cursor } wrapper
-    if (url.pathname.includes('/events/keyset')) {
-      const cursor = url.searchParams.get('after_cursor');
-      const events = cursor ? secondPage : firstPage;
-      const payload = {
-        events,
-        next_cursor: cursor ? null : 'cursor_page2',
-      };
-      return new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-
-    // Fallback: legacy endpoint (shouldn't be hit in this test)
-    return new Response(JSON.stringify([]), {
+    // Legacy offset endpoint: return bare array
+    const offset = parseInt(url.searchParams.get('offset') ?? '0', 10);
+    const events = offset === 0 ? firstPage : secondPage;
+    return new Response(JSON.stringify(events), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -279,12 +267,13 @@ test('fetchPaginatedGammaEventMarkets paginates with keyset cursors and flattens
     fetchImpl,
   });
 
-  // Verify keyset endpoint used
-  assert.ok(requestedUrls[0]?.pathname.includes('/events/keyset'));
+  // Verify legacy /events endpoint used (default, keyset is opt-in)
+  assert.ok(requestedUrls[0]?.pathname.endsWith('/events'));
   assert.equal(requestedUrls[0]?.searchParams.get('tag_id'), '21');
   assert.equal(requestedUrls[0]?.searchParams.get('related_tags'), 'true');
-  // Second request should have cursor
-  assert.equal(requestedUrls[1]?.searchParams.get('after_cursor'), 'cursor_page2');
+  assert.equal(requestedUrls[0]?.searchParams.get('offset'), '0');
+  // Second request should have offset=200
+  assert.equal(requestedUrls[1]?.searchParams.get('offset'), '200');
   assert.equal(result.pagesFetched, 2);
   assert.equal(result.events.length, 201);
   assert.equal(result.marketSources.length, 201);
