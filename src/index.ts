@@ -2942,6 +2942,8 @@ export class MarketMakerRuntime {
       // obiEngine.positions so the dead position doesn't linger until wallet
       // reconciliation. Previously only async fills (via fillTracker) did this.
       // Phase 44: also handles OBI_MM_QUOTE_ASK (MM cycle sell) same as VS_MM_ASK pattern.
+      // Phase 53: MUST call recordExitForStats() here — sync (taker) exits
+      // never reach applyConfirmedFill(), so exit counter stayed at 0.
       if (
         (executionSignal.signalType === 'OBI_REBALANCE_EXIT' ||
           executionSignal.signalType === 'OBI_SCALP_EXIT' ||
@@ -2949,6 +2951,12 @@ export class MarketMakerRuntime {
         executionSignal.action === 'SELL' &&
         config.obiEngine.enabled
       ) {
+        // Phase 53: record exit stats BEFORE clearing state (need entry price)
+        const obiExitCoin = extractCoinFromObiTitle(market.title);
+        const obiEntryPrice = this.obiEngine.getPositionEntryPrice(market.marketId) ?? effectivePrice;
+        const obiExitPnl = roundTo((effectivePrice - obiEntryPrice) * effectiveShares, 4);
+        this.obiEngine.recordExitForStats(obiExitCoin, obiExitPnl, executionSignal.signalType);
+
         const remainingShares = positionManager.getShares(executionSignal.outcome);
         if (remainingShares <= 0) {
           this.obiEngine.clearState(market.marketId);
@@ -2957,6 +2965,8 @@ export class MarketMakerRuntime {
             signalType: executionSignal.signalType,
             soldShares: effectiveShares,
             exitPrice: effectivePrice,
+            entryPrice: obiEntryPrice,
+            pnl: obiExitPnl,
           });
         } else if (remainingShares > 0 && remainingShares < 1) {
           // Phase 30E: Clamped exit left a sub-1-share remainder (settlement

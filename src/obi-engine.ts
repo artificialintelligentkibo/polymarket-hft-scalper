@@ -1909,6 +1909,11 @@ export class ObiEngine {
     this.lastImbalanceRatios.delete(marketId);
   }
 
+  /** Get entry price for a position (used by sync fill PnL calculation). */
+  getPositionEntryPrice(marketId: string): number | null {
+    return this.positions.get(marketId)?.entryPrice ?? null;
+  }
+
   /** Phase 36: last computed imbalance ratio for slot replay tracker. */
   getLastImbalanceRatio(marketId: string): number | null {
     return this.lastImbalanceRatios.get(marketId) ?? null;
