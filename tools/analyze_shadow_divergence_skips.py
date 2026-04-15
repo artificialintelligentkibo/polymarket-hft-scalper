@@ -81,6 +81,7 @@ def main() -> int:
     # Bucket by divergence magnitude to see if the guard threshold is right.
     buckets: dict[str, list[tuple[dict, dict]]] = defaultdict(list)
     by_coin: dict[str, list[tuple[dict, dict]]] = defaultdict(list)
+    by_vs_binance: dict[str, list[tuple[dict, dict]]] = defaultdict(list)
     for skip, out in matched:
         div = float(skip.get("divergence", 0))
         if div < 0.12:
@@ -93,6 +94,15 @@ def main() -> int:
             label = ">=0.20"
         buckets[label].append((skip, out))
         by_coin[skip.get("coin") or "?"].append((skip, out))
+        against = skip.get("shadow_betting_against_binance")
+        if against is None:
+            against = out.get("shadow_betting_against_binance")
+        bin_label = (
+            "AGAINST_BINANCE" if against is True
+            else "WITH_BINANCE" if against is False
+            else "UNKNOWN"
+        )
+        by_vs_binance[bin_label].append((skip, out))
 
     def summarize(label: str, pairs: list[tuple[dict, dict]]) -> None:
         correct = sum(1 for _, o in pairs if o.get("shadow_correct"))
@@ -114,6 +124,11 @@ def main() -> int:
     print("\nBy coin:")
     for coin in sorted(by_coin):
         summarize(coin, by_coin[coin])
+
+    print("\nBy Binance alignment:")
+    for label in ("AGAINST_BINANCE", "WITH_BINANCE", "UNKNOWN"):
+        if by_vs_binance.get(label):
+            summarize(label, by_vs_binance[label])
 
     total_correct = sum(1 for _, o in matched if o.get("shadow_correct"))
     total_pnl = sum(float(o.get("shadow_pnl", 0)) for _, o in matched)

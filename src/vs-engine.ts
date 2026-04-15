@@ -450,6 +450,9 @@ export class VsEngine {
     readonly size: number;
     readonly cost: number;
     readonly placedAtMs: number;
+    readonly binanceImpliedWinner: Outcome;
+    readonly binanceDistanceToStrikeBps: number;
+    readonly bettingAgainstBinance: boolean;
   }>();
   /** Shadow divergence-skips keyed by `${marketId}:${outcome}` (may be many
    *  per market since ACCUMULATE retries each scan). Store the LATEST skip. */
@@ -462,10 +465,19 @@ export class VsEngine {
     readonly divergence: number;
     readonly size: number;
     readonly placedAtMs: number;
+    readonly binanceImpliedWinner: Outcome;
+    readonly binanceDistanceToStrikeBps: number;
+    readonly bettingAgainstBinance: boolean;
   }>();
   /** Track markets we've already logged a shadow-MR transition for, so we
    *  don't re-emit on every tick while phase stays TAKE_PROFIT. */
   private readonly shadowMrEmitted = new Set<string>();
+  /** Phase 58P dedup: key = `${marketId}:${outcome}` → last emit ts + div.
+   *  Skip if < 30s since last AND divergence changed < 0.05. */
+  private readonly shadowDivergenceLastLog = new Map<string, {
+    readonly tsMs: number;
+    readonly divergence: number;
+  }>();
 
   /* ── Session stats ─────────────────────────────────────────────── */
   private totalEntries = 0;
@@ -1317,6 +1329,11 @@ export class VsEngine {
     const spotStrikeDiffPct = strikePrice > 0
       ? roundTo(((spotPrice - strikePrice) / strikePrice) * 100, 4)
       : 0;
+    const binanceImpliedWinner: Outcome = spotPrice >= strikePrice ? 'YES' : 'NO';
+    const bettingAgainstBinance = bettingOn !== binanceImpliedWinner;
+    const distanceToStrikeBps = strikePrice > 0
+      ? roundTo(((spotPrice - strikePrice) / strikePrice) * 10_000, 2)
+      : 0;
 
     logger.info('VS SHADOW shadow_mean_reversion', {
       event: 'shadow_mean_reversion',
@@ -1340,6 +1357,9 @@ export class VsEngine {
       shadow_size: size,
       shadow_cost: cost,
       spot_strike_diff_pct: spotStrikeDiffPct,
+      binance_implied_winner: binanceImpliedWinner,
+      binance_distance_to_strike_bps: distanceToStrikeBps,
+      shadow_betting_against_binance: bettingAgainstBinance,
     });
 
     this.shadowMrOpps.set(market.marketId, {
@@ -1350,6 +1370,9 @@ export class VsEngine {
       size,
       cost,
       placedAtMs: nowMs,
+      binanceImpliedWinner,
+      binanceDistanceToStrikeBps: distanceToStrikeBps,
+      bettingAgainstBinance,
     });
   }
 
@@ -1375,22 +1398,55 @@ export class VsEngine {
     const spotStrikeDiffPct = strikePrice > 0
       ? roundTo(((spotPrice - strikePrice) / strikePrice) * 100, 4)
       : 0;
-    logger.info('VS SHADOW shadow_pm_fv_divergence_skip', {
-      event: 'shadow_pm_fv_divergence_skip',
-      marketId: market.marketId,
-      coin,
-      ts: new Date(nowMs).toISOString(),
-      remainingMs,
-      outcome,
-      pm_mid: roundTo(pmMid, 4),
-      fv: roundTo(fv, 4),
-      divergence: roundTo(divergence, 4),
-      would_have_bid: wouldHaveBid,
-      shadow_size: size,
-      shadow_cost: roundTo(wouldHaveBid * size, 4),
-      spot_strike_diff_pct: spotStrikeDiffPct,
-    });
-    this.shadowDivergenceSkips.set(`${market.marketId}:${outcome}`, {
+    // Binance-implied winner: spot >= strike → YES, else NO. If shadow is
+    // buying the OTHER side, we're betting against Binance (low conviction
+    // mean-reversion / PM-knows-more); same side = cheap entry on the side
+    // Binance already says wins.
+    const binanceImpliedWinner: Outcome = spotPrice >= strikePrice ? 'YES' : 'NO';
+    const bettingAgainstBinance = outcome !== binanceImpliedWinner;
+    const distanceToStrikeBps = strikePrice > 0
+      ? roundTo(((spotPrice - strikePrice) / strikePrice) * 10_000, 2)
+      : 0;
+
+    // Phase 58P dedup: one log per (market, outcome) per 30s, unless
+    // divergence has moved >=5¢. Bot quotes every ~3s → raw rate is ~20 events
+    // per slot per coin; dedup collapses that to ~2-3 meaningful events.
+    const dedupKey = `${market.marketId}:${outcome}`;
+    const last = this.shadowDivergenceLastLog.get(dedupKey);
+    const DEDUP_WINDOW_MS = 30_000;
+    const DEDUP_DIV_THRESHOLD = 0.05;
+    const shouldEmit = !last
+      || (nowMs - last.tsMs) >= DEDUP_WINDOW_MS
+      || Math.abs(divergence - last.divergence) >= DEDUP_DIV_THRESHOLD;
+
+    if (shouldEmit) {
+      logger.info('VS SHADOW shadow_pm_fv_divergence_skip', {
+        event: 'shadow_pm_fv_divergence_skip',
+        marketId: market.marketId,
+        coin,
+        ts: new Date(nowMs).toISOString(),
+        remainingMs,
+        outcome,
+        pm_mid: roundTo(pmMid, 4),
+        fv: roundTo(fv, 4),
+        divergence: roundTo(divergence, 4),
+        would_have_bid: wouldHaveBid,
+        shadow_size: size,
+        shadow_cost: roundTo(wouldHaveBid * size, 4),
+        spot_strike_diff_pct: spotStrikeDiffPct,
+        binance_implied_winner: binanceImpliedWinner,
+        binance_distance_to_strike_bps: distanceToStrikeBps,
+        shadow_betting_against_binance: bettingAgainstBinance,
+      });
+      this.shadowDivergenceLastLog.set(dedupKey, {
+        tsMs: nowMs, divergence,
+      });
+    }
+
+    // Always update the skip state — resolveShadowOutcomes needs the LATEST
+    // snapshot regardless of whether the log fired. This way outcome events
+    // reflect the most recent would-have-bid, not a stale 30s-old one.
+    this.shadowDivergenceSkips.set(dedupKey, {
       coin,
       outcome,
       wouldHaveBid,
@@ -1399,6 +1455,9 @@ export class VsEngine {
       divergence,
       size,
       placedAtMs: nowMs,
+      binanceImpliedWinner,
+      binanceDistanceToStrikeBps: distanceToStrikeBps,
+      bettingAgainstBinance,
     });
   }
 
@@ -1428,6 +1487,9 @@ export class VsEngine {
         shadow_cost: mr.cost,
         shadow_correct: correct,
         shadow_pnl: pnl,
+        binance_implied_winner: mr.binanceImpliedWinner,
+        binance_distance_to_strike_bps: mr.binanceDistanceToStrikeBps,
+        shadow_betting_against_binance: mr.bettingAgainstBinance,
       });
       this.shadowMrOpps.delete(marketId);
     }
@@ -1458,6 +1520,9 @@ export class VsEngine {
         shadow_cost: cost,
         shadow_correct: correct,
         shadow_pnl: pnl,
+        binance_implied_winner: skip.binanceImpliedWinner,
+        binance_distance_to_strike_bps: skip.binanceDistanceToStrikeBps,
+        shadow_betting_against_binance: skip.bettingAgainstBinance,
       });
     }
     for (const k of keysToDelete) this.shadowDivergenceSkips.delete(k);
