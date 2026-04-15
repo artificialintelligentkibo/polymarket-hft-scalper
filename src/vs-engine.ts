@@ -164,6 +164,10 @@ export interface VsEngineConfig {
   /** Phase 58: asymmetric take-profit — hold winners past time-exit, let
    *  resolution redeem @ $1. Only losers are dumped @ bestBid. */
   readonly holdWinnersToResolution: boolean;
+  /** Phase 58: master opt-in for 4-phase entry routing. When false,
+   *  generateSignals uses legacy 2-phase (PASSIVE_MM / MOMENTUM).
+   *  When true: EARLY_MM / ACCUMULATE / CONTINUATION / TAKE_PROFIT. */
+  readonly phase58Enabled: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -858,6 +862,7 @@ export class VsEngine {
     // allows immediate re-entry on the same market → cascade losses.
     // Cooldowns naturally expire via their timeout or get cleaned up at slot end.
     this.lastOrphanEmitMs.delete(marketId);
+    this.lastPhase58.delete(marketId);
   }
 
   /* ── Entry signal generation ────────────────────────────────────── */
@@ -967,6 +972,79 @@ export class VsEngine {
     // Phase 36: cache last FV for slot replay tracker
     this.lastFairValues.set(market.marketId, fairValueUp);
 
+    // Phase 58: 4-phase routing (opt-in). When phase58Enabled=true, use
+    // EARLY_MM / ACCUMULATE / CONTINUATION / TAKE_PROFIT phase boundaries.
+    // When false, fall through to legacy 2-phase (PASSIVE_MM / MOMENTUM).
+    if (config.phase58Enabled) {
+      const phase58 = resolvePhase58(
+        slotEndMs, nowMs, config.slotWarmupMs, slotStartMs,
+        config.phaseBStartBeforeEndMs,
+        config.phaseCStartBeforeEndMs,
+        config.phaseDStartBeforeEndMs,
+        config.timeExitBeforeEndMs
+      );
+      // Log phase transitions (once per market per phase)
+      const lastPhase = this.lastPhase58.get(market.marketId);
+      if (lastPhase !== phase58) {
+        this.lastPhase58.set(market.marketId, phase58);
+        const yesShares = positionManager.getShares('YES');
+        const noShares = positionManager.getShares('NO');
+        logger.info(`VS Phase 58 transition: ${lastPhase ?? '(init)'} → ${phase58}`, {
+          marketId: market.marketId,
+          coin,
+          remainingMs: slotEndMs - nowMs,
+          inventory: { YES: yesShares, NO: noShares },
+          spotPrice,
+          strikePrice,
+          movePct: roundTo(((spotPrice - strikePrice) / strikePrice) * 100, 4),
+        });
+      }
+
+      if (phase58 === 'TAKE_PROFIT' || phase58 === 'EXIT' || phase58 === 'NONE') {
+        return [];
+      }
+
+      if (phase58 === 'EARLY_MM') {
+        if (!config.mmPhaseEnabled) return [];
+        return this.generatePassiveMMSignals(
+          market, orderbook, positionManager, config, coin, fairValueUp,
+          fairValueDown, spotPrice, strikePrice, slotEndMs, slotStartMs,
+          params.vsSizeMultiplier ?? 1, nowMs
+        );
+      }
+
+      if (phase58 === 'ACCUMULATE') {
+        return this.generateAccumulateSignals(
+          market, orderbook, positionManager, config, coin,
+          fairValueUp, fairValueDown, spotPrice, strikePrice,
+          slotEndMs, slotStartMs, params.vsSizeMultiplier ?? 1, nowMs
+        );
+      }
+
+      if (phase58 === 'CONTINUATION') {
+        if (!config.phaseCTakerEnabled) {
+          this.recordDecision(coin, 'SKIP', 'MOMENTUM',
+            'phase_c_taker_disabled', null);
+          return [];
+        }
+        // Override max-buy-price with Phase C cap (default 0.70, vs legacy 0.85).
+        // Everything else (edge threshold, size, etc.) stays identical.
+        const phaseCConfig: VsEngineConfig = {
+          ...config,
+          momentumMaxBuyPrice: config.phaseCMaxBuyPrice,
+        };
+        return this.generateMomentumSignals(
+          market, orderbook, positionManager, phaseCConfig, coin, fairValueUp,
+          fairValueDown, rawVol, spotPrice, strikePrice, slotEndMs, slotStartMs,
+          params.vsSizeMultiplier ?? 1, nowMs
+        );
+      }
+
+      return [];
+    }
+
+    /* ── Legacy 2-phase routing (phase58Enabled=false) ─────────────── */
+
     if (phase === 'PASSIVE_MM') {
       // Phase 52: skip MM entirely when disabled. With 180ms latency,
       // 100% of maker fills are staleQuote=true → toxic flow.
@@ -989,6 +1067,142 @@ export class VsEngine {
     }
 
     return [];
+  }
+
+  /* ── Phase 58: ACCUMULATE — tilted maker on Binance-indicated side ─ */
+
+  /** Tracks last observed phase58 per market for transition logging. */
+  private readonly lastPhase58 = new Map<string, VsPhase58>();
+
+  /**
+   * Generate ACCUMULATE signal: one-sided limit BID on the Binance-indicated
+   * winning outcome, with directional tilt that pushes the bid closer to mid
+   * (higher fill probability). This is the 65%-of-PnL phase per DS3.
+   *
+   * Rules:
+   * - Requires meaningful Binance direction (|movePct| >= minDirectionThreshold).
+   * - Max cumulative fills capped via totalShares >= accumulateShares × accumulateMaxFills.
+   * - Refill cadence enforced via accumulateRefillDelayMs (reuses lastEntryMs map).
+   * - Complete-set protection: skip if already holding opposite outcome.
+   * - Does NOT increment entriesPerSlot cap — ACCUMULATE is multi-fill by design.
+   */
+  private generateAccumulateSignals(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot,
+    positionManager: PositionManager,
+    config: VsEngineConfig,
+    coin: string,
+    fairValueUp: number,
+    fairValueDown: number,
+    spotPrice: number,
+    strikePrice: number,
+    slotEndMs: number,
+    slotStartMs: number,
+    sizeMultiplier: number,
+    nowMs: number
+  ): StrategySignal[] {
+    // Refill cadence (overrides default cooldownMs for ACCUMULATE).
+    const lastEntry = this.lastEntryMs.get(market.marketId);
+    if (lastEntry && nowMs - lastEntry < config.accumulateRefillDelayMs) {
+      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+        `accumulate_refill_wait ${roundTo((nowMs - lastEntry) / 1000, 1)}s/${config.accumulateRefillDelayMs / 1000}s`, null);
+      return [];
+    }
+
+    // Binance direction
+    const movePct = ((spotPrice - strikePrice) / strikePrice) * 100;
+    const absMove = Math.abs(movePct);
+
+    // Require meaningful direction — ACCUMULATE is directional by definition.
+    if (absMove < config.minDirectionThreshold) {
+      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+        `accumulate_no_direction move=${roundTo(movePct, 4)}%`, fairValueUp);
+      return [];
+    }
+
+    const binanceUp = movePct > 0;
+    const outcome: Outcome = binanceUp ? 'YES' : 'NO';
+    const mid = outcome === 'YES'
+      ? (orderbook.yes.midPrice ?? 0.50)
+      : (orderbook.no.midPrice ?? 0.50);
+    const outcomeFV = outcome === 'YES' ? fairValueUp : fairValueDown;
+
+    // Skip near-resolved markets
+    if (mid < 0.10 || mid > 0.90) {
+      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+        `accumulate_market_resolved ${outcome} mid=${roundTo(mid, 3)}`, outcomeFV);
+      return [];
+    }
+
+    // Complete-set protection — no entry if holding opposite side
+    if (this.hasPosition(market.marketId)
+        && !this.hasPositionForOutcome(market.marketId, outcome)) {
+      const heldSide = outcome === 'YES' ? 'NO' : 'YES';
+      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+        `accumulate_holding_opposite_${heldSide}`, outcomeFV);
+      return [];
+    }
+
+    // Cumulative-fill cap per side: accumulateShares × accumulateMaxFills.
+    // Use positionManager (source of truth for filled shares).
+    const currentShares = positionManager.getShares(outcome);
+    const cap = config.accumulateShares * config.accumulateMaxFills;
+    if (currentShares >= cap) {
+      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+        `accumulate_cap_reached ${outcome} ${currentShares}/${cap}`, outcomeFV);
+      return [];
+    }
+
+    // Tilted maker bid: tilt scales with |movePct|, capped by accumulateTiltMaxCents.
+    // On winner side, bid is pulled UP toward mid (narrower spread → higher fill rate).
+    const tiltCents = Math.min(absMove * 0.01, config.accumulateTiltMaxCents);
+    const bidPrice = roundTo(
+      Math.max(mid - config.mmSpreadCents + tiltCents, config.mmMinPrice),
+      2
+    );
+
+    // Price guard (legacy bounds still apply)
+    if (bidPrice < config.minEntryPrice || bidPrice > config.maxEntryPrice) {
+      this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+        `accumulate_price_out ${outcome} bid=${bidPrice}`, outcomeFV);
+      return [];
+    }
+
+    // Balance check
+    const shares = Math.round(config.accumulateShares * sizeMultiplier);
+    if (config.preflightBalanceCheck && this.availableUsdcBalance !== null) {
+      const cost = shares * bidPrice;
+      const budget = this.availableUsdcBalance * 0.9;
+      if (cost > budget) {
+        this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+          `accumulate_insufficient_balance cost=${roundTo(cost, 2)} budget=${roundTo(budget, 2)}`, outcomeFV);
+        return [];
+      }
+    }
+
+    this.recordDecision(coin, 'ENTRY', 'PASSIVE_MM',
+      `ACCUMULATE ${outcome} bid=${bidPrice} mid=${roundTo(mid, 3)} tilt=${roundTo(tiltCents, 4)} move=${roundTo(movePct, 3)}% fills=${currentShares}/${cap}`,
+      outcomeFV);
+
+    // Mark refill cadence. Do NOT increment entriesPerSlot — ACCUMULATE is
+    // intentionally multi-fill. Fills are counted via onEntryFill (totalEntries).
+    this.lastEntryMs.set(market.marketId, nowMs);
+
+    return [this.buildSignal({
+      market,
+      orderbook,
+      signalType: 'VS_MM_BID',
+      action: 'BUY',
+      outcome,
+      shares,
+      targetPrice: bidPrice,
+      fairValue: outcomeFV,
+      urgency: 'passive',
+      reason: `VS Phase 58 ACCUMULATE ${outcome}: bid=${bidPrice} mid=${roundTo(mid, 3)} tilt=+${roundTo(tiltCents, 4)} binance=${roundTo(movePct, 3)}% FV=${roundTo(outcomeFV, 3)} (fills ${currentShares}/${cap})`,
+      reduceOnly: false,
+      priority: 810,
+      edgeAmount: outcomeFV - bidPrice,
+    })];
   }
 
   /* ── Phase 1: Passive MM (Binance-skewed inventory accumulation) ─── */

@@ -1774,6 +1774,11 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         env.VS_HOLD_WINNERS_TO_RESOLUTION,
         true
       ),
+      // Phase 58: master opt-in for 4-phase entry routing. When false,
+      // generateSignals uses legacy 2-phase (PASSIVE_MM / MOMENTUM).
+      // When true: EARLY_MM / ACCUMULATE / CONTINUATION / TAKE_PROFIT / EXIT.
+      // Default false — foundation commit (asymmetric exits) is independent.
+      phase58Enabled: parseBoolean(env.VS_PHASE58_ENABLED, false),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
