@@ -1157,10 +1157,14 @@ export class VsEngine {
       : (orderbook.no.midPrice ?? 0.50);
     const outcomeFV = outcome === 'YES' ? fairValueUp : fairValueDown;
 
-    // Skip near-resolved markets
-    if (mid < 0.10 || mid > 0.90) {
+    // Skip near-resolved markets. Upper ceiling is 0.95 (not 0.90) when
+    // holdWinnersToResolution=true: buying winner at 0.92 and holding to $1
+    // redeem yields 8¢ in ~2 min, which is the core Phase-B thesis. Only
+    // truly-resolved markets (>0.95) are skipped to avoid last-tick bagholding.
+    const midCeiling = config.holdWinnersToResolution ? 0.95 : 0.90;
+    if (mid < 0.10 || mid > midCeiling) {
       this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
-        `accumulate_market_resolved ${outcome} mid=${roundTo(mid, 3)}`, outcomeFV);
+        `accumulate_market_resolved ${outcome} mid=${roundTo(mid, 3)} ceil=${midCeiling}`, outcomeFV);
       return [];
     }
 
