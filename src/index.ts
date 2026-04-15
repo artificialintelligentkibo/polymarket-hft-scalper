@@ -2039,11 +2039,14 @@ export class MarketMakerRuntime {
         for (const sig of vsEntrySignals) signals.push(sig);
       }
       // Always allow VS exits (even if OBI claimed)
+      // Phase 58: pass binanceEdge so time-exit can skip winners (asymmetric
+      // take-profit — winners redeem @ $1, only losers dumped @ bestBid).
       const vsExitSignals = this.vsEngine.generateExitSignals({
         market,
         orderbook,
         positionManager,
         config: config.vsEngine,
+        binanceFeed: this.binanceEdge,
       });
       for (const sig of vsExitSignals) signals.push(sig);
     }

@@ -149,6 +149,21 @@ export interface VsEngineConfig {
   /** Phase 57: cent-based dyn-exit threshold for aggressor-origin positions.
    *  Wider than MM cut to absorb PM-gamma near 0.35. 0 = disabled. */
   readonly aggDynExitLossCents: number;
+  /** Phase 58: 4-phase model boundaries (ms before slot end). */
+  readonly phaseBStartBeforeEndMs: number;   // A→B transition (default T-120)
+  readonly phaseCStartBeforeEndMs: number;   // B→C transition (default T-60)
+  readonly phaseDStartBeforeEndMs: number;   // C→D transition (default T-30)
+  /** Phase 58: Phase C taker fallback toggle + price cap. */
+  readonly phaseCTakerEnabled: boolean;
+  readonly phaseCMaxBuyPrice: number;
+  /** Phase 58: ACCUMULATE (Phase B) tilted-maker config. */
+  readonly accumulateShares: number;
+  readonly accumulateMaxFills: number;
+  readonly accumulateRefillDelayMs: number;
+  readonly accumulateTiltMaxCents: number;
+  /** Phase 58: asymmetric take-profit — hold winners past time-exit, let
+   *  resolution redeem @ $1. Only losers are dumped @ bestBid. */
+  readonly holdWinnersToResolution: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -263,6 +278,64 @@ export function resolvePhase(
   if (remaining <= timeExitBeforeEndMs) return 'EXIT';
   if (remaining <= momentumPhaseMs) return 'MOMENTUM';
   return 'PASSIVE_MM';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Phase 58: 4-phase model per DS3 (Feb 17-19) analysis.              */
+/*                                                                     */
+/*  A  T-300 → T-120   EARLY_MM      mid-anchored, spread 6¢, both sides
+/*  B  T-120 → T-60    ACCUMULATE    tilted maker, Binance side — 65% PnL
+/*  C  T-60  → T-30    CONTINUATION  taker fallback if B underweight
+/*  D  T-30  → T-exit  TAKE_PROFIT   sell losers @bid, HOLD winners
+/*        T-exit → end EXIT          force flatten losers only
+/* ------------------------------------------------------------------ */
+
+export type VsPhase58 =
+  | 'NONE'
+  | 'EARLY_MM'
+  | 'ACCUMULATE'
+  | 'CONTINUATION'
+  | 'TAKE_PROFIT'
+  | 'EXIT';
+
+export function resolvePhase58(
+  slotEndMs: number,
+  nowMs: number,
+  warmupMs: number,
+  slotStartMs: number,
+  phaseBStartBeforeEndMs: number,
+  phaseCStartBeforeEndMs: number,
+  phaseDStartBeforeEndMs: number,
+  timeExitBeforeEndMs: number
+): VsPhase58 {
+  const elapsed = nowMs - slotStartMs;
+  const remaining = slotEndMs - nowMs;
+
+  if (elapsed < warmupMs) return 'NONE';
+  if (remaining <= timeExitBeforeEndMs) return 'EXIT';
+  if (remaining <= phaseDStartBeforeEndMs) return 'TAKE_PROFIT';
+  if (remaining <= phaseCStartBeforeEndMs) return 'CONTINUATION';
+  if (remaining <= phaseBStartBeforeEndMs) return 'ACCUMULATE';
+  return 'EARLY_MM';
+}
+
+/**
+ * Phase 58: determine whether a given outcome is the "winner" side per
+ * current Binance spot vs slot-open strike. Used by asymmetric take-profit
+ * to decide which positions to HOLD (winners → $1 redeem) vs dump @ bestBid.
+ *
+ * Returns null if Binance data unavailable (caller should fall back to legacy
+ * symmetric time-exit).
+ */
+export function isWinnerSide(
+  outcome: Outcome,
+  spotPrice: number | null,
+  strikePrice: number | null
+): boolean | null {
+  if (spotPrice == null || strikePrice == null) return null;
+  if (spotPrice === strikePrice) return null; // exact tie — treat as unknown
+  const spotAboveStrike = spotPrice > strikePrice;
+  return outcome === 'YES' ? spotAboveStrike : !spotAboveStrike;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1229,9 +1302,12 @@ export class VsEngine {
     orderbook: MarketOrderbookSnapshot;
     positionManager: PositionManager;
     config: VsEngineConfig;
+    /** Phase 58: optional Binance feed for winner/loser detection at
+     *  asymmetric take-profit. When omitted, time-exit is symmetric (legacy). */
+    binanceFeed?: VsBinanceFeed;
     nowMs?: number;
   }): StrategySignal[] {
-    const { market, orderbook, positionManager, config } = params;
+    const { market, orderbook, positionManager, config, binanceFeed } = params;
     const nowMs = params.nowMs ?? Date.now();
     const signals: StrategySignal[] = [];
 
@@ -1347,8 +1423,42 @@ export class VsEngine {
       // Phase 50: ALWAYS exit — even at 0.01. Holding to resolution = $0.00.
       // Selling at 0.01 × 6 = $0.06 recovered vs $0.00 at resolution.
       // The old min_price guard at 0.05 caused 135 stuck positions overnight.
+      //
+      // Phase 58: ASYMMETRIC take-profit. If holdWinnersToResolution=true AND
+      // we can determine winner via Binance spot vs strike, SKIP time-exit on
+      // the winning side — let settlement redeem @ $1 instead of dumping @bid.
+      // Only losers are dumped (cash recovery). Per DS3: VS holds 46% inventory
+      // to resolution precisely for this reason.
       if (remaining <= config.timeExitBeforeEndMs) {
         if (!bestBid) continue;
+
+        if (config.holdWinnersToResolution && binanceFeed) {
+          const coin = extractCoin(market.title);
+          if (coin) {
+            const spot = binanceFeed.getLatestPrice(coin);
+            // position.strikePrice was captured at fill time; fall back to
+            // slot-open lookup if missing (defensive — should always be set).
+            const strike = position.strikePrice > 0
+              ? position.strikePrice
+              : binanceFeed.getSlotOpenPrice(coin, market.startTime ?? null);
+            const winner = isWinnerSide(position.outcome, spot, strike);
+            if (winner === true) {
+              // HOLD — skip time-exit. Settlement will redeem @ $1.
+              logger.info('VS Phase 58: HOLD winner past time-exit', {
+                marketId: market.marketId,
+                outcome: position.outcome,
+                coin,
+                spot,
+                strike,
+                shares: liveShares,
+                bestBid,
+                remainingMs: remaining,
+                expectedRedeem: liveShares, // $1 × shares
+              });
+              continue;
+            }
+          }
+        }
 
         this.totalExitSignals += 1;
         signals.push(this.buildSignal({

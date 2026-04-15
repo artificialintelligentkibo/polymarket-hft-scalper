@@ -1725,6 +1725,55 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.VS_AGG_DYN_EXIT_LOSS_CENTS, '0.05')
       ),
+      // Phase 58: 4-phase model per DS3 analysis.
+      // A: T-300 → -phaseBStartMs    → EARLY_MM (mid-anchored, both sides)
+      // B: -phaseBStartMs → -phaseCStartMs  → ACCUMULATE (tilted maker, Binance side)  — 65% PnL
+      // C: -phaseCStartMs → -phaseDStartMs  → CONTINUATION (taker fallback, capped price)
+      // D: -phaseDStartMs → -timeExitBeforeEndMs → TAKE_PROFIT (sell losers, hold winners)
+      phaseBStartBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_PHASE_B_START_BEFORE_END_MS, '120000')
+      ),
+      phaseCStartBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_PHASE_C_START_BEFORE_END_MS, '60000')
+      ),
+      phaseDStartBeforeEndMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_PHASE_D_START_BEFORE_END_MS, '30000')
+      ),
+      // Phase 58: Phase C taker fallback — only fires if Phase B accumulation
+      // failed to fill target inventory. Tighter price cap than old aggressor.
+      phaseCTakerEnabled: parseBoolean(env.VS_PHASE_C_TAKER_ENABLED, true),
+      phaseCMaxBuyPrice: clamp(
+        parseFloatOrDefault(env.VS_PHASE_C_MAX_BUY_PRICE, '0.70'),
+        0.50,
+        0.98
+      ),
+      // Phase 58: ACCUMULATE phase (B) config — tilted maker quotes.
+      accumulateShares: Math.max(
+        1,
+        parseIntOrDefault(env.VS_ACCUMULATE_SHARES, '6')
+      ),
+      accumulateMaxFills: Math.max(
+        1,
+        parseIntOrDefault(env.VS_ACCUMULATE_MAX_FILLS, '4')
+      ),
+      accumulateRefillDelayMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_ACCUMULATE_REFILL_DELAY_MS, '5000')
+      ),
+      accumulateTiltMaxCents: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_ACCUMULATE_TILT_MAX_CENTS, '0.05')
+      ),
+      // Phase 58: asymmetric take-profit. When true, VS_TIME_EXIT SKIPS the
+      // winning side (determined by Binance spot vs strike at T-exit) and lets
+      // paper/real settlement redeem @ $1. Only losers are dumped @ bestBid.
+      holdWinnersToResolution: parseBoolean(
+        env.VS_HOLD_WINNERS_TO_RESOLUTION,
+        true
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
