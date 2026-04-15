@@ -6100,11 +6100,17 @@ export class MarketMakerRuntime {
       const slotHasEnded = slotEndMsForExit > 0 && Date.now() >= slotEndMsForExit;
       const minBidForCross = config.vsEngine.dynExitMinBidForCross;
       if (!slotHasEnded && minBidForCross > 0 && bestBid < minBidForCross) {
+        // Phase 58K: apply floor-fallback cooldown so WS ticks don't re-trigger
+        // this abort every second. Reuses the same cooldown map as Phase 56
+        // limit_at_floor; first abort logs + starts cooldown, subsequent ticks
+        // during cooldown are silently skipped at the vs-engine gate.
         logger.warn('Phase 57: dyn exit ABORTED — bestBid below absolute floor', {
           marketId, outcome, entryVwap: roundTo(entryVwap, 4),
           bestBid: roundTo(bestBid, 4), minBidForCross,
+          cooldownMs: config.vsEngine.dynExitFloorCooldownMs,
         });
         this.vsEngine.incrementDynExitFallbackSkipped();
+        this.vsEngine.markFloorFallback(marketId, outcome);
         this.vsEngine.clearPendingDynamicExit(marketId, outcome);
         return;
       }
