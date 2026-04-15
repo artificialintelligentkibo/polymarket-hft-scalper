@@ -1487,9 +1487,13 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // Phase 52: disable MM phase when latency makes maker quotes toxic.
       // With 180ms avg latency, 100% of fills are staleQuote=true.
       mmPhaseEnabled: parseBoolean(env.VS_MM_PHASE_ENABLED, true),
+      // Phase 57: default bumped 0.02 → 0.06. At 180ms latency, a 2-4¢ spread
+      // is fully absorbed by adverse selection (every fill is staleQuote=true).
+      // 6¢ spread gives the MM a realistic shot at spread capture vs VS's 50ms
+      // latency at 2-3¢.
       mmSpreadCents: Math.max(
         0.005,
-        parseFloatOrDefault(env.VS_MM_SPREAD_CENTS, '0.02')
+        parseFloatOrDefault(env.VS_MM_SPREAD_CENTS, '0.06')
       ),
       mmMinPrice: clamp(
         parseFloatOrDefault(env.VS_MM_MIN_PRICE, '0.10'),
@@ -1700,6 +1704,27 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       dynExitFallbackMode: (
         (env.VS_DYN_EXIT_FALLBACK_MODE ?? 'limit_at_floor').trim().toLowerCase()
       ) as 'limit_at_floor' | 'skip' | 'cross',
+      // Phase 57: hard safety — if PM bestBid drops below this absolute floor,
+      // never cross regardless of entryVwap or fallback mode. Stops catastrophic
+      // dumps on thin books (e.g. bestBid 0.042 from entry 0.37). Time-exit
+      // becomes the only remaining unwinder. 0 = disabled.
+      dynExitMinBidForCross: clamp(
+        parseFloatOrDefault(env.VS_DYN_EXIT_MIN_BID_FOR_CROSS, '0.20'),
+        0,
+        0.99
+      ),
+      // Phase 57: split dyn-exit cent thresholds by entry source. MM positions
+      // (maker fills near 0.50) can tolerate tighter -3¢ cut; aggressor positions
+      // (cross buys near 0.35) need wider -5¢ to absorb PM gamma. Values ≤ 0
+      // disable the cent-based guard (legacy dynamic-pct path only).
+      mmDynExitLossCents: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_MM_DYN_EXIT_LOSS_CENTS, '0.03')
+      ),
+      aggDynExitLossCents: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_AGG_DYN_EXIT_LOSS_CENTS, '0.05')
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),

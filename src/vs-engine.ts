@@ -139,6 +139,16 @@ export interface VsEngineConfig {
    *  - 'skip'           → abort dyn exit, let time-exit flatten later
    *  - 'cross'          → legacy behaviour (dump @bid, catastrophic slippage) */
   readonly dynExitFallbackMode: 'limit_at_floor' | 'skip' | 'cross';
+  /** Phase 57: absolute minimum bestBid for crossing on dyn-exit. Overrides
+   *  floor pct — if bestBid < this, skip cross regardless of entryVwap and
+   *  fallback mode (time-exit becomes the only unwinder). 0 = disabled. */
+  readonly dynExitMinBidForCross: number;
+  /** Phase 57: cent-based dyn-exit threshold for MM-origin positions. If
+   *  entryVwap - bestBid ≥ this, trigger dyn exit. 0 = disabled. */
+  readonly mmDynExitLossCents: number;
+  /** Phase 57: cent-based dyn-exit threshold for aggressor-origin positions.
+   *  Wider than MM cut to absorb PM-gamma near 0.35. 0 = disabled. */
+  readonly aggDynExitLossCents: number;
 }
 
 /* ------------------------------------------------------------------ */

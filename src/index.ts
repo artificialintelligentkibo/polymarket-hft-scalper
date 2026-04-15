@@ -6081,6 +6081,21 @@ export class MarketMakerRuntime {
       const outcomeBook = outcome === 'YES' ? exitBook.yes : exitBook.no;
       const bestBid = outcomeBook.bestBid ?? 0.01;
 
+      // Phase 57: hard floor — never cross below absolute bid threshold.
+      // This is stricter than the entry-relative floor: stops catastrophic
+      // dumps like bestBid=0.042 where even entry*0.5 fallback would still
+      // fill at a terrible price. Time-exit becomes the only unwinder.
+      const minBidForCross = config.vsEngine.dynExitMinBidForCross;
+      if (minBidForCross > 0 && bestBid < minBidForCross) {
+        logger.warn('Phase 57: dyn exit ABORTED — bestBid below absolute floor', {
+          marketId, outcome, entryVwap: roundTo(entryVwap, 4),
+          bestBid: roundTo(bestBid, 4), minBidForCross,
+        });
+        this.vsEngine.incrementDynExitFallbackSkipped();
+        this.vsEngine.clearPendingDynamicExit(marketId, outcome);
+        return;
+      }
+
       // Phase 56: slippage-floor check. If bestBid dropped below entry*floorPct,
       // the thin PM book would dump at a catastrophic fill (e.g. 0.37→0.042).
       // Fallback: place passive limit @floor instead of cross-through.
