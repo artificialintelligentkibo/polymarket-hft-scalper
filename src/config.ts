@@ -1461,6 +1461,14 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0.01,
         1.0
       ),
+      // Phase 59 (2026-04-15): post-entry hard-stop grace period. Default 6s
+      // — long enough for a thin-book re-quote after an aggressive cross,
+      // short enough that a real runaway still gets caught within the slot.
+      // Set to 0 to restore pre-59 behaviour (hard-stop active from tick 1).
+      hardStopGraceMs: Math.max(
+        0,
+        parseIntOrDefault(env.OBI_HARD_STOP_GRACE_MS, '6000')
+      ),
     },
     vsEngine: {
       enabled: parseBoolean(env.VS_ENGINE_ENABLED, false),

@@ -51,6 +51,7 @@ function baseConfig(overrides: Partial<ObiEngineConfig> = {}): ObiEngineConfig {
     maxRiskPerTradePct: 1.0, // no cap in tests by default
     timeTakeProfitMs: 0, // disabled in tests by default
     timeTakeProfitMinEdge: 0.005,
+    hardStopGraceMs: 0, // Phase 59: disabled in tests for deterministic hard-stop
     ...overrides,
   };
 }

@@ -143,6 +143,18 @@ export interface ObiEngineConfig {
    * fees would eat the "profit". Only relevant when timeTakeProfitMs > 0.
    */
   readonly timeTakeProfitMinEdge: number;
+  /**
+   * Phase 59 (2026-04-15): post-entry hard-stop grace period (ms). During the
+   * first `hardStopGraceMs` after fill the emergency hard-stop is suppressed
+   * on BOTH paths (candidate loop + sweep). Rationale: when OBI crosses into
+   * a thin ask we consume the only liquidity on that side, and `bestBid`
+   * briefly collapses to a stale far-away level. Live incident 2026-04-15
+   * 16:00 DOGE: entry @ 0.495, bestBid snapped to 0.27 within 360ms, hard
+   * stop fired, sold -$9.01 — yet the market resolved YES at 0.84+. The
+   * hard-stop was evaluating our own impact, not a real loss. Grace of
+   * 5-8s lets the book re-quote. Set to 0 to disable (legacy behaviour).
+   */
+  readonly hardStopGraceMs: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1349,7 +1361,15 @@ export class ObiEngine {
     // === Hard PnL stop ===
     // Exit immediately when the position is more than `hardStopUsd` underwater.
     // This is the safety net that prevents -$5 redemptions.
-    if (livePnlUsd <= -config.hardStopUsd && bestBid !== null) {
+    //
+    // Phase 59: suppress hard-stop for `hardStopGraceMs` after entry. After an
+    // aggressive cross entry our own order consumed the thin side; bestBid
+    // can briefly snap to a stale far level that isn't a real tradable price.
+    // Let the book re-quote before we panic-sell into our own impact.
+    const sinceEntryMs = nowMs - position.enteredAtMs;
+    const withinHardStopGrace =
+      config.hardStopGraceMs > 0 && sinceEntryMs < config.hardStopGraceMs;
+    if (livePnlUsd <= -config.hardStopUsd && bestBid !== null && !withinHardStopGrace) {
       if (config.shadowMode) {
         this.totalShadowDecisions += 1;
         logger.info('OBI engine (shadow) would hard-stop', {
@@ -1624,6 +1644,16 @@ export class ObiEngine {
       );
 
       if (livePnlUsd > -config.hardStopUsd) continue;
+
+      // Phase 59: same grace as candidate-loop path. During the first
+      // hardStopGraceMs after entry, bestBid may be a stale level left over
+      // after we crossed a thin ask; it is not a real tradable price.
+      if (
+        config.hardStopGraceMs > 0
+        && nowMs - position.enteredAtMs < config.hardStopGraceMs
+      ) {
+        continue;
+      }
 
       // Throttle repeat emits.
       const lastEmit = this.lastOrphanEmitMs.get(marketId);
