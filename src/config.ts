@@ -1713,6 +1713,14 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         0.99
       ),
+      // Phase 58F: cooldown after limit-at-floor fallback is placed. Prevents
+      // WS-driven duplicate limit submissions while the first passive order
+      // sits unfilled on the book. Default 15s — short enough to retry if the
+      // market recovers, long enough to stop the spam loop observed in prod.
+      dynExitFloorCooldownMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_DYN_EXIT_FLOOR_COOLDOWN_MS, '15000')
+      ),
       // Phase 57: split dyn-exit cent thresholds by entry source. MM positions
       // (maker fills near 0.50) can tolerate tighter -3¢ cut; aggressor positions
       // (cross buys near 0.35) need wider -5¢ to absorb PM gamma. Values ≤ 0

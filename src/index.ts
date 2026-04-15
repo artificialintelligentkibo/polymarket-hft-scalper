@@ -6017,7 +6017,9 @@ export class MarketMakerRuntime {
     if (exitThreshold <= 0) return;
 
     const positionsToExit = this.vsEngine.getDynamicExitPositions(
-      coin, price, exitThreshold, config.vsEngine.dynExitMinHoldMs
+      coin, price, exitThreshold,
+      config.vsEngine.dynExitMinHoldMs,
+      config.vsEngine.dynExitFloorCooldownMs
     );
     if (positionsToExit.length === 0) return;
 
@@ -6123,10 +6125,14 @@ export class MarketMakerRuntime {
 
       if (useLimitAtFloor) {
         this.vsEngine.incrementDynExitFallbackLimit();
+        // Phase 58F: start cooldown so WS ticks don't re-trigger while the
+        // passive limit sits on the book unfilled.
+        this.vsEngine.markFloorFallback(marketId, outcome);
         logger.warn('Phase 56: dyn exit FALLBACK — bestBid below floor, placing limit @floor', {
           marketId, outcome, entryVwap: roundTo(entryVwap, 4),
           bestBid: roundTo(bestBid, 4), floor: roundTo(floor, 4),
           floorPct,
+          cooldownMs: config.vsEngine.dynExitFloorCooldownMs,
         });
       } else {
         this.vsEngine.incrementDynExitCrossFilled();

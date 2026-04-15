@@ -143,6 +143,11 @@ export interface VsEngineConfig {
    *  floor pct — if bestBid < this, skip cross regardless of entryVwap and
    *  fallback mode (time-exit becomes the only unwinder). 0 = disabled. */
   readonly dynExitMinBidForCross: number;
+  /** Phase 58F: cooldown (ms) after placing a limit-at-floor fallback during
+   *  dyn-exit. Within this window, new dyn-exit triggers are suppressed for
+   *  the same (marketId, outcome). Prevents the WS-loop from re-submitting
+   *  duplicate passive limits while the first one waits to fill. 0 = disabled. */
+  readonly dynExitFloorCooldownMs: number;
   /** Phase 57: cent-based dyn-exit threshold for MM-origin positions. If
    *  entryVwap - bestBid ≥ this, trigger dyn exit. 0 = disabled. */
   readonly mmDynExitLossCents: number;
@@ -403,6 +408,9 @@ export class VsEngine {
   private readonly lastOrphanEmitMs = new Map<string, number>();
   /** Phase 51: positions currently being exited by dynamic exit (prevents re-trigger) */
   private readonly pendingDynamicExits = new Set<string>();
+  /** Phase 58F: last time a limit-at-floor fallback was placed for a position.
+   *  Used to suppress dyn-exit re-triggers while a passive limit sits on the book. */
+  private readonly lastFloorFallbackMs = new Map<string, number>();
   private availableUsdcBalance: number | null = null;
 
   /* ── Session stats ─────────────────────────────────────────────── */
@@ -662,7 +670,8 @@ export class VsEngine {
     coin: string,
     currentBinancePrice: number,
     thresholdPct: number,
-    minHoldMs: number = 0
+    minHoldMs: number = 0,
+    floorCooldownMs: number = 0
   ): Array<{
     marketId: string;
     outcome: Outcome;
@@ -684,6 +693,15 @@ export class VsEngine {
       if (pos.binancePriceAtEntry <= 0) continue;
       // Skip if already pending dynamic exit (async execution in flight)
       if (this.pendingDynamicExits.has(key)) continue;
+      // Phase 58F: skip if a limit-at-floor fallback was recently placed. The
+      // passive limit is still live on the book; re-triggering here would
+      // submit a duplicate limit every WS tick. Cooldown expires naturally.
+      if (floorCooldownMs > 0) {
+        const lastFallback = this.lastFloorFallbackMs.get(key);
+        if (lastFallback !== undefined && now - lastFallback < floorCooldownMs) {
+          continue;
+        }
+      }
 
       // Signed delta: positive = price went UP, negative = price went DOWN
       const signedDeltaPct = ((currentBinancePrice - pos.binancePriceAtEntry)
@@ -732,6 +750,12 @@ export class VsEngine {
   /** Phase 51: mark position as pending dynamic exit (prevents re-trigger from WS ticks) */
   markPendingDynamicExit(marketId: string, outcome: Outcome): void {
     this.pendingDynamicExits.add(this.positionKey(marketId, outcome));
+  }
+
+  /** Phase 58F: record that a limit-at-floor fallback was just placed for this
+   *  position. Triggers the dyn-exit cooldown window (see getDynamicExitPositions). */
+  markFloorFallback(marketId: string, outcome: Outcome, nowMs: number = Date.now()): void {
+    this.lastFloorFallbackMs.set(this.positionKey(marketId, outcome), nowMs);
   }
 
   /** Phase 51: clear pending dynamic exit flag (call after exit completes or fails) */
@@ -852,12 +876,15 @@ export class VsEngine {
       // Phase 45a: clear specific outcome position
       this.positions.delete(this.positionKey(marketId, outcome));
       this.pendingDynamicExits.delete(this.positionKey(marketId, outcome));
+      this.lastFloorFallbackMs.delete(this.positionKey(marketId, outcome));
     } else {
       // Clear both outcomes
       this.positions.delete(this.positionKey(marketId, 'YES'));
       this.positions.delete(this.positionKey(marketId, 'NO'));
       this.pendingDynamicExits.delete(this.positionKey(marketId, 'YES'));
       this.pendingDynamicExits.delete(this.positionKey(marketId, 'NO'));
+      this.lastFloorFallbackMs.delete(this.positionKey(marketId, 'YES'));
+      this.lastFloorFallbackMs.delete(this.positionKey(marketId, 'NO'));
     }
     this.lastFairValues.delete(marketId);
     // Phase 47b: do NOT delete lastEntryMs or lastLosingExitMs here.
