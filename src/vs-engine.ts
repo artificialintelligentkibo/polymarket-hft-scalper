@@ -118,6 +118,27 @@ export interface VsEngineConfig {
   readonly reversalEnabled: boolean;
   readonly reversalMinBinanceMovePct: number;
   readonly reversalMaxBuyPrice: number;
+  /** Phase 54: max aggressor entries per (marketId = slot). Re-entry cycling
+   *  was the #1 source of catastrophic losses — 2-3 small maker wins wiped
+   *  out by a single late-slot entry that crashed into time-exit. Capping
+   *  at 1 stops the cascade at the root. */
+  readonly maxEntriesPerSlot: number;
+  /** Phase 55: minimum hold time (ms) before dynamic exit can fire. Prevents
+   *  noise-panic when Binance ticks past threshold within seconds of entry,
+   *  before maker-ask had a chance to fill. Data: 6/8 dyn exits <12s = 100% loss. */
+  readonly dynExitMinHoldMs: number;
+  /** Phase 55: coins excluded from VS engine (e.g. ['DOGE']). Used for
+   *  structurally toxic coins where signal:PM-gamma ratio is catastrophic. */
+  readonly coinBlacklist: readonly string[];
+  /** Phase 56: minimum exit price as fraction of entryVwap. If bestBid < this,
+   *  dynamic exit falls back to limit-at-floor (or skip) instead of crossing
+   *  a thin book. 0 = disabled (legacy cross). Typical value: 0.50. */
+  readonly dynExitMinPriceFloorPct: number;
+  /** Phase 56: behaviour when bestBid drops below floor:
+   *  - 'limit_at_floor' → place passive SELL @ entry*floorPct (default)
+   *  - 'skip'           → abort dyn exit, let time-exit flatten later
+   *  - 'cross'          → legacy behaviour (dump @bid, catastrophic slippage) */
+  readonly dynExitFallbackMode: 'limit_at_floor' | 'skip' | 'cross';
 }
 
 /* ------------------------------------------------------------------ */
@@ -285,6 +306,9 @@ export class VsEngine {
   /* ── Position tracking ─────────────────────────────────────────── */
   private readonly positions = new Map<string, VsPosition>();
   private readonly lastEntryMs = new Map<string, number>();
+  /** Phase 54: count of entry signals emitted per marketId (slot).
+   *  Used to cap re-entry cycling. Resets in clearMarketState on slot purge. */
+  private readonly entriesPerSlot = new Map<string, number>();
   /** Phase 36: last computed fair value per market (for slot replay). */
   private readonly lastFairValues = new Map<string, number>();
   private readonly lastLosingExitMs = new Map<string, number>();
@@ -306,6 +330,10 @@ export class VsEngine {
   private phase2Entries = 0;
   private staleCancels = 0;
   private dynamicExits = 0;
+  // Phase 56: slippage-floor diagnostic counters
+  private dynExitCrossFilled = 0;       // bestBid >= floor → normal cross
+  private dynExitFallbackLimit = 0;     // bestBid < floor → placed limit @floor
+  private dynExitFallbackSkipped = 0;   // bestBid < floor + mode=skip
   private pmExits = 0;
   private reversals = 0;
   private phase2Pnl = 0;
@@ -543,7 +571,8 @@ export class VsEngine {
   getDynamicExitPositions(
     coin: string,
     currentBinancePrice: number,
-    thresholdPct: number
+    thresholdPct: number,
+    minHoldMs: number = 0
   ): Array<{
     marketId: string;
     outcome: Outcome;
@@ -578,13 +607,17 @@ export class VsEngine {
         : signedDeltaPct > thresholdPct;
 
       if (isAgainst) {
+        const holdAgeMs = now - pos.enteredAtMs;
+        // Phase 55: skip if position is younger than minHoldMs — gives maker-ask
+        // a chance to fill before panic-exit on Binance noise
+        if (holdAgeMs < minHoldMs) continue;
         toExit.push({
           marketId: pos.marketId,
           outcome: pos.outcome,
           entryVwap: pos.entryVwap,
           shares: pos.totalShares,
           binanceDeltaPct: signedDeltaPct,
-          holdAgeMs: now - pos.enteredAtMs,
+          holdAgeMs,
         });
       }
     }
@@ -595,6 +628,11 @@ export class VsEngine {
   incrementDynamicExits(): void {
     this.dynamicExits += 1;
   }
+
+  /** Phase 56: record outcome of dyn-exit floor check */
+  incrementDynExitCrossFilled(): void { this.dynExitCrossFilled += 1; }
+  incrementDynExitFallbackLimit(): void { this.dynExitFallbackLimit += 1; }
+  incrementDynExitFallbackSkipped(): void { this.dynExitFallbackSkipped += 1; }
 
   /** Phase 53: increment reversal counter for dashboard stats */
   incrementReversals(): void {
@@ -758,6 +796,13 @@ export class VsEngine {
     const coin = extractCoin(market.title);
     if (!coin) return [];
 
+    // Phase 55C: coin blacklist — structurally toxic coins (e.g. DOGE with
+    // tick-size:PM-gamma ratio causing catastrophic slippage on thin books)
+    if (config.coinBlacklist.includes(coin)) {
+      this.recordDecision(coin, 'SKIP', 'NONE', 'coin_blacklisted', null);
+      return [];
+    }
+
     // Time checks
     const slotEndMs = market.endTime ? new Date(market.endTime).getTime() : null;
     const slotStartMs = market.startTime ? new Date(market.startTime).getTime() : null;
@@ -772,6 +817,17 @@ export class VsEngine {
     // Cooldown
     const lastEntry = this.lastEntryMs.get(market.marketId);
     if (lastEntry && nowMs - lastEntry < config.cooldownMs) return [];
+
+    // Phase 54: per-slot entry cap — prevent re-entry cycling within the
+    // same 5-min slot. Single biggest source of losses: 2-3 maker wins
+    // followed by one late-slot entry crashing into time-exit.
+    if (config.maxEntriesPerSlot > 0) {
+      const entryCount = this.entriesPerSlot.get(market.marketId) ?? 0;
+      if (entryCount >= config.maxEntriesPerSlot) {
+        this.recordDecision(coin, 'SKIP', phase, `slot_entry_cap(${entryCount}/${config.maxEntriesPerSlot})`, null);
+        return [];
+      }
+    }
 
     // Losing exit cooldowns
     const lastLoss = this.lastLosingExitMs.get(market.marketId);
@@ -993,6 +1049,8 @@ export class VsEngine {
 
       // Lock cooldown on signal GENERATION
       this.lastEntryMs.set(market.marketId, nowMs);
+      // Phase 54: increment per-slot entry count
+      this.entriesPerSlot.set(market.marketId, (this.entriesPerSlot.get(market.marketId) ?? 0) + 1);
 
       // Phase 47c: track quote placement for adverse selection diagnostics
       this.trackQuotePlacement(market.marketId, outcome, bidPrice, spotPrice, coin);
@@ -1134,6 +1192,8 @@ export class VsEngine {
 
     // Lock cooldown on signal GENERATION
     this.lastEntryMs.set(market.marketId, nowMs);
+    // Phase 54: increment per-slot entry count
+    this.entriesPerSlot.set(market.marketId, (this.entriesPerSlot.get(market.marketId) ?? 0) + 1);
 
     return [this.buildSignal({
       market,
@@ -1611,6 +1671,11 @@ export class VsEngine {
       staleCancels: this.staleCancels,
       dynamicExitThresholdPct: config.dynamicExitThresholdPct,
       dynamicExits: this.dynamicExits,
+      dynExitCrossFilled: this.dynExitCrossFilled,
+      dynExitFallbackLimit: this.dynExitFallbackLimit,
+      dynExitFallbackSkipped: this.dynExitFallbackSkipped,
+      dynExitMinPriceFloorPct: config.dynExitMinPriceFloorPct,
+      dynExitFallbackMode: config.dynExitFallbackMode,
       pmExitThresholdCents: config.pmExitThresholdCents,
       pmExits: this.pmExits,
       reversalEnabled: config.reversalEnabled,

@@ -1666,6 +1666,40 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseIntOrDefault(env.VS_MIN_WARMUP_TICKS, '3')
       ),
+      // Phase 54: max aggressor entries per slot (marketId). 1 = no re-entry.
+      // Data showed re-entry cycling was the dominant loss source: 2-3 small
+      // maker wins wiped out by one late-slot re-entry crashing to time-exit.
+      maxEntriesPerSlot: Math.max(
+        0,
+        parseIntOrDefault(env.VS_MAX_ENTRIES_PER_SLOT, '1')
+      ),
+      // Phase 55A: min hold time before dynamic exit fires (ms). Prevents
+      // noise-panic in first seconds when maker-ask hasn't had chance to fill.
+      dynExitMinHoldMs: Math.max(
+        0,
+        parseIntOrDefault(env.VS_DYN_EXIT_MIN_HOLD_MS, '15000')
+      ),
+      // Phase 55C: coin blacklist for VS engine (comma-separated, e.g. "DOGE").
+      // DOGE default-excluded: tick-size:PM-gamma ratio causes catastrophic
+      // slippage on thin books (4/6 largest losses were DOGE).
+      coinBlacklist: (env.VS_COIN_BLACKLIST ?? 'DOGE')
+        .split(',')
+        .map((s) => s.trim().toUpperCase())
+        .filter((s) => s.length > 0),
+      // Phase 56: slippage floor for dynamic exit. If bestBid < entry*floorPct,
+      // the thin-book cross would dump at catastrophic price (e.g. XRP @0.042
+      // from entry 0.37). Instead, place a passive limit SELL @floor and let
+      // time-exit act as the final safety net. 0 = disabled (legacy cross).
+      dynExitMinPriceFloorPct: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_DYN_EXIT_MIN_PRICE_FLOOR_PCT, '0.50')
+      ),
+      // Phase 56: fallback mode when bestBid < floor. 'limit_at_floor' submits
+      // a passive limit SELL @ entry*floorPct. 'skip' aborts the exit and lets
+      // time-exit flatten later. 'cross' preserves legacy behaviour (dump @bid).
+      dynExitFallbackMode: (
+        (env.VS_DYN_EXIT_FALLBACK_MODE ?? 'limit_at_floor').trim().toLowerCase()
+      ) as 'limit_at_floor' | 'skip' | 'cross',
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),

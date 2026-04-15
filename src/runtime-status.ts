@@ -266,6 +266,12 @@ export interface VsSessionStats {
   readonly staleCancels: number;
   readonly dynamicExitThresholdPct: number;
   readonly dynamicExits: number;
+  // Phase 56: slippage-floor diagnostics
+  readonly dynExitCrossFilled: number;
+  readonly dynExitFallbackLimit: number;
+  readonly dynExitFallbackSkipped: number;
+  readonly dynExitMinPriceFloorPct: number;
+  readonly dynExitFallbackMode: 'limit_at_floor' | 'skip' | 'cross';
   readonly pmExitThresholdCents: number;
   readonly pmExits: number;
   readonly reversalEnabled: boolean;

@@ -6013,7 +6013,9 @@ export class MarketMakerRuntime {
     const exitThreshold = config.vsEngine.dynamicExitThresholdPct;
     if (exitThreshold <= 0) return;
 
-    const positionsToExit = this.vsEngine.getDynamicExitPositions(coin, price, exitThreshold);
+    const positionsToExit = this.vsEngine.getDynamicExitPositions(
+      coin, price, exitThreshold, config.vsEngine.dynExitMinHoldMs
+    );
     if (positionsToExit.length === 0) return;
 
     for (const pos of positionsToExit) {
@@ -6079,6 +6081,39 @@ export class MarketMakerRuntime {
       const outcomeBook = outcome === 'YES' ? exitBook.yes : exitBook.no;
       const bestBid = outcomeBook.bestBid ?? 0.01;
 
+      // Phase 56: slippage-floor check. If bestBid dropped below entry*floorPct,
+      // the thin PM book would dump at a catastrophic fill (e.g. 0.37→0.042).
+      // Fallback: place passive limit @floor instead of cross-through.
+      const floorPct = config.vsEngine.dynExitMinPriceFloorPct;
+      const floor = floorPct > 0 ? entryVwap * floorPct : 0;
+      const floorBreached = floorPct > 0 && bestBid < floor;
+      const fallbackMode = config.vsEngine.dynExitFallbackMode;
+
+      if (floorBreached && fallbackMode === 'skip') {
+        logger.warn('Phase 56: dyn exit SKIPPED — bestBid below floor', {
+          marketId, outcome, entryVwap: roundTo(entryVwap, 4),
+          bestBid: roundTo(bestBid, 4), floor: roundTo(floor, 4),
+          floorPct,
+        });
+        this.vsEngine.incrementDynExitFallbackSkipped();
+        this.vsEngine.clearPendingDynamicExit(marketId, outcome);
+        return;
+      }
+
+      const useLimitAtFloor = floorBreached && fallbackMode === 'limit_at_floor';
+      const exitPrice = useLimitAtFloor ? floor : bestBid;
+
+      if (useLimitAtFloor) {
+        this.vsEngine.incrementDynExitFallbackLimit();
+        logger.warn('Phase 56: dyn exit FALLBACK — bestBid below floor, placing limit @floor', {
+          marketId, outcome, entryVwap: roundTo(entryVwap, 4),
+          bestBid: roundTo(bestBid, 4), floor: roundTo(floor, 4),
+          floorPct,
+        });
+      } else {
+        this.vsEngine.incrementDynExitCrossFilled();
+      }
+
       const slotKey = getSlotKey(market);
       const exitSignal: StrategySignal = {
         marketId,
@@ -6090,12 +6125,12 @@ export class MarketMakerRuntime {
         outcome,
         outcomeIndex: outcome === 'YES' ? 0 : 1,
         shares: liveShares,
-        targetPrice: bestBid,
-        referencePrice: bestBid,
+        targetPrice: exitPrice,
+        referencePrice: exitPrice,
         tokenPrice: outcomeBook.midPrice,
         midPrice: outcomeBook.midPrice,
         fairValue: null,
-        edgeAmount: bestBid - entryVwap,
+        edgeAmount: exitPrice - entryVwap,
         combinedBid: exitBook.combined.combinedBid,
         combinedAsk: exitBook.combined.combinedAsk,
         combinedMid: exitBook.combined.combinedMid,
@@ -6104,9 +6139,11 @@ export class MarketMakerRuntime {
         fillRatio: 1,
         capitalClamp: 1,
         priceMultiplier: 1,
-        urgency: 'cross',
+        urgency: useLimitAtFloor ? 'passive' : 'cross',
         reduceOnly: true,
-        reason: `Phase 51: dynamic exit — Binance moved ${roundTo(binanceDeltaPct, 3)}% against ${outcome}, selling @${bestBid}`,
+        reason: useLimitAtFloor
+          ? `Phase 56: dyn exit fallback — bestBid ${roundTo(bestBid, 4)} < floor ${roundTo(floor, 4)} (entry=${roundTo(entryVwap, 4)}), passive limit @floor`
+          : `Phase 51: dynamic exit — Binance moved ${roundTo(binanceDeltaPct, 3)}% against ${outcome}, selling @${bestBid}`,
         strategyLayer: 'VS_ENGINE',
       } as StrategySignal;
 
@@ -6115,11 +6152,19 @@ export class MarketMakerRuntime {
 
       await this.executeSignal(market, exitBook, pm, exitSignal, slotKey);
 
-      // Record VS exit stats
+      // Phase 56: when fallback-limit is placed, the order is passive and may
+      // not fill. Do NOT record synchronous exit stats or trigger reversal —
+      // the limit is still live. Stats will reconcile via fill tracker, or
+      // VS_TIME_EXIT will flatten later. The position stays open intentionally.
+      if (useLimitAtFloor) {
+        return;
+      }
+
+      // Record VS exit stats (cross path — assumed immediate fill at bestBid)
       const exitCoin = extractCoinFromTitle(market.title);
       const vsPos = this.vsEngine.getPosition(marketId, outcome);
       const realEntryVwap = vsPos?.entryVwap ?? entryVwap;
-      const realizedDelta = (bestBid - realEntryVwap) * liveShares;
+      const realizedDelta = (exitPrice - realEntryVwap) * liveShares;
       this.vsEngine.recordExitForStats(exitCoin, realizedDelta, 'VS_DYNAMIC_EXIT');
       const remainingShares = pm.getShares(outcome);
       if (remainingShares <= 0) {
