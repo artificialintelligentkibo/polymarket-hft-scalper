@@ -175,6 +175,14 @@ export interface VsEngineConfig {
    *  doesn't know yet (flow, sentiment, external news); if the gap is large,
    *  our FV is stale and we'd be buying consensus-losing side. 0 = disabled. */
   readonly accumulateMaxFvMidDivergence: number;
+  /** Phase 58M: PM mid drift cancel — when an ACCUMULATE quote's PM mid
+   *  has drifted DOWN by this many cents since placement, cancel the quote.
+   *  Catches stale bids that became toxic (bid above current mid). */
+  readonly accumulatePmMidDriftCancel: number;
+  /** Phase 58N: TAKE_PROFIT aggressive scalp — cross @bestBid in Phase D
+   *  window when profitable, rather than leaving passive maker-ask. */
+  readonly takeProfitAggressiveEnabled: boolean;
+  readonly takeProfitAggressiveMinEdge: number;
   /** Phase 58: asymmetric take-profit — hold winners past time-exit, let
    *  resolution redeem @ $1. Only losers are dumped @ bestBid. */
   readonly holdWinnersToResolution: boolean;
@@ -463,6 +471,10 @@ export class VsEngine {
     bidPrice: number;
     outcome: Outcome;
     coin: string;
+    /** Phase 58M: PM mid at quote placement — for mid-drift stale cancel. */
+    quotedMid: number;
+    /** Phase 58M: phase tag so drift check only applies to ACCUMULATE. */
+    phase: 'MM' | 'ACCUMULATE';
   }>();
   /** Per-slot diagnostic accumulators (keyed by marketId) */
   private readonly slotDiagnostics = new Map<string, {
@@ -491,7 +503,8 @@ export class VsEngine {
   /** Call when a VS_MM_BID signal is generated — records quote placement metadata */
   trackQuotePlacement(
     marketId: string, outcome: Outcome, bidPrice: number,
-    binancePrice: number, coin: string
+    binancePrice: number, coin: string,
+    quotedMid = bidPrice, phase: 'MM' | 'ACCUMULATE' = 'MM'
   ): void {
     const key = this.positionKey(marketId, outcome);
     this.quoteMeta.set(key, {
@@ -500,6 +513,8 @@ export class VsEngine {
       bidPrice,
       outcome,
       coin,
+      quotedMid,
+      phase,
     });
     // Increment slot diagnostics
     const diag = this.getOrCreateSlotDiag(marketId);
@@ -663,6 +678,56 @@ export class VsEngine {
       }
     }
     return stale;
+  }
+
+  /**
+   * Phase 58M: Check ACCUMULATE quotes where PM mid has drifted by more than
+   * threshold from the mid observed when the quote was placed. Catches the
+   * scenario where a stale bid becomes toxic — e.g. bid @ 0.32 placed when
+   * mid=0.355, but 30 seconds later mid=0.30 and our bid is NOW above mid,
+   * guaranteeing adverse fill.
+   *
+   * Called from the per-market scan loop (where we already have orderbook).
+   */
+  getPmMidDriftQuotes(
+    marketId: string,
+    yesMid: number,
+    noMid: number,
+    threshold: number
+  ): Array<{
+    outcome: Outcome;
+    quoteAgeMs: number;
+    quotedMid: number;
+    currentMid: number;
+    midDrift: number;
+    bidPrice: number;
+  }> {
+    if (threshold <= 0) return [];
+    const drifted: Array<{
+      outcome: Outcome; quoteAgeMs: number; quotedMid: number;
+      currentMid: number; midDrift: number; bidPrice: number;
+    }> = [];
+    const now = Date.now();
+
+    for (const [key, meta] of this.quoteMeta) {
+      if (meta.phase !== 'ACCUMULATE') continue;
+      if (!key.startsWith(marketId)) continue;
+
+      const currentMid = meta.outcome === 'YES' ? yesMid : noMid;
+      // Only cancel on DOWNWARD drift (mid fell) — upward drift is in our favor.
+      const drift = meta.quotedMid - currentMid;
+      if (drift >= threshold) {
+        drifted.push({
+          outcome: meta.outcome,
+          quoteAgeMs: now - meta.placedAtMs,
+          quotedMid: meta.quotedMid,
+          currentMid,
+          midDrift: drift,
+          bidPrice: meta.bidPrice,
+        });
+      }
+    }
+    return drifted;
   }
 
   /**
@@ -1270,6 +1335,9 @@ export class VsEngine {
     // intentionally multi-fill. Fills are counted via onEntryFill (totalEntries).
     this.lastEntryMs.set(market.marketId, nowMs);
 
+    // Phase 58M: track quote placement with PM mid for drift-cancel detection.
+    this.trackQuotePlacement(market.marketId, outcome, bidPrice, spotPrice, coin, mid, 'ACCUMULATE');
+
     return [this.buildSignal({
       market,
       orderbook,
@@ -1795,6 +1863,56 @@ export class VsEngine {
           edgeAmount: bestBid - position.entryVwap,
         }));
         continue;
+      }
+
+      // Phase 58N: TAKE_PROFIT aggressive scalp. When inside Phase D window
+      // (T-30s → T-exit) AND position is profitable beyond threshold, cross
+      // @bestBid immediately rather than leaving passive maker-ask to decay.
+      // Rationale: observed ETH trade had bestBid peak ~0.34-0.35 (entry 0.32)
+      // but maker-ask never filled; Binance reversed → PM crashed 0.01 → stuck
+      // with passive ask. Aggressive cross locks in the profit while it exists.
+      //
+      // Winner-hold interaction: when holdWinnersToResolution=true AND Binance
+      // says winner, SKIP aggressive sell — redeem @ $1 beats any bestBid.
+      if (
+        config.takeProfitAggressiveEnabled
+        && bestBid
+        && bestBid >= position.entryVwap + config.takeProfitAggressiveMinEdge
+        && remaining <= config.phaseDStartBeforeEndMs
+        && remaining > config.timeExitBeforeEndMs
+      ) {
+        let isWinner = false;
+        if (config.holdWinnersToResolution && binanceFeed) {
+          const coin = extractCoin(market.title);
+          if (coin) {
+            const spot = binanceFeed.getLatestPrice(coin);
+            const strike = binanceFeed.getSlotOpenPrice(coin, market.startTime ?? null);
+            if (isWinnerSide(position.outcome, spot, strike) === true) {
+              isWinner = true;
+            }
+          }
+        }
+
+        if (!isWinner) {
+          this.totalExitSignals += 1;
+          const profit = roundTo((bestBid - position.entryVwap) * liveShares, 2);
+          signals.push(this.buildSignal({
+            market,
+            orderbook,
+            signalType: 'VS_SCALP_EXIT',
+            action: 'SELL',
+            outcome: position.outcome,
+            shares: liveShares,
+            targetPrice: bestBid,
+            fairValue: null,
+            urgency: 'cross',
+            reason: `VS Phase 58N TP-aggressive: ${outcome} bid=${bestBid} >= entry+${config.takeProfitAggressiveMinEdge} (entry=${roundTo(position.entryVwap, 3)} profit=+${profit} remaining=${roundTo(remaining / 1000, 1)}s)`,
+            reduceOnly: true,
+            priority: 965,
+            edgeAmount: bestBid - position.entryVwap,
+          }));
+          continue;
+        }
       }
 
       // MM ask: place resting sell above entry to capture profit.

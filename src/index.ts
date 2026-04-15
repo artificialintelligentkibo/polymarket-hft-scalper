@@ -2022,6 +2022,40 @@ export class MarketMakerRuntime {
         }
       }
 
+      // Phase 58M: PM mid drift cancel — before generating new ACCUMULATE
+      // quote, check if existing quote's PM mid has drifted DOWN beyond
+      // threshold. If yes, cancel the stale bid (it's now above current mid
+      // and guaranteed adverse fill).
+      if (config.vsEngine.accumulatePmMidDriftCancel > 0) {
+        const yesMid = orderbook.yes.midPrice ?? 0.50;
+        const noMid = orderbook.no.midPrice ?? 0.50;
+        const drifted = this.vsEngine.getPmMidDriftQuotes(
+          market.marketId,
+          yesMid,
+          noMid,
+          config.vsEngine.accumulatePmMidDriftCancel
+        );
+        for (const dq of drifted) {
+          const cancelled = await this.cancelStaleVsBuyQuotes(
+            market.marketId, dq.outcome
+          );
+          if (cancelled > 0) {
+            this.vsEngine.clearQuoteMeta(market.marketId, dq.outcome);
+            logger.info('Phase 58M: cancelled ACCUMULATE quote — PM mid drift', {
+              marketId: market.marketId,
+              outcome: dq.outcome,
+              quoteAgeMs: dq.quoteAgeMs,
+              quotedMid: roundTo(dq.quotedMid, 3),
+              currentMid: roundTo(dq.currentMid, 3),
+              midDrift: roundTo(dq.midDrift, 3),
+              threshold: config.vsEngine.accumulatePmMidDriftCancel,
+              bidPrice: dq.bidPrice,
+              cancelled,
+            });
+          }
+        }
+      }
+
       // Phase 35C: skip VS entries if OBI already claimed this market
       // Phase 43: skip VS entries if paper pending BUY orders already exist
       //   (prevents accumulating maker orders while previous ones haven't filled)

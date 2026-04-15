@@ -1796,6 +1796,25 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.VS_ACCUMULATE_MAX_FV_MID_DIVERGENCE, '0.10')
       ),
+      // Phase 58M: PM mid drift cancel. When an ACCUMULATE bid's PM mid
+      // drifts DOWN by this many cents since placement, cancel the quote.
+      // Prevents stale bid becoming adverse-selection bait. Default 0.02.
+      // Set to 0 to disable.
+      accumulatePmMidDriftCancel: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_ACCUMULATE_PM_MID_DRIFT_CANCEL, '0.02')
+      ),
+      // Phase 58N: TAKE_PROFIT aggressive scalp. In Phase D window, cross
+      // @bestBid when position profitable beyond minEdge, instead of passive
+      // maker-ask. Winner-hold takes precedence (redeem @ $1 beats bestBid).
+      takeProfitAggressiveEnabled: parseBoolean(
+        env.VS_TAKE_PROFIT_AGGRESSIVE_ENABLED,
+        true
+      ),
+      takeProfitAggressiveMinEdge: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_TAKE_PROFIT_AGGRESSIVE_MIN_EDGE, '0.03')
+      ),
       // Phase 58: asymmetric take-profit. When true, VS_TIME_EXIT SKIPS the
       // winning side (determined by Binance spot vs strike at T-exit) and lets
       // paper/real settlement redeem @ $1. Only losers are dumped @ bestBid.
