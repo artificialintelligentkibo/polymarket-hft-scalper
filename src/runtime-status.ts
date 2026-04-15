@@ -279,6 +279,14 @@ export interface VsSessionStats {
   readonly minWarmupTicks: number;
   readonly activePositions: readonly VsActivePosition[];
   readonly totalSignalsGenerated: number;
+  // Phase 58
+  readonly phase58Enabled: boolean;
+  readonly holdWinnersToResolution: boolean;
+  readonly winnerHolds: number;
+  readonly phaseCTakerEnabled: boolean;
+  readonly phaseCMaxBuyPrice: number;
+  readonly accumulateShares: number;
+  readonly accumulateMaxFills: number;
 }
 
 export interface RuntimeStatusSnapshot {

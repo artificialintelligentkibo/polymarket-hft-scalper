@@ -594,6 +594,27 @@ function renderVsSessionStats(stats: VsSessionStats): string {
       ['Dyn Floor', color.bold(`${((stats.dynExitMinPriceFloorPct ?? 0) * 100).toFixed(0)}% (${stats.dynExitFallbackMode ?? 'cross'})`), 'Dyn Cross/Fb/Skip', color.yellow(`${stats.dynExitCrossFilled ?? 0}/${stats.dynExitFallbackLimit ?? 0}/${stats.dynExitFallbackSkipped ?? 0}`)],
       ['PM Guard', color.bold(`${(stats.pmExitThresholdCents ?? 0.05).toFixed(2)}¢`), 'PM Exits', color.yellow(String(stats.pmExits ?? 0))],
       ['Signals Gen', color.dim(String(stats.totalSignalsGenerated ?? 0)), 'Active Pos', color.bold(String((stats.activePositions ?? []).length))],
+      // Phase 58 rows
+      [
+        'P58 Routing',
+        stats.phase58Enabled
+          ? color.cyan(stats.phaseCTakerEnabled ? 'A+B+C' : 'A+B (no taker)')
+          : color.dim('off (legacy)'),
+        'Hold Winners',
+        stats.holdWinnersToResolution ? color.green('ON') : color.red('OFF'),
+      ],
+      [
+        'Winner Holds',
+        color.green(String(stats.winnerHolds ?? 0)),
+        'Phase C Cap',
+        color.bold((stats.phaseCMaxBuyPrice ?? 0.85).toFixed(2)),
+      ],
+      [
+        'Accum Size',
+        color.bold(`${stats.accumulateShares ?? 6}×${stats.accumulateMaxFills ?? 4}`),
+        '',
+        '',
+      ],
     ]
   );
 }
@@ -871,9 +892,15 @@ function renderDashboardFrame(runtimeConfig: AppConfig): string {
   // VS Engine section — shown when vsStats is present (parallel to OBI)
   const vsStats = runtimeStatus?.vsStats;
   if (vsStats?.enabled) {
+    const p58Suffix = vsStats.phase58Enabled
+      ? color.cyan(vsStats.phaseCTakerEnabled ? ' [P58: A+B+C]' : ' [P58: A+B]')
+      : color.dim(' [P58: off]');
+    const holdSuffix = vsStats.holdWinnersToResolution
+      ? color.green(' [HOLD-WINNERS]')
+      : '';
     lines.push(
       renderSection(
-        `VS ENGINE  -  SINGLE-SIDE MM + AGGRESSOR ${vsStats.shadowMode ? color.yellow('[SHADOW]') : ''}`,
+        `VS ENGINE  -  SINGLE-SIDE MM + AGGRESSOR${p58Suffix}${holdSuffix} ${vsStats.shadowMode ? color.yellow('[SHADOW]') : ''}`,
         renderVsSessionStats(vsStats)
       )
     );

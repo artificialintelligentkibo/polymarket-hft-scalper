@@ -424,6 +424,9 @@ export class VsEngine {
   private pmExits = 0;
   private reversals = 0;
   private phase2Pnl = 0;
+  /** Phase 58: count of time-exits SKIPPED because position is on winner side.
+   *  Each skip means one position is held to resolution for expected $1 redeem. */
+  private winnerHolds = 0;
   private readonly coinStats = new Map<string, {
     entries: number;
     exits: number;
@@ -1658,6 +1661,7 @@ export class VsEngine {
             const winner = isWinnerSide(position.outcome, spot, strike);
             if (winner === true) {
               // HOLD — skip time-exit. Settlement will redeem @ $1.
+              this.winnerHolds += 1;
               logger.info('VS Phase 58: HOLD winner past time-exit', {
                 marketId: market.marketId,
                 outcome: position.outcome,
@@ -2017,6 +2021,14 @@ export class VsEngine {
       minWarmupTicks: config.minWarmupTicks,
       activePositions,
       totalSignalsGenerated: this.totalExitSignals + this.totalEntries,
+      // Phase 58
+      phase58Enabled: config.phase58Enabled,
+      holdWinnersToResolution: config.holdWinnersToResolution,
+      winnerHolds: this.winnerHolds,
+      phaseCTakerEnabled: config.phaseCTakerEnabled,
+      phaseCMaxBuyPrice: config.phaseCMaxBuyPrice,
+      accumulateShares: config.accumulateShares,
+      accumulateMaxFills: config.accumulateMaxFills,
     };
   }
 
