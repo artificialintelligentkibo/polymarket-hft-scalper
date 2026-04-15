@@ -6090,8 +6090,16 @@ export class MarketMakerRuntime {
       // This is stricter than the entry-relative floor: stops catastrophic
       // dumps like bestBid=0.042 where even entry*0.5 fallback would still
       // fill at a terrible price. Time-exit becomes the only unwinder.
+      //
+      // Phase 58J: OVERRIDE when slot has already ended — if we don't cross
+      // now the position resolves at $0 (loser) or relies on redeem path.
+      // The 34x spam loop we observed was WS ticks re-triggering this abort
+      // after slot expiry with no unwinder. When slotEndMs passed, cross at
+      // ANY bestBid > 0 to realize whatever salvage value exists.
+      const slotEndMsForExit = market.endTime ? new Date(market.endTime).getTime() : 0;
+      const slotHasEnded = slotEndMsForExit > 0 && Date.now() >= slotEndMsForExit;
       const minBidForCross = config.vsEngine.dynExitMinBidForCross;
-      if (minBidForCross > 0 && bestBid < minBidForCross) {
+      if (!slotHasEnded && minBidForCross > 0 && bestBid < minBidForCross) {
         logger.warn('Phase 57: dyn exit ABORTED — bestBid below absolute floor', {
           marketId, outcome, entryVwap: roundTo(entryVwap, 4),
           bestBid: roundTo(bestBid, 4), minBidForCross,
@@ -6099,6 +6107,13 @@ export class MarketMakerRuntime {
         this.vsEngine.incrementDynExitFallbackSkipped();
         this.vsEngine.clearPendingDynamicExit(marketId, outcome);
         return;
+      }
+      if (slotHasEnded && minBidForCross > 0 && bestBid < minBidForCross) {
+        logger.warn('Phase 58J: slot ended — overriding Phase 57 floor to flatten', {
+          marketId, outcome, entryVwap: roundTo(entryVwap, 4),
+          bestBid: roundTo(bestBid, 4), minBidForCross,
+          expiredSec: roundTo((Date.now() - slotEndMsForExit) / 1000, 1),
+        });
       }
 
       // Phase 56: slippage-floor check. If bestBid dropped below entry*floorPct,
@@ -6109,7 +6124,7 @@ export class MarketMakerRuntime {
       const floorBreached = floorPct > 0 && bestBid < floor;
       const fallbackMode = config.vsEngine.dynExitFallbackMode;
 
-      if (floorBreached && fallbackMode === 'skip') {
+      if (floorBreached && fallbackMode === 'skip' && !slotHasEnded) {
         logger.warn('Phase 56: dyn exit SKIPPED — bestBid below floor', {
           marketId, outcome, entryVwap: roundTo(entryVwap, 4),
           bestBid: roundTo(bestBid, 4), floor: roundTo(floor, 4),
@@ -6120,7 +6135,9 @@ export class MarketMakerRuntime {
         return;
       }
 
-      const useLimitAtFloor = floorBreached && fallbackMode === 'limit_at_floor';
+      // Phase 58J: when slot ended we MUST cross at bestBid — don't leave
+      // a passive limit @floor that will never fill post-expiry.
+      const useLimitAtFloor = floorBreached && fallbackMode === 'limit_at_floor' && !slotHasEnded;
       const exitPrice = useLimitAtFloor ? floor : bestBid;
 
       if (useLimitAtFloor) {
