@@ -487,6 +487,17 @@ export class MarketMakerRuntime {
           outcome: resolution.winningOutcome,
           payoutUsd: actualPayoutUsd,
         });
+        // Phase 58O/58P: emit shadow outcome events on real resolution.
+        try {
+          this.vsEngine.resolveShadowOutcomes(
+            lotteryMarketId,
+            resolution.winningOutcome
+          );
+        } catch (err) {
+          logger.debug('Shadow outcome resolution failed (redeem)', {
+            marketId: lotteryMarketId, err: String(err),
+          });
+        }
         if (result.found && Number.isFinite(result.pnl)) {
           const dayState = market
             ? recordSettlementPnl({
@@ -5351,6 +5362,33 @@ export class MarketMakerRuntime {
         spreadCaptured: slotDiag.spreadCaptured,
       });
     }
+    // Phase 58O/58P: resolve shadow outcomes BEFORE clearState drops them.
+    // Derive the winner from Binance (same basis paper resolution uses):
+    // slot_open_price vs latest_price. If we can't (no history, missing
+    // slot_open), drop shadow state silently via dropShadowState().
+    try {
+      const coinForShadow = market ? extractCoinFromTitle(market.title) : null;
+      const slotOpenForShadow = coinForShadow
+        ? this.binanceEdge.getSlotOpenPrice(coinForShadow, market?.startTime ?? null)
+        : null;
+      const latestForShadow = coinForShadow
+        ? this.binanceEdge.getLatestPrice(coinForShadow)
+        : null;
+      if (
+        slotOpenForShadow !== null
+        && latestForShadow !== null
+        && Number.isFinite(slotOpenForShadow)
+        && Number.isFinite(latestForShadow)
+      ) {
+        const shadowWinner: 'YES' | 'NO' =
+          latestForShadow >= slotOpenForShadow ? 'YES' : 'NO';
+        this.vsEngine.resolveShadowOutcomes(marketId, shadowWinner);
+      } else {
+        this.vsEngine.dropShadowState(marketId);
+      }
+    } catch {
+      this.vsEngine.dropShadowState(marketId);
+    }
     this.vsEngine.clearState(marketId);
     // Phase 46b: cancel any pending VS time-exit timers for this market
     for (const outcome of ['YES', 'NO'] as const) {
@@ -7665,6 +7703,16 @@ export class MarketMakerRuntime {
     }
 
     const winningOutcome: 'YES' | 'NO' = settlementPrice >= slotOpenPrice ? 'YES' : 'NO';
+    // Phase 58O/58P: emit shadow outcome events as soon as winner is known.
+    // Safe to call even if no shadow state exists (no-op). Must run before
+    // positions.delete() below so shadow state is still live.
+    try {
+      this.vsEngine.resolveShadowOutcomes(market.marketId, winningOutcome);
+    } catch (err) {
+      logger.debug('Shadow outcome resolution failed (paper)', {
+        marketId: market.marketId, err: String(err),
+      });
+    }
     const resolution = this.executor.resolvePaperSlot({
       marketId: market.marketId,
       marketTitle: market.title,

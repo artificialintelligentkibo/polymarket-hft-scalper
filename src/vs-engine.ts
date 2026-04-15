@@ -190,6 +190,16 @@ export interface VsEngineConfig {
    *  generateSignals uses legacy 2-phase (PASSIVE_MM / MOMENTUM).
    *  When true: EARLY_MM / ACCUMULATE / CONTINUATION / TAKE_PROFIT. */
   readonly phase58Enabled: boolean;
+  /** Phase 58O: shadow mean-reversion logger. Pure logging, no trades. */
+  readonly shadowMeanReversionEnabled: boolean;
+  readonly shadowMrExtremeHigh: number;       // e.g. 0.65
+  readonly shadowMrExtremeLow: number;        // e.g. 0.35
+  readonly shadowMrConsolidationPct: number;  // e.g. 0.02 (%)
+  readonly shadowMrLookbackMs: number;        // e.g. 15000
+  readonly shadowMrSize: number;              // e.g. 3 shares
+  /** Phase 58P: shadow divergence-skip logger. Pure logging. */
+  readonly shadowDivergenceSkipEnabled: boolean;
+  readonly shadowDivergenceSize: number;      // e.g. 6 shares
 }
 
 /* ------------------------------------------------------------------ */
@@ -429,6 +439,33 @@ export class VsEngine {
    *  Used to suppress dyn-exit re-triggers while a passive limit sits on the book. */
   private readonly lastFloorFallbackMs = new Map<string, number>();
   private availableUsdcBalance: number | null = null;
+
+  /* ── Phase 58O/58P: Shadow-logging state ─────────────────────────── */
+  /** One shadow-mean-reversion opportunity per market (fired at C→D). */
+  private readonly shadowMrOpps = new Map<string, {
+    readonly coin: string;
+    readonly extremeSide: 'YES_HIGH' | 'YES_LOW';
+    readonly bettingOn: Outcome;
+    readonly entryPrice: number;
+    readonly size: number;
+    readonly cost: number;
+    readonly placedAtMs: number;
+  }>();
+  /** Shadow divergence-skips keyed by `${marketId}:${outcome}` (may be many
+   *  per market since ACCUMULATE retries each scan). Store the LATEST skip. */
+  private readonly shadowDivergenceSkips = new Map<string, {
+    readonly coin: string;
+    readonly outcome: Outcome;
+    readonly wouldHaveBid: number;
+    readonly pmMid: number;
+    readonly fv: number;
+    readonly divergence: number;
+    readonly size: number;
+    readonly placedAtMs: number;
+  }>();
+  /** Track markets we've already logged a shadow-MR transition for, so we
+   *  don't re-emit on every tick while phase stays TAKE_PROFIT. */
+  private readonly shadowMrEmitted = new Set<string>();
 
   /* ── Session stats ─────────────────────────────────────────────── */
   private totalEntries = 0;
@@ -972,6 +1009,20 @@ export class VsEngine {
     this.lastPhase58.delete(marketId);
   }
 
+  /**
+   * Phase 58O/58P: called by the main loop as a last-resort cleanup when a
+   * market is torn down without a derivable winner (bot restart, no Binance
+   * history). Drops shadow state silently so no outcome event is emitted.
+   */
+  dropShadowState(marketId: string): void {
+    this.shadowMrOpps.delete(marketId);
+    this.shadowMrEmitted.delete(marketId);
+    const prefix = `${marketId}:`;
+    for (const key of Array.from(this.shadowDivergenceSkips.keys())) {
+      if (key.startsWith(prefix)) this.shadowDivergenceSkips.delete(key);
+    }
+  }
+
   /* ── Entry signal generation ────────────────────────────────────── */
 
   generateSignals(params: {
@@ -1105,6 +1156,23 @@ export class VsEngine {
           strikePrice,
           movePct: roundTo(((spotPrice - strikePrice) / strikePrice) * 100, 4),
         });
+
+        // Phase 58O: shadow mean-reversion check at CONTINUATION → TAKE_PROFIT.
+        // Pure logging. Hypothesis: when Binance is flat but PM yes-mid is
+        // extreme (>0.65 or <0.35), PM has overreacted — fading the extreme
+        // would pay. We log only; the outcome is recorded on slot resolution.
+        if (
+          config.shadowMeanReversionEnabled
+          && lastPhase === 'CONTINUATION'
+          && phase58 === 'TAKE_PROFIT'
+          && !this.shadowMrEmitted.has(market.marketId)
+        ) {
+          this.checkShadowMeanReversion(
+            market, orderbook, binanceFeed, coin,
+            spotPrice, strikePrice, slotEndMs, nowMs, config
+          );
+          this.shadowMrEmitted.add(market.marketId);
+        }
       }
 
       if (phase58 === 'TAKE_PROFIT' || phase58 === 'EXIT' || phase58 === 'NONE') {
@@ -1181,6 +1249,221 @@ export class VsEngine {
   /** Tracks last observed phase58 per market for transition logging. */
   private readonly lastPhase58 = new Map<string, VsPhase58>();
 
+  /* ── Phase 58O/58P: Shadow logging ─────────────────────────────── */
+
+  /**
+   * Phase 58O: shadow mean-reversion opportunity check. Called once per
+   * market at CONTINUATION → TAKE_PROFIT transition. Logs when Binance is
+   * consolidating (|Δ over lookback| < consolidationPct) AND PM yes-mid is
+   * at an extreme (> extremeHigh or < extremeLow). The counterfactual trade
+   * is fading the extreme (buy NO when PM overpriced YES, vice versa).
+   * Outcome event is emitted later by resolveShadowOutcomes().
+   */
+  private checkShadowMeanReversion(
+    market: MarketCandidate,
+    orderbook: MarketOrderbookSnapshot,
+    binanceFeed: VsBinanceFeed,
+    coin: string,
+    spotPrice: number,
+    strikePrice: number,
+    slotEndMs: number,
+    nowMs: number,
+    config: VsEngineConfig
+  ): void {
+    // Need at least `lookbackMs` of Binance history to compute Δ.
+    const history = binanceFeed.getPriceHistory(coin);
+    if (!history || history.length < 2) return;
+    const cutoff = nowMs - config.shadowMrLookbackMs;
+    // Find first tick at or after cutoff (history assumed ascending by time).
+    let oldestIdx = -1;
+    for (let i = 0; i < history.length; i += 1) {
+      if (history[i].recordedAtMs >= cutoff) {
+        oldestIdx = i;
+        break;
+      }
+    }
+    if (oldestIdx < 0 || oldestIdx >= history.length - 1) return;
+    const oldest = history[oldestIdx];
+    const latest = history[history.length - 1];
+    if (oldest.price <= 0) return;
+    const changePct = Math.abs(latest.price - oldest.price) / oldest.price * 100;
+    if (changePct >= config.shadowMrConsolidationPct) return;
+
+    // Need both sides quoted for shadow to be meaningful.
+    const yesBid = orderbook.yes.bestBid;
+    const yesAsk = orderbook.yes.bestAsk;
+    const noBid = orderbook.no.bestBid;
+    const noAsk = orderbook.no.bestAsk;
+    if (yesBid == null || yesAsk == null || noBid == null || noAsk == null) return;
+    const yesMid = (yesBid + yesAsk) / 2;
+    const noMid = (noBid + noAsk) / 2;
+
+    let extremeSide: 'YES_HIGH' | 'YES_LOW' | null = null;
+    let bettingOn: Outcome | null = null;
+    let entryPrice = 0;
+    if (yesMid > config.shadowMrExtremeHigh) {
+      extremeSide = 'YES_HIGH';
+      bettingOn = 'NO';
+      entryPrice = noAsk;
+    } else if (yesMid < config.shadowMrExtremeLow) {
+      extremeSide = 'YES_LOW';
+      bettingOn = 'YES';
+      entryPrice = yesAsk;
+    }
+    if (!extremeSide || !bettingOn) return;
+
+    const size = config.shadowMrSize;
+    const cost = roundTo(entryPrice * size, 4);
+    const spotStrikeDiffPct = strikePrice > 0
+      ? roundTo(((spotPrice - strikePrice) / strikePrice) * 100, 4)
+      : 0;
+
+    logger.info('VS SHADOW shadow_mean_reversion', {
+      event: 'shadow_mean_reversion',
+      marketId: market.marketId,
+      coin,
+      ts: new Date(nowMs).toISOString(),
+      remainingMs: slotEndMs - nowMs,
+      binance_price_now: latest.price,
+      binance_price_oldest: oldest.price,
+      binance_lookback_ms: latest.recordedAtMs - oldest.recordedAtMs,
+      binance_change_pct: roundTo(changePct, 4),
+      pm_yes_bid: yesBid,
+      pm_yes_ask: yesAsk,
+      pm_yes_mid: roundTo(yesMid, 4),
+      pm_no_bid: noBid,
+      pm_no_ask: noAsk,
+      pm_no_mid: roundTo(noMid, 4),
+      extreme_side: extremeSide,
+      shadow_betting_on: bettingOn,
+      shadow_entry_price: entryPrice,
+      shadow_size: size,
+      shadow_cost: cost,
+      spot_strike_diff_pct: spotStrikeDiffPct,
+    });
+
+    this.shadowMrOpps.set(market.marketId, {
+      coin,
+      extremeSide,
+      bettingOn,
+      entryPrice,
+      size,
+      cost,
+      placedAtMs: nowMs,
+    });
+  }
+
+  /**
+   * Phase 58P: log a counterfactual ACCUMULATE skip. Many skips may fire for
+   * the same market/outcome across a slot; we keep only the most recent so
+   * resolveShadowOutcomes() emits one outcome event per (marketId, outcome).
+   */
+  private logShadowDivergenceSkip(
+    market: MarketCandidate,
+    coin: string,
+    outcome: Outcome,
+    pmMid: number,
+    fv: number,
+    divergence: number,
+    wouldHaveBid: number,
+    size: number,
+    spotPrice: number,
+    strikePrice: number,
+    remainingMs: number,
+    nowMs: number
+  ): void {
+    const spotStrikeDiffPct = strikePrice > 0
+      ? roundTo(((spotPrice - strikePrice) / strikePrice) * 100, 4)
+      : 0;
+    logger.info('VS SHADOW shadow_pm_fv_divergence_skip', {
+      event: 'shadow_pm_fv_divergence_skip',
+      marketId: market.marketId,
+      coin,
+      ts: new Date(nowMs).toISOString(),
+      remainingMs,
+      outcome,
+      pm_mid: roundTo(pmMid, 4),
+      fv: roundTo(fv, 4),
+      divergence: roundTo(divergence, 4),
+      would_have_bid: wouldHaveBid,
+      shadow_size: size,
+      shadow_cost: roundTo(wouldHaveBid * size, 4),
+      spot_strike_diff_pct: spotStrikeDiffPct,
+    });
+    this.shadowDivergenceSkips.set(`${market.marketId}:${outcome}`, {
+      coin,
+      outcome,
+      wouldHaveBid,
+      pmMid,
+      fv,
+      divergence,
+      size,
+      placedAtMs: nowMs,
+    });
+  }
+
+  /**
+   * Phase 58O/58P: emit paired outcome events when a slot resolves, then
+   * drop the shadow state. Safe to call multiple times — second call is
+   * a no-op for already-consumed markets. `winningOutcome` is the
+   * Binance-derived winner (same basis as paper resolution uses).
+   */
+  resolveShadowOutcomes(marketId: string, winningOutcome: Outcome): void {
+    const mr = this.shadowMrOpps.get(marketId);
+    if (mr) {
+      const correct = mr.bettingOn === winningOutcome;
+      const pnl = correct
+        ? roundTo(mr.size - mr.cost, 4)   // redeem @ $1 per share
+        : roundTo(-mr.cost, 4);           // total loss
+      logger.info('VS SHADOW shadow_mean_reversion_outcome', {
+        event: 'shadow_mean_reversion_outcome',
+        marketId,
+        coin: mr.coin,
+        ts: new Date().toISOString(),
+        winning_outcome: winningOutcome,
+        extreme_side: mr.extremeSide,
+        shadow_betting_on: mr.bettingOn,
+        shadow_entry_price: mr.entryPrice,
+        shadow_size: mr.size,
+        shadow_cost: mr.cost,
+        shadow_correct: correct,
+        shadow_pnl: pnl,
+      });
+      this.shadowMrOpps.delete(marketId);
+    }
+
+    // Divergence-skip outcomes: emit one per tracked (marketId, outcome).
+    const prefix = `${marketId}:`;
+    const keysToDelete: string[] = [];
+    for (const [key, skip] of this.shadowDivergenceSkips) {
+      if (!key.startsWith(prefix)) continue;
+      keysToDelete.push(key);
+      const correct = skip.outcome === winningOutcome;
+      const cost = roundTo(skip.wouldHaveBid * skip.size, 4);
+      const pnl = correct
+        ? roundTo(skip.size - cost, 4)
+        : roundTo(-cost, 4);
+      logger.info('VS SHADOW shadow_pm_fv_divergence_skip_outcome', {
+        event: 'shadow_pm_fv_divergence_skip_outcome',
+        marketId,
+        coin: skip.coin,
+        ts: new Date().toISOString(),
+        winning_outcome: winningOutcome,
+        outcome: skip.outcome,
+        pm_mid: roundTo(skip.pmMid, 4),
+        fv: roundTo(skip.fv, 4),
+        divergence: roundTo(skip.divergence, 4),
+        would_have_bid: skip.wouldHaveBid,
+        shadow_size: skip.size,
+        shadow_cost: cost,
+        shadow_correct: correct,
+        shadow_pnl: pnl,
+      });
+    }
+    for (const k of keysToDelete) this.shadowDivergenceSkips.delete(k);
+    this.shadowMrEmitted.delete(marketId);
+  }
+
   /**
    * Generate ACCUMULATE signal: one-sided limit BID on the Binance-indicated
    * winning outcome, with directional tilt that pushes the bid closer to mid
@@ -1256,6 +1539,20 @@ export class VsEngine {
         this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
           `accumulate_fv_mid_divergence mid=${roundTo(mid, 3)} fv=${roundTo(outcomeFV, 3)} div=${roundTo(divergence, 3)} max=${config.accumulateMaxFvMidDivergence}`,
           outcomeFV);
+        // Phase 58P: shadow-log the skip. Counterfactual "what if we'd taken
+        // this" — resolution event tells us whether the 58L guard was
+        // correct (shadow loss) or too tight (shadow profit).
+        if (config.shadowDivergenceSkipEnabled) {
+          const counterfactualBid = roundTo(
+            Math.max(mid - config.mmSpreadCents, config.mmMinPrice),
+            3
+          );
+          this.logShadowDivergenceSkip(
+            market, coin, outcome, mid, outcomeFV, divergence,
+            counterfactualBid, config.shadowDivergenceSize,
+            spotPrice, strikePrice, slotEndMs - nowMs, nowMs
+          );
+        }
         return [];
       }
     }

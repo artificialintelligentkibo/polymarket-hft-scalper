@@ -1827,6 +1827,48 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // When true: EARLY_MM / ACCUMULATE / CONTINUATION / TAKE_PROFIT / EXIT.
       // Default false — foundation commit (asymmetric exits) is independent.
       phase58Enabled: parseBoolean(env.VS_PHASE58_ENABLED, false),
+      // Phase 58O: shadow-mean-reversion logger. Pure logging, zero side
+      // effects. Fires at CONTINUATION → TAKE_PROFIT transition when Binance
+      // is consolidating (|Δ| < consolidationPct) AND PM yes-mid is extreme
+      // (> extremeHigh or < extremeLow). Emits a JSONL event with full
+      // context + a matching outcome event at slot resolution, so an
+      // offline analyzer can compute win-rate and shadow PnL.
+      shadowMeanReversionEnabled: parseBoolean(
+        env.VS_SHADOW_MEAN_REVERSION_ENABLED,
+        true
+      ),
+      shadowMrExtremeHigh: Math.max(
+        0,
+        Math.min(1, parseFloatOrDefault(env.VS_SHADOW_MR_EXTREME_HIGH, '0.65'))
+      ),
+      shadowMrExtremeLow: Math.max(
+        0,
+        Math.min(1, parseFloatOrDefault(env.VS_SHADOW_MR_EXTREME_LOW, '0.35'))
+      ),
+      shadowMrConsolidationPct: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_SHADOW_MR_CONSOLIDATION_PCT, '0.02')
+      ),
+      shadowMrLookbackMs: Math.max(
+        1_000,
+        parseFloatOrDefault(env.VS_SHADOW_MR_LOOKBACK_MS, '15000')
+      ),
+      shadowMrSize: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_SHADOW_MR_SIZE, '3')
+      ),
+      // Phase 58P: shadow-divergence-skip logger. Each time 58L aborts an
+      // ACCUMULATE entry due to PM-FV divergence exceeding threshold, log
+      // what we DIDN'T take. Outcome event at resolution tells us whether
+      // our guard was correct (shadow loss) or too tight (shadow profit).
+      shadowDivergenceSkipEnabled: parseBoolean(
+        env.VS_SHADOW_DIVERGENCE_SKIP_ENABLED,
+        true
+      ),
+      shadowDivergenceSize: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_SHADOW_DIVERGENCE_SIZE, '6')
+      ),
     },
     paperTrading: {
       enabled: parseBoolean(env.PAPER_TRADING_ENABLED, false),
