@@ -1788,6 +1788,14 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.VS_ACCUMULATE_REFILL_MIN_PRICE_DELTA, '0.02')
       ),
+      // Phase 58L: PM-FV divergence brake. When |PM_mid - FV| exceeds this,
+      // skip ACCUMULATE — PM knows something Binance doesn't. Default 0.10.
+      // Observed ETH loss had divergence 0.145 (mid=0.355 vs FV=0.50).
+      // Set to 0 to disable.
+      accumulateMaxFvMidDivergence: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_ACCUMULATE_MAX_FV_MID_DIVERGENCE, '0.10')
+      ),
       // Phase 58: asymmetric take-profit. When true, VS_TIME_EXIT SKIPS the
       // winning side (determined by Binance spot vs strike at T-exit) and lets
       // paper/real settlement redeem @ $1. Only losers are dumped @ bestBid.

@@ -170,6 +170,11 @@ export interface VsEngineConfig {
    *  (minus refillMinPriceDelta tolerance). Prevents ladder-buying losers. */
   readonly accumulateNoRefillOnDrawdown: boolean;
   readonly accumulateRefillMinPriceDelta: number;
+  /** Phase 58L: PM-FV divergence brake — when |PM_mid - FV| exceeds this
+   *  threshold, skip ACCUMULATE entry. PM mid embeds information Binance
+   *  doesn't know yet (flow, sentiment, external news); if the gap is large,
+   *  our FV is stale and we'd be buying consensus-losing side. 0 = disabled. */
+  readonly accumulateMaxFvMidDivergence: number;
   /** Phase 58: asymmetric take-profit — hold winners past time-exit, let
    *  resolution redeem @ $1. Only losers are dumped @ bestBid. */
   readonly holdWinnersToResolution: boolean;
@@ -1173,6 +1178,21 @@ export class VsEngine {
       this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
         `accumulate_market_resolved ${outcome} mid=${roundTo(mid, 3)} ceil=${midCeiling}`, outcomeFV);
       return [];
+    }
+
+    // Phase 58L: PM-FV divergence brake. Large gap between PM mid and our
+    // CDF fair value means PM has priced in information Binance hasn't
+    // reflected yet (observed ETH loss: mid=0.355, FV=0.50, divergence=0.145
+    // → bot bought YES, PM crashed to 0.01). Skip when divergence exceeds
+    // threshold (default 0.10).
+    if (config.accumulateMaxFvMidDivergence > 0) {
+      const divergence = Math.abs(mid - outcomeFV);
+      if (divergence > config.accumulateMaxFvMidDivergence) {
+        this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+          `accumulate_fv_mid_divergence mid=${roundTo(mid, 3)} fv=${roundTo(outcomeFV, 3)} div=${roundTo(divergence, 3)} max=${config.accumulateMaxFvMidDivergence}`,
+          outcomeFV);
+        return [];
+      }
     }
 
     // Complete-set protection — no entry if holding opposite side
