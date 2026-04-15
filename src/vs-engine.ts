@@ -166,6 +166,10 @@ export interface VsEngineConfig {
   readonly accumulateMaxFills: number;
   readonly accumulateRefillDelayMs: number;
   readonly accumulateTiltMaxCents: number;
+  /** Phase 58I: anti-DCA — block refill if PM mid fell below entry VWAP
+   *  (minus refillMinPriceDelta tolerance). Prevents ladder-buying losers. */
+  readonly accumulateNoRefillOnDrawdown: boolean;
+  readonly accumulateRefillMinPriceDelta: number;
   /** Phase 58: asymmetric take-profit — hold winners past time-exit, let
    *  resolution redeem @ $1. Only losers are dumped @ bestBid. */
   readonly holdWinnersToResolution: boolean;
@@ -747,6 +751,9 @@ export class VsEngine {
     this.reversals += 1;
   }
 
+  /** Phase 58H: increment winner-hold counter from external timer path. */
+  incrementWinnerHolds(): void { this.winnerHolds += 1; }
+
   /** Phase 51: mark position as pending dynamic exit (prevents re-trigger from WS ticks) */
   markPendingDynamicExit(marketId: string, outcome: Outcome): void {
     this.pendingDynamicExits.add(this.positionKey(marketId, outcome));
@@ -1185,6 +1192,27 @@ export class VsEngine {
       this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
         `accumulate_cap_reached ${outcome} ${currentShares}/${cap}`, outcomeFV);
       return [];
+    }
+
+    // Phase 58I: ANTI-DCA guard. Once we have an existing position, only
+    // refill if PM mid has NOT moved below our entry VWAP. This prevents
+    // "ladder buying into a falling knife" (BTC @0.54 → 0.48 → 0.39 → 0.34
+    // → -$3.30). Config: accumulateNoRefillOnDrawdown = true.
+    // Refill is allowed when mid >= entryVwap - refillMinPriceDelta (cents).
+    if (
+      config.accumulateNoRefillOnDrawdown
+      && currentShares > 0
+    ) {
+      const existing = this.getPosition(market.marketId, outcome);
+      if (existing && existing.entryVwap > 0) {
+        const floor = existing.entryVwap - config.accumulateRefillMinPriceDelta;
+        if (mid < floor) {
+          this.recordDecision(coin, 'SKIP', 'PASSIVE_MM',
+            `accumulate_anti_dca mid=${roundTo(mid, 3)} entry_vwap=${roundTo(existing.entryVwap, 3)} floor=${roundTo(floor, 3)}`,
+            outcomeFV);
+          return [];
+        }
+      }
     }
 
     // Tilted maker bid: tilt scales with |movePct|, capped by accumulateTiltMaxCents.

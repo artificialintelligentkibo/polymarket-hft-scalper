@@ -42,7 +42,7 @@ import {
 import { OrderBookImbalanceFilter } from './order-book-imbalance.js';
 import { ObiEngine, extractCoinFromObiTitle } from './obi-engine.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
-import { VsEngine } from './vs-engine.js';
+import { VsEngine, isWinnerSide } from './vs-engine.js';
 import { SlotReplayTracker } from './slot-replay-tracker.js';
 import { meetsClobMinimums, resolveMinimumTradableShares, MIN_CLOB_ORDER_SHARES } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
@@ -6369,6 +6369,30 @@ export class MarketMakerRuntime {
 
           const outcomeBook = outcome === 'YES' ? exitBook.yes : exitBook.no;
           const bestBid = outcomeBook.bestBid ?? 0.01;
+
+          // Phase 58H: winner-hold gate. Timer path previously dumped ALL
+          // positions at T-5s regardless of side, overriding the scan-loop's
+          // asymmetric take-profit logic. With holdWinnersToResolution=true,
+          // skip dump on winner side and let settlement redeem @ $1.
+          if (config.vsEngine.holdWinnersToResolution) {
+            const coin = extractCoinFromTitle(cachedTitle);
+            if (coin) {
+              const spot = this.binanceEdge.getLatestPrice(coin);
+              const strike = this.binanceEdge.getSlotOpenPrice(coin, cachedMarket.startTime ?? null);
+              const winner = isWinnerSide(outcome, spot, strike);
+              if (winner === true) {
+                // HOLD — skip time-exit, $1 redeem expected.
+                this.vsEngine.incrementWinnerHolds();
+                logger.info('Phase 58H: HOLD winner past timer time-exit', {
+                  marketId, outcome, coin, spot, strike,
+                  shares: liveShares, bestBid,
+                  remainingSec: roundTo((slotEndMs - Date.now()) / 1000, 1),
+                  expectedRedeem: liveShares,
+                });
+                return;
+              }
+            }
+          }
 
           // Phase 50: ALWAYS exit at time-exit. Even $0.01 × 6 = $0.06 is better
           // than holding to resolution = $0.00. The old min_price guard caused

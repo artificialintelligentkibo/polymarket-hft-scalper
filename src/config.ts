@@ -1775,6 +1775,19 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         0,
         parseFloatOrDefault(env.VS_ACCUMULATE_TILT_MAX_CENTS, '0.05')
       ),
+      // Phase 58I: anti-DCA — when true, block refill if PM mid < entry VWAP
+      // (minus tolerance). Prevents ladder-buying into a losing position.
+      // Default ON — observed BTC 0.54 → 0.48 → 0.39 → 0.34 ladder lost -$3.30.
+      accumulateNoRefillOnDrawdown: parseBoolean(
+        env.VS_ACCUMULATE_NO_REFILL_ON_DRAWDOWN,
+        true
+      ),
+      // Cents of tolerance: mid can be up to this far below entryVwap and still
+      // refill (covers passive-maker sitting slightly below current mid). 0 = strict.
+      accumulateRefillMinPriceDelta: Math.max(
+        0,
+        parseFloatOrDefault(env.VS_ACCUMULATE_REFILL_MIN_PRICE_DELTA, '0.02')
+      ),
       // Phase 58: asymmetric take-profit. When true, VS_TIME_EXIT SKIPS the
       // winning side (determined by Binance spot vs strike at T-exit) and lets
       // paper/real settlement redeem @ $1. Only losers are dumped @ bestBid.
