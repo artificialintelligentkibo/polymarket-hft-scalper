@@ -179,7 +179,10 @@ export class IndicatorClient {
       ts: now,
       lastBarCloseTs: raw.lastBarCloseTs,
       fresh: raw.fresh,
-      trend: raw.trend ? 'UP' : 'DOWN',
+      // Service sends trend:boolean always; only meaningful once fresh=true.
+      // Pre-bootstrap: trend=null so analyzer buckets those entries as UNKNOWN
+      // rather than biasing DOWN (raw.trend defaults to false before warmup).
+      trend: raw.fresh ? (raw.trend ? 'UP' : 'DOWN') : null,
       count: raw.count,
       value: raw.value,
       valueUpper: raw.valueUpper,

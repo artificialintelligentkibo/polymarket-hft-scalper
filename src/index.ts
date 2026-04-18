@@ -168,6 +168,27 @@ export interface LatencySample {
   readonly recordedAtMs: number;
 }
 
+/**
+ * Resolve symbol list for the RB IndicatorClient.
+ * Order: explicit INDICATOR_CLIENT_SYMBOLS env > COINS_TO_TRADE minus blacklist.
+ * Always returns Binance-style suffix (e.g. "BTCUSDT").
+ */
+function resolveIndicatorSymbols(): string[] {
+  const override = process.env.INDICATOR_CLIENT_SYMBOLS;
+  if (override && override.trim().length > 0) {
+    return override.split(',').map((s) => s.trim().toUpperCase()).filter((s) => s.length > 0);
+  }
+  const blacklist = new Set(config.vsEngine.coinBlacklist.map((c) => c.toUpperCase()));
+  const syms: string[] = [];
+  for (const coin of config.COINS_TO_TRADE) {
+    if (blacklist.has(coin.toUpperCase())) continue;
+    syms.push(`${coin.toUpperCase()}USDT`);
+  }
+  // Defensive: if blacklist drained everything, fall back to BTC so the client
+  // still has a warm cache for one symbol (test coverage + generic sanity).
+  return syms.length > 0 ? syms : ['BTCUSDT'];
+}
+
 export class MarketMakerRuntime {
   private readonly monitor = new MarketMonitor();
   private readonly fetcher = new ClobFetcher();
@@ -190,10 +211,14 @@ export class MarketMakerRuntime {
    * Phase A RB shadow: polls range-indicator HTTP service and attaches rb
    * context to every VS decision event for offline correlation analysis.
    * Shadow-only — no strategy branching.
+   *
+   * Symbol list = COINS_TO_TRADE minus VS_COIN_BLACKLIST (blacklisted coins
+   * never produce ENTRY decisions, so polling them wastes HTTP). Override
+   * via INDICATOR_CLIENT_SYMBOLS if needed.
    */
   private readonly indicatorClient: IndicatorClient = new IndicatorClient({
     baseUrl: process.env.INDICATOR_BASE_URL ?? 'http://localhost:7788',
-    symbols: ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'BNBUSDT', 'SOLUSDT', 'DOGEUSDT'],
+    symbols: resolveIndicatorSymbols(),
     pollIntervalMs: Number.parseInt(process.env.INDICATOR_POLL_MS ?? '2000', 10),
     logger,
   });
@@ -875,6 +900,7 @@ export class MarketMakerRuntime {
     logger.info('Phase A RB indicator client started', {
       baseUrl: process.env.INDICATOR_BASE_URL ?? 'http://localhost:7788',
       shadowEnabled,
+      symbols: resolveIndicatorSymbols(),
     });
 
     if (isDynamicQuotingEnabled(config)) {

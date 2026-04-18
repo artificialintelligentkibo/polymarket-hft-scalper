@@ -2694,9 +2694,10 @@ export class VsEngine {
 
     // Phase A shadow: exit decisions get rb context too, so the analyzer can
     // correlate RB state at exit with realized PnL / outcome. Pure log emission.
-    if (params.signalType === 'VS_SCALP_EXIT'
-        || params.signalType === 'VS_TIME_EXIT'
-        || params.signalType === 'VS_DYNAMIC_EXIT') {
+    // Gate on reduceOnly — covers every exit path (VS_SCALP_EXIT, VS_TIME_EXIT,
+    // VS_DYNAMIC_EXIT, and maker-side exits emitted as VS_MM_ASK / VS_MM_BID).
+    // Entries never set reduceOnly=true, so this doesn't double-log them.
+    if (params.reduceOnly) {
       const exitCoin = extractCoin(params.market.title);
       const rb = this.buildRbContext(exitCoin, params.market.marketId);
       if (rb !== null) {

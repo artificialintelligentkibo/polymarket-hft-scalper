@@ -114,6 +114,29 @@ test('IndicatorClient populates cache and computes channelPos', async () => {
   await srv.close();
 });
 
+test('trend is null during pre-bootstrap (fresh=false) even if raw.trend=true', async () => {
+  const state: MockState = {
+    levels: { BTCUSDT: sampleLevels('BTCUSDT', { fresh: false, trend: true }) },
+    events: { BTCUSDT: [] },
+    failNext: false,
+    timeoutNext: false,
+    requestCount: 0,
+  };
+  const srv = await startMockServer(state);
+  const client = new IndicatorClient({
+    baseUrl: srv.url,
+    symbols: ['BTCUSDT'],
+    pollIntervalMs: 100,
+  });
+  client.start();
+  await new Promise((r) => setTimeout(r, 250));
+  const snap = client.getSnapshot('BTC', 100);
+  assert.equal(snap.fresh, false);
+  assert.equal(snap.trend, null);
+  client.stop();
+  await srv.close();
+});
+
 test('channelPos is clamped [0,1] but channelPosRaw exposes overshoot', async () => {
   const state: MockState = {
     levels: { BTCUSDT: sampleLevels('BTCUSDT') },
