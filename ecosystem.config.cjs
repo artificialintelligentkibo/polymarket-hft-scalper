@@ -1,0 +1,41 @@
+module.exports = {
+  apps: [
+    {
+      name: 'polymarket-hft',
+      script: './node_modules/.bin/tsx',
+      args: 'src/index.ts',
+      cwd: '/apps/polymarket-hft-scalper',
+      interpreter: 'none',
+      max_memory_restart: '2G',
+      error_file: '/apps/polymarket-hft-scalper/logs/pm2-error.log',
+      out_file: '/apps/polymarket-hft-scalper/logs/pm2-out.log',
+      time: true,
+      kill_timeout: 10000,
+      wait_ready: false,
+      autorestart: true,
+      max_restarts: 5,
+      min_uptime: '30s',
+      env: {
+        NODE_ENV: 'production',
+      },
+    },
+    {
+      name: 'range-indicator',
+      script: './node_modules/.bin/tsx',
+      args: 'src/indicator/index.ts',
+      cwd: '/apps/polymarket-hft-scalper',
+      interpreter: 'none',
+      max_memory_restart: '500M',
+      error_file: '/apps/polymarket-hft-scalper/logs/indicator-error.log',
+      out_file: '/apps/polymarket-hft-scalper/logs/indicator-out.log',
+      time: true,
+      kill_timeout: 5000,
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '30s',
+      env: {
+        NODE_ENV: 'production',
+      },
+    },
+  ],
+};

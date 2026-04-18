@@ -4,6 +4,7 @@ dist/
 .env
 logs/
 data/
+indicator.db*
 backtest/data/
 comparison/output/*.csv
 comparison/output/*.md
