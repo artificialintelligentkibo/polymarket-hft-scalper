@@ -1914,14 +1914,15 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         parseIntOrDefault(env.PAPER_TRADING_MAKER_ORDER_TTL_MS, '60000')
       ),
       minOrderNotionalUsd: parseFloatOrDefault(env.PAPER_TRADING_MIN_ORDER_NOTIONAL, '1'),
-      // Legacy fields — kept for backward compat, not used in new fill logic
+      // Submission latency — now consumed by paper-trader to model the signal →
+      // exchange round-trip. Defaults reflect observed live conditions (100-600ms).
       simulatedLatencyMinMs: Math.max(
         0,
-        parseIntOrDefault(env.PAPER_TRADING_LATENCY_MIN_MS, '400')
+        parseIntOrDefault(env.PAPER_TRADING_LATENCY_MIN_MS, '100')
       ),
       simulatedLatencyMaxMs: Math.max(
         0,
-        parseIntOrDefault(env.PAPER_TRADING_LATENCY_MAX_MS, '1500')
+        parseIntOrDefault(env.PAPER_TRADING_LATENCY_MAX_MS, '600')
       ),
       fillProbability: {
         passive: parseFloatOrDefault(env.PAPER_TRADING_FILL_PROB_PASSIVE, '0.40'),

@@ -105,8 +105,20 @@ interface PendingPaperOrder {
   readonly side: 'BUY' | 'SELL';
   readonly shares: number;
   readonly price: number;
+  /** When the caller invoked simulateOrder (pre-latency). */
+  readonly submittedAtMs: number;
+  /** When the order became visible on the book (post submission latency). */
   readonly createdAtMs: number;
+  /** TTL expiry — relative to createdAtMs (time live on book), not submission. */
   readonly expiresAtMs: number;
+  /** How much size stood at our exact price level the moment we joined the queue (FIFO assumption). */
+  readonly initialDepthAhead: number;
+  /** Live queue counter — shares ahead of us at our price. Fills only when this reaches 0. */
+  depthAheadShares: number;
+  /** Size seen at our price on the previous tick — used to compute "eaten" volume deltas. */
+  prevLevelSize: number;
+  /** Submission latency actually applied (ms) — kept for diagnostics. */
+  readonly submissionLatencyMs: number;
 }
 
 /* ================================================================
@@ -214,6 +226,21 @@ export class PaperTrader {
   }): Promise<TradeExecutionResult> {
     await this.ensureReady();
 
+    // Polymarket enforces a min notional — paper used to silently accept
+    // sub-dollar orders that live would bounce with a MIN_SIZE error.
+    const notional = params.shares * params.price;
+    if (notional < this.runtimeConfig.minOrderNotionalUsd) {
+      logger.debug('Paper order below min notional — rejected', {
+        marketId: params.marketId,
+        signalType: params.signalType,
+        shares: params.shares,
+        price: params.price,
+        notional: roundTo(notional, 4),
+        minOrderNotionalUsd: this.runtimeConfig.minOrderNotionalUsd,
+      });
+      return this.buildTradeResult(params, 0, 0, 0, false);
+    }
+
     const isTaker = params.urgency === 'cross';
 
     if (isTaker) {
@@ -244,15 +271,20 @@ export class PaperTrader {
         continue;
       }
 
-      // Check if book has crossed our price
       const book = order.outcome === 'YES' ? currentBook.yes : currentBook.no;
+
+      // Advance queue position by the amount eaten at our price level since
+      // the last tick. This replaces the old "crossed => instant fill" model,
+      // which inflated paper fill rates by giving us priority we didn't earn.
+      this.advanceQueuePosition(order, book);
+
+      // Fill only when BOTH conditions hold:
+      //   1. The book has crossed our limit (someone's marketable on the other side)
+      //   2. There's nobody ahead of us at our price (depthAhead reached 0)
       const crossed = this.checkMakerOrderCrossed(order, book);
 
-      if (crossed) {
+      if (crossed && order.depthAheadShares <= 0) {
         const actualFilled = this.fillMakerOrder(order, book);
-        // Phase 44c: only report fills with actual shares (Bug 1 fix —
-        // previously used order.shares which is the REQUESTED amount,
-        // not the actual filled amount after balance/inventory clamping).
         if (actualFilled > 0) {
           fills.push({
             marketId: order.marketId,
@@ -261,8 +293,6 @@ export class PaperTrader {
             shares: actualFilled,
             price: order.price,
             signalType: order.signalType,
-            // Phase 44d: use canonical resolveStrategyLayer instead of manual mapping
-            // (previously OBI_MM_QUOTE_ASK → SNIPER, now correctly → OBI)
             strategyLayer: resolveStrategyLayer(order.signalType),
           });
         }
@@ -617,9 +647,18 @@ export class PaperTrader {
     urgency: SignalUrgency;
     currentOrderbook: MarketOrderbookSnapshot;
   }): Promise<TradeExecutionResult> {
-    const book = params.outcome === 'YES'
-      ? params.currentOrderbook.yes
-      : params.currentOrderbook.no;
+    // Submission latency: simulates the signal → exchange round-trip during
+    // which the book can (and usually does) move against us. We then walk
+    // against the FRESHEST available book — not the snapshot the caller
+    // captured — which is how adverse selection bleeds into taker fills.
+    const submissionLatencyMs = this.computeSubmissionLatencyMs();
+    if (submissionLatencyMs > 0) {
+      await sleep(submissionLatencyMs);
+    }
+
+    const latestSnapshot = this.orderbookHistory.getLatest(params.marketId);
+    const snapshot = latestSnapshot ?? params.currentOrderbook;
+    const book = params.outcome === 'YES' ? snapshot.yes : snapshot.no;
 
     // Walk the book to find realistic fill
     const levels = params.side === 'BUY' ? book.asks : book.bids;
@@ -762,9 +801,32 @@ export class PaperTrader {
       }
     }
 
-    const orderId = buildPaperOrderId(params.marketId, params.signalType);
-    const nowMs = Date.now();
+    // Submission latency: real orders take tens to hundreds of ms to reach the
+    // book after the caller decides to submit. Paper used to skip this, which
+    // (a) inflated fill rate by giving orders unrealistic queue priority and
+    // (b) obscured taker adverse selection during the "in flight" window.
+    const submittedAtMs = Date.now();
+    const submissionLatencyMs = this.computeSubmissionLatencyMs();
+    if (submissionLatencyMs > 0) {
+      await sleep(submissionLatencyMs);
+    }
+    const createdAtMs = Date.now();
 
+    // After latency, prefer the freshest snapshot we have. If the main loop
+    // refreshed the book during the sleep, we reflect that here.
+    const latestSnapshot = this.orderbookHistory.getLatest(params.marketId);
+    const bookAtRest = latestSnapshot !== null
+      ? (params.outcome === 'YES' ? latestSnapshot.yes : latestSnapshot.no)
+      : book;
+
+    // Re-check crossing against the post-latency book. If someone took the
+    // liquidity during our submission window, we land as a passive maker
+    // normally; if the book moved AGAINST us (our price no longer crosses),
+    // we still enqueue as maker. This is the "slipped into maker" case.
+    const ourSideLevels = params.side === 'BUY' ? bookAtRest.bids : bookAtRest.asks;
+    const initialDepthAhead = findLevelSize(ourSideLevels, params.price);
+
+    const orderId = buildPaperOrderId(params.marketId, params.signalType);
     const pendingOrder: PendingPaperOrder = {
       orderId,
       marketId: params.marketId,
@@ -775,8 +837,13 @@ export class PaperTrader {
       side: params.side,
       shares: params.shares,
       price: params.price,
-      createdAtMs: nowMs,
-      expiresAtMs: nowMs + this.runtimeConfig.makerOrderTtlMs,
+      submittedAtMs,
+      createdAtMs,
+      expiresAtMs: createdAtMs + this.runtimeConfig.makerOrderTtlMs,
+      initialDepthAhead,
+      depthAheadShares: initialDepthAhead,
+      prevLevelSize: initialDepthAhead,
+      submissionLatencyMs,
     };
 
     const existing = this.pendingOrders.get(params.marketId) ?? [];
@@ -791,6 +858,8 @@ export class PaperTrader {
       price: params.price,
       shares: params.shares,
       ttlMs: this.runtimeConfig.makerOrderTtlMs,
+      submissionLatencyMs,
+      initialDepthAhead,
     });
 
     // Return "pending" result — not yet filled
@@ -815,6 +884,45 @@ export class PaperTrader {
       balanceCacheMisses: 0,
       balanceCacheHitRatePct: null,
     };
+  }
+
+  /* ================================================================
+   * PRIVATE: ADVANCE QUEUE POSITION
+   *
+   * Each tick, compare the current resting size at our price against what
+   * we saw on the previous tick. If size shrank, that volume got taken
+   * ahead of us → shift the queue forward. If size grew, new joiners
+   * arrived behind us (FIFO) → depth unchanged. If our level disappeared
+   * entirely without us filling, we assume the queue was cancelled out,
+   * which puts us first when/if the level re-emerges.
+   * ================================================================ */
+  private advanceQueuePosition(order: PendingPaperOrder, book: TokenBookSnapshot): void {
+    const levels = order.side === 'BUY' ? book.bids : book.asks;
+    const currentLevelSize = findLevelSize(levels, order.price);
+
+    const eaten = Math.max(0, order.prevLevelSize - currentLevelSize);
+    if (eaten > 0) {
+      order.depthAheadShares = Math.max(0, order.depthAheadShares - eaten);
+    }
+
+    // Level vanished without us filling — treat remaining queue as cancelled
+    // so that on the next crossing event we're first in line.
+    if (currentLevelSize === 0 && order.depthAheadShares > 0) {
+      order.depthAheadShares = 0;
+    }
+
+    order.prevLevelSize = currentLevelSize;
+  }
+
+  /* ================================================================
+   * PRIVATE: COMPUTE SUBMISSION LATENCY
+   * Uniform random in [min, max] from config. Returns 0 if max <= 0.
+   * ================================================================ */
+  private computeSubmissionLatencyMs(): number {
+    const min = Math.max(0, this.runtimeConfig.simulatedLatencyMinMs | 0);
+    const max = Math.max(min, this.runtimeConfig.simulatedLatencyMaxMs | 0);
+    if (max <= 0) return 0;
+    return min + Math.floor(Math.random() * (max - min + 1));
   }
 
   /* ================================================================
@@ -876,7 +984,8 @@ export class PaperTrader {
       isMaker: true,
     });
 
-    const latencyMs = Date.now() - order.createdAtMs;
+    const waitMs = Date.now() - order.createdAtMs;
+    const totalTimeFromSubmissionMs = Date.now() - order.submittedAtMs;
 
     const trade: PaperTrade = {
       timestamp: new Date().toISOString(),
@@ -909,7 +1018,10 @@ export class PaperTrader {
       price: fillPrice,
       shares: filledShares,
       fee: roundTo(fee, 6),
-      waitMs: latencyMs,
+      submissionLatencyMs: order.submissionLatencyMs,
+      waitMs,
+      totalTimeFromSubmissionMs,
+      initialDepthAhead: order.initialDepthAhead,
       balance: roundTo(this.balance, 4),
     });
 
@@ -950,6 +1062,9 @@ export class PaperTrader {
       price: order.price,
       shares: order.shares,
       livedMs: Date.now() - order.createdAtMs,
+      submissionLatencyMs: order.submissionLatencyMs,
+      initialDepthAhead: order.initialDepthAhead,
+      remainingDepthAhead: order.depthAheadShares,
     });
   }
 
@@ -1179,6 +1294,19 @@ export function simulateOrderbookWalk(
     avgPrice: roundTo(avgPrice, 6),
     slippage: roundTo(slippage, 6),
   };
+}
+
+/**
+ * Return the resting size at an exact price level, or 0 if no such level.
+ * Polymarket ticks are $0.01, but prices on the wire are floats, so a tight
+ * tolerance avoids FP-equality misses.
+ */
+export function findLevelSize(levels: readonly OrderbookLevel[], price: number): number {
+  const TOL = 1e-6;
+  for (const level of levels) {
+    if (Math.abs(level.price - price) < TOL) return level.size;
+  }
+  return 0;
 }
 
 function createEmptyPaperPosition(): PaperPositionState {
