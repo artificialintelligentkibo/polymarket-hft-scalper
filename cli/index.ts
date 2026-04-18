@@ -1012,14 +1012,19 @@ function renderActiveMarkets(
 }
 
 function renderOpenPositions(positions: readonly RuntimePositionSnapshot[]): string {
-  if (positions.length === 0) {
+  // Filter dust-abandoned positions (sub-1-share residuals redeemed on wallet but
+  // lingering in bot state with nonsensical ROI%). Preserved in runtime-status.json
+  // for history; only hidden from terminal dashboard.
+  const displayPositions = positions.filter((p) => !p.dustAbandoned);
+
+  if (displayPositions.length === 0) {
     return color.dim('No live inventory open right now.');
   }
 
   return renderTable(
     ['POSITION', 'YES', 'NO', 'VALUE', 'UNRL P&L', 'TOTAL', 'ROI'],
     [28, 8, 8, 11, 11, 11, 8],
-    positions.map((position) => [
+    displayPositions.map((position) => [
       truncateDashboardLabel(buildPositionLabel(position), 28),
       formatShares(position.yesShares),
       formatShares(position.noShares),
@@ -1148,7 +1153,15 @@ function renderStrategyLayers(runtimeStatus: RuntimeStatusSnapshot | null): stri
     return color.dim('No runtime status snapshot available yet.');
   }
 
-  const rows = runtimeStatus.strategyLayers.map((layer) => {
+  const allLayers = runtimeStatus.strategyLayers;
+  const activeLayers = allLayers.filter((l) => l.status !== 'OFF');
+  const hiddenCount = allLayers.length - activeLayers.length;
+
+  if (activeLayers.length === 0) {
+    return color.dim('No active strategy layers.');
+  }
+
+  const rows = activeLayers.map((layer) => {
     const status =
       layer.status === 'ACTIVE'
         ? color.green(layer.status)
@@ -1177,7 +1190,8 @@ function renderStrategyLayers(runtimeStatus: RuntimeStatusSnapshot | null): stri
       [12, 10, 12, 12, 12],
       rows
     ),
-    `${color.dim('GLOBAL EXPOSURE:')} ${color.bold(formatPlainCurrency(runtimeStatus.globalExposure.totalUsd))} / ${color.bold(formatPlainCurrency(runtimeStatus.globalExposure.maxUsd))} max`,
+    `${color.dim('GLOBAL EXPOSURE:')} ${color.bold(formatPlainCurrency(runtimeStatus.globalExposure.totalUsd))} / ${color.bold(formatPlainCurrency(runtimeStatus.globalExposure.maxUsd))} max${hiddenCount > 0 ? `
+${color.dim(`(${hiddenCount} inactive layers hidden)`)}` : ''}`,
   ].join('\n');
 }
 

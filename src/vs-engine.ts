@@ -2178,8 +2178,48 @@ export class VsEngine {
               : binanceFeed.getSlotOpenPrice(coin, market.startTime ?? null);
             const winner = isWinnerSide(position.outcome, spot, strike);
             if (winner === true) {
-              // HOLD — skip time-exit. Settlement will redeem @ $1.
+              // Зміна 1: try maker-ask @ premium BEFORE falling back to hold.
+              // Sell winners @ $0.80+ for ~30c profit instead of waiting full
+              // resolution (which has empirical 0% WR on our live holds).
+              const outcomeBook = position.outcome === 'YES' ? orderbook.yes : orderbook.no;
+              const bestAskSide = outcomeBook.bestAsk;
+              const makerAskTarget = roundTo(
+                Math.min(0.85, position.entryVwap + 0.30),
+                2
+              );
+              // Post if: target above bestBid (maker side) AND doesn't cross current ask
+              if (
+                makerAskTarget > bestBid &&
+                (bestAskSide === null || makerAskTarget < bestAskSide)
+              ) {
+                this.totalExitSignals += 1;
+                signals.push(this.buildSignal({
+                  market,
+                  orderbook,
+                  signalType: 'VS_MM_ASK',
+                  action: 'SELL',
+                  outcome: position.outcome,
+                  shares: liveShares,
+                  targetPrice: makerAskTarget,
+                  fairValue: null,
+                  urgency: 'passive',
+                  reason: `Zmina 1: winner maker-ask @ ${makerAskTarget} (entry=${roundTo(position.entryVwap, 3)})`,
+                  reduceOnly: true,
+                  priority: 990,
+                  edgeAmount: makerAskTarget - position.entryVwap,
+                }));
+                logger.info('Zmina 1: winner maker-ask attempt', {
+                  marketId: market.marketId,
+                  outcome: position.outcome,
+                  askPrice: makerAskTarget,
+                  entryVwap: roundTo(position.entryVwap, 3),
+                  bestBid, bestAskSide,
+                });
+                continue;
+              }
+              // Fallback: hold to resolution (existing Phase 58H behavior)
               this.winnerHolds += 1;
+              // Zmina 3: log ratio — monitor 58H WR manually
               logger.info('VS Phase 58: HOLD winner past time-exit', {
                 marketId: market.marketId,
                 outcome: position.outcome,
@@ -2189,11 +2229,29 @@ export class VsEngine {
                 shares: liveShares,
                 bestBid,
                 remainingMs: remaining,
-                expectedRedeem: liveShares, // $1 × shares
+                expectedRedeem: liveShares,
+                cumulativeHolds: this.winnerHolds, // track manually
               });
               continue;
             }
           }
+        }
+
+        // Zmina 2: losing position + thin book → hold to $0 resolution
+        // (avoid dust dump; when bestBid < 0.15, dump recovers ~$0.90 max on 6
+        // shares vs full position cost ~$3, so letting resolution handle equals
+        // same outcome with less volatility and no trade cost).
+        const thinBookThreshold = 0.15;
+        if (bestBid < thinBookThreshold) {
+          logger.info('Zmina 2: losing thin-book — hold to resolution', {
+            marketId: market.marketId,
+            outcome: position.outcome,
+            bestBid,
+            entryVwap: roundTo(position.entryVwap, 3),
+            threshold: thinBookThreshold,
+            remainingMs: remaining,
+          });
+          continue;
         }
 
         this.totalExitSignals += 1;

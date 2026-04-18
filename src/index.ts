@@ -6240,6 +6240,19 @@ export class MarketMakerRuntime {
         return;
       }
       if (slotHasEnded && minBidForCross > 0 && bestBid < minBidForCross) {
+        if (config.AUTO_REDEEM) {
+          // Phase 58J (AUTO_REDEEM path): do not dump post-expiry below floor.
+          // auto-redeemer will claim $1/share if position resolves in our favor;
+          // dumping at bestBid (typically <=$0.01) sacrifices the full redeem value.
+          logger.info('Phase 58J: slot ended with AUTO_REDEEM — holding for resolution', {
+            marketId, outcome, entryVwap: roundTo(entryVwap, 4),
+            bestBid: roundTo(bestBid, 4), minBidForCross,
+            expiredSec: roundTo((Date.now() - slotEndMsForExit) / 1000, 1),
+          });
+          this.vsEngine.incrementDynExitFallbackSkipped();
+          this.vsEngine.clearPendingDynamicExit(marketId, outcome);
+          return;
+        }
         logger.warn('Phase 58J: slot ended — overriding Phase 57 floor to flatten', {
           marketId, outcome, entryVwap: roundTo(entryVwap, 4),
           bestBid: roundTo(bestBid, 4), minBidForCross,
