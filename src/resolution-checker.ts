@@ -53,6 +53,7 @@ export class ResolutionChecker {
       readonly gammaUrl?: string;
       readonly requestTimeoutMs?: number;
       readonly now?: () => Date;
+      readonly useKeysetPagination?: boolean;
     } = {}
   ) {}
 
@@ -98,21 +99,39 @@ export class ResolutionChecker {
   }
 
   private async fetchMarketByConditionId(conditionId: string): Promise<JsonRecord | null> {
-    // V2 migration: try /markets/keyset first, fall back to /markets
     const baseUrl = this.gammaUrl().replace(/\/+$/, '');
+    const match = (records: readonly JsonRecord[]): JsonRecord | null =>
+      records.find(
+        (record) =>
+          String(record.conditionId ?? record.condition_id ?? '').trim().toLowerCase() ===
+          conditionId.toLowerCase()
+      ) ?? null;
+
+    // V2 migration: try /markets/keyset first when the toggle is on, fall back to /markets.
+    if (this.useKeysetPagination()) {
+      try {
+        const keysetUrl = new URL(`${baseUrl}/markets/keyset`);
+        keysetUrl.searchParams.set('condition_ids', conditionId);
+        keysetUrl.searchParams.set('limit', '10');
+        const payload = await this.fetchJson(keysetUrl);
+        const hit = match(extractMarketRecords(payload));
+        if (hit) {
+          return hit;
+        }
+      } catch (error) {
+        logger.warn('Gamma /markets/keyset lookup failed, falling back to /markets', {
+          conditionId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     const url = new URL(`${baseUrl}/markets`);
     url.searchParams.set('condition_ids', conditionId);
     url.searchParams.set('limit', '10');
 
     const payload = await this.fetchJson(url);
-    const records = extractMarketRecords(payload);
-    return (
-      records.find(
-        (record) =>
-          String(record.conditionId ?? record.condition_id ?? '').trim().toLowerCase() ===
-          conditionId.toLowerCase()
-      ) ?? null
-    );
+    return match(extractMarketRecords(payload));
   }
 
   private async fetchMarketBySlug(slug: string): Promise<JsonRecord | null> {
@@ -169,6 +188,10 @@ export class ResolutionChecker {
 
   private gammaUrl(): string {
     return this.options.gammaUrl ?? config.clob.gammaUrl;
+  }
+
+  private useKeysetPagination(): boolean {
+    return this.options.useKeysetPagination ?? config.clob.useKeysetPagination ?? false;
   }
 
   private now(): Date {

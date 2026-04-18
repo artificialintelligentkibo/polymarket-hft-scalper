@@ -49,6 +49,22 @@ export interface ClobAdapterConfig {
 }
 
 /**
+ * Resolve the effective CLOB host based on the configured API version.
+ * V2 (April 22, 2026 upgrade) uses a different base URL; everywhere else
+ * we honor the legacy V1 host.
+ */
+export function resolveClobHost(clob: {
+  readonly host: string;
+  readonly hostV2?: string;
+  readonly apiVersion?: 'v1' | 'v2';
+}): string {
+  if (clob.apiVersion === 'v2' && clob.hostV2) {
+    return clob.hostV2;
+  }
+  return clob.host;
+}
+
+/**
  * Create an unauthenticated ClobClient (for API key derivation).
  */
 export function createUnauthenticatedClobClient(

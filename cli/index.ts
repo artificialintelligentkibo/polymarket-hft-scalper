@@ -1,3 +1,6 @@
+// settings-loader must come FIRST so config/bot-config.jsonc → process.env
+// is populated before any downstream module reads config.
+import '../src/settings-loader.js';
 import {
   existsSync,
   mkdirSync,

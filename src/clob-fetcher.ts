@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { ClobClient } from '@polymarket/clob-client';
 import WebSocket from 'ws';
 import { config, type AppConfig } from './config.js';
+import { resolveClobHost } from './clob-adapter.js';
 import { logger } from './logger.js';
 import type { MarketCandidate } from './monitor.js';
 import {
@@ -96,7 +97,7 @@ export class ClobFetcher {
 
   constructor(private readonly runtimeConfig: AppConfig = config) {
     this.client = new ClobClient(
-      runtimeConfig.clob.host,
+      resolveClobHost(runtimeConfig.clob),
       runtimeConfig.chainId as ClobChainId
     );
   }

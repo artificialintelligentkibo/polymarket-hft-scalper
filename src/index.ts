@@ -1,3 +1,6 @@
+// settings-loader must come FIRST so config/bot-config.jsonc → process.env
+// is populated before any module that reads config runs.
+import './settings-loader.js';
 import { AutoRedeemer } from './auto-redeemer.js';
 import { pathToFileURL } from 'node:url';
 import { TradeNarrator } from './trade-narrator.js';

@@ -8,3 +8,14 @@ backtest/data/
 comparison/output/*.csv
 comparison/output/*.md
 !comparison/output/.gitkeep
+
+# --- bot config (contains secrets — NEVER commit) ---
+config/bot-config.jsonc
+config/bot-config.*.jsonc
+!config/bot-config.example.jsonc
+
+# --- local-only state (Claude Code, ad-hoc analysis, raw trade data) ---
+.claude/
+CLAUDE.md
+vs_data/
+tools/vs2_analysis/

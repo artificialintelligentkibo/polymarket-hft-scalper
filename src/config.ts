@@ -415,6 +415,23 @@ export interface AppConfig {
     readonly bookDepthLevels: number;
     readonly snapshotRefreshMs: number;
     readonly initialDump: boolean;
+    /**
+     * Scope A — Gamma V2 keyset pagination toggle.
+     * When true, /markets and /events use /markets/keyset + /events/keyset
+     * with cursor-based pagination. Falls back to legacy offset pagination
+     * if the keyset endpoint returns 404. Default false until Polymarket
+     * fully deprecates the offset endpoints (announced April 10, 2026 —
+     * three weeks to migrate).
+     */
+    readonly useKeysetPagination: boolean;
+    /**
+     * Scope B — CLOB API version switch. "v1" = pre-April-22 (legacy SDK,
+     * USDC.e collateral). "v2" = post-April-22 (new SDK, pUSD collateral,
+     * new exchange addresses). Controls which adapter the runtime wires up.
+     */
+    readonly apiVersion: 'v1' | 'v2';
+    /** Scope B — pre-cutover test URL for V2; fall back to host in production. */
+    readonly hostV2: string;
   };
   readonly strategy: {
     readonly minCombinedDiscount: number;
@@ -1075,6 +1092,9 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       bookDepthLevels: Math.max(1, parseIntOrDefault(env.ORDERBOOK_DEPTH_LEVELS, '5')),
       snapshotRefreshMs: Math.max(250, parseIntOrDefault(env.ORDERBOOK_REFRESH_MS, '1500')),
       initialDump: parseBoolean(env.CLOB_WS_INITIAL_DUMP, true),
+      useKeysetPagination: parseBoolean(env.GAMMA_USE_KEYSET_PAGINATION, false),
+      apiVersion: (env.CLOB_API_VERSION || '').trim().toLowerCase() === 'v2' ? 'v2' : 'v1',
+      hostV2: (env.CLOB_HOST_V2 || 'https://clob-v2.polymarket.com').trim(),
     },
     strategy: {
       minCombinedDiscount: parseFloatOrDefault(env.MIN_COMBINED_DISCOUNT, '0.01'),

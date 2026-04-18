@@ -1,0 +1,362 @@
+// ==============================================================
+//   POLYMARKET HFT SCALPER — BOT CONFIGURATION (JSONC)
+// ==============================================================
+//
+// This is the canonical source of truth for runtime configuration.
+// The settings-loader reads this file and populates process.env before
+// src/config.ts runs, so the bot sees these values as if they came from
+// a classic .env file (backwards compatible).
+//
+// FILE LOCATIONS
+//   config/bot-config.example.jsonc  — this template (git-tracked, no secrets)
+//   config/bot-config.jsonc          — YOUR config (git-ignored, 600 perms!)
+//
+// QUICK START
+//   1. cp config/bot-config.example.jsonc config/bot-config.jsonc
+//   2. chmod 600 config/bot-config.jsonc   (Unix) — restrict to owner
+//   3. Fill in the `auth` section (private key + API creds)
+//   4. Adjust strategy + risk sections as needed
+//   5. npm start
+//
+// PRECEDENCE (lowest → highest)
+//   1. src/config.ts defaults
+//   2. .env   (legacy, deprecated — still read as fallback)
+//   3. config/bot-config.jsonc  (THIS FILE — authoritative)
+//   4. Real process.env (shell exports — highest priority, e.g. `VS_MM_SHARES=6 npm start`)
+//
+// ACCESS CONTROL RECOMMENDATIONS
+//   • Unix/Linux/macOS: chmod 600 config/bot-config.jsonc
+//   • Windows: icacls config\bot-config.jsonc /inheritance:r /grant:r "%USERNAME%:F"
+//   • Never commit this file with real credentials
+//   • For production, prefer a secrets manager (1Password, HashiCorp Vault, AWS Secrets Manager)
+//     and inject via environment variables — they still win over this file.
+//
+// See docs/WALLET_SETUP.md for step-by-step wallet + API credential generation.
+
+{
+  "$schema": "./bot-config.schema.json",
+  "version": "1.0.0",
+
+  // ============================================================
+  // RUNTIME MODE
+  // ============================================================
+  "mode": {
+    "simulation": true,        // SIMULATION_MODE — paper trading, no real orders
+    "dryRun": true,            // DRY_RUN — validate flow without submitting
+    "testMode": false,         // TEST_MODE
+    "productTest": false,      // PRODUCT_TEST_MODE — real orders, tiny size
+    "paperTrading": false,     // PAPER_TRADING_ENABLED
+    "enableSignal": true       // ENABLE_SIGNAL
+  },
+
+  // ============================================================
+  // AUTHENTICATION  ⚠️  SECRETS — NEVER COMMIT WITH REAL VALUES
+  // ============================================================
+  "auth": {
+    "authMode": "PROXY",            // AUTH_MODE — PROXY (Magic Link/MetaMask proxy wallet) | EOA
+    "signatureType": 2,             // SIGNATURE_TYPE — 1=Magic Link, 2=MetaMask/Rabby EOA
+
+    // MetaMask private key (Account Details → Show Private Key)
+    // Address derived from this key must match the "Signer Address" on
+    // Polymarket → Settings → Relayer API Keys.
+    "signerPrivateKey": "",         // SIGNER_PRIVATE_KEY
+
+    // Proxy wallet from Polymarket → Settings → Profile → Address
+    "funderAddress": "",            // FUNDER_ADDRESS
+
+    // CLOB API creds — generate ONCE via scripts/derive-clob-creds.ts
+    // Re-running invalidates previous credentials.
+    "clob": {
+      "apiKey": "",                 // POLYMARKET_API_KEY
+      "apiSecret": "",              // POLYMARKET_API_SECRET
+      "apiPassphrase": "",          // POLYMARKET_API_PASSPHRASE
+      "apiKeyAddress": ""           // POLYMARKET_API_KEY_ADDRESS — signer addr (NOT funder)
+    },
+
+    // Relayer creds — Polymarket → Settings → Relayer API Keys
+    // DIFFERENT from CLOB creds. Used for gasless on-chain actions (redeem, approve).
+    "relayer": {
+      "key": "",                    // POLYMARKET_RELAYER_KEY
+      "keyAddress": ""              // POLYMARKET_RELAYER_KEY_ADDRESS
+    }
+  },
+
+  // ============================================================
+  // POLYMARKET INFRASTRUCTURE
+  // ============================================================
+  "polymarket": {
+    // CLOB API version — "v1" (legacy) or "v2" (April 22, 2026 upgrade).
+    // When "v2", clobHost should point to clob-v2.polymarket.com or the
+    // post-cutover production URL. See docs/V2_MIGRATION.md.
+    "apiVersion": "v1",             // CLOB_API_VERSION
+    "clobHost": "https://clob.polymarket.com",                       // CLOB_HOST
+    "clobHostV2": "https://clob-v2.polymarket.com",                  // CLOB_HOST_V2 (pre-cutover test URL)
+    "clobWsUrl": "wss://ws-subscriptions-clob.polymarket.com/ws/market", // CLOB_WS_URL
+    "gammaApiUrl": "https://gamma-api.polymarket.com",               // GAMMA_API_URL
+    "relayerUrl": "https://relayer-v2.polymarket.com",               // POLYMARKET_RELAYER_URL
+    "rpcUrl": "https://polygon.drpc.org",                            // RPC_URL
+    "chainId": 137,                                                  // CHAIN_ID (Polygon mainnet)
+    "geoToken": "",                                                  // POLYMARKET_GEO_TOKEN
+
+    // Scope A — V2 keyset pagination for Gamma /markets and /events.
+    // Legacy offset-based pagination deprecates 3 weeks after April 10, 2026.
+    "useKeysetPagination": false,   // GAMMA_USE_KEYSET_PAGINATION
+
+    "orderBookDepthLevels": 5,      // ORDERBOOK_DEPTH_LEVELS
+    "orderBookRefreshMs": 1500,     // ORDERBOOK_REFRESH_MS
+    "clobWsInitialDump": true       // CLOB_WS_INITIAL_DUMP
+  },
+
+  // ============================================================
+  // CONTRACTS (Polygon mainnet)
+  // V1 addresses active until April 22, 2026 cutover.
+  // V2 addresses active afterwards.
+  // Leave fields empty to use code defaults.
+  // ============================================================
+  "contracts": {
+    // Shared across V1/V2
+    "ctf": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",             // POLY_CTF_ADDRESS
+    "negRiskAdapter": "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296",  // POLY_NEG_RISK_ADAPTER_ADDRESS
+
+    // V1 (pre-April-22)
+    "v1": {
+      "exchange": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",      // POLY_EXCHANGE_ADDRESS
+      "negRiskExchange": "0xC5d563A36AE78145C45a50134d48A1215220f80a", // POLY_NEG_RISK_EXCHANGE_ADDRESS
+      "collateral": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"     // POLY_COLLATERAL_ADDRESS (USDC.e)
+    },
+
+    // V2 (post-April-22)
+    "v2": {
+      "exchange": "0xE111180000d2663C0091e4f400237545B87B996B",       // POLY_EXCHANGE_V2_ADDRESS
+      "negRiskExchange": "0xe2222d279d744050d28e00520010520000310F59", // POLY_NEG_RISK_EXCHANGE_V2_ADDRESS
+      "collateral": "",                                               // POLY_PUSD_ADDRESS (fill at cutover)
+      "collateralOnramp": ""                                          // POLY_COLLATERAL_ONRAMP_ADDRESS (fill at cutover)
+    }
+  },
+
+  // ============================================================
+  // MARKET SELECTION
+  // ============================================================
+  "market": {
+    "coinsToTrade": ["BTC", "SOL", "XRP", "ETH"],   // COINS_TO_TRADE
+    "filter5MinOnly": true,                          // FILTER_5MIN_ONLY
+    "minLiquidityUsd": 500,                          // MIN_LIQUIDITY_USD
+    "whitelistConditionIds": [],                     // WHITELIST_CONDITION_IDS
+    "scanIntervalMs": 2500,                          // MARKET_SCAN_INTERVAL_MS
+    "maxConcurrentMarkets": 6,                       // MAX_CONCURRENT_MARKETS
+    "queryLimit": 80                                 // MARKET_QUERY_LIMIT
+  },
+
+  // ============================================================
+  // RISK LIMITS  ⚠️  Hard ceilings — breach → auto-halt
+  // ============================================================
+  "risk": {
+    "maxDrawdownUsdc": -15,                          // MAX_DRAWDOWN_USDC
+    "globalMaxExposureUsd": null,                    // GLOBAL_MAX_EXPOSURE_USD (null → use code default)
+    "hardStopLoss": 0.025,                           // HARD_STOP_LOSS
+    "hardStopCooldownMs": 15000,                     // HARD_STOP_COOLDOWN_MS
+    "trailingTakeProfit": 0.012,                     // TRAILING_TAKE_PROFIT
+    "slippageTolerance": 0.02,                       // SLIPPAGE_TOLERANCE
+    "sizeLiquidityCapUsd": 4000                      // SIZE_LIQUIDITY_CAP_USD
+  },
+
+  // ============================================================
+  // STRATEGY — top-level preset + engine enable flags
+  // ============================================================
+  "strategy": {
+    "active": "CURRENT_SNIPER",                      // ACTIVE_STRATEGY — CURRENT_SNIPER|PAIRED_ARBITRAGE|ORDER_BOOK_IMBALANCE|ALL
+    "entryStrategy": "LEGACY",                       // ENTRY_STRATEGY — LEGACY|PAIRED_ARBITRAGE|LATENCY_MOMENTUM|ALL
+
+    // --- Engine switches ---
+    "marketMakerMode": false,                        // MARKET_MAKER_MODE
+    "sniperEnabled": false,                          // SNIPER_MODE_ENABLED
+    "pairedArbEnabled": false,                       // PAIRED_ARB_ENABLED
+    "latencyMomentumEnabled": false,                 // LATENCY_MOMENTUM_ENABLED
+    "orderBookImbalanceEnabled": false,              // ORDER_BOOK_IMBALANCE_ENABLED
+    "obiEngineEnabled": false,                       // OBI_ENGINE_ENABLED
+    "lotteryLayerEnabled": false,                    // LOTTERY_LAYER_ENABLED
+    "regimeFilterEnabled": false,                    // REGIME_FILTER_ENABLED
+    "autoRedeem": false                              // AUTO_REDEEM
+  },
+
+  // ============================================================
+  // BINANCE EDGE (fair value signal)
+  // ============================================================
+  "binance": {
+    "edgeEnabled": true,                             // BINANCE_EDGE_ENABLED
+    "wsEnabled": true,                               // BINANCE_WS_ENABLED
+    "symbols": "btcusdt,ethusdt,solusdt,xrpusdt,dogeusdt,bnbusdt,linkusdt", // BINANCE_SYMBOLS
+    "flatThreshold": 0.05,                           // BINANCE_FLAT_THRESHOLD
+    "strongThreshold": 0.20,                         // BINANCE_STRONG_THRESHOLD
+    "boostMultiplier": 1.5,                          // BINANCE_BOOST_MULTIPLIER
+    "reduceMultiplier": 0.5,                         // BINANCE_REDUCE_MULTIPLIER
+    "blockStrongContra": true,                       // BINANCE_BLOCK_STRONG_CONTRA
+    "fvSensitivity": 0.02,                           // BINANCE_FV_SENSITIVITY
+    "deepMode": false,                               // DEEP_BINANCE_MODE
+    "depthLevels": 20,                               // BINANCE_DEPTH_LEVELS
+    "fundingWeight": 0.3,                            // BINANCE_FUNDING_WEIGHT
+    "fairValueWeight": 0.7,                          // BINANCE_FAIR_VALUE_WEIGHT
+    "fvDecayWindowMs": 300000,                       // BINANCE_FV_DECAY_WINDOW_MS
+    "fvDecayMinMultiplier": 0.25,                    // BINANCE_FV_DECAY_MIN_MULTIPLIER
+    "wsReconnectMs": 5000,                           // BINANCE_WS_RECONNECT_MS
+    "maxReconnectAttempts": 10                       // BINANCE_MAX_RECONNECT
+  },
+
+  // ============================================================
+  // ORDER EXECUTION
+  // ============================================================
+  "execution": {
+    "orderType": "GTC",                              // ORDER_TYPE
+    "orderTypeFallback": "GTC",                      // ORDER_TYPE_FALLBACK
+    "postOnly": true,                                // POST_ONLY
+    "postOnlyOnly": true,                            // POST_ONLY_ONLY
+    "orderRetryAttempts": 3,                         // ORDER_RETRY_ATTEMPTS
+    "orderRateLimitMs": 350,                         // ORDER_RATE_LIMIT_MS
+    "passiveTicks": 1,                               // PASSIVE_TICKS
+    "improveTicks": 1,                               // IMPROVE_TICKS
+    "crossTicks": 0,                                 // CROSS_TICKS
+    "fillPollIntervalMs": 2500,                      // FILL_POLL_INTERVAL_MS
+    "fillPollTimeoutMs": 120000,                     // FILL_POLL_TIMEOUT_MS
+    "fillCancelBeforeEndMs": 20000,                  // FILL_CANCEL_BEFORE_END_MS
+    "balanceCacheTtlMs": 10000,                      // BALANCE_CACHE_TTL_MS
+    "sellAfterFillDelayMs": 8000,                    // SELL_AFTER_FILL_DELAY_MS
+    "exitBeforeEndMs": 20000                         // EXIT_BEFORE_END_MS
+  },
+
+  // ============================================================
+  // POSITION SIZING (classic layer)
+  // ============================================================
+  "sizing": {
+    "minShares": 8,                                  // MIN_SHARES
+    "maxShares": 35,                                 // MAX_SHARES
+    "baseOrderShares": 12,                           // BASE_ORDER_SHARES
+    "maxNetYes": 200,                                // MAX_NET_YES
+    "maxNetNo": 250,                                 // MAX_NET_NO
+    "inventoryImbalanceThreshold": 90,               // INVENTORY_IMBALANCE_THRESHOLD
+    "inventoryRebalanceFraction": 0.45,              // INVENTORY_REBALANCE_FRACTION
+    "depthReferenceShares": 180,                     // DEPTH_REFERENCE_SHARES
+    "capitalReferenceShares": 120                    // CAPITAL_REFERENCE_SHARES
+  },
+
+  // ============================================================
+  // DYNAMIC COMPOUNDING (balance-aware sizing)
+  // ============================================================
+  "compounding": {
+    "enabled": false,                                // COMPOUNDING_ENABLED
+    "baseRiskPct": 0.008,                            // COMPOUNDING_BASE_RISK_PCT
+    "maxSlotExposurePct": 0.15,                      // COMPOUNDING_MAX_SLOT_EXPOSURE_PCT
+    "globalExposurePct": 0.35,                       // COMPOUNDING_GLOBAL_EXPOSURE_PCT
+    "layerMultipliers": "1.0,1.5,2.0,2.5,3.0,3.5",   // COMPOUNDING_LAYER_MULTIPLIERS
+    "drawdownGuardPct": 0.08                         // COMPOUNDING_DRAWDOWN_GUARD_PCT
+  },
+
+  // ============================================================
+  // ENTRY GUARDS
+  // ============================================================
+  "entryGuards": {
+    "minEntryDepthUsd": 2,                           // MIN_ENTRY_DEPTH_USD
+    "maxEntrySpread": 0.12,                          // MAX_ENTRY_SPREAD
+    "maxEntrySpreadCombinedDiscount": 0.08,          // MAX_ENTRY_SPREAD_COMBINED_DISCOUNT
+    "maxEntrySpreadExtreme": 0.15,                   // MAX_ENTRY_SPREAD_EXTREME
+    "maxEntrySpreadFairValue": 0.06,                 // MAX_ENTRY_SPREAD_FAIR_VALUE
+    "maxEntrySpreadRebalance": 0.20,                 // MAX_ENTRY_SPREAD_REBALANCE
+    "entryImbalanceBlockThreshold": 100,             // ENTRY_IMBALANCE_BLOCK_THRESHOLD
+    "maxSignalsPerTick": 2,                          // MAX_SIGNALS_PER_TICK
+    "priceMultiplierLevels": "0.20:1.65,0.35:1.35,0.50:1.15,0.70:1.00,1.00:0.85",  // PRICE_MULTIPLIER_LEVELS
+    "minCombinedDiscount": 0.01,                     // MIN_COMBINED_DISCOUNT
+    "extremeSellThreshold": 0.93,                    // EXTREME_SELL_THRESHOLD
+    "extremeBuyThreshold": 0.04,                     // EXTREME_BUY_THRESHOLD
+    "fairValueBuyThreshold": 0.005,                  // FAIR_VALUE_BUY_THRESHOLD
+    "fairValueSellThreshold": 0.005                  // FAIR_VALUE_SELL_THRESHOLD
+  },
+
+  // ============================================================
+  // LATENCY PROTECTION
+  // ============================================================
+  "latency": {
+    "pauseThresholdMs": 2000,                        // LATENCY_PAUSE_THRESHOLD_MS
+    "resumeThresholdMs": 1000,                       // LATENCY_RESUME_THRESHOLD_MS
+    "pauseWindowSize": 10,                           // LATENCY_PAUSE_WINDOW_SIZE
+    "pauseSampleTtlMs": 90000                        // LATENCY_PAUSE_SAMPLE_TTL_MS
+  },
+
+  // ============================================================
+  // LOGGING + REPORTS
+  // ============================================================
+  "logging": {
+    "level": "info",                                 // LOG_LEVEL
+    "toFile": true,                                  // LOG_TO_FILE
+    "directory": "logs",                             // LOG_DIRECTORY
+    "reportsDir": "./reports",                       // REPORTS_DIR
+    "reportsFilePrefix": "slot-reports",             // REPORTS_FILE_PREFIX
+    "stateFile": "./reports/state.json",             // STATE_FILE
+    "latencyLog": "./reports/latency_YYYY-MM-DD.log" // LATENCY_LOG
+  },
+
+  // ============================================================
+  // MONITORING / CIRCUIT BREAKERS
+  // ============================================================
+  "monitoring": {
+    "statusCheckIntervalMs": 300000,                 // STATUS_CHECK_INTERVAL_MS
+    "autoPauseOnIncident": true,                     // AUTO_PAUSE_ON_INCIDENT
+    "pauseGracePeriodMs": 60000,                     // PAUSE_GRACE_PERIOD_MS
+    "gracefulShutdownTimeoutMs": 12000,              // GRACEFUL_SHUTDOWN_TIMEOUT_MS
+    "redeemIntervalMs": 30000                        // REDEEM_INTERVAL_MS
+  },
+
+  // ============================================================
+  // PRODUCT TEST MODE
+  // ============================================================
+  "productTest": {
+    "minTradeUsdc": 1,                               // TEST_MIN_TRADE_USDC
+    "maxSlots": 1                                    // TEST_MAX_SLOTS
+  },
+
+  // ============================================================
+  // DASHBOARD (HTTP)
+  // ============================================================
+  "dashboard": {
+    "enabled": false,                                // DASHBOARD_ENABLED
+    "host": "0.0.0.0",                               // DASHBOARD_HOST
+    "port": 3847                                     // DASHBOARD_PORT
+  },
+
+  // ============================================================
+  // extraEnv — CATCH-ALL for any env var not listed above.
+  //
+  // Values here are injected into process.env verbatim (stringified).
+  // Use this for:
+  //   • Engine-specific knobs (VS_*, OBI_*, SNIPER_*, MM_*, PAIRED_ARB_*,
+  //     LATENCY_MOMENTUM_*, LOTTERY_*, PAPER_TRADING_*, EV_*, KELLY_*,
+  //     BAYESIAN_FV_*, REGIME_FILTER_*, FV_BUY_*, COMPOUNDING_LAYER_*,
+  //     MM_QUOTE_*, DYNAMIC_*, etc.)
+  //   • Experimental flags not yet promoted to a typed section
+  //   • Per-deployment overrides
+  //
+  // Any structured key above that is left empty/null falls through to
+  // the code default; extraEnv always wins over src/config.ts defaults.
+  // ============================================================
+  "extraEnv": {
+    // --- Example VS engine knobs (uncomment + adjust) ---
+    // "VS_MM_SHARES": "6",
+    // "VS_ACCUMULATE_MAX_FILLS": "1",
+    // "VS_HARD_STOP_USD": "3.0",
+    // "VS_TIME_EXIT_BEFORE_END_MS": "30000",
+    // "VS_PHASE_D_START_BEFORE_END_MS": "45000",
+    // "VS_HOLD_WINNERS_TO_RESOLUTION": "false",
+    // "VS_COIN_BLACKLIST": "DOGE,SOL,ETH,BNB",
+    // "VS_DYNAMIC_EXIT_THRESHOLD_PCT": "0.08",
+    // "VS_MIN_DIRECTION_THRESHOLD": "0.10",
+    // "VS_ACCUMULATE_MAX_FV_MID_DIVERGENCE": "0.50",
+    // "VS_SHADOW_MEAN_REVERSION_ENABLED": "true",
+
+    // --- Example OBI knobs ---
+    // "OBI_ENTRY_SHARES": "8",
+    // "OBI_MIN_ENTRY_PRICE": "0.04",
+    // "OBI_MAX_ENTRY_PRICE": "0.50",
+
+    // --- Example SNIPER knobs ---
+    // "SNIPER_MIN_BINANCE_MOVE_PCT": "0.10",
+    // "SNIPER_BASE_SHARES": "6"
+  }
+}

@@ -20,6 +20,7 @@ import {
   retryWithBackoff,
 } from './api-retry.js';
 import { logger } from './logger.js';
+import { resolveClobHost } from './clob-adapter.js';
 import { clampProductTestShares } from './product-test-mode.js';
 import type { Outcome } from './clob-fetcher.js';
 import { roundTo } from './utils.js';
@@ -504,7 +505,7 @@ export class Trader {
 
   private createUnauthenticatedClient(): ClobClient {
     return new ClobClient(
-      this.runtimeConfig.clob.host,
+      resolveClobHost(this.runtimeConfig.clob),
       this.runtimeConfig.chainId as ClobChainId,
       this.clobSigner,
       undefined,
@@ -518,7 +519,7 @@ export class Trader {
     // V2 migration: builder attribution is wired synchronously for now.
     // When v6 ships, this will go through the async adapter path.
     return new ClobClient(
-      this.runtimeConfig.clob.host,
+      resolveClobHost(this.runtimeConfig.clob),
       this.runtimeConfig.chainId as ClobChainId,
       this.clobSigner,
       {

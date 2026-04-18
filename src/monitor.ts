@@ -156,6 +156,7 @@ export class MarketMonitor extends EventEmitter {
         marketQueryLimit: this.runtimeConfig.runtime.marketQueryLimit,
         fetchImpl: this.fetchImpl,
         breaker: this.gammaCircuitBreaker,
+        useKeysetPagination: this.runtimeConfig.clob.useKeysetPagination,
       });
     } catch (error: any) {
       logger.warn('Could not fetch active Gamma events for market discovery', {
@@ -347,6 +348,12 @@ export async function fetchPaginatedGammaEventMarkets(params: {
   marketQueryLimit: number;
   fetchImpl?: FetchLike;
   breaker?: CircuitBreaker;
+  /**
+   * Scope A: when true, attempt /events/keyset first with cursor-based
+   * pagination. Falls back to legacy /events offset-based on 404 or
+   * keyset errors. Defaults to false for backward compat.
+   */
+  useKeysetPagination?: boolean;
 }): Promise<GammaEventFetchResult> {
   const fetchImpl = params.fetchImpl ?? fetch;
   const targetMarketCount = Math.max(
@@ -370,6 +377,7 @@ export async function fetchPaginatedGammaEventMarkets(params: {
       cursor,
       fetchImpl,
       breaker: params.breaker,
+      useKeysetPagination: params.useKeysetPagination,
     });
 
     if (result.events.length === 0) {
