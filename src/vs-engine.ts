@@ -29,6 +29,8 @@ import { resolveStrategyLayer } from './strategy-types.js';
 import { logger } from './logger.js';
 import { roundTo } from './utils.js';
 import type { VsSessionStats, VsCoinStats, VsDecisionRecord } from './runtime-status.js';
+import type { IndicatorClient } from './indicator-client.js';
+import { serializeRb } from './indicator-client.js';
 
 /* ------------------------------------------------------------------ */
 /*  Binance feed interface (BinanceEdgeProvider implements this)       */
@@ -511,6 +513,11 @@ export class VsEngine {
     lastActionAt: string | null;
   }>();
   private recentDecisions: VsDecisionRecord[] = [];
+
+  /* ── Phase A RB shadow logging (additive, no logic branching) ─── */
+  private indicatorClient: IndicatorClient | null = null;
+  private lastBinanceFeed: VsBinanceFeed | null = null;
+  private shadowEnabled = true;
 
   /* ── Phase 47c: Adverse selection diagnostics ───────────────────── */
   /** Track when each quote was placed and what Binance price was at that moment */
@@ -1048,6 +1055,7 @@ export class VsEngine {
   }): StrategySignal[] {
     const { market, orderbook, positionManager, config, binanceFeed } = params;
     const nowMs = params.nowMs ?? Date.now();
+    this.lastBinanceFeed = binanceFeed;
 
     if (!config.enabled) return [];
 
@@ -1691,7 +1699,7 @@ export class VsEngine {
 
     this.recordDecision(coin, 'ENTRY', 'PASSIVE_MM',
       `ACCUMULATE ${outcome} bid=${bidPrice} mid=${roundTo(mid, 3)} tilt=${roundTo(tiltCents, 4)} move=${roundTo(movePct, 3)}% fills=${currentShares}/${cap}`,
-      outcomeFV);
+      outcomeFV, market.marketId);
 
     // Mark refill cadence. Do NOT increment entriesPerSlot — ACCUMULATE is
     // intentionally multi-fill. Fills are counted via onEntryFill (totalEntries).
@@ -1852,7 +1860,7 @@ export class VsEngine {
       const skewLabel = binanceFlat ? 'FLAT' : (binanceUp ? 'UP' : 'DOWN');
       this.recordDecision(coin, 'ENTRY', 'PASSIVE_MM',
         `${outcome} mid=${roundTo(mid, 3)} bid=${bidPrice} skew=${skewLabel} move=${roundTo(movePct, 3)}%`,
-        outcomeFV);
+        outcomeFV, market.marketId);
 
       if (config.shadowMode) continue;
 
@@ -1995,7 +2003,7 @@ export class VsEngine {
     const skewLabel = binanceUp ? 'UP' : 'DOWN';
     this.recordDecision(coin, 'ENTRY', 'MOMENTUM',
       `${outcome} edge=${roundTo(edge, 4)} FV=${roundTo(outcomeFV, 3)} ask=${bestAsk} ${skewLabel} ${roundTo(movePct, 3)}% vol=${roundTo(aggressorVol, 4)}`,
-      outcomeFV);
+      outcomeFV, market.marketId);
 
     if (config.shadowMode) return [];
 
@@ -2035,6 +2043,7 @@ export class VsEngine {
   }): StrategySignal[] {
     const { market, orderbook, positionManager, config, binanceFeed } = params;
     const nowMs = params.nowMs ?? Date.now();
+    if (binanceFeed !== undefined) this.lastBinanceFeed = binanceFeed;
     const signals: StrategySignal[] = [];
 
     // Phase 45a: iterate both YES and NO positions for this market
@@ -2605,12 +2614,39 @@ export class VsEngine {
     return stats;
   }
 
+  /**
+   * Phase A RB shadow — wire an IndicatorClient so every VS decision (entry,
+   * skip, exit, transition) is logged alongside a range-breakout snapshot.
+   * Pure observability: no branches on rb fields, no strategy changes.
+   */
+  setIndicatorClient(client: IndicatorClient | null, enabled = true): void {
+    this.indicatorClient = client;
+    this.shadowEnabled = enabled;
+  }
+
+  /** Build an rb context object for a given coin. Returns null if shadow off
+   *  or no spot price available (never throws). */
+  buildRbContext(coin: string | null, marketId?: string): Record<string, unknown> | null {
+    if (!this.shadowEnabled || this.indicatorClient === null || coin === null) return null;
+    const spot = this.lastBinanceFeed?.getLatestPrice(coin) ?? null;
+    if (spot === null) {
+      return { coin, available: false, reason: 'no_spot' };
+    }
+    try {
+      const snap = this.indicatorClient.getSnapshot(coin, spot);
+      return { ...serializeRb(snap), coin, marketId: marketId ?? null };
+    } catch {
+      return { coin, available: false, reason: 'snapshot_error' };
+    }
+  }
+
   private recordDecision(
     coin: string | null,
     action: string,
     phase: string,
     reason: string,
-    fairValue: number | null
+    fairValue: number | null,
+    marketId?: string
   ): void {
     this.recentDecisions.push({
       timestamp: new Date().toISOString(),
@@ -2622,6 +2658,19 @@ export class VsEngine {
     });
     if (this.recentDecisions.length > MAX_RECENT_DECISIONS * 2) {
       this.recentDecisions = this.recentDecisions.slice(-MAX_RECENT_DECISIONS);
+    }
+    // Phase A shadow: emit JSONL event for offline correlation analysis.
+    const rb = this.buildRbContext(coin, marketId);
+    if (rb !== null) {
+      logger.event('vs_decision', 'VS shadow decision', {
+        coin,
+        action,
+        phase,
+        reason,
+        fairValue: fairValue !== null ? roundTo(fairValue, 4) : null,
+        marketId: marketId ?? null,
+        rb,
+      });
     }
   }
 
@@ -2642,6 +2691,27 @@ export class VsEngine {
   }): StrategySignal {
     const outcomeBook =
       params.outcome === 'YES' ? params.orderbook.yes : params.orderbook.no;
+
+    // Phase A shadow: exit decisions get rb context too, so the analyzer can
+    // correlate RB state at exit with realized PnL / outcome. Pure log emission.
+    if (params.signalType === 'VS_SCALP_EXIT'
+        || params.signalType === 'VS_TIME_EXIT'
+        || params.signalType === 'VS_DYNAMIC_EXIT') {
+      const exitCoin = extractCoin(params.market.title);
+      const rb = this.buildRbContext(exitCoin, params.market.marketId);
+      if (rb !== null) {
+        logger.event('vs_decision', 'VS shadow decision', {
+          coin: exitCoin,
+          action: 'EXIT',
+          phase: params.signalType,
+          reason: params.reason,
+          fairValue: params.fairValue !== null ? roundTo(params.fairValue, 4) : null,
+          marketId: params.market.marketId,
+          rb,
+        });
+      }
+    }
+
     return {
       marketId: params.market.marketId,
       marketTitle: params.market.title,

@@ -46,6 +46,7 @@ import { OrderBookImbalanceFilter } from './order-book-imbalance.js';
 import { ObiEngine, extractCoinFromObiTitle } from './obi-engine.js';
 import { OrderExecutor, type OrderExecutionReport } from './order-executor.js';
 import { VsEngine, isWinnerSide } from './vs-engine.js';
+import { IndicatorClient } from './indicator-client.js';
 import { SlotReplayTracker } from './slot-replay-tracker.js';
 import { meetsClobMinimums, resolveMinimumTradableShares, MIN_CLOB_ORDER_SHARES } from './paired-arbitrage.js';
 import { PositionManager } from './position-manager.js';
@@ -185,6 +186,17 @@ export class MarketMakerRuntime {
   private readonly orderBookImbalance = new OrderBookImbalanceFilter(config.orderBookImbalance);
   private readonly obiEngine = new ObiEngine();
   private readonly vsEngine = new VsEngine();
+  /**
+   * Phase A RB shadow: polls range-indicator HTTP service and attaches rb
+   * context to every VS decision event for offline correlation analysis.
+   * Shadow-only — no strategy branching.
+   */
+  private readonly indicatorClient: IndicatorClient = new IndicatorClient({
+    baseUrl: process.env.INDICATOR_BASE_URL ?? 'http://localhost:7788',
+    symbols: ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'BNBUSDT', 'SOLUSDT', 'DOGEUSDT'],
+    pollIntervalMs: Number.parseInt(process.env.INDICATOR_POLL_MS ?? '2000', 10),
+    logger,
+  });
   private readonly slotReplay = new SlotReplayTracker({
     reportsDir: config.REPORTS_DIR,
     snapshotIntervalMs: config.SLOT_REPLAY_SNAPSHOT_INTERVAL_MS,
@@ -854,6 +866,17 @@ export class MarketMakerRuntime {
     }
 
     this.deepBinance.start();
+
+    // Phase A RB shadow: start indicator client polling + inject into VS engine.
+    // Shadow-only observability — zero branching in strategy code.
+    const shadowEnabled = (process.env.INDICATOR_SHADOW_ENABLED ?? 'true').toLowerCase() !== 'false';
+    this.indicatorClient.start();
+    this.vsEngine.setIndicatorClient(this.indicatorClient, shadowEnabled);
+    logger.info('Phase A RB indicator client started', {
+      baseUrl: process.env.INDICATOR_BASE_URL ?? 'http://localhost:7788',
+      shadowEnabled,
+    });
+
     if (isDynamicQuotingEnabled(config)) {
       this.quotingEngine.start(async (plan) => {
         await this.handleQuoteRefresh(plan);
@@ -1005,6 +1028,7 @@ export class MarketMakerRuntime {
       this.statusMonitor.stop();
       this.binanceEdge.stop();
       this.deepBinance.stop();
+      this.indicatorClient.stop();
       this.fetcher.close();
     }
   }
